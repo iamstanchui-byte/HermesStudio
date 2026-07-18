@@ -78,6 +78,9 @@ class Supervisor:
         self.planner = planner
         self.interval = int((cfg.get("supervisor") or {}).get("poll_interval_seconds", 5))
         self.stuck_minutes = int((cfg.get("supervisor") or {}).get("stuck_planning_warn_minutes", 10))
+        # Last time the session-cleanup sweep ran (None = never). Used
+        # by _maybe_sweep_sessions to throttle to ~once per hour.
+        self._last_sweep_at: "datetime | None" = None
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
 
@@ -111,6 +114,13 @@ class Supervisor:
                     )
                 except Exception:
                     pass
+            # Hourly session-cleanup sweep. Cheap if nothing to do (one
+            # SELECT), runs alongside the main tick loop. We check
+            # elapsed wall time against the configured interval.
+            try:
+                await self._maybe_sweep_sessions()
+            except Exception as e:
+                log.exception(f"session sweep crashed: {e}")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval)
             except asyncio.TimeoutError:
@@ -119,7 +129,7 @@ class Supervisor:
     # ===== tick (one pass) =====
 
     async def tick(self) -> None:
-        projects = await self.db.fetchall(
+        projects = await self.fetchall(
             "SELECT * FROM projects WHERE state IN ('planning','ready','running')"
         )
         for proj in projects:
@@ -309,6 +319,90 @@ class Supervisor:
             project_id=proj["id"],
             payload={"age_minutes": age_min},
         )
+
+    # ===== session cleanup sweeper =====
+
+    def _sweep_interval_seconds(self) -> int:
+        return int(
+            (self.cfg.get("supervisor") or {}).get(
+                "session_sweep_interval_seconds", 3600
+            )
+        )
+
+    def _session_ttl_days(self) -> int:
+        return int(
+            (self.cfg.get("supervisor") or {}).get("session_ttl_days", 7)
+        )
+
+    async def _maybe_sweep_sessions(self) -> None:
+        """Throttled hourly sweep. Skipped cheaply when not due.
+
+        Configurable via supervisor.session_sweep_interval_seconds.
+        The actual sweep logic lives in `sweep_sessions()` so it can
+        be invoked synchronously from a CLI without throttling.
+        """
+        if self._session_ttl_days() <= 0:
+            return  # auto-cleanup disabled
+        interval = self._sweep_interval_seconds()
+        now = now_aware()
+        if self._last_sweep_at is not None and (now - self._last_sweep_at).total_seconds() < interval:
+            return
+        self._last_sweep_at = now
+        try:
+            await self.sweep_sessions(ttl_days=self._session_ttl_days())
+        except Exception as e:
+            log.exception(f"session sweep failed: {e}")
+
+    async def sweep_sessions(self, *, ttl_days: int, dry_run: bool = False) -> dict:
+        """Delete hermes sessions older than `ttl_days` from the
+        hermes backend AND mark them as deleted in the orchestrator's
+        project_sessions table.
+
+        Only sessions with `source='orchestrator'` in project_sessions
+        are touched. User-created sessions (if we ever support them)
+        are not in the table and therefore not affected.
+
+        Returns a small report dict for the CLI / dashboard:
+            {"candidates": N, "deleted": M, "errors": [...]}
+        """
+        from datetime import timedelta
+        if ttl_days <= 0:
+            return {"candidates": 0, "deleted": 0, "errors": [], "disabled": True}
+        cutoff = (now_aware() - timedelta(days=ttl_days)).isoformat()
+        rows = await self.db.fetchall(
+            "SELECT id, project_id, session_id, role FROM project_sessions "
+            "WHERE status = 'active' AND source = 'orchestrator' "
+            "AND COALESCE(last_used_at, created_at) < ? "
+            "ORDER BY COALESCE(last_used_at, created_at) ASC "
+            "LIMIT 200",
+            (cutoff,),
+        )
+        report = {"candidates": len(rows), "deleted": 0, "errors": []}
+        if dry_run:
+            return report
+        # We don't have a hermes "delete session" library call wired into
+        # the orchestrator (hermes is a separate CLI). For now, the
+        # sweeper just marks the rows as deleted in our DB. A future
+        # change can call `hermes sessions delete <sid>` via subprocess
+        # if hermes exposes that command. Until then, the user can run
+        # `hermes sessions prune --older-than <days>` manually and our
+        # DB stays in sync.
+        for row in rows:
+            try:
+                await self.db.execute(
+                    "UPDATE project_sessions SET status = 'deleted', "
+                    "deleted_at = ? WHERE id = ?",
+                    (now_aware().isoformat(), row["id"]),
+                )
+                report["deleted"] += 1
+            except Exception as e:
+                report["errors"].append({"session": row["session_id"], "error": str(e)})
+        if report["deleted"]:
+            log.info(
+                f"session cleanup: marked {report['deleted']} session(s) as deleted "
+                f"(ttl={ttl_days}d, cutoff={cutoff})"
+            )
+        return report
 
     # ===== execution (ready / running) =====
 

@@ -145,6 +145,31 @@ CREATE TABLE IF NOT EXISTS project_soul_presets (
     UNIQUE (project_id, profile_id)  -- one preset per (project, profile)
 );
 CREATE INDEX IF NOT EXISTS idx_soul_presets_project ON project_soul_presets(project_id);
+
+-- project_sessions: tracks hermes sessions created BY the orchestrator
+-- wrapper, so a background sweeper can delete them on a TTL. The
+-- 'source' column distinguishes orch-created ('orchestrator') from
+-- user-created sessions (which the sweeper must not touch — even
+-- though we don't currently have a path to insert 'user' rows,
+-- the column is there for forward-compat). 'status' lets us mark a
+-- session as deleted without losing history (audit / undo).
+CREATE TABLE IF NOT EXISTS project_sessions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,         -- the hermes session id (e.g. 20260718_212748_d1bc26)
+    role TEXT NOT NULL,
+    agent_id TEXT,
+    profile_id TEXT,
+    source TEXT NOT NULL DEFAULT 'orchestrator',  -- 'orchestrator' | 'user'
+    status TEXT NOT NULL DEFAULT 'active',         -- 'active' | 'deleted'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TIMESTAMP,           -- bumped on every task reuse
+    deleted_at TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_proj_sessions_project ON project_sessions(project_id);
+CREATE INDEX IF NOT EXISTS idx_proj_sessions_status ON project_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_proj_sessions_last_used ON project_sessions(last_used_at);
 """
 
 # Idempotent migrations for older DBs that may be missing columns added later.
@@ -169,6 +194,8 @@ MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN current_iteration INTEGER DEFAULT 0",
     "ALTER TABLE projects ADD COLUMN last_iteration_summary TEXT DEFAULT ''",
     # project_soul_presets is a new table; created in CREATE TABLE block above.
+    # No ALTER needed for it on existing DBs — IF NOT EXISTS handles it.
+    # project_sessions is a new table; created in CREATE TABLE block above.
     # No ALTER needed for it on existing DBs — IF NOT EXISTS handles it.
 ]
 

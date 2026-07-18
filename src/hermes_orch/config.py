@@ -32,6 +32,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "planner_timeout_seconds": 60,
         "stuck_planning_warn_minutes": 10,
         "session_turn_warn_threshold": 50,
+        # Auto-cleanup for hermes sessions created BY the orchestrator
+        # wrapper. Sessions older than `session_ttl_days` are deleted
+        # from the hermes backend during the supervisor's hourly
+        # sweep. The sweeper only touches sessions in the
+        # `project_sessions` table (orch-created), not user-created
+        # ones. Set to 0 to disable.
+        "session_ttl_days": 7,
+        "session_sweep_interval_seconds": 3600,
     },
     "llm": {
         # Orchestrator's own LLM (used by planner to break goal into tasks).

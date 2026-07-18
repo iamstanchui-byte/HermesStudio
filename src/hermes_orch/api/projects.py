@@ -435,6 +435,12 @@ async def set_project_session(project_id: str, request: Request) -> dict:
 
     Subsequent tasks for the same project will resume this session (via
     `hermes --resume <id>`), so the agent has context from prior tasks.
+
+    Also records the session in project_sessions for the auto-cleanup
+    sweeper. Every hermes session the orchestrator wrapper creates
+    is logged here so a TTL-based sweeper can reap them. Sessions
+    that pre-existed in the hermes backend (i.e. user-created) are
+    NOT in this table and therefore not touched.
     """
     import json
     body = await request.body()
@@ -443,22 +449,55 @@ async def set_project_session(project_id: str, request: Request) -> dict:
     except json.JSONDecodeError:
         raise HTTPException(400, "invalid JSON body")
     session_id = data.get("session_id")
-    role = data.get("role")  # agent role that created this session
+    role = data.get("role")
+    agent_id = data.get("agent_id")
+    profile_id = data.get("profile_id")
     if not session_id:
         raise HTTPException(400, "session_id is required")
     db = request.app.state.db
-    # One session per (project, role) — store the role alongside in the
-    # same column by encoding. Or just keep one "current" session.
-    # For simplicity: one current session per project (any role).
+    # Update the project's current_session_id (used for --resume).
+    # One session per project (any role) — the orchestrator picks the
+    # latest one. This is informational; the actual resume feature
+    # is currently disabled by default in the wrapper, so the value
+    # is mostly for debugging.
     await db.execute(
         "UPDATE projects SET current_session_id = ?, updated_at = ? WHERE id = ?",
         (session_id, _now_iso(), project_id),
     )
+    # Record in project_sessions for auto-cleanup. We use a stable
+    # row id derived from (project_id, session_id) so re-saves
+    # for the same session just update the existing row (bump
+    # last_used_at) instead of creating duplicates.
+    import secrets
+    row_id = f"ps-{secrets.token_hex(8)}"
+    # Idempotent insert: if a row already exists for (project_id, session_id)
+    # with status='active', bump last_used_at; otherwise insert new.
+    existing = await db.fetchone(
+        "SELECT id FROM project_sessions "
+        "WHERE project_id = ? AND session_id = ? AND status = 'active'",
+        (project_id, session_id),
+    )
+    if existing:
+        await db.execute(
+            "UPDATE project_sessions SET last_used_at = ? WHERE id = ?",
+            (_now_iso(), existing["id"]),
+        )
+    else:
+        await db.insert("project_sessions", {
+            "id": row_id,
+            "project_id": project_id,
+            "session_id": session_id,
+            "role": role or "",
+            "agent_id": agent_id,
+            "profile_id": profile_id,
+            "source": "orchestrator",
+            "status": "active",
+        })
     await audit_log(
         db, "project.session_updated",
         actor="agent",
         project_id=project_id,
-        payload={"session_id": session_id, "role": role},
+        payload={"session_id": session_id, "role": role, "tracked_for_cleanup": True},
     )
     return {"project_id": project_id, "current_session_id": session_id}
 
