@@ -254,26 +254,25 @@ they target different agent profiles. -->
             {% endif %}
             {% if t.result and (t.result.summary or t.result.session_id or t.result.error or t.result.artifacts) %}
             <div class="mt-1 flex items-center gap-3 text-xs flex-wrap">
-                {% if t.result.artifacts %}
-                <span class="text-gray-500">📎</span>
-                {% for a in t.result.artifacts %}
-                <a href="/projects/{{ t.project_id }}/files/{{ a.name }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name }}</a>
-                <span class="text-gray-400">({{ a.size_bytes }}b)</span>
-                {% if not loop.last %}<span class="text-gray-300">·</span>{% endif %}
-                {% endfor %}
-                {% endif %}
-                {% if t.result.session_id %}
-                <span class="text-gray-500">|</span>
-                <span class="text-gray-500">session:</span>
-                <span class="font-mono text-gray-600">{{ t.result.session_id[:16] }}…</span>
-                {% endif %}
-                <span class="text-gray-500">|</span>
                 <button onclick="toggleResultPersist('{{ t.id }}', 'presult-')" class="text-blue-600 hover:underline">View result</button>
                 {% if t.result.summary and t.result.summary|length > 300 %}
                 <button onclick="toggleFull('{{ t.id }}')" id="full-btn-{{ t.id }}" class="text-blue-600 hover:underline">Show full</button>
                 {% endif %}
                 {% if t.result.summary %}
                 <button onclick="copyResult('{{ t.id }}')" class="text-blue-600 hover:underline">Copy</button>
+                {% endif %}
+                {% if t.result.session_id %}
+                <span class="text-gray-500">|</span>
+                <span class="text-gray-500">session:</span>
+                <span class="font-mono text-gray-600">{{ t.result.session_id[:16] }}…</span>
+                {% endif %}
+                {% if t.result.artifacts %}
+                <span class="text-gray-500">|</span>
+                <span class="text-gray-500">📎</span>
+                {% for a in t.result.artifacts %}
+                <a href="/projects/{{ t.project_id }}/files/{{ a.name or a.path }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name or a.path }}</a>
+                {% if not loop.last %}<span class="text-gray-300">·</span>{% endif %}
+                {% endfor %}
                 {% endif %}
             </div>
             <div id="presult-{{ t.id }}" class="hidden mt-2 bg-gray-50 border rounded p-2 text-xs">
@@ -292,7 +291,7 @@ they target different agent profiles. -->
                     <ul class="list-disc ml-6 mt-1">
                     {% for a in t.result.artifacts %}
                         <li>
-                            <a href="/projects/{{ t.project_id }}/files/{{ a.name }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name }}</a>
+                            <a href="/projects/{{ t.project_id }}/files/{{ a.name or a.path }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name or a.path }}</a>
                             <span class="text-gray-500">({{ a.storage_kind|default('?') }}{% if a.size_bytes %}, {{ a.size_bytes }} bytes{% endif %})</span>
                         </li>
                     {% endfor %}
