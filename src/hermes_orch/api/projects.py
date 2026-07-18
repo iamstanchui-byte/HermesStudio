@@ -84,6 +84,16 @@ class PlanUpdate(BaseModel):
 # _now_iso is now imported from hermes_orch.utils (consolidated).
 
 
+def _project_id() -> str:
+    """Generate a new project ID like 'proj-1a2b3c4d' (8 hex chars).
+
+    Used by create_project. Kept here (rather than in utils) because
+    it's project-API-specific — the wrapper uses a different ID
+    scheme for agents, and tasks use 't-' + uuid4().hex.
+    """
+    return "proj-" + secrets.token_hex(4)
+
+
 def _projects_root(request: Request) -> Path:
     cfg = request.app.state.config
     root = Path(cfg["projects"]["storage_root"]).resolve()
