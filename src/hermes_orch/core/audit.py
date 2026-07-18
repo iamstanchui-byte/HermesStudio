@@ -16,17 +16,9 @@ Usage:
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from typing import Any
 
-
-def _now_iso() -> str:
-    """Local-time ISO-8601 with timezone offset (e.g. 2026-07-18T18:30:00+08:00).
-
-    Mirrors the helper in core/supervisor.py. We can't import from supervisor
-    without risking a circular import, so duplicate the (trivial) logic.
-    """
-    return datetime.now().astimezone().isoformat()
+from hermes_orch.utils import now_iso as _now_iso
 
 
 async def audit_log(

@@ -28,6 +28,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from hermes_orch.core.audit import audit_log
+from hermes_orch.utils import now_iso as _now_iso
 
 router = APIRouter()
 
@@ -87,10 +88,7 @@ class TaskAssign(BaseModel):
 
 
 # ===== Helpers =====
-
-
-def _now_iso() -> str:
-    return datetime.now().astimezone().isoformat()
+# _now_iso is now imported from hermes_orch.utils (consolidated).
 
 
 def _task_id() -> str:

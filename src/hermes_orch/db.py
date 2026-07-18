@@ -10,24 +10,12 @@ Per REVIEW.md §3-§6, the DB stores denormalized views of:
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
-
-def _now_iso() -> str:
-    """Local-time ISO-8601 with timezone offset (e.g. 2026-07-18T19:30:00+08:00).
-
-    Used by db.insert to auto-fill created_at/updated_at with local time
-    rather than relying on SQLite's CURRENT_TIMESTAMP (which is UTC naive).
-    Without this, dashboard timestamps show as if they were local time but
-    are actually 8 hours behind (in HK). Mirrors the helper in
-    core/supervisor.py and core/audit.py — kept here to avoid a circular
-    import.
-    """
-    return datetime.now().astimezone().isoformat()
+from hermes_orch.utils import now_iso as _now_iso
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (

@@ -20,6 +20,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from hermes_orch.utils import now_iso as _now_iso, now_aware
+
 router = APIRouter()
 
 # Templates directory (relative to this file: src/hermes_orch/api/dashboard.py)
@@ -271,8 +273,8 @@ async def tasks_page(
         # plus a +08:00 suffix). Computing the cutoff in Python and
         # passing it as a parameter sidesteps the issue: both sides of
         # the comparison are now in the same ISO-8601-with-offset format.
-        from datetime import datetime, timedelta
-        cutoff = (datetime.now().astimezone() - timedelta(days=days)).isoformat()
+        from datetime import timedelta
+        cutoff = (now_aware() - timedelta(days=days)).isoformat()
         where.append("created_at >= ?")
         params.append(cutoff)
     where_sql = " WHERE " + " AND ".join(where) if where else ""
@@ -489,8 +491,8 @@ async def history_page(
         # Same local-time cutoff as the tasks page above — keeps the
         # comparison format-consistent regardless of which timestamp
         # format the rows were originally written in.
-        from datetime import datetime, timedelta
-        cutoff = (datetime.now().astimezone() - timedelta(days=days)).isoformat()
+        from datetime import timedelta
+        cutoff = (now_aware() - timedelta(days=days)).isoformat()
         where.append("created_at >= ?")
         params.append(cutoff)
     sql = "SELECT * FROM audit_log"

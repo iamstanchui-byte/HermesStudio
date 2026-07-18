@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from hermes_orch.core.audit import audit_log
+from hermes_orch.utils import now_iso as _now_iso
 
 router = APIRouter()
 
@@ -80,22 +81,7 @@ class PlanUpdate(BaseModel):
 
 
 # ===== Helpers =====
-
-
-def _now_iso() -> str:
-    """ISO 8601 timestamp in the server's local timezone (with offset).
-
-    Uses local time so the dashboard shows times that match what the
-    operator sees on their wall clock. We attach the timezone offset
-    via `astimezone()` so downstream code can still parse it back
-    unambiguously (UTC fallback was confusing — the displayed strings
-    had no offset, so users assumed the time was wrong by hours).
-    """
-    return datetime.now().astimezone().isoformat()
-
-
-def _project_id() -> str:
-    return "proj-" + secrets.token_hex(4)
+# _now_iso is now imported from hermes_orch.utils (consolidated).
 
 
 def _projects_root(request: Request) -> Path:

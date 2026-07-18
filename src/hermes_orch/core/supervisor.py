@@ -33,12 +33,9 @@ from typing import Any
 from hermes_orch.core.audit import audit_log
 from hermes_orch.core.notifier import Notifier
 from hermes_orch.core.planner import Planner
+from hermes_orch.utils import now_iso as _now_iso, now_aware
 
 log = logging.getLogger("hermes_orch.supervisor")
-
-
-def _now_iso() -> str:
-    return datetime.now().astimezone().isoformat()
 
 
 async def _load_role_skills(db: Any) -> dict[str, list[str]]:
@@ -283,11 +280,19 @@ class Supervisor:
         age_min = (datetime.now(timezone.utc) - created).total_seconds() / 60
         if age_min < self.stuck_minutes:
             return
-        # Has anyone warned about this project being stuck? Check audit log
+        # Has anyone warned about this project being stuck? Check audit log.
+        # Compute the cutoff in Python (local time + offset) for the same
+        # reason as the history/tasks days filter: stored created_at is
+        # now local with offset, and `datetime('now', '-1 hour')` would
+        # return UTC naive — string comparison across the two formats is
+        # unreliable. Best-effort: if the SELECT fails for any reason,
+        # fall through to the warning (better to warn twice than not at all).
+        from datetime import timedelta as _td
+        recent_cutoff = (now_aware() - _td(hours=1)).isoformat()
         recent = await self.db.fetchone(
             "SELECT id FROM audit_log WHERE project_id = ? AND event_type = ? "
-            "AND created_at > datetime('now', '-1 hour') LIMIT 1",
-            (proj["id"], "project.stuck_in_planning"),
+            "AND created_at > ? LIMIT 1",
+            (proj["id"], "project.stuck_in_planning", recent_cutoff),
         )
         if recent:
             return
