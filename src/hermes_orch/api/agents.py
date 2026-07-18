@@ -140,7 +140,11 @@ class SkillInfo(BaseModel):
     name: str
     file_path: str
     status: str  # 'applied' | 'pending' | 'applying' | 'failed' | 'deleted'
-    size: int
+    size: int  # byte length of desired_content (UTF-8 encoded)
+    sha256: str | None = None  # hex sha256 of desired_content bytes; the
+    # wrapper uses this for content-addressed change detection (more
+    # reliable than byte-length comparison, which is sensitive to
+    # multi-byte chars + encoding round-trips).
     created_at: str | None = None
     applied_at: str | None = None
     error: str | None = None
@@ -835,11 +839,13 @@ def _row_to_skill(row: dict[str, Any], include_content: bool = False) -> SkillIn
         status = "deleted" if content == "" else "applied"
     else:
         status = raw_status
+    content_bytes = content.encode("utf-8") if content else b""
     return SkillInfo(
         name=row["file_path"].removeprefix("skills/").removesuffix(".md"),
         file_path=row["file_path"],
         status=status,
-        size=len(content),
+        size=len(content_bytes),
+        sha256=row.get("desired_sha256"),
         created_at=row.get("created_at"),
         applied_at=row.get("applied_at"),
         error=row.get("error"),

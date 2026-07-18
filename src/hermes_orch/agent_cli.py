@@ -129,8 +129,13 @@ def _clean_hermes_output(stdout: str) -> str:
     # Strip ANSI escape codes (color, cursor moves, etc.)
     s = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s)
     # Strip the box-drawing borders that wrap "Hermes" tool headers.
-    # Pattern: lines of repeated ─ / ╭ / ╰ / │ that are mostly chrome.
-    s = re.sub(r"[─━╭╮╰╯│┌┐└┘├┤┬┴┼]{10,}", "[…]", s)
+    # First: long runs of box-drawing chars (─━━╭╮╰╯│...).
+    s = re.sub(r"[─━╭╮╰╯│┌┐└┘├┤┬┴┼]{4,}", "[…]", s)
+    # Then: drop lines that are mostly box-drawing chrome
+    # (e.g. individual `╭─ ⚕ Hermes ─...╮` lines, or short `╰─...╯`).
+    s = re.sub(r"^\s*[╭╮╰╯│┌┐└┘├┤┬┴┼─━┃━╾╼]+\s*[^\n]*$", "", s, flags=re.MULTILINE)
+    # Drop the standalone "⚕ Hermes" brand mark on its own line.
+    s = re.sub(r"^\s*⚕\s*Hermes[^\n]*$", "", s, flags=re.MULTILINE)
     # Strip hermes' "tool call" rows like "┊ 💻 preparing terminal…"
     # and "┊ 💻 $         curl ... 1.2s". These dominate the output.
     s = re.sub(r"^\s*┊\s*[^\n]*$", "", s, flags=re.MULTILINE)
@@ -1094,15 +1099,20 @@ def start(
                 if not file_bytes:
                     continue  # skip empty files
                 sha = hashlib.sha256(file_bytes).hexdigest()
-                # Compare to current DB state. The list endpoint returns
-                # `size` (length of desired_content) — close enough for
-                # change detection without a sha roundtrip. (A real
-                # byte-identical change would be a stretch.)
+                # Change detection: prefer SHA over byte-length. The API
+                # returns `sha256` (hex of desired_content bytes). If the
+                # file's SHA matches what the DB already has, the file is
+                # unchanged — don't re-post. This is content-addressed so
+                # it's immune to encoding round-trip bugs (the previous
+                # byte-length compare was sensitive to em-dash = 3 bytes
+                # and caused an infinite re-apply loop on files with
+                # multi-byte chars).
                 db_skill = db_skills.get(name)
                 if (
                     db_skill
                     and db_skill.get("status") in ("applied", "pending", "applying")
-                    and db_skill.get("size") == len(file_bytes)
+                    and db_skill.get("sha256")
+                    and db_skill.get("sha256") == sha
                 ):
                     continue
                 # New or changed file — push to orchestrator. The orchestrator
