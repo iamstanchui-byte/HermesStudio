@@ -10,10 +10,24 @@ Per REVIEW.md §3-§6, the DB stores denormalized views of:
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+
+def _now_iso() -> str:
+    """Local-time ISO-8601 with timezone offset (e.g. 2026-07-18T19:30:00+08:00).
+
+    Used by db.insert to auto-fill created_at/updated_at with local time
+    rather than relying on SQLite's CURRENT_TIMESTAMP (which is UTC naive).
+    Without this, dashboard timestamps show as if they were local time but
+    are actually 8 hours behind (in HK). Mirrors the helper in
+    core/supervisor.py and core/audit.py — kept here to avoid a circular
+    import.
+    """
+    return datetime.now().astimezone().isoformat()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -219,6 +233,35 @@ class Database:
             return [dict(r) for r in rows]
 
     async def insert(self, table: str, data: dict[str, Any]) -> None:
+        """Insert a row. Auto-fills created_at/updated_at with local time
+        if the table has those columns and the caller didn't provide them.
+
+        SQLite's DEFAULT CURRENT_TIMESTAMP is UTC-naive (no offset) and
+        stores as 'YYYY-MM-DD HH:MM:SS', which the dashboard then renders
+        as if it were local time. By overriding at the Python layer, every
+        caller — supervisors, API endpoints, wrapper uploads — gets
+        consistent local-time + offset timestamps without having to
+        remember to set them. Cached per-table column list to keep the
+        hot path cheap.
+        """
+        if not hasattr(self, "_ts_columns_cache"):
+            self._ts_columns_cache: dict[str, set[str]] = {}
+        cached = self._ts_columns_cache.get(table)
+        if cached is None:
+            # Discover which timestamp columns this table has. We use a
+            # sync cursor here (PRAGMA) — fine for connect-time setup.
+            cur = await self.conn.execute(f"PRAGMA table_info({table})")
+            cols_info = await cur.fetchall()
+            cached = {
+                row[1] for row in cols_info
+                if row[1] in ("created_at", "updated_at")
+            }
+            self._ts_columns_cache[table] = cached
+        now = _now_iso()
+        if "created_at" in cached and "created_at" not in data:
+            data["created_at"] = now
+        if "updated_at" in cached and "updated_at" not in data:
+            data["updated_at"] = now
         cols = ", ".join(data.keys())
         placeholders = ", ".join("?" for _ in data)
         await self.execute(
