@@ -268,11 +268,7 @@ they target different agent profiles. -->
                 {% endif %}
                 {% if t.result.artifacts %}
                 <span class="text-gray-500">|</span>
-                <span class="text-gray-500">📎</span>
-                {% for a in t.result.artifacts %}
-                <a href="/projects/{{ t.project_id }}/files/{{ a.name or a.path }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name or a.path }}</a>
-                {% if not loop.last %}<span class="text-gray-300">·</span>{% endif %}
-                {% endfor %}
+                <span class="text-gray-500">📎 {{ t.result.artifacts|length }}</span>
                 {% endif %}
             </div>
             <div id="presult-{{ t.id }}" class="hidden mt-2 bg-gray-50 border rounded p-2 text-xs">
