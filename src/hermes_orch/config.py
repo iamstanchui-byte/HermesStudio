@@ -38,7 +38,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # sweep. The sweeper only touches sessions in the
         # `project_sessions` table (orch-created), not user-created
         # ones. Set to 0 to disable.
-        "session_ttl_days": 7,
+        #
+        # Note: the orchestrator does NOT reuse hermes sessions across
+        # tasks — each task gets a fresh session (or resumes its own
+        # role's session, but only for the lifetime of the project).
+        # So a long TTL is wasted disk + memory; 1 day is plenty for
+        # debug-ability (you can `hermes sessions list` to see what
+        # an agent did yesterday) while keeping the store lean.
+        "session_ttl_days": 1,
         "session_sweep_interval_seconds": 3600,
     },
     "llm": {

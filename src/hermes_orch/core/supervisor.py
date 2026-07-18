@@ -330,8 +330,12 @@ class Supervisor:
         )
 
     def _session_ttl_days(self) -> int:
+        # Default 1 day: orchestrator doesn't reuse hermes sessions
+        # across tasks, so the long TTL only wastes disk. Operators
+        # who need longer history (e.g. for `hermes sessions list`
+        # auditing) can set this higher in their config.yaml.
         return int(
-            (self.cfg.get("supervisor") or {}).get("session_ttl_days", 7)
+            (self.cfg.get("supervisor") or {}).get("session_ttl_days", 1)
         )
 
     async def _maybe_sweep_sessions(self) -> None:
