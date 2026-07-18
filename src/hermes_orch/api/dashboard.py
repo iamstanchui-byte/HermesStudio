@@ -262,8 +262,19 @@ async def tasks_page(
         where.append("status = ?")
         params.append(status)
     if days:
-        where.append("created_at >= datetime('now', ?)")
-        params.append(f"-{days} days")
+        # Compute the cutoff in local time with offset, matching the
+        # format that db.insert / audit_log now writes. SQLite's
+        # datetime('now', '-N days') would return UTC naive, but our
+        # stored timestamps are local +offset — string comparison across
+        # mixed formats is unreliable (date strings compare OK, but
+        # the time portion has T-separator vs space-separator differences
+        # plus a +08:00 suffix). Computing the cutoff in Python and
+        # passing it as a parameter sidesteps the issue: both sides of
+        # the comparison are now in the same ISO-8601-with-offset format.
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now().astimezone() - timedelta(days=days)).isoformat()
+        where.append("created_at >= ?")
+        params.append(cutoff)
     where_sql = " WHERE " + " AND ".join(where) if where else ""
 
     # Total count for pagination
@@ -475,8 +486,13 @@ async def history_page(
         where.append("agent_id = ?")
         params.append(agent_id)
     if days:
-        where.append("created_at >= datetime('now', ?)")
-        params.append(f"-{days} days")
+        # Same local-time cutoff as the tasks page above — keeps the
+        # comparison format-consistent regardless of which timestamp
+        # format the rows were originally written in.
+        from datetime import datetime, timedelta
+        cutoff = (datetime.now().astimezone() - timedelta(days=days)).isoformat()
+        where.append("created_at >= ?")
+        params.append(cutoff)
     sql = "SELECT * FROM audit_log"
     if where:
         sql += " WHERE " + " AND ".join(where)
