@@ -1,0 +1,71 @@
+"""Audit log helper for tracking system events.
+
+Per REVIEW.md §7 — history page shows what happened to projects / tasks / agents.
+
+Usage:
+    from hermes_orch.core.audit import audit_log
+
+    await audit_log(
+        db, "task.created",
+        actor="operator",
+        project_id=proj_id,
+        task_id=task_id,
+        payload={"action": "run_backtest"},
+    )
+"""
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from typing import Any
+
+
+def _now_iso() -> str:
+    """Local-time ISO-8601 with timezone offset (e.g. 2026-07-18T18:30:00+08:00).
+
+    Mirrors the helper in core/supervisor.py. We can't import from supervisor
+    without risking a circular import, so duplicate the (trivial) logic.
+    """
+    return datetime.now().astimezone().isoformat()
+
+
+async def audit_log(
+    db: Any,
+    event_type: str,
+    *,
+    actor: str | None = None,
+    project_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+    payload: dict | str | None = None,
+    created_at: str | None = None,
+) -> None:
+    """Write a row to the audit_log table.
+
+    Args:
+        db: Database instance with .insert() method
+        event_type: dot-separated event name (e.g. 'task.created', 'agent.registered')
+        actor: who triggered the event ('operator', 'agent:<id>', etc.)
+        project_id, task_id, agent_id: optional foreign keys
+        payload: dict (auto-serialized to JSON) or string
+        created_at: override the auto-stamped timestamp (default: local
+            ISO-8601 with offset). We always set this from Python (rather
+            than relying on the SQLite DEFAULT CURRENT_TIMESTAMP, which is
+            UTC-naive and rendered in the dashboard as if it were local).
+    """
+    if isinstance(payload, (dict, list)):
+        payload = json.dumps(payload)
+    data: dict[str, Any] = {"event_type": event_type}
+    if actor is not None:
+        data["actor"] = actor
+    if project_id is not None:
+        data["project_id"] = project_id
+    if task_id is not None:
+        data["task_id"] = task_id
+    if agent_id is not None:
+        data["agent_id"] = agent_id
+    if payload is not None:
+        data["payload"] = payload
+    data["created_at"] = created_at if created_at is not None else _now_iso()
+    await db.insert("audit_log", data)
+

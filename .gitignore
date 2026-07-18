@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local data — these are operator-specific paths
+.hermes-orchestrator/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+server.log*
+server.log.err*
+daemon.log
+daemon.err
+
+# Project files generated at runtime (per-project working dirs, both
+# inside and outside the repo root)
+hermes-project/
+projects/
+
+# Build artifacts
+artifacts/
+build/
+dist/*.whl
+*.egg-info/
+wheel-test.log
+wheel-build.log
+
+# Test outputs (debug)
+_test-*.out
+
+# Local smoke-test DBs created by tests
+test-smoke.db
+
+# OS
+Thumbs.db
+desktop.ini

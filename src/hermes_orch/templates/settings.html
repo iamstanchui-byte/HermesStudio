@@ -1,0 +1,464 @@
+{% extends "base.html" %}
+{% block title %}Settings - Hermes Orchestrator{% endblock %}
+{% block content %}
+
+<div class="mb-4">
+    <a href="/agents" class="text-sm text-blue-600 hover:underline">&larr; Back to dashboard</a>
+</div>
+
+<h1 class="text-2xl font-bold text-gray-800 mb-1">Settings</h1>
+<p class="text-sm text-gray-500 mb-6">Connect an LLM provider to enable natural-language project planning.</p>
+
+<!-- LLM Settings Card -->
+<div class="bg-white border rounded-lg p-6 shadow-sm mb-4">
+    <h2 class="text-lg font-semibold text-gray-800 mb-3">LLM Provider</h2>
+
+    {% if llm_configured %}
+    <div class="bg-green-50 border border-green-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-2">
+            <span class="px-2 py-0.5 bg-green-600 text-white rounded text-xs font-semibold">CONNECTED</span>
+            <span class="text-sm text-green-800">Using real LLM for project planning</span>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1 text-sm">
+            <div><span class="text-gray-500">Provider:</span> <span class="font-mono font-semibold">{{ providers | selectattr('id', 'equalto', current_provider) | map(attribute='name') | first or current_provider or '(unknown)' }}</span></div>
+            <div><span class="text-gray-500">Model:</span> <span class="font-mono font-semibold">{{ current_model or '(not set)' }}</span></div>
+            <div class="md:col-span-2"><span class="text-gray-500">Endpoint:</span> <span class="font-mono text-xs">{{ current_base_url or '(not set)' }}</span></div>
+            <div><span class="text-gray-500">API key:</span> <span class="font-mono">ending in {{ api_key_last4 }}</span></div>
+            <div><span class="text-gray-500">Status:</span> <span class="text-green-700">Mock mode disabled</span></div>
+        </div>
+    </div>
+    {% else %}
+    <div class="bg-yellow-50 border border-yellow-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-1">
+            <span class="px-2 py-0.5 bg-yellow-600 text-white rounded text-xs font-semibold">MOCK MODE</span>
+            <span class="text-sm text-yellow-800">Not connected — using hard-coded plans</span>
+        </div>
+        <p class="text-sm text-yellow-700">
+            Pick a provider below and enter your API key to enable real LLM planning.
+        </p>
+    </div>
+    {% endif %}
+
+    <p class="text-sm text-gray-500 mb-4">
+        The orchestrator's planner uses an LLM to break your goal into a team of agents.
+    </p>
+
+    <form id="llm-form" class="space-y-3">
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">Provider</label>
+            <select id="llm-provider" class="block w-full border rounded px-2 py-1 text-sm" onchange="onProviderChange()">
+                {% for p in providers %}
+                <option value="{{ p.id }}"
+                    data-base="{{ p.base_url }}"
+                    data-model="{{ p.default_model }}"
+                    data-signup="{{ p.signup_url }}"
+                    data-note="{{ p.note }}"
+                    {% if p.id == current_provider %}selected{% endif %}
+                >{{ p.name }}</option>
+                {% endfor %}
+            </select>
+            <div id="provider-note" class="text-xs text-gray-500 mt-1"></div>
+        </div>
+
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">API Key</label>
+            <input id="llm-key" type="password" class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                placeholder="{% if api_key_last4 %}Current: ending in {{ api_key_last4 }}{% else %}Paste your API key{% endif %}"
+                autocomplete="off">
+            <div class="text-xs text-gray-500 mt-1">
+                Don't have one? <a id="signup-link" href="#" target="_blank" class="text-blue-600 hover:underline">Get a key &rarr;</a>
+            </div>
+        </div>
+
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">Base URL</label>
+            <input id="llm-base" type="text" class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                value="{{ current_base_url or 'https://api.minimaxi.com/v1' }}">
+        </div>
+
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">Model</label>
+            <input id="llm-model" type="text" class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                value="{{ current_model or 'MiniMax-Text-01' }}">
+        </div>
+
+        <div class="flex items-center gap-2 pt-2">
+            <button type="button" onclick="testLLM()" class="px-4 py-2 bg-gray-700 text-white rounded text-sm hover:bg-gray-800">
+                Test connection
+            </button>
+            <button type="button" onclick="saveLLM()" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                Save
+            </button>
+            <button type="button" onclick="onProviderChange()" class="px-3 py-2 bg-white border text-gray-600 rounded text-sm hover:bg-gray-50" title="Refill base URL + model with the selected provider's recommended values">
+                Reset to provider defaults
+            </button>
+            <span id="llm-status" class="text-sm text-gray-500"></span>
+        </div>
+    </form>
+</div>
+
+<!-- Project Storage Card -->
+<div class="bg-white border rounded-lg p-6 shadow-sm mb-4">
+    <h2 class="text-lg font-semibold text-gray-800 mb-3">
+        Project Storage
+        <span class="text-xs text-gray-500 font-normal">(shared folder for cross-host file flow)</span>
+    </h2>
+
+    {% if project_storage.exists and project_storage.writable %}
+    <div class="bg-green-50 border border-green-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-2">
+            <span class="px-2 py-0.5 bg-green-600 text-white rounded text-xs font-semibold">OK</span>
+            <span class="text-sm text-green-800">{{ project_storage.project_count }} project(s) in storage</span>
+        </div>
+        <div class="text-sm text-gray-700">
+            <div><span class="text-gray-500">Path:</span> <span class="font-mono text-xs">{{ project_storage.storage_root }}</span></div>
+        </div>
+    </div>
+    {% elif project_storage.exists and not project_storage.writable %}
+    <div class="bg-yellow-50 border border-yellow-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-1">
+            <span class="px-2 py-0.5 bg-yellow-600 text-white rounded text-xs font-semibold">EXISTS BUT NOT WRITABLE</span>
+        </div>
+        <p class="text-sm text-yellow-700">Check permissions or pick a different path.</p>
+    </div>
+    {% else %}
+    <div class="bg-gray-50 border border-gray-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-1">
+            <span class="px-2 py-0.5 bg-gray-500 text-white rounded text-xs font-semibold">NOT CONFIGURED</span>
+            <span class="text-sm text-gray-700">Path does not exist or not set</span>
+        </div>
+        <p class="text-sm text-gray-600">Pick a folder below. Use a shared folder (SMB) for cross-host data flow.</p>
+    </div>
+    {% endif %}
+
+    <p class="text-sm text-gray-500 mb-4">
+        Each project lives in its own subfolder here. The agent wrappers read/write
+        files via the orchestrator's file API, so a shared folder path on this host
+        works fine for both Windows and Linux agents (no SMB mount needed on agents).
+    </p>
+
+    <form id="project-form" class="space-y-3">
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">Storage Root Path</label>
+            <input id="project-path" type="text" class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                value="{{ project_storage.storage_root }}">
+            <div class="text-xs text-gray-500 mt-1">
+                Examples:
+                <code>C:\Project\minimax code\hermes-project</code> (Windows) ·
+                <code>/home/stanley/hermes-project</code> (Linux) ·
+                <code>\\fileserver\share\hermes-project</code> (UNC)
+            </div>
+        </div>
+        <div class="flex items-center gap-2 pt-2">
+            <button type="button" onclick="testProjectStorage()" class="px-4 py-2 bg-gray-700 text-white rounded text-sm hover:bg-gray-800">
+                Test write access
+            </button>
+            <button type="button" onclick="saveProjectStorage()" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                Save
+            </button>
+            <button type="button" onclick="openInExplorer()" class="px-3 py-2 bg-white border text-gray-600 rounded text-sm hover:bg-gray-50">
+                Open in Explorer
+            </button>
+            <span id="project-status" class="text-sm text-gray-500"></span>
+        </div>
+        <div class="text-xs text-gray-500 pt-1">
+            ⚠ Changing the path does NOT move existing projects. Old projects stay where they were created.
+        </div>
+    </form>
+</div>
+
+<!-- Telegram Settings Card -->
+<div class="bg-white border rounded-lg p-6 shadow-sm mb-4">
+    <h2 class="text-lg font-semibold text-gray-800 mb-3">Telegram Notifications <span class="text-xs text-gray-500 font-normal">(optional)</span></h2>
+
+    {% if tg_enabled and tg_token_set %}
+    <div class="bg-green-50 border border-green-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-2">
+            <span class="px-2 py-0.5 bg-green-600 text-white rounded text-xs font-semibold">ENABLED</span>
+            <span class="text-sm text-green-800">Will send alerts to your Telegram</span>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1 text-sm">
+            <div><span class="text-gray-500">Bot token:</span> <span class="font-mono">ending in {{ tg_token_last4 }}</span></div>
+            <div><span class="text-gray-500">Chat ID:</span> <span class="font-mono font-semibold">{{ tg_chat_id }}</span></div>
+        </div>
+    </div>
+    {% elif tg_token_set or tg_chat_id %}
+    <div class="bg-yellow-50 border border-yellow-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-1">
+            <span class="px-2 py-0.5 bg-yellow-600 text-white rounded text-xs font-semibold">CONFIGURED BUT NOT ENABLED</span>
+        </div>
+        <p class="text-sm text-yellow-700">
+            Bot token saved, but notifications are disabled. Check the "Enable" box below and Save.
+        </p>
+    </div>
+    {% else %}
+    <div class="bg-gray-50 border border-gray-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-1">
+            <span class="px-2 py-0.5 bg-gray-500 text-white rounded text-xs font-semibold">NOT SET UP</span>
+            <span class="text-sm text-gray-700">No Telegram bot configured</span>
+        </div>
+        <p class="text-sm text-gray-600">
+            Optional. Get notified when the supervisor needs your attention.
+        </p>
+    </div>
+    {% endif %}
+
+    <p class="text-sm text-gray-500 mb-4">
+        Get notified when the supervisor needs your attention (planner failure, stuck project, project completed).
+    </p>
+
+    <form id="tg-form" class="space-y-3">
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">Bot Token <span class="text-gray-400">(from @BotFather)</span></label>
+            <input id="tg-token" type="password" class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                placeholder="{% if tg_token_last4 %}Current: ending in {{ tg_token_last4 }}{% else %}e.g. 123456789:ABCdef...{% endif %}"
+                autocomplete="off">
+        </div>
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">Chat ID <span class="text-gray-400">(your personal or group chat ID)</span></label>
+            <input id="tg-chat" type="text" class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                value="{{ tg_chat_id or '' }}">
+            <div class="text-xs text-gray-500 mt-1">
+                Tip: send a message to your bot, then check <code>getUpdates</code> at
+                <code>https://api.telegram.org/bot&lt;token&gt;/getUpdates</code> to find your chat ID.
+            </div>
+        </div>
+        <div class="flex items-center gap-2">
+            <input id="tg-enabled" type="checkbox" {% if tg_enabled %}checked{% endif %} class="rounded">
+            <label for="tg-enabled" class="text-sm text-gray-700">Enable Telegram notifications</label>
+        </div>
+        <div class="flex items-center gap-2 pt-2">
+            <button type="button" onclick="testTelegram()" class="px-4 py-2 bg-gray-700 text-white rounded text-sm hover:bg-gray-800">
+                Send test message
+            </button>
+            <button type="button" onclick="saveTelegram()" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                Save
+            </button>
+            <span id="tg-status" class="text-sm text-gray-500"></span>
+        </div>
+    </form>
+</div>
+
+<div class="text-xs text-gray-500">
+    <p>Settings are saved to <code>~/.hermes-orchestrator/config.yaml</code>.</p>
+    <p class="mt-1">After changing LLM settings, the next planning call will use the new configuration automatically.</p>
+</div>
+
+<script>
+const PROVIDERS = {{ providers | tojson }};
+
+function onProviderChange() {
+    const sel = document.getElementById('llm-provider');
+    const opt = sel.options[sel.selectedIndex];
+    const base = opt.getAttribute('data-base');
+    const model = opt.getAttribute('data-model');
+    const signup = opt.getAttribute('data-signup');
+    const note = opt.getAttribute('data-note');
+    if (base) document.getElementById('llm-base').value = base;
+    if (model) document.getElementById('llm-model').value = model;
+    const link = document.getElementById('signup-link');
+    if (signup) { link.href = signup; link.style.display = ''; } else { link.style.display = 'none'; }
+    document.getElementById('provider-note').textContent = note || '';
+}
+
+// Initialize note on load
+onProviderChange();
+
+async function testLLM() {
+    const status = document.getElementById('llm-status');
+    const key = document.getElementById('llm-key').value;
+    const base = document.getElementById('llm-base').value;
+    const model = document.getElementById('llm-model').value;
+    if (!key) {
+        status.textContent = 'Enter an API key first';
+        status.className = 'text-sm text-yellow-700';
+        return;
+    }
+    status.textContent = 'Testing...';
+    status.className = 'text-sm text-gray-500';
+    try {
+        const r = await fetch('/api/settings/llm/test', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({api_key: key, base_url: base, model: model}),
+        });
+        const data = await r.json();
+        if (data.ok) {
+            status.textContent = 'Connection successful!';
+            status.className = 'text-sm text-green-600';
+        } else {
+            status.textContent = 'Failed: ' + (data.error || ('HTTP ' + data.status));
+            status.className = 'text-sm text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-sm text-red-600';
+    }
+}
+
+async function saveLLM() {
+    const status = document.getElementById('llm-status');
+    const key = document.getElementById('llm-key').value;
+    const base = document.getElementById('llm-base').value;
+    const model = document.getElementById('llm-model').value;
+    const provider = document.getElementById('llm-provider').value;
+    status.textContent = 'Saving...';
+    status.className = 'text-sm text-gray-500';
+    const body = {
+        base_url: base,
+        model: model,
+        provider: provider,
+    };
+    if (key) body.api_key = key;
+    try {
+        const r = await fetch('/api/settings/llm', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        const data = await r.json();
+        if (r.ok) {
+            status.textContent = 'Saved! Reloading...';
+            status.className = 'text-sm text-green-600';
+            setTimeout(() => location.reload(), 800);
+        } else {
+            status.textContent = 'Failed: ' + (data.detail || r.status);
+            status.className = 'text-sm text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-sm text-red-600';
+    }
+}
+
+async function testTelegram() {
+    const status = document.getElementById('tg-status');
+    status.textContent = 'Sending...';
+    status.className = 'text-sm text-gray-500';
+    try {
+        const r = await fetch('/api/settings/telegram/test', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({text: 'Test from Hermes Orchestrator'}),
+        });
+        const data = await r.json();
+        if (data.ok) {
+            status.textContent = 'Sent! Check your Telegram.';
+            status.className = 'text-sm text-green-600';
+        } else {
+            status.textContent = 'Failed: ' + (data.error || ('HTTP ' + data.status));
+            status.className = 'text-sm text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-sm text-red-600';
+    }
+}
+
+async function saveTelegram() {
+    const status = document.getElementById('tg-status');
+    const token = document.getElementById('tg-token').value;
+    const chat = document.getElementById('tg-chat').value;
+    const enabled = document.getElementById('tg-enabled').checked;
+    status.textContent = 'Saving...';
+    status.className = 'text-sm text-gray-500';
+    const body = {enabled: enabled};
+    if (token) body.bot_token = token;
+    if (chat) body.chat_id = chat;
+    try {
+        const r = await fetch('/api/settings/telegram', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        const data = await r.json();
+        if (r.ok) {
+            status.textContent = 'Saved! Reloading...';
+            status.className = 'text-sm text-green-600';
+            setTimeout(() => location.reload(), 800);
+        } else {
+            status.textContent = 'Failed: ' + (data.detail || r.status);
+            status.className = 'text-sm text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-sm text-red-600';
+    }
+}
+
+async function testProjectStorage() {
+    const status = document.getElementById('project-status');
+    const path = document.getElementById('project-path').value;
+    status.textContent = 'Testing...';
+    status.className = 'text-sm text-gray-500';
+    try {
+        const r = await fetch('/api/settings/project/test', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({storage_root: path}),
+        });
+        const data = await r.json();
+        if (data.ok) {
+            status.textContent = `OK — ${data.project_count} project(s) at ${data.path}`;
+            status.className = 'text-sm text-green-600';
+        } else {
+            status.textContent = 'Failed: ' + (data.error || ('HTTP ' + data.status));
+            status.className = 'text-sm text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-sm text-red-600';
+    }
+}
+
+async function saveProjectStorage() {
+    const status = document.getElementById('project-status');
+    const path = document.getElementById('project-path').value;
+    status.textContent = 'Saving...';
+    status.className = 'text-sm text-gray-500';
+    try {
+        const r = await fetch('/api/settings/project', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({storage_root: path}),
+        });
+        const data = await r.json();
+        if (r.ok) {
+            status.textContent = 'Saved! Reloading...';
+            status.className = 'text-sm text-green-600';
+            setTimeout(() => location.reload(), 800);
+        } else {
+            status.textContent = 'Failed: ' + (data.detail || r.status);
+            status.className = 'text-sm text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-sm text-red-600';
+    }
+}
+
+function openInExplorer() {
+    const path = document.getElementById('project-path').value;
+    // Use the orchestrator's API to open the path (browsers can't open local paths directly)
+    fetch('/api/settings/project/open', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({storage_root: path}),
+    }).then(r => r.json()).then(d => {
+        const status = document.getElementById('project-status');
+        if (d.ok) {
+            status.textContent = 'Opened in Explorer';
+            status.className = 'text-sm text-green-600';
+        } else {
+            status.textContent = 'Failed: ' + (d.error || 'unknown');
+            status.className = 'text-sm text-red-600';
+        }
+    }).catch(err => {
+        const status = document.getElementById('project-status');
+        status.textContent = 'Error: ' + err.message;
+        status.className = 'text-sm text-red-600';
+    });
+}
+</script>
+
+{% endblock %}

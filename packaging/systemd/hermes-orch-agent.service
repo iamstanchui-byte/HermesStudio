@@ -1,0 +1,61 @@
+# systemd unit file for hermes-orch-agent (wrapper daemon).
+#
+# Install:
+#   sudo cp hermes-orch-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable hermes-orch-agent
+#   sudo systemctl start hermes-orch-agent
+#
+# Status:
+#   sudo systemctl status hermes-orch-agent
+#   journalctl -u hermes-orch-agent -f
+
+[Unit]
+Description=Hermes Orchestrator Agent Wrapper Daemon
+Documentation=https://github.com/<your-repo>/hermes-orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as the user that installed the wheel. Edit before installing.
+User=stanley
+Group=stanley
+
+# Where the venv was created (matches install.sh default)
+WorkingDirectory=/home/stanley/.hermes-orchestrator
+Environment="PATH=/home/stanley/.hermes-orchestrator/venv/bin:/home/stanley/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+# Where hermes keeps profile directories. Edit to match your install:
+#   - pip/git install:  ~/.hermes/profiles  (older default)
+#   - XDG install:      ~/.local/share/hermes/profiles
+# `hermes --version` shows the install dir; profiles live in a sibling `profiles/` dir.
+Environment="HERMES_PROFILES_DIR=/home/stanley/.hermes/profiles"
+
+# Daemon loop. Heartbeat every 5s, task timeout 30 min.
+ExecStart=/home/stanley/.hermes-orchestrator/venv/bin/hermes-orch-agent start --interval 5 --timeout 1800
+
+# Restart on failure, but not on clean exit (Ctrl-C).
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Hardening
+# NOTE: ProtectHome is intentionally NOT set (= full access to /home).
+# Reason: hermes writes to its profile dir (~/.hermes/profiles/<role>/logs,
+# state, sessions), and ReadWritePaths= cannot override ProtectHome=.
+# ProtectSystem=full + ReadWritePaths= still keeps /usr, /etc, /boot read-only.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# Allow writes to the orchestrator config dir (read-write mount)
+ReadWritePaths=/home/stanley/.hermes-orchestrator
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-orch-agent
+
+[Install]
+WantedBy=multi-user.target

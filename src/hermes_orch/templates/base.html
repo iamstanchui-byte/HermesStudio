@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Hermes Orchestrator{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft JhengHei", sans-serif; background: #f9fafb; }
+        pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+        .dot-running { background: #10b981; }
+        .dot-idle { background: #9ca3af; }
+        .dot-error { background: #ef4444; }
+        .dot-verifying { background: #f59e0b; }
+    </style>
+</head>
+<body>
+    <nav class="bg-white border-b sticky top-0 z-10">
+        <div class="container flex items-center gap-6 py-3">
+            <a href="/agents" class="font-semibold text-gray-800">Hermes Orchestrator</a>
+            <div class="flex gap-4 text-sm">
+                <a href="/agents" class="{% if active_page == 'agents' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Agents</a>
+                <a href="/tasks" class="{% if active_page == 'tasks' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Tasks</a>
+                <a href="/projects" class="{% if active_page == 'projects' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Projects</a>
+                <a href="/history" class="{% if active_page == 'history' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">History</a>
+                <a href="/settings" class="{% if active_page == 'settings' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Settings</a>
+            </div>
+            <div class="ml-auto flex items-center gap-3 text-xs">
+                {% if llm_configured %}
+                <span class="px-2 py-0.5 bg-green-100 text-green-800 rounded">LLM ready</span>
+                {% else %}
+                <span class="px-2 py-0.5 bg-yellow-100 text-yellow-800 rounded">Mock mode</span>
+                {% endif %}
+                <span class="text-gray-400">5s polling</span>
+            </div>
+        </div>
+    </nav>
+    {% if not llm_configured %}
+    <div class="bg-yellow-50 border-b border-yellow-200">
+        <div class="container py-2 flex items-center gap-3 text-sm">
+            <span class="text-yellow-800">
+                <strong>Running in mock mode.</strong>
+                Add an LLM API key to enable natural-language project planning.
+            </span>
+            <a href="/settings" class="ml-auto px-3 py-1 bg-yellow-600 text-white rounded text-xs hover:bg-yellow-700">
+                Set up LLM &rarr;
+            </a>
+        </div>
+    </div>
+    {% endif %}
+    <div class="container">
+        {% block content %}{% endblock %}
+    </div>
+    <script>
+    // Smart polling: skip when user is editing a form, or tab is hidden
+    let pollTimer = null;
+    function startPolling() {
+        if (pollTimer) return;
+        pollTimer = setInterval(() => {
+            if (document.hidden) return;  // tab not visible
+            const a = document.activeElement;
+            if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT')) {
+                return;  // user is editing a form
+            }
+            location.reload();
+        }, 10000);  // 10s polling (less aggressive than 5s)
+    }
+    function stopPolling() {
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+    startPolling();
+    // Also explicitly pause when focusing inputs (extra safety)
+    document.addEventListener('focusin', (e) => {
+        if (e.target.matches('input, textarea, select')) stopPolling();
+    });
+    document.addEventListener('focusout', (e) => {
+        if (e.target.matches('input, textarea, select')) startPolling();
+    });
+    </script>
+</body>
+</html>

@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}Projects - Hermes Orchestrator{% endblock %}
+{% block content %}
+
+<div class="flex items-center justify-between mb-4">
+    <h1 class="text-2xl font-bold text-gray-800">Projects</h1>
+    <div class="text-sm text-gray-500">{{ projects|length }} shown</div>
+</div>
+
+<!-- Create new project (collapsed) -->
+<button onclick="toggleForm('new-project-form')" class="mb-3 text-sm text-blue-600 hover:underline">
+    + Create new project
+</button>
+
+<form id="new-project-form" class="hidden bg-white border rounded-lg p-4 mb-4 shadow-sm">
+    <h3 class="text-lg font-semibold mb-3 text-gray-800">Create new project</h3>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+            <label class="block text-xs font-medium text-gray-700">Name</label>
+            <input name="name" type="text" required class="mt-1 block w-full border rounded px-2 py-1 text-sm" placeholder="e.g. EURUSD Q3">
+        </div>
+        <div>
+            <label class="block text-xs font-medium text-gray-700">
+                Goal
+                <span class="text-gray-400 font-normal">(optional — leave empty for manual mode)</span>
+            </label>
+            <input name="goal" type="text" class="mt-1 block w-full border rounded px-2 py-1 text-sm" placeholder="Backtest EURUSD and write report">
+        </div>
+        <div>
+            <label class="block text-xs font-medium text-gray-700">
+                Coordinator role
+                <span class="text-gray-400 font-normal">(optional — for iterative projects)</span>
+            </label>
+            <select name="coordinator_role" class="mt-1 block w-full border rounded px-2 py-1 text-sm">
+                <option value="">(none — single-pass project)</option>
+                {% for p in all_profiles %}
+                <option value="{{ p.name }}">{{ p.agent_id }} / {{ p.name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div>
+            <label class="block text-xs font-medium text-gray-700">
+                Max iterations
+                <span class="text-gray-400 font-normal">(0 = no cap)</span>
+            </label>
+            <input name="max_iterations" type="number" min="0" max="20" class="mt-1 block w-full border rounded px-2 py-1 text-sm" placeholder="0">
+        </div>
+        <div class="md:col-span-2">
+            <label class="block text-xs font-medium text-gray-700">
+                Accept criteria
+                <span class="text-gray-400 font-normal">(what counts as "done enough" to stop iterating)</span>
+            </label>
+            <input name="accept_criteria" type="text" class="mt-1 block w-full border rounded px-2 py-1 text-sm" placeholder="e.g. Report ≥ 3000 words, includes 2 charts, all data cited">
+        </div>
+        <div class="md:col-span-2">
+            <label class="block text-xs font-medium text-gray-700">
+                Deliverable path
+                <span class="text-gray-400 font-normal">(optional — under project folder, e.g. report/final.md)</span>
+            </label>
+            <input name="deliverable_path" type="text" class="mt-1 block w-full border rounded px-2 py-1 text-sm" placeholder="report/final.md">
+        </div>
+    </div>
+    <div class="mt-3 flex items-center gap-2">
+        <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Create</button>
+        <span id="form-status" class="text-sm text-gray-500"></span>
+        <span class="text-xs text-gray-400 ml-auto">
+            Tip: no goal? Project starts in <code>ready</code> state — add tasks via the project page.
+        </span>
+    </div>
+</form>
+
+<!-- Filter: show archived -->
+<div class="mb-3 text-sm">
+    {% if show_archived %}
+    <a href="/projects" class="text-blue-600 hover:underline">Hide archived projects</a>
+    {% else %}
+    <a href="/projects?show_archived=true" class="text-gray-500 hover:text-gray-700">Show archived projects</a>
+    {% endif %}
+</div>
+
+{% if not projects %}
+<div class="bg-yellow-50 border border-yellow-200 rounded p-4 text-sm text-yellow-800">
+    No projects yet. Use the form above.
+</div>
+{% endif %}
+
+<div class="space-y-2" id="projects-list">
+    {% for p in projects %}
+    <a href="/projects/{{ p.id }}" class="block bg-white border rounded-lg p-4 shadow-sm hover:bg-gray-50">
+        <div class="flex items-center justify-between">
+            <div>
+                <div class="font-mono text-sm text-gray-500">{{ p.id }}</div>
+                <div class="font-semibold text-gray-800">{{ p.name or '(unnamed)' }}</div>
+                <div class="text-sm text-gray-600 mt-1">{{ p.goal or '-' }}</div>
+            </div>
+            <div class="text-right">
+                <span class="px-2 py-0.5 text-xs rounded
+                    {% if p.state == 'running' %}bg-blue-100 text-blue-800
+                    {% elif p.state == 'completed' %}bg-green-100 text-green-800
+                    {% elif p.state == 'cancelled' %}bg-gray-200 text-gray-700
+                    {% elif p.state == 'archived' %}bg-yellow-100 text-yellow-800
+                    {% else %}bg-yellow-100 text-yellow-800{% endif %}">
+                    {{ p.state }}
+                </span>
+                <div class="text-xs text-gray-500 mt-1">{{ p.created_at }}</div>
+            </div>
+        </div>
+    </a>
+    {% endfor %}
+</div>
+
+<script>
+function toggleForm(id) {
+    document.getElementById(id).classList.toggle('hidden');
+}
+
+document.getElementById('new-project-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const status = document.getElementById('form-status');
+    status.textContent = 'Creating...';
+    status.className = 'text-sm text-gray-500';
+
+    try {
+        const body = {
+            name: form.name.value,
+            goal: form.goal.value,
+        };
+        if (form.coordinator_role && form.coordinator_role.value) body.coordinator_role = form.coordinator_role.value;
+        if (form.max_iterations && form.max_iterations.value) body.max_iterations = parseInt(form.max_iterations.value, 10);
+        if (form.accept_criteria && form.accept_criteria.value) body.accept_criteria = form.accept_criteria.value;
+        if (form.deliverable_path && form.deliverable_path.value) body.deliverable_path = form.deliverable_path.value;
+        const r = await fetch('/api/projects/', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        if (r.ok) {
+            const data = await r.json();
+            status.textContent = 'Created ' + data.id + '!';
+            status.className = 'text-sm text-green-600';
+            if (document.activeElement) document.activeElement.blur();
+            setTimeout(() => location.href = '/projects/' + data.id, 500);
+        } else {
+            const err = await r.json().catch(() => ({}));
+            status.textContent = 'Error: ' + (err.detail || r.status);
+            status.className = 'text-sm text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error';
+        status.className = 'text-sm text-red-600';
+    }
+});
+</script>
+
+{% endblock %}
