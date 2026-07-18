@@ -110,6 +110,52 @@ def _atomic_write(target: Path, content: str) -> None:
     tmp.replace(target)
 
 
+def _clean_hermes_output(stdout: str) -> str:
+    """Strip noise from hermes stdout before storing as task summary.
+
+    Hermes prints a lot of UI chrome (box-drawing borders, ANSI color codes,
+    "Initializing agent..." / "Session: <id>" / "Resume this session with..."
+    / "Duration: 14s" / "Messages: 24..." lines) that is useful for a
+    human watching a live terminal but pure noise in the orchestrator's
+    task-result summary. The dashboard renders 300 chars of this, and we
+    want the agent's actual conclusion to show, not hermes' session
+    metadata.
+
+    We keep the first 8000 chars (mostly safe — most tasks are < 8KB of
+    useful output, and a TAIL is what the dashboard shows anyway).
+    """
+    import re
+    s = stdout[:8000]
+    # Strip ANSI escape codes (color, cursor moves, etc.)
+    s = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s)
+    # Strip the box-drawing borders that wrap "Hermes" tool headers.
+    # Pattern: lines of repeated ─ / ╭ / ╰ / │ that are mostly chrome.
+    s = re.sub(r"[─━╭╮╰╯│┌┐└┘├┤┬┴┼]{10,}", "[…]", s)
+    # Strip hermes' "tool call" rows like "┊ 💻 preparing terminal…"
+    # and "┊ 💻 $         curl ... 1.2s". These dominate the output.
+    s = re.sub(r"^\s*┊\s*[^\n]*$", "", s, flags=re.MULTILINE)
+    # Strip the trailing session metadata block that hermes prints on
+    # exit. Everything from "Resume this session with:" to EOF is noise
+    # for a human reading the task summary.
+    s = re.sub(
+        r"\n*Resume this session with:.*$",
+        "\n[…session metadata stripped…]",
+        s,
+        flags=re.DOTALL,
+    )
+    # Also strip the equivalent "Session: <id>" / "Duration:" / "Messages:"
+    # block that sometimes appears at the start of the output.
+    s = re.sub(
+        r"^Session:\s+\S+.*?Messages:\s+\d+.*$",
+        "[…session metadata stripped…]",
+        s,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    # Collapse 3+ blank lines into 1.
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
 def _load_wrapper_config(config_path: Path) -> dict:
     """Load wrapper config JSON. Fields:
     {
@@ -819,7 +865,7 @@ def start(
                             click.echo(f"  WARN: session save failed: {e}")
 
             if rc == 0:
-                summary = stdout[:8000] if stdout else "(no output)"
+                summary = _clean_hermes_output(stdout) if stdout else "(no output)"
                 result = {"status": "completed", "summary": summary}
                 # If task declared an output_path: check local cache, upload
                 # to orchestrator via PUT file API, then attach artifact meta.

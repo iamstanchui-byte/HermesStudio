@@ -129,7 +129,15 @@
         <div class="mt-2 text-xs text-gray-600 grid grid-cols-2 md:grid-cols-5 gap-2">
             <div><span class="text-gray-500">role:</span> <span class="font-mono">{{ task.agent_role }}</span></div>
             <div><span class="text-gray-500">agent:</span> <span class="font-mono">{{ task.assigned_agent_id or '-' }}</span></div>
-            <div><span class="text-gray-500">action:</span> <span class="font-mono">{{ task.action or '-' }}</span></div>
+            <div class="min-w-0">
+                <span class="text-gray-500">action:</span>
+                {% set action_str = (task.action or '-') %}
+                {% if action_str|length > 60 %}
+                <span class="font-mono truncate inline-block max-w-[28ch] align-middle" title="{{ action_str }}">{{ action_str[:60] }}…</span>
+                {% else %}
+                <span class="font-mono">{{ action_str }}</span>
+                {% endif %}
+            </div>
             <div><span class="text-gray-500">retries:</span> {{ task.retry_count }}/{{ task.max_retries }}</div>
             <div>
                 <span class="text-gray-500">took:</span>
@@ -145,12 +153,45 @@
         {% endif %}
         {% if task.result and (task.result.summary or task.result.session_id or task.result.error or task.result.artifacts) %}
         <div class="mt-2">
-            <button onclick="toggleResultPersist('{{ task.id }}')" class="text-xs text-blue-600 hover:underline">
-                View result
-            </button>
+            {% set summary_text = task.result.summary or '' %}
+            {% set summary_clean = summary_text
+                |replace('\x1b[2;3m', '')
+                |replace('\x1b[38;2;255;191;0m', '')
+                |replace('\x1b[38;2;255;248;220m', '')
+                |replace('\x1b[38;2;255;215;0m', '')
+                |replace('\x1b[1;38;2;255;215;0m', '')
+                |replace('\x1b[0m', '') %}
+            {% if summary_clean %}
+            <div class="text-xs text-gray-700 bg-gray-50 border rounded p-2 font-mono whitespace-pre-wrap break-words">
+                <span class="text-gray-500 not-italic font-sans">tail (last 300 chars):</span>
+                <span id="tail-{{ task.id }}">{{ summary_clean[-300:] }}</span>
+            </div>
+            {% endif %}
+            <div class="mt-1 flex items-center gap-3 text-xs">
+                <button onclick="toggleResultPersist('{{ task.id }}')" class="text-blue-600 hover:underline">
+                    View result
+                </button>
+                {% if task.result.summary and task.result.summary|length > 300 %}
+                <button onclick="toggleFull('{{ task.id }}')" id="full-btn-{{ task.id }}" class="text-blue-600 hover:underline">
+                    Show full
+                </button>
+                {% endif %}
+                {% if task.result.summary %}
+                <button onclick="copyResult('{{ task.id }}')" class="text-blue-600 hover:underline">
+                    Copy
+                </button>
+                {% endif %}
+                {% if task.result.artifacts %}
+                <span class="text-gray-500">| {{ task.result.artifacts|length }} artifact{{ '' if task.result.artifacts|length == 1 else 's' }}</span>
+                {% endif %}
+            </div>
             <div id="result-{{ task.id }}" class="hidden mt-2 bg-gray-50 border rounded p-3 text-xs">
                 {% if task.result.summary %}
-                <div class="mb-1"><span class="text-gray-500">Summary:</span> {{ task.result.summary }}</div>
+                <div class="mb-1">
+                    <span class="text-gray-500">Summary:</span>
+                    <span class="text-gray-400">({{ task.result.summary|length }} chars)</span>
+                </div>
+                <pre id="full-{{ task.id }}" class="hidden whitespace-pre-wrap break-words text-xs bg-white border rounded p-2 mt-1 max-h-96 overflow-auto">{{ task.result.summary }}</pre>
                 {% endif %}
                 {% if task.result.session_id %}
                 <div class="mb-1"><span class="text-gray-500">Session ID:</span> <span class="font-mono">{{ task.result.session_id }}</span></div>
@@ -164,7 +205,7 @@
                     <ul class="list-disc ml-6 mt-1">
                     {% for a in task.result.artifacts %}
                         <li>
-                            <span class="font-mono">{{ a.name }}</span>
+                            <a href="/projects/{{ task.project_id }}/files/{{ a.name }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name }}</a>
                             <span class="text-gray-500">({{ a.storage_kind|default('?') }}{% if a.size_bytes %}, {{ a.size_bytes }} bytes{% endif %})</span>
                         </li>
                     {% endfor %}
@@ -215,6 +256,53 @@ getOpenResults().forEach(taskId => {
     const el = document.getElementById('result-' + taskId);
     if (el) el.classList.remove('hidden');
 });
+
+// Toggle the full <pre> block for a task's result.
+function toggleFull(taskId) {
+    const pre = document.getElementById('full-' + taskId);
+    const btn = document.getElementById('full-btn-' + taskId);
+    if (!pre || !btn) return;
+    const hidden = pre.classList.toggle('hidden');
+    btn.textContent = hidden ? 'Show full' : 'Hide full';
+}
+
+// Copy the raw summary text to clipboard. Fall back to a textarea +
+// execCommand('copy') for environments where navigator.clipboard is
+// unavailable (e.g. plain http on a non-localhost host).
+function copyResult(taskId) {
+    const pre = document.getElementById('full-' + taskId);
+    if (!pre) return;
+    const text = pre.textContent || '';
+    const showOk = (btn) => {
+        const orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = orig; }, 1500);
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => {
+            const btn = document.querySelector(`button[onclick="copyResult('${taskId}')"]`);
+            if (btn) showOk(btn);
+        }).catch(() => fallbackCopy(text, taskId));
+    } else {
+        fallbackCopy(text, taskId);
+    }
+}
+function fallbackCopy(text, taskId) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch {}
+    document.body.removeChild(ta);
+    const btn = document.querySelector(`button[onclick="copyResult('${taskId}')"]`);
+    if (btn) {
+        const orig = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = orig; }, 1500);
+    }
+}
 
 document.getElementById('new-task-form').addEventListener('submit', async (e) => {
     e.preventDefault();
