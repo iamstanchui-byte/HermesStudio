@@ -410,11 +410,27 @@ async def heartbeat(
             t["parent_outputs"] = parent_outputs
         tasks.append(t)
 
+    # Session cleanup: list hermes sessions the wrapper should delete from
+    # its local hermes backend. These are sessions the supervisor's sweeper
+    # has aged out (status='pending_cleanup'); the wrapper runs
+    # `hermes sessions delete <id> --yes` and acks via
+    # /sessions/{session_id}/cleanup-ack, which flips the DB row to
+    # status='deleted'. Without this, hermes's local session store grows
+    # unbounded; the orchestrator's DB mark-as-deleted alone is purely
+    # audit-trail.
+    cleanup_rows = await db.fetchall(
+        "SELECT id, project_id, session_id, role FROM project_sessions "
+        "WHERE status = 'pending_cleanup' AND source = 'orchestrator' "
+        "AND role IN (SELECT name FROM agent_profiles WHERE agent_id = ?)",
+        (agent_id,),
+    )
+
     return {
         "status": "ok",
         "timestamp": now,
         "agent_status": body_data.get("status", "idle"),
         "tasks": tasks,
+        "cleanup_session_ids": [r["session_id"] for r in cleanup_rows],
     }
 
 
@@ -773,6 +789,64 @@ async def ack_config(
         },
     )
     return _row_to_config(updated)
+
+
+@router.post("/{agent_id}/sessions/{session_id}/cleanup-ack")
+async def session_cleanup_ack(
+    agent_id: str,
+    session_id: str,
+    request: Request,
+) -> dict:
+    """Wrapper called this after deleting the hermes session locally.
+
+    Flips the matching project_sessions row from `pending_cleanup` to
+    `deleted`. Idempotent: if the row is already `deleted` (e.g. another
+    ack raced us), the call returns 200 with `already_deleted: true`.
+
+    We match by (agent_id, session_id) — the role can vary (e.g. coord
+    review tasks delete a session belonging to a different profile than
+    the wrapper's own, but the wrapper's role is the one that owned the
+    hermes session in its local backend).
+    """
+    db = request.app.state.db
+    # Match against project_sessions rows where the session_id is owned
+    # by a profile belonging to this agent.
+    rows = await db.fetchall(
+        "SELECT ps.id, ps.role FROM project_sessions ps "
+        "JOIN agent_profiles ap ON ap.id = ps.profile_id "
+        "WHERE ap.agent_id = ? AND ps.session_id = ? "
+        "AND ps.status = 'pending_cleanup'",
+        (agent_id, session_id),
+    )
+    if not rows:
+        # Already deleted, or never existed, or no matching pending row.
+        # Return 200 with already_deleted=true to keep the wrapper
+        # idempotent.
+        return {
+            "ok": True,
+            "already_deleted": True,
+            "session_id": session_id,
+        }
+    now = _now_iso()
+    deleted = 0
+    for row in rows:
+        await db.execute(
+            "UPDATE project_sessions SET status = 'deleted', deleted_at = ? "
+            "WHERE id = ?",
+            (now, row["id"]),
+        )
+        deleted += 1
+        await audit_log(
+            db, "project.session_cleaned",
+            actor="wrapper",
+            agent_id=agent_id,
+            payload={"session_id": session_id, "role": row["role"]},
+        )
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "session_id": session_id,
+    }
 
 
 # ===== Skill endpoints (skills/<name>.md via profile_configs) =====

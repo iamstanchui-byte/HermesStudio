@@ -358,16 +358,27 @@ class Supervisor:
         hermes backend AND mark them as deleted in the orchestrator's
         project_sessions table.
 
+        Two-phase state machine for the row:
+          active  -> pending_cleanup  (sweeper picks it up here)
+          pending_cleanup -> deleted   (wrapper acks after running
+                                        `hermes sessions delete <id>`)
+
+        The wrapper reads `cleanup_session_ids` from each heartbeat
+        response and POSTs `/sessions/{id}/cleanup-ack` after the local
+        delete succeeds. The heartbeat response is per-agent (filtered
+        to profiles owned by that agent), so the right wrapper does the
+        right delete.
+
         Only sessions with `source='orchestrator'` in project_sessions
         are touched. User-created sessions (if we ever support them)
         are not in the table and therefore not affected.
 
         Returns a small report dict for the CLI / dashboard:
-            {"candidates": N, "deleted": M, "errors": [...]}
+            {"candidates": N, "marked_pending": M, "errors": [...]}
         """
         from datetime import timedelta
         if ttl_days <= 0:
-            return {"candidates": 0, "deleted": 0, "errors": [], "disabled": True}
+            return {"candidates": 0, "marked_pending": 0, "errors": [], "disabled": True}
         cutoff = (now_aware() - timedelta(days=ttl_days)).isoformat()
         rows = await self.db.fetchall(
             "SELECT id, project_id, session_id, role FROM project_sessions "
@@ -377,30 +388,24 @@ class Supervisor:
             "LIMIT 200",
             (cutoff,),
         )
-        report = {"candidates": len(rows), "deleted": 0, "errors": []}
+        report = {"candidates": len(rows), "marked_pending": 0, "errors": []}
         if dry_run:
             return report
-        # We don't have a hermes "delete session" library call wired into
-        # the orchestrator (hermes is a separate CLI). For now, the
-        # sweeper just marks the rows as deleted in our DB. A future
-        # change can call `hermes sessions delete <sid>` via subprocess
-        # if hermes exposes that command. Until then, the user can run
-        # `hermes sessions prune --older-than <days>` manually and our
-        # DB stays in sync.
         for row in rows:
             try:
                 await self.db.execute(
-                    "UPDATE project_sessions SET status = 'deleted', "
-                    "deleted_at = ? WHERE id = ?",
-                    (now_aware().isoformat(), row["id"]),
+                    "UPDATE project_sessions SET status = 'pending_cleanup' "
+                    "WHERE id = ?",
+                    (row["id"],),
                 )
-                report["deleted"] += 1
+                report["marked_pending"] += 1
             except Exception as e:
                 report["errors"].append({"session": row["session_id"], "error": str(e)})
-        if report["deleted"]:
+        if report["marked_pending"]:
             log.info(
-                f"session cleanup: marked {report['deleted']} session(s) as deleted "
-                f"(ttl={ttl_days}d, cutoff={cutoff})"
+                f"session cleanup: marked {report['marked_pending']} session(s) as "
+                f"pending_cleanup (ttl={ttl_days}d, cutoff={cutoff}). Wrappers "
+                f"will delete from local hermes backends on next heartbeat."
             )
         return report
 

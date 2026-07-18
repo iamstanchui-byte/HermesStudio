@@ -215,9 +215,16 @@ def sessions_cleanup(older_than: int | None, dry_run: bool) -> None:
         click.echo(f"  cutoff:  {ttl} day(s) ago")
         click.echo(f"  candidates:  {report['candidates']}")
         if dry_run:
-            click.echo(f"  (dry-run — pass --no-dry-run to actually mark deleted)")
+            click.echo(f"  (dry-run — pass --no-dry-run to actually mark pending_cleanup)")
         else:
-            click.echo(f"  deleted:  {report['deleted']}")
+            # Two-phase: sweeper marks as 'pending_cleanup' so the
+            # wrapper picks it up on its next heartbeat, runs
+            # `hermes sessions delete <id> --yes`, and acks. The
+            # report dict uses 'marked_pending' for the count of
+            # rows we just flipped; subsequent 'deleted' transitions
+            # happen asynchronously on the wrapper.
+            click.echo(f"  marked_pending:  {report.get('marked_pending', 0)}")
+            click.echo(f"  (wrappers will delete from local hermes backends on next heartbeat)")
         if report.get("errors"):
             click.echo(f"  errors:  {len(report['errors'])}")
             for e in report["errors"][:5]:

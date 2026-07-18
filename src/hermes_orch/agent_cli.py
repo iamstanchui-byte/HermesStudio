@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import platform
 import re
 import time
@@ -524,7 +525,14 @@ def start(
             "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
         }
 
-    def _heartbeat() -> list[dict]:
+    def _heartbeat() -> tuple[list[dict], list[str]]:
+        """Heartbeat to orchestrator. Returns (tasks, cleanup_session_ids).
+
+        cleanup_session_ids is a list of hermes session IDs the supervisor
+        has aged out (status='pending_cleanup' in project_sessions). The
+        wrapper runs `hermes sessions delete <id> --yes` for each and
+        POSTs to /sessions/{id}/cleanup-ack to mark the row deleted.
+        """
         try:
             r = httpx.post(
                 f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
@@ -534,11 +542,84 @@ def start(
             )
             if r.status_code != 200:
                 click.echo(f"[daemon] heartbeat {r.status_code}: {r.text[:200]}")
-                return []
-            return r.json().get("tasks", [])
+                return [], []
+            body = r.json() or {}
+            return body.get("tasks", []), body.get("cleanup_session_ids", []) or []
         except httpx.RequestError as e:
             click.echo(f"[daemon] heartbeat failed: {e}")
-            return []
+            return [], []
+
+    def _cleanup_local_sessions(session_ids: list[str]) -> None:
+        """Run `hermes sessions delete <id> --yes` for each session ID,
+        then POST /cleanup-ack to the orchestrator so the DB row flips
+        from pending_cleanup to deleted. Best-effort: a hermes delete
+        failure (e.g. session already gone) is non-fatal — we still
+        ack so the DB doesn't get stuck in pending_cleanup forever.
+        """
+        if not session_ids:
+            return
+        # Locate the hermes CLI. On Linux it's typically at
+        # ~/.local/bin/hermes. On Windows it's usually at
+        # %LOCALAPPDATA%\hermes\hermes-agent\hermes.exe. We try a few
+        # common locations; if all fail, fall back to "hermes" and let
+        # the OS resolve via PATH.
+        hermes_bin: str | None = None
+        candidates: list[Path] = [
+            Path.home() / ".local" / "bin" / "hermes",
+        ]
+        # Add Windows-specific candidates
+        if sys.platform == "win32":
+            local_app = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            candidates += [
+                Path(local_app) / "hermes" / "hermes-agent" / "hermes.exe",
+                Path(local_app) / "hermes" / "hermes-agent" / "venv" / "Scripts" / "hermes.exe",
+                Path(local_app) / "Programs" / "hermes" / "hermes.exe",
+            ]
+        else:
+            candidates += [
+                Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "hermes",
+                Path.home() / ".hermes" / "hermes-agent" / "hermes",
+            ]
+        for cand in candidates:
+            if cand.exists() and os.access(str(cand), os.X_OK):
+                hermes_bin = str(cand)
+                break
+        if not hermes_bin:
+            hermes_bin = "hermes"
+        for sid in session_ids:
+            try:
+                proc = subprocess.run(
+                    [hermes_bin, "sessions", "delete", sid, "--yes"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if proc.returncode == 0:
+                    click.echo(f"[daemon] deleted hermes session: {sid}")
+                else:
+                    # "Session not found" / "no such session" is fine —
+                    # the session is already gone, which is what we wanted.
+                    stderr_low = (proc.stderr or "").lower()
+                    if "not found" in stderr_low or "no such" in stderr_low:
+                        click.echo(f"[daemon] hermes session already gone: {sid}")
+                    else:
+                        click.echo(
+                            f"[daemon] hermes sessions delete {sid} failed "
+                            f"(rc={proc.returncode}): {(proc.stderr or '').strip()[:200]}"
+                        )
+            except Exception as e:
+                click.echo(f"[daemon] hermes sessions delete {sid} error: {e}")
+            # Always ack — even on failure, we don't want the row stuck
+            # in pending_cleanup. The audit log retains the failure
+            # context via the stdout/stderr we just printed.
+            try:
+                httpx.post(
+                    f"{orchestrator_url}/api/agents/{agent_id}/sessions/{sid}/cleanup-ack",
+                    headers=_auth_headers(),
+                    timeout=10,
+                )
+            except Exception as e:
+                click.echo(f"[daemon] cleanup-ack failed for {sid}: {e}")
 
     def _claim(task_id: str) -> bool:
         """Atomically flip task from 'assigned' to 'running'."""
@@ -1320,7 +1401,11 @@ def start(
 
     try:
         while not stop_flag["stop"]:
-            tasks = _heartbeat()
+            tasks, cleanup_ids = _heartbeat()
+            # Process any session-cleanup requests the supervisor queued
+            # before the rest of the loop work. Cheap when empty.
+            if cleanup_ids:
+                _cleanup_local_sessions(cleanup_ids)
             assigned = [t for t in tasks if t.get("status") == "assigned"]
             if assigned:
                 click.echo(f"[daemon] got {len(assigned)} assigned task(s)")
