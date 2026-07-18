@@ -49,9 +49,15 @@
                 <button onclick="openProjectFolder('{{ project.id }}')" class="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded hover:bg-gray-200" title="Open the project folder in File Explorer (only works if your browser is on the orchestrator host)">
                     Open in Explorer
                 </button>
-                <button onclick="replanProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-purple-100 text-purple-800 rounded hover:bg-purple-200" title="Re-trigger the LLM planner: set/update the project goal and generate a fresh task plan. Existing pending tasks are kept unless you also call /replan with clear_tasks.">
+                <button onclick="openReplanModal('{{ project.id }}')" class="px-2 py-1 text-xs bg-purple-100 text-purple-800 rounded hover:bg-purple-200" title="Re-trigger the LLM planner: set/update the project goal and configure iter-loop settings. Existing pending tasks are kept unless you also tick 'clear tasks'.">
                     &#x2728; Generate plan
                 </button>
+                {# Hidden fields that openReplanModal pre-populates the modal with #}
+                <input type="hidden" id="replan-goal" value="{{ project.goal or '' }}">
+                <input type="hidden" id="replan-coord" value="{{ project.coordinator_role or '' }}">
+                <input type="hidden" id="replan-max-iter" value="{{ project.max_iterations or 0 }}">
+                <input type="hidden" id="replan-criteria" value="{{ project.accept_criteria or '' }}">
+                <input type="hidden" id="replan-deliverable" value="{{ project.deliverable_path or '' }}">
                 {% if project.state == 'archived' %}
                 <button onclick="unarchiveProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-blue-100 text-blue-800 rounded hover:bg-blue-200">Unarchive</button>
                 {% else %}
@@ -419,32 +425,82 @@ async function deleteProject(projectId) {
 }
 
 // Re-trigger the LLM planner. If the project has no goal yet, prompt for one.
-async function replanProject(projectId) {
-    const goalPreview = prompt(
-        "Set the project goal (leave blank to use the current goal if any):",
-        document.querySelector('p.text-sm.text-gray-600.mt-1')?.textContent || ""
-    );
-    if (goalPreview === null) return;  // user cancelled
-    const clearTasks = confirm("Clear existing pending/assigned tasks before replanning? Recommended for a fresh plan.");
+// ===== Generate plan modal =====
+
+function openReplanModal(projectId) {
+    // Pre-fill the modal fields from the project values stored in
+    // hidden inputs next to the Generate button. We use a fresh form
+    // instance each open so the user can change just one field without
+    // having to clear others.
+    const form = document.getElementById('replan-form');
+    form.goal.value = document.getElementById('replan-goal').value;
+    form.coordinator_role.value = document.getElementById('replan-coord').value;
+    form.max_iterations.value = document.getElementById('replan-max-iter').value;
+    form.accept_criteria.value = document.getElementById('replan-criteria').value;
+    form.deliverable_path.value = document.getElementById('replan-deliverable').value;
+    form.clear_tasks.checked = false;
+    // Reset status
+    const status = document.getElementById('replan-status');
+    status.textContent = '';
+    status.className = 'text-sm text-gray-500';
+    document.getElementById('replan-submit-btn').disabled = false;
+    // Show modal
+    document.getElementById('replan-modal-overlay').classList.remove('hidden');
+    setTimeout(() => {
+        const ta = document.getElementById('replan-goal-input');
+        if (ta) ta.focus();
+    }, 50);
+}
+
+function closeReplanModal() {
+    document.getElementById('replan-modal-overlay').classList.add('hidden');
+}
+
+async function submitReplan(projectId) {
+    const form = document.getElementById('replan-form');
+    const status = document.getElementById('replan-status');
+    const btn = document.getElementById('replan-submit-btn');
+    const goal = form.goal.value.trim();
+    if (!goal) {
+        status.textContent = 'Goal is required';
+        status.className = 'text-sm text-red-600';
+        return;
+    }
+    status.textContent = 'Queueing...';
+    status.className = 'text-sm text-gray-500';
+    btn.disabled = true;
+    const clearTasks = form.clear_tasks.checked;
+    const body = {
+        goal: goal,
+        clear_tasks: clearTasks,
+    };
+    // Only include iter-loop fields if the user changed them
+    // (presence of value is enough — the endpoint uses None to skip
+    // and overwrites with provided values). Empty strings clear.
+    body.coordinator_role = form.coordinator_role.value || '';
+    body.max_iterations = form.max_iterations.value === '' ? 0 : parseInt(form.max_iterations.value, 10);
+    body.accept_criteria = form.accept_criteria.value || '';
+    body.deliverable_path = form.deliverable_path.value || '';
     try {
         const r = await fetch('/api/projects/' + projectId + '/replan', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                goal: goalPreview.trim() || null,
-                clear_tasks: clearTasks,
-            }),
+            body: JSON.stringify(body),
         });
         const data = await r.json().catch(() => ({}));
         if (!r.ok) {
-            alert('Replan failed: ' + (data.detail || r.status));
+            status.textContent = 'Replan failed: ' + (data.detail || r.status);
+            status.className = 'text-sm text-red-600';
+            btn.disabled = false;
             return;
         }
-        alert(`Replan queued. ${data.cleared_tasks} task(s) cleared. The supervisor will call the planner on its next tick (~1s). Reload the page in a few seconds to see the generated tasks.`);
-        // Wait briefly then reload so the user can see the new tasks
-        setTimeout(() => location.reload(), 2500);
+        status.textContent = `Replan queued. ${data.cleared_tasks} task(s) cleared. Reloading...`;
+        status.className = 'text-sm text-green-600';
+        setTimeout(() => location.reload(), 1500);
     } catch (err) {
-        alert('Error: ' + err.message);
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-sm text-red-600';
+        btn.disabled = false;
     }
 }
 
@@ -582,5 +638,89 @@ async function deletePreset(agentId, profileName, btn) {
     }
 }
 </script>
+
+<!-- ===== Generate plan modal ===== -->
+<div id="replan-modal-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center" style="background-color: rgba(0,0,0,0.5);">
+    <div class="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-screen overflow-y-auto">
+        <form id="replan-form" onsubmit="event.preventDefault(); submitReplan('{{ project.id }}');" class="p-5">
+            <h2 class="text-lg font-semibold text-gray-800 mb-1">&#x2728; Generate plan</h2>
+            <p class="text-sm text-gray-500 mb-4">
+                Set the goal and (optionally) configure iter-loop settings.
+                The supervisor will call the LLM planner on the next tick.
+            </p>
+
+            <div class="grid grid-cols-1 gap-3">
+                <div>
+                    <label class="block text-xs font-medium text-gray-700">
+                        Goal <span class="text-red-500">*</span>
+                    </label>
+                    <textarea id="replan-goal-input" name="goal" required rows="3"
+                              class="mt-1 block w-full border rounded px-2 py-1 text-sm"
+                              placeholder="What should the agents do? Be specific — the LLM uses this to break the work into tasks."></textarea>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-medium text-gray-700 mt-2">
+                        Coordinator role
+                        <span class="text-gray-400 font-normal">(optional — for iterative projects)</span>
+                    </label>
+                    <select name="coordinator_role" class="mt-1 block w-full border rounded px-2 py-1 text-sm">
+                        <option value="">(none — single-pass project)</option>
+                        {% for p in all_profiles %}
+                        <option value="{{ p.name }}">{{ p.agent_id }} / {{ p.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-xs font-medium text-gray-700">
+                            Max iterations
+                            <span class="text-gray-400 font-normal">(0 = no cap)</span>
+                        </label>
+                        <input name="max_iterations" type="number" min="0" max="20" class="mt-1 block w-full border rounded px-2 py-1 text-sm" placeholder="0">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-gray-700">
+                            Clear existing pending tasks?
+                        </label>
+                        <label class="mt-1 flex items-center gap-2 text-sm text-gray-700">
+                            <input id="replan-clear-tasks" name="clear_tasks" type="checkbox" class="rounded">
+                            Yes — start from a fresh plan
+                        </label>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-medium text-gray-700">
+                        Accept criteria
+                        <span class="text-gray-400 font-normal">(what counts as "done enough")</span>
+                    </label>
+                    <input name="accept_criteria" type="text" class="mt-1 block w-full border rounded px-2 py-1 text-sm"
+                           placeholder="e.g. Report ≥ 3000 words, includes 2 charts, all data cited">
+                </div>
+
+                <div>
+                    <label class="block text-xs font-medium text-gray-700">
+                        Deliverable path
+                        <span class="text-gray-400 font-normal">(optional — under project folder)</span>
+                    </label>
+                    <input name="deliverable_path" type="text" class="mt-1 block w-full border rounded px-2 py-1 text-sm"
+                           placeholder="report/final.md">
+                </div>
+            </div>
+
+            <div class="mt-4 flex items-center gap-2">
+                <button id="replan-submit-btn" type="submit" class="px-4 py-2 bg-purple-600 text-white rounded text-sm hover:bg-purple-700">
+                    Generate
+                </button>
+                <button type="button" onclick="closeReplanModal()" class="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm hover:bg-gray-200">
+                    Cancel
+                </button>
+                <span id="replan-status" class="text-sm text-gray-500 ml-2"></span>
+            </div>
+        </form>
+    </div>
+</div>
 
 {% endblock %}

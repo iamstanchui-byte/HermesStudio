@@ -516,9 +516,20 @@ async def get_project_session(project_id: str, request: Request) -> dict:
 
 class ProjectReplan(BaseModel):
     """Body for POST /replan. Either provides a new goal, or just kicks the
-    planner to retry with the existing goal (e.g. after manual cleanup)."""
+    planner to retry with the existing goal (e.g. after manual cleanup).
+
+    The iter-loop fields (coordinator_role, max_iterations, accept_criteria,
+    deliverable_path) are optional. If provided, they overwrite the project's
+    existing values. The primary use case is a manual-mode project (created
+    with no goal) where the operator is now adding a plan: they fill in
+    goal AND configure the iter-loop at the same time.
+    """
     goal: str | None = None  # if None, replan uses the current goal
     clear_tasks: bool = False  # if True, delete existing pending/assigned tasks first
+    coordinator_role: str | None = None  # 'auto' or a profile name; '' to clear
+    max_iterations: int | None = None  # 0 = no cap; None = leave unchanged
+    accept_criteria: str | None = None  # '' to clear
+    deliverable_path: str | None = None  # '' to clear
 
 
 @router.post("/{project_id}/replan")
@@ -573,15 +584,32 @@ async def replan_project(
         (project_id,),
     )
     cleared_reviews = old_reviews.rowcount if hasattr(old_reviews, "rowcount") else 0
-    # Reset current_iteration so the Q2 iteration loop re-runs from 0
-    # against the new goal. Also clear the stale decision.md so the
-    # supervisor's decision_is_pass check doesn't auto-complete the
-    # project based on a verdict from the previous goal's last review.
+    # Build the SET clause incrementally. Always update goal/state/iter
+    # state. Only update the iter-loop fields if the caller actually
+    # provided them (so a bare replan with no settings doesn't wipe
+    # the existing config).
+    set_parts = [
+        "goal = ?", "state = 'planning'",
+        "current_iteration = 0", "last_iteration_summary = ''",
+        "updated_at = ?",
+    ]
+    set_params: list[Any] = [new_goal, _now_iso()]
+    if body.coordinator_role is not None:
+        set_parts.append("coordinator_role = ?")
+        set_params.append(body.coordinator_role)
+    if body.max_iterations is not None:
+        set_parts.append("max_iterations = ?")
+        set_params.append(int(body.max_iterations))
+    if body.accept_criteria is not None:
+        set_parts.append("accept_criteria = ?")
+        set_params.append(body.accept_criteria)
+    if body.deliverable_path is not None:
+        set_parts.append("deliverable_path = ?")
+        set_params.append(body.deliverable_path)
+    set_params.append(project_id)
     await db.execute(
-        "UPDATE projects SET goal = ?, state = 'planning', "
-        "current_iteration = 0, last_iteration_summary = '', "
-        "updated_at = ? WHERE id = ?",
-        (new_goal, _now_iso(), project_id),
+        f"UPDATE projects SET {', '.join(set_parts)} WHERE id = ?",
+        tuple(set_params),
     )
     try:
         dpath = _project_dir(request, project_id) / "decision.md"
@@ -598,6 +626,14 @@ async def replan_project(
             "cleared_tasks": cleared,
             "cleared_reviews": cleared_reviews,
             "previous_state": project["state"],
+            "iter_fields_updated": {
+                k: v for k, v in {
+                    "coordinator_role": body.coordinator_role,
+                    "max_iterations": body.max_iterations,
+                    "accept_criteria": body.accept_criteria,
+                    "deliverable_path": body.deliverable_path,
+                }.items() if v is not None
+            },
         },
     )
     return {
