@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS projects (
     state TEXT NOT NULL DEFAULT 'planning',
     session_id TEXT,
     current_session_id TEXT,
+    current_sessions_json TEXT DEFAULT '{}',
     supervisor_turn_count INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -180,6 +181,14 @@ MIGRATIONS = [
     "ALTER TABLE agent_profiles ADD COLUMN updated_at TIMESTAMP DEFAULT ''",
     "ALTER TABLE tasks ADD COLUMN output_path TEXT",
     "ALTER TABLE projects ADD COLUMN current_session_id TEXT",
+    # Per-role session map: {"<role>": "<session_id>", ...}. The old
+    # `current_session_id` was a single string (latest wins) which caused
+    # cross-profile session reuse: a task running on profile X would
+    # --resume a session that profile Y created, and hermes would return
+    # "Session not found" because hermes session namespaces are
+    # per-profile. The new column stores one session per role so the
+    # wrapper can resume only sessions that belong to its own role.
+    "ALTER TABLE projects ADD COLUMN current_sessions_json TEXT DEFAULT '{}'",
     # Project iteration tracking (Q3): fields that describe how the project
     # is driven at the system level, not per-task. coordinator_role names
     # the agent (or 'auto') that owns iteration. accept_criteria is plain

@@ -129,7 +129,7 @@ class Supervisor:
     # ===== tick (one pass) =====
 
     async def tick(self) -> None:
-        projects = await self.fetchall(
+        projects = await self.db.fetchall(
             "SELECT * FROM projects WHERE state IN ('planning','ready','running')"
         )
         for proj in projects:

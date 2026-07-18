@@ -407,6 +407,20 @@ class Planner:
             content_clean = content[brace_idx:].strip() if brace_idx >= 0 else ""
         else:
             content_clean = content.strip()
+        # Strip markdown code fences (```json ... ``` or ``` ... ```). MiniMax
+        # M3 in particular wraps JSON in fences even when the SYSTEM_PROMPT
+        # says "Output JSON only." Without this, json.loads fails and we
+        # fall back to the mock plan unnecessarily. We match either the
+        # first opening fence + the last closing fence, or the whole
+        # fenced block.
+        fence_match = re.search(r"```(?:json)?\s*\n(.*?)\n```", content_clean, re.DOTALL)
+        if fence_match:
+            content_clean = fence_match.group(1).strip()
+        else:
+            # No full fenced block — maybe just a leading ```json line.
+            # Strip any leading "```json" / "```" and trailing "```".
+            content_clean = re.sub(r"^```(?:json)?\s*\n?", "", content_clean)
+            content_clean = re.sub(r"\n?```\s*$", "", content_clean)
         if not content_clean:
             raise RuntimeError(f"LLM returned only thinking, no JSON: {content[:200]!r}")
         try:

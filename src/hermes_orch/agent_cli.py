@@ -711,13 +711,18 @@ def start(
         if accept_hooks:
             hermes_args.append("--accept-hooks")
 
-        # Session resume: if the project has a current_session_id, pass
-        # --resume so the agent has context from prior tasks. This is critical
-        # for multi-step workflows (e.g. synth task reading the data tasks did).
-        if project_id:
+        # Session resume: query for THIS role's session. Hermes session
+        # namespaces are per-profile, so a session created by profile X
+        # cannot be resumed by profile Y (hermes returns "Session not
+        # found" and the agent echoes the action without doing real
+        # work). The orchestrator's per-role map (`current_sessions_json`)
+        # ensures each wrapper only ever tries to resume a session that
+        # its own profile created.
+        if project_id and role:
             try:
                 r = httpx.get(
                     f"{orchestrator_url}/api/projects/{project_id}/session",
+                    params={"role": role},
                     headers={
                         "X-Agent-Id": agent_id,
                         "X-Timestamp": str(int(time_mod.time())),
@@ -729,7 +734,11 @@ def start(
                     sid = (r.json() or {}).get("current_session_id")
                     if sid:
                         hermes_args += ["--resume", sid]
-                        click.echo(f"  resuming session: {sid}")
+                        click.echo(f"  resuming session: {sid} (role={role})")
+                    else:
+                        click.echo(
+                            f"  no prior session for role={role}, starting fresh"
+                        )
             except Exception as e:
                 click.echo(f"  WARN: session lookup failed: {e}")
 

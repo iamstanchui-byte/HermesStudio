@@ -431,10 +431,17 @@ async def unarchive_project(project_id: str, request: Request) -> dict:
 
 @router.post("/{project_id}/session")
 async def set_project_session(project_id: str, request: Request) -> dict:
-    """Set the project's current_session_id (called by wrapper after each task).
+    """Set the project's session for the calling role (wrapper after each task).
 
-    Subsequent tasks for the same project will resume this session (via
-    `hermes --resume <id>`), so the agent has context from prior tasks.
+    Sessions are stored PER ROLE (not per project) so the wrapper can resume
+    only sessions that belong to its own profile. Hermes session namespaces
+    are per-profile, so reusing a session from profile Y when running on
+    profile X causes "Session not found" and the agent echos back the
+    action without doing real work.
+
+    `current_sessions_json` is a JSON dict: {role: session_id, ...}. We
+    ALSO keep `current_session_id` (latest wins) for backward compat with
+    any external consumer; new code should read the role-specific one.
 
     Also records the session in project_sessions for the auto-cleanup
     sweeper. Every hermes session the orchestrator wrapper creates
@@ -443,6 +450,7 @@ async def set_project_session(project_id: str, request: Request) -> dict:
     NOT in this table and therefore not touched.
     """
     import json
+    import secrets
     body = await request.body()
     try:
         data = json.loads(body) if body else {}
@@ -454,21 +462,38 @@ async def set_project_session(project_id: str, request: Request) -> dict:
     profile_id = data.get("profile_id")
     if not session_id:
         raise HTTPException(400, "session_id is required")
+    if not role:
+        # role is now required so the per-role map is correctly populated.
+        # Without it, we'd write to current_session_id only (and a future
+        # task on a different profile would try to resume it).
+        raise HTTPException(400, "role is required (sessions are per-role)")
     db = request.app.state.db
-    # Update the project's current_session_id (used for --resume).
-    # One session per project (any role) — the orchestrator picks the
-    # latest one. This is informational; the actual resume feature
-    # is currently disabled by default in the wrapper, so the value
-    # is mostly for debugging.
+    # Read existing per-role map and update under this role's key.
+    row = await db.fetchone(
+        "SELECT current_sessions_json FROM projects WHERE id = ?", (project_id,)
+    )
+    if not row:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    try:
+        sess_map = json.loads(row["current_sessions_json"] or "{}")
+        if not isinstance(sess_map, dict):
+            sess_map = {}
+    except (json.JSONDecodeError, TypeError):
+        sess_map = {}
+    sess_map[role] = session_id
+    # Update the project's current_session_id (used by --resume).
+    # Per-role map (current_sessions_json) is the source of truth; the
+    # legacy current_session_id is kept for backward compat with any
+    # external consumer and points to this role's session (latest write).
     await db.execute(
-        "UPDATE projects SET current_session_id = ?, updated_at = ? WHERE id = ?",
-        (session_id, _now_iso(), project_id),
+        "UPDATE projects SET current_session_id = ?, "
+        "current_sessions_json = ?, updated_at = ? WHERE id = ?",
+        (session_id, json.dumps(sess_map), _now_iso(), project_id),
     )
     # Record in project_sessions for auto-cleanup. We use a stable
     # row id derived from (project_id, session_id) so re-saves
     # for the same session just update the existing row (bump
     # last_used_at) instead of creating duplicates.
-    import secrets
     row_id = f"ps-{secrets.token_hex(8)}"
     # Idempotent insert: if a row already exists for (project_id, session_id)
     # with status='active', bump last_used_at; otherwise insert new.
@@ -499,19 +524,56 @@ async def set_project_session(project_id: str, request: Request) -> dict:
         project_id=project_id,
         payload={"session_id": session_id, "role": role, "tracked_for_cleanup": True},
     )
-    return {"project_id": project_id, "current_session_id": session_id}
+    return {
+        "project_id": project_id,
+        "current_session_id": session_id,
+        "session_id": sess_map.get(role),
+        "role": role,
+    }
 
 
 @router.get("/{project_id}/session")
-async def get_project_session(project_id: str, request: Request) -> dict:
-    """Get the project's current_session_id (called by wrapper before each task)."""
+async def get_project_session(
+    project_id: str, request: Request, role: str | None = None
+) -> dict:
+    """Get the project's current session (called by wrapper before each task).
+
+    With `?role=<name>` (recommended): returns the session for that
+    specific role. The wrapper passes its own role so it never resumes
+    a session that belongs to a different profile (cross-profile session
+    reuse is broken at the hermes level — session namespaces are
+    per-profile).
+
+    Without `?role`: returns the legacy `current_session_id` (latest
+    write wins) for backward compat. The wrapper MUST pass role.
+    """
+    import json
     db = request.app.state.db
     project = await db.fetchone(
-        "SELECT current_session_id FROM projects WHERE id = ?", (project_id,)
+        "SELECT current_session_id, current_sessions_json "
+        "FROM projects WHERE id = ?",
+        (project_id,),
     )
     if not project:
         raise HTTPException(404, f"Project not found: {project_id}")
-    return {"project_id": project_id, "current_session_id": project.get("current_session_id")}
+    if role:
+        try:
+            sess_map = json.loads(project["current_sessions_json"] or "{}")
+            if not isinstance(sess_map, dict):
+                sess_map = {}
+        except (json.JSONDecodeError, TypeError):
+            sess_map = {}
+        sid = sess_map.get(role)
+        return {
+            "project_id": project_id,
+            "current_session_id": sid,  # role-specific
+            "role": role,
+        }
+    # No role filter: legacy behavior (latest write).
+    return {
+        "project_id": project_id,
+        "current_session_id": project.get("current_session_id"),
+    }
 
 
 class ProjectReplan(BaseModel):
