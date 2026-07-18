@@ -253,30 +253,27 @@ they target different agent profiles. -->
             </div>
             {% endif %}
             {% if t.result and (t.result.summary or t.result.session_id or t.result.error or t.result.artifacts) %}
-            {% set p_summary = t.result.summary or '' %}
-            {% set p_summary_clean = p_summary
-                |replace('\x1b[2;3m', '')
-                |replace('\x1b[38;2;255;191;0m', '')
-                |replace('\x1b[38;2;255;248;220m', '')
-                |replace('\x1b[38;2;255;215;0m', '')
-                |replace('\x1b[1;38;2;255;215;0m', '')
-                |replace('\x1b[0m', '') %}
-            {% if p_summary_clean %}
-            <div class="mt-1 text-xs text-gray-700 bg-gray-50 border rounded p-2 font-mono whitespace-pre-wrap break-words">
-                <span class="text-gray-500 font-sans">tail (last 300 chars):</span>
-                {{ p_summary_clean[-300:] }}
-            </div>
-            {% endif %}
-            <div class="mt-1 flex items-center gap-3 text-xs">
+            <div class="mt-1 flex items-center gap-3 text-xs flex-wrap">
+                {% if t.result.artifacts %}
+                <span class="text-gray-500">📎</span>
+                {% for a in t.result.artifacts %}
+                <a href="/projects/{{ t.project_id }}/files/{{ a.name }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name }}</a>
+                <span class="text-gray-400">({{ a.size_bytes }}b)</span>
+                {% if not loop.last %}<span class="text-gray-300">·</span>{% endif %}
+                {% endfor %}
+                {% endif %}
+                {% if t.result.session_id %}
+                <span class="text-gray-500">|</span>
+                <span class="text-gray-500">session:</span>
+                <span class="font-mono text-gray-600">{{ t.result.session_id[:16] }}…</span>
+                {% endif %}
+                <span class="text-gray-500">|</span>
                 <button onclick="toggleResultPersist('{{ t.id }}', 'presult-')" class="text-blue-600 hover:underline">View result</button>
-                {% if p_summary and p_summary|length > 300 %}
+                {% if t.result.summary and t.result.summary|length > 300 %}
                 <button onclick="toggleFull('{{ t.id }}')" id="full-btn-{{ t.id }}" class="text-blue-600 hover:underline">Show full</button>
                 {% endif %}
-                {% if p_summary %}
+                {% if t.result.summary %}
                 <button onclick="copyResult('{{ t.id }}')" class="text-blue-600 hover:underline">Copy</button>
-                {% endif %}
-                {% if t.result.artifacts %}
-                <span class="text-gray-500">| {{ t.result.artifacts|length }} artifact{{ '' if t.result.artifacts|length == 1 else 's' }}</span>
                 {% endif %}
             </div>
             <div id="presult-{{ t.id }}" class="hidden mt-2 bg-gray-50 border rounded p-2 text-xs">

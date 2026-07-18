@@ -152,67 +152,62 @@
         </div>
         {% endif %}
         {% if task.result and (task.result.summary or task.result.session_id or task.result.error or task.result.artifacts) %}
-        <div class="mt-2">
-            {% set summary_text = task.result.summary or '' %}
-            {% set summary_clean = summary_text
-                |replace('\x1b[2;3m', '')
-                |replace('\x1b[38;2;255;191;0m', '')
-                |replace('\x1b[38;2;255;248;220m', '')
-                |replace('\x1b[38;2;255;215;0m', '')
-                |replace('\x1b[1;38;2;255;215;0m', '')
-                |replace('\x1b[0m', '') %}
-            {% if summary_clean %}
-            <div class="text-xs text-gray-700 bg-gray-50 border rounded p-2 font-mono whitespace-pre-wrap break-words">
-                <span class="text-gray-500 not-italic font-sans">tail (last 300 chars):</span>
-                <span id="tail-{{ task.id }}">{{ summary_clean[-300:] }}</span>
+        <div class="mt-2 flex items-center gap-3 text-xs flex-wrap">
+            {% if task.result.artifacts %}
+            <span class="text-gray-500">📎</span>
+            {% for a in task.result.artifacts %}
+            <a href="/projects/{{ task.project_id }}/files/{{ a.name }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name }}</a>
+            <span class="text-gray-400">({{ a.size_bytes }}b)</span>
+            {% if not loop.last %}<span class="text-gray-300">·</span>{% endif %}
+            {% endfor %}
+            {% endif %}
+            {% if task.result.session_id %}
+            <span class="text-gray-500">|</span>
+            <span class="text-gray-500">session:</span>
+            <span class="font-mono text-gray-600">{{ task.result.session_id[:16] }}…</span>
+            {% endif %}
+            <span class="text-gray-500">|</span>
+            <button onclick="toggleResultPersist('{{ task.id }}')" class="text-blue-600 hover:underline">
+                View result
+            </button>
+            {% if task.result.summary and task.result.summary|length > 300 %}
+            <button onclick="toggleFull('{{ task.id }}')" id="full-btn-{{ task.id }}" class="text-blue-600 hover:underline">
+                Show full
+            </button>
+            {% endif %}
+            {% if task.result.summary %}
+            <button onclick="copyResult('{{ task.id }}')" class="text-blue-600 hover:underline">
+                Copy
+            </button>
+            {% endif %}
+        </div>
+        <div id="result-{{ task.id }}" class="hidden mt-2 bg-gray-50 border rounded p-3 text-xs">
+            {% if task.result.summary %}
+            <div class="mb-1">
+                <span class="text-gray-500">Summary:</span>
+                <span class="text-gray-400">({{ task.result.summary|length }} chars)</span>
+            </div>
+            <pre id="full-{{ task.id }}" class="hidden whitespace-pre-wrap break-words text-xs bg-white border rounded p-2 mt-1 max-h-96 overflow-auto">{{ task.result.summary }}</pre>
+            {% endif %}
+            {% if task.result.session_id %}
+            <div class="mb-1"><span class="text-gray-500">Session ID:</span> <span class="font-mono">{{ task.result.session_id }}</span></div>
+            {% endif %}
+            {% if task.result.error %}
+            <div class="mb-1 text-red-700"><span class="text-gray-500">Error:</span> {{ task.result.error }}</div>
+            {% endif %}
+            {% if task.result.artifacts %}
+            <div class="mt-2">
+                <span class="text-gray-500">Artifacts:</span> {{ task.result.artifacts|length }}
+                <ul class="list-disc ml-6 mt-1">
+                {% for a in task.result.artifacts %}
+                    <li>
+                        <a href="/projects/{{ task.project_id }}/files/{{ a.name }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name }}</a>
+                        <span class="text-gray-500">({{ a.storage_kind|default('?') }}{% if a.size_bytes %}, {{ a.size_bytes }} bytes{% endif %})</span>
+                    </li>
+                {% endfor %}
+                </ul>
             </div>
             {% endif %}
-            <div class="mt-1 flex items-center gap-3 text-xs">
-                <button onclick="toggleResultPersist('{{ task.id }}')" class="text-blue-600 hover:underline">
-                    View result
-                </button>
-                {% if task.result.summary and task.result.summary|length > 300 %}
-                <button onclick="toggleFull('{{ task.id }}')" id="full-btn-{{ task.id }}" class="text-blue-600 hover:underline">
-                    Show full
-                </button>
-                {% endif %}
-                {% if task.result.summary %}
-                <button onclick="copyResult('{{ task.id }}')" class="text-blue-600 hover:underline">
-                    Copy
-                </button>
-                {% endif %}
-                {% if task.result.artifacts %}
-                <span class="text-gray-500">| {{ task.result.artifacts|length }} artifact{{ '' if task.result.artifacts|length == 1 else 's' }}</span>
-                {% endif %}
-            </div>
-            <div id="result-{{ task.id }}" class="hidden mt-2 bg-gray-50 border rounded p-3 text-xs">
-                {% if task.result.summary %}
-                <div class="mb-1">
-                    <span class="text-gray-500">Summary:</span>
-                    <span class="text-gray-400">({{ task.result.summary|length }} chars)</span>
-                </div>
-                <pre id="full-{{ task.id }}" class="hidden whitespace-pre-wrap break-words text-xs bg-white border rounded p-2 mt-1 max-h-96 overflow-auto">{{ task.result.summary }}</pre>
-                {% endif %}
-                {% if task.result.session_id %}
-                <div class="mb-1"><span class="text-gray-500">Session ID:</span> <span class="font-mono">{{ task.result.session_id }}</span></div>
-                {% endif %}
-                {% if task.result.error %}
-                <div class="mb-1 text-red-700"><span class="text-gray-500">Error:</span> {{ task.result.error }}</div>
-                {% endif %}
-                {% if task.result.artifacts %}
-                <div class="mt-2">
-                    <span class="text-gray-500">Artifacts:</span> {{ task.result.artifacts|length }}
-                    <ul class="list-disc ml-6 mt-1">
-                    {% for a in task.result.artifacts %}
-                        <li>
-                            <a href="/projects/{{ task.project_id }}/files/{{ a.name }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name }}</a>
-                            <span class="text-gray-500">({{ a.storage_kind|default('?') }}{% if a.size_bytes %}, {{ a.size_bytes }} bytes{% endif %})</span>
-                        </li>
-                    {% endfor %}
-                    </ul>
-                </div>
-                {% endif %}
-            </div>
         </div>
         {% endif %}
     </div>

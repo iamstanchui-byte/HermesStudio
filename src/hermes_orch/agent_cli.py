@@ -101,6 +101,12 @@ def _read_secret(secret_path: Path) -> str:
     return secret_path.read_text(encoding="utf-8").strip()
 
 
+# Cap on the cleaned task summary stored in the DB. 32KB is enough for
+# long research / backtest tasks; a "Show full" button on the dashboard
+# lets the user read the whole thing in a scrollable block.
+MAX_SUMMARY_CHARS = 32_000
+
+
 def _atomic_write(target: Path, content: str) -> None:
     """Atomic write: write to .tmp then rename. Survives partial writes."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -117,15 +123,18 @@ def _clean_hermes_output(stdout: str) -> str:
     "Initializing agent..." / "Session: <id>" / "Resume this session with..."
     / "Duration: 14s" / "Messages: 24..." lines) that is useful for a
     human watching a live terminal but pure noise in the orchestrator's
-    task-result summary. The dashboard renders 300 chars of this, and we
-    want the agent's actual conclusion to show, not hermes' session
+    task-result summary. The dashboard renders the result block on demand
+    (300 char preview by default, "Show full" for the cleaned text), and
+    we want the agent's actual conclusion to show, not hermes' session
     metadata.
 
-    We keep the first 8000 chars (mostly safe — most tasks are < 8KB of
-    useful output, and a TAIL is what the dashboard shows anyway).
+    We keep the first MAX_SUMMARY_CHARS chars (32KB by default — large
+    enough for research / backtest / multi-step tasks; small enough to
+    keep the DB row light). The dashboard's "Show full" button + max-h-96
+    scroll lets the user read the whole thing.
     """
     import re
-    s = stdout[:8000]
+    s = stdout[:MAX_SUMMARY_CHARS]
     # Strip ANSI escape codes (color, cursor moves, etc.)
     s = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s)
     # Strip the box-drawing borders that wrap "Hermes" tool headers.

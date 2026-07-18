@@ -54,12 +54,20 @@
         {% block content %}{% endblock %}
     </div>
     <script>
-    // Smart polling: skip when user is editing a form, or tab is hidden
+    // Smart polling: skip when user is editing a form, or tab is hidden,
+    // or any result panel is currently open (so reading a long result
+    // doesn't get interrupted by a reload).
     let pollTimer = null;
     function startPolling() {
         if (pollTimer) return;
         pollTimer = setInterval(() => {
             if (document.hidden) return;  // tab not visible
+            // Pause if any [id^="result-"] or [id^="presult-"] panel is
+            // currently visible (user is reading the agent's output).
+            // The user can close the panel manually; polling resumes.
+            if (document.querySelector('[id^="result-"]:not(.hidden), [id^="presult-"]:not(.hidden)')) {
+                return;
+            }
             const a = document.activeElement;
             if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT')) {
                 return;  // user is editing a form
