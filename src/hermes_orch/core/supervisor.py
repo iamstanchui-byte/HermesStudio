@@ -150,6 +150,23 @@ class Supervisor:
 
     # ===== planning -> ready =====
 
+    def _plan_source_label(self) -> str:
+        """Return 'llm' / 'llm-fallback' / 'mock' for audit logging.
+
+        - 'llm': the LLM call succeeded and produced the plan
+        - 'llm-fallback': the LLM call failed (network, truncation, parse
+          error) and we used the deterministic mock plan instead
+        - 'mock': the planner is configured in mock-only mode (no api_key)
+
+        Without the 'llm-fallback' state, operators can't tell a working
+        LLM plan from a failed one in the audit log.
+        """
+        if self.planner.mock:
+            return "mock"
+        if getattr(self.planner, "last_plan_was_fallback", False):
+            return "llm-fallback"
+        return "llm"
+
     async def _handle_planning(self, proj: dict[str, Any]) -> None:
         pid = proj["id"]
         goal = proj.get("goal") or proj.get("name") or ""
@@ -232,9 +249,19 @@ class Supervisor:
                 self.db, "project.plan_generated",
                 actor="supervisor",
                 project_id=pid,
-                payload={"task_count": len(plan), "planner": "mock" if self.planner.mock else "llm"},
+                payload={
+                    "task_count": len(plan),
+                    # Report the actual planner used: if the LLM call
+                    # failed and we fell back to mock, say so. Previously
+                    # this always reported "llm" when self.planner.mock
+                    # was False, which hid LLM failures from the audit log.
+                    "planner": self._plan_source_label(),
+                },
             )
-            log.info(f"project {pid}: plan generated, {len(plan)} tasks -> state=ready")
+            log.info(
+                f"project {pid}: plan generated ({self._plan_source_label()}), "
+                f"{len(plan)} tasks -> state=ready"
+            )
         except Exception as e:
             log.exception(f"failed to save plan for {pid}: {e}")
             await self.notifier.send(

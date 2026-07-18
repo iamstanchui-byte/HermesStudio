@@ -59,7 +59,19 @@ Rules:
    do the work, prefer the one with more matching skills. If NO role has a
    matching skill, pick the most general role and have it improvise — don't
    invent a new role.
+10. TERSENESS: keep `name` and `action` to ≤ 5 words each. No prose in any
+    field. params should be a small flat object (≤ 4 keys) with concrete
+    values, not long strings. The model's output token budget is tight;
+    verbose tasks get truncated and the plan fails. Stay terse.
 """
+
+
+# Max chars of the goal to inline in the planner prompt. The full goal is
+# always stored in projects.goal; we just shorten it for the LLM so it
+# doesn't burn reasoning tokens on rephrasing a long prompt. The LLM only
+# needs the gist to plan; concrete values still go in task params from
+# the full goal.
+GOAL_PROMPT_CHARS = 200
 
 
 USER_PROMPT_TEMPLATE = """\
@@ -106,15 +118,35 @@ class Planner:
         """
         if not available_roles:
             raise ValueError("no available agent roles registered")
+        # Track whether the last call fell back to mock so callers (e.g. the
+        # supervisor's audit log) can report which planner actually produced
+        # the plan. Without this, the audit logs "llm" even when the LLM
+        # failed and we silently used the mock fallback — operators can't
+        # tell a working LLM plan from a failed one.
+        self.last_plan_was_fallback = False
         if self.mock:
             return self._plan_mock(goal, available_roles, role_skills)
         try:
             return await self._plan_llm(goal, available_roles, role_skills)
         except Exception as e:
-            log.warning(
-                "LLM planner failed (%s), falling back to mock plan: %s",
-                type(e).__name__, e,
-            )
+            # Distinguish truncation from other failures so operators can
+            # tell at a glance whether the M3 cap was the cause. The
+            # finish_reason=length message has a specific prefix that
+            # logs and dashboards can grep on.
+            err_str = str(e)
+            if "finish_reason=length" in err_str:
+                log.warning(
+                    "LLM planner response truncated by model output cap "
+                    "(likely M3 ~2-3k limit), falling back to mock plan. "
+                    "Goal len=%d, goal_preview=%r",
+                    len(goal), goal[:200],
+                )
+            else:
+                log.warning(
+                    "LLM planner failed (%s), falling back to mock plan: %s",
+                    type(e).__name__, err_str,
+                )
+            self.last_plan_was_fallback = True
             return self._plan_mock(goal, available_roles, role_skills)
 
     @staticmethod
@@ -288,9 +320,29 @@ class Planner:
 
         role_skills, if provided, is rendered into the prompt so the LLM
         picks the role whose skills best match each step.
+
+        Truncation defenses (added 2026-07-18 after observing MiniMax M3
+        hit a ~2-3k output cap and emit non-JSON):
+        - Truncate the goal in the prompt to GOAL_PROMPT_CHARS so the LLM
+          doesn't burn reasoning tokens rephrasing a long prompt.
+        - SYSTEM_PROMPT rule #10: keep name/action ≤ 5 words, params ≤ 4 keys.
+        - Detect finish_reason="length" before parsing — that means the
+          response was cut off mid-JSON. Raise a specific error so the
+          caller's try/except in plan() can fall back to the mock planner.
         """
+        # Truncate the goal for the prompt only. The full goal remains in
+        # projects.goal; concrete values still get pulled into task params
+        # by the LLM (it sees the role_skills block which gives context).
+        # Word-boundary split keeps the truncation from chopping a word.
+        if len(goal) > GOAL_PROMPT_CHARS:
+            truncated = goal[:GOAL_PROMPT_CHARS]
+            # Drop the partial last word so we don't end on "inter" or similar
+            truncated = truncated.rsplit(" ", 1)[0] + "..."
+            goal_for_prompt = truncated
+        else:
+            goal_for_prompt = goal
         user_prompt = USER_PROMPT_TEMPLATE.format(
-            goal=goal,
+            goal=goal_for_prompt,
             roles=available_roles,
             role_skills_block=self._format_role_skills(available_roles, role_skills),
         )
@@ -320,9 +372,26 @@ class Planner:
             data = r.json()
         # Parse the content
         try:
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
+            finish_reason = choice.get("finish_reason", "")
         except (KeyError, IndexError) as e:
             raise RuntimeError(f"LLM response missing content: {data}") from e
+        # Detect truncation BEFORE we try to parse the JSON. If the model
+        # hit its output cap mid-stream, finish_reason will be "length"
+        # and the JSON is almost certainly incomplete. Falling back to
+        # the mock planner is more useful than retrying (same model,
+        # same cap, same result) or raising (the project would get stuck
+        # in 'planning' until manual replan). The error message includes
+        # enough detail for an operator to recognize "yes, this is the
+        # M3 cap" vs other failures.
+        if finish_reason == "length":
+            preview = (content or "")[:200]
+            raise RuntimeError(
+                f"LLM response truncated (finish_reason=length, "
+                f"content_len={len(content) if content else 0}); "
+                f"preview={preview!r}"
+            )
         # Some models (MiniMax M3, DeepSeek R1, etc.) wrap output in
         # <think>...</think> reasoning blocks. Sometimes the closing </think>
         # is missing (truncated). Handle both cases:
