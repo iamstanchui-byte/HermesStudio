@@ -33,7 +33,9 @@
                 {% else %}
                 <span class="px-2 py-0.5 bg-yellow-100 text-yellow-800 rounded">Mock mode</span>
                 {% endif %}
-                <span class="text-gray-400">5s polling</span>
+                <button id="auto-refresh-toggle" onclick="toggleAutoRefresh()" class="px-2 py-0.5 bg-blue-100 text-blue-800 rounded hover:bg-blue-200" title="Pause/resume the 10s auto-refresh polling. Persists across page reloads via localStorage.">
+                    <span id="auto-refresh-label">10s polling</span>
+                </button>
             </div>
         </div>
     </nav>
@@ -58,8 +60,9 @@
     // or any result panel is currently open (so reading a long result
     // doesn't get interrupted by a reload).
     let pollTimer = null;
+    let userPaused = localStorage.getItem('orch.autoRefresh') === 'off';
     function startPolling() {
-        if (pollTimer) return;
+        if (pollTimer || userPaused) return;
         pollTimer = setInterval(() => {
             if (document.hidden) return;  // tab not visible
             // Pause if any [id^="result-"] or [id^="presult-"] panel is
@@ -73,11 +76,37 @@
                 return;  // user is editing a form
             }
             location.reload();
-        }, 10000);  // 10s polling (less aggressive than 5s)
+        }, 10000);  // 10s polling
     }
     function stopPolling() {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     }
+    function toggleAutoRefresh() {
+        userPaused = !userPaused;
+        localStorage.setItem('orch.autoRefresh', userPaused ? 'off' : 'on');
+        const btn = document.getElementById('auto-refresh-toggle');
+        const label = document.getElementById('auto-refresh-label');
+        if (userPaused) {
+            stopPolling();
+            btn.className = 'px-2 py-0.5 bg-gray-200 text-gray-600 rounded hover:bg-gray-300';
+            label.textContent = 'paused';
+            btn.title = 'Auto-refresh paused. Click to resume.';
+        } else {
+            startPolling();
+            btn.className = 'px-2 py-0.5 bg-blue-100 text-blue-800 rounded hover:bg-blue-200';
+            label.textContent = '10s polling';
+            btn.title = 'Pause/resume the 10s auto-refresh polling. Persists across page reloads via localStorage.';
+        }
+    }
+    // Apply persisted state on load
+    (function initRefreshToggle() {
+        if (!userPaused) return;
+        const btn = document.getElementById('auto-refresh-toggle');
+        const label = document.getElementById('auto-refresh-label');
+        if (btn) { btn.className = 'px-2 py-0.5 bg-gray-200 text-gray-600 rounded hover:bg-gray-300'; }
+        if (label) { label.textContent = 'paused'; }
+        if (btn) { btn.title = 'Auto-refresh paused. Click to resume.'; }
+    })();
     startPolling();
     // Also explicitly pause when focusing inputs (extra safety)
     document.addEventListener('focusin', (e) => {
