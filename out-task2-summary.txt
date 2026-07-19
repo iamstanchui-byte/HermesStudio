@@ -1,0 +1,23 @@
+=== full summary ===
+Initializing agent...
+↻ Resumed session 20260719_073602_4010a3 (1 user message, 6 total messages)
+[…]
+
+    Verified hello.txt.
+    
+    Content:
+    python
+    print("Hello")
+    
+    
+    Execution:
+    - Output: Hello
+    - Exit code: 0
+[…]
+[…session metadata stripped…]
+=== contains L3 state references? ===
+  'Goal' in summary: False
+  'Project State' in summary: False
+  'Key Findings' in summary: False
+  'PROJECT STATE' marker in summary: False
+  'Next Steps' in summary: False

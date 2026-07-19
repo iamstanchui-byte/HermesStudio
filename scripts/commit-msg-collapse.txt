@@ -1,0 +1,38 @@
+Dashboard: drop "Show full" step + add "Collapse all" button
+
+Two UX improvements:
+
+1. Show full step is gone. The task result panel used to
+   show a truncated summary with a "Show full" button to
+   expand the full <pre>. With long summaries, the user
+   clicked "View result" then "Show full" to actually see
+   the agent's output. Now "View result" shows the full
+   content directly:
+   - Removed the "Show full" button from both tasks.html
+     and project.html
+   - Removed the `hidden` class from <pre id="full-...">
+     so it's visible by default when the panel opens
+   - Kept max-h-96 + overflow-auto so very long outputs
+     scroll inside the panel instead of pushing the page
+
+2. "Collapse all" button in the page header. The 10s
+   auto-refresh script (in base.html) pauses whenever a
+   result panel is visible:
+     [id^="result-"]:not(.hidden), [id^="presult-"]:not(.hidden)
+   This is intentional (so reading a long result doesn't
+   get interrupted by a reload), but it means the user
+   could end up with 5+ panels open and no auto-refresh.
+   The Collapse-all button:
+   - Fetches the open-set from localStorage
+   - Hides every result-* / presult-* element whose id is
+     in the set
+   - Clears the localStorage set
+   - Brief "Collapsed N" / "Nothing open" feedback before
+     reverting to the default label
+   - Auto-refresh then resumes on the next 10s tick
+
+Implementation: same `collapseAllResults()` function in
+both tasks.html and project.html, with the appropriate
+id prefix (`result-` vs `presult-`). Two-button column
+in tasks.html header, single button next to the task
+count in project.html.

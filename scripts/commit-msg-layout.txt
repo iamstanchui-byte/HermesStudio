@@ -1,0 +1,34 @@
+Dashboard layout: stack profiles + collapse skills list
+
+User feedback: with the new 'caps: X' line added above SKILLS,
+win-agent01 and win-agent02 cards looked "joined" because:
+
+1. The profile grid was `grid-cols-1 md:grid-cols-2 lg:grid-cols-3`
+   — at small viewports only 1 column, but the cards were tall
+   (5 skills visible by default + 9-line SKILLS section + caps
+   line) and visually overlapped. Stacking in a 1-col grid
+   looks cramped when cards are tall.
+
+2. Skills list auto-showed the first 5 entries with a
+   "Show all N" button. With many skills per profile, this
+   made the cards very tall before the user even asked to
+   see them.
+
+Fix:
+
+1. Profile grid: drop to `grid-cols-1 gap-2` (no responsive
+   widening). Profiles always stack vertically with a small
+   gap. The two-column responsive layout wasn't earning its
+   keep — it just crammed two tall cards side by side on
+   medium viewports, which looked worse than stacking.
+
+2. Skills list: collapsed by default. The whole list is one
+   `<div class="hidden" id="skills-list-...">` instead of
+   first-5-visible + extras hidden. Button text toggles
+   "Show N skills ▼" / "Hide N skills ▲" via the existing
+   toggleSkillsList JS (updated to toggle the parent div
+   instead of `.skills-extra-*` rows, which no longer exist).
+
+Result: each profile card is now just a few lines tall
+(name + status + caps + edit form + 'Show N skills' button).
+Click to expand. Much less visual noise on the page.

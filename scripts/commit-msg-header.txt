@@ -1,0 +1,29 @@
+Dashboard: compact profile header (name+status left, caps+actions right)
+
+User feedback: with caps line as a separate row, the profile card
+grew tall enough that flex-wrap kicked in and stacked two
+profiles vertically. The user proposed folding the layout:
+
+- Profile name + idle status on the LEFT
+- Capabilities chips + edit + SOUL.md + × on the RIGHT
+- All in one row, no separate caps line
+
+This makes the card header a single line that can shrink/wrap
+gracefully. The previous design had name/buttons on row 1, an
+optional caps row 2, an optional description row 3 — three
+potential rows just for the header.
+
+Changes:
+1. Header: name + status on left, caps chips + edit + SOUL + ×
+   on right, all in one flex row with flex-wrap fallback.
+2. Removed the separate "caps: <name>" line (it was redundant
+   once caps are chips in the header).
+3. Capabilities chips now appear inline next to the action
+   buttons (e.g. "mt5" chip in indigo, then ✏ SOUL.md ×).
+4. min-width changed from 320px to 0 on the profile card, so
+   the flex layout can squeeze two cards into one row on
+   narrower viewports (the 320px minimum was too rigid).
+
+Result: profile cards are at most 2-3 lines tall (header,
+optional description, skills section). Much harder for flex
+to decide to stack them.

@@ -70,6 +70,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "audit_log_path": "./audit.log",
         "audit_log_retention_days": 90,
     },
+    "cleanup": {
+        # Hard-delete projects in 'deleted' state older than this many
+        # days. Set to 0 to disable (the Settings page still lets you
+        # run cleanup manually with a one-off retention override).
+        # - On server startup, cleanup runs once (fire-and-forget).
+        # - The supervisor runs cleanup every 24h if daily_sweep=true.
+        # - The Settings page has a "Run cleanup now" button.
+        # Hard-delete = DELETE FROM projects (cascades to tasks,
+        # artifacts, project_sessions, project_soul_presets) +
+        # shutil.rmtree the project folder. Audit_log is preserved.
+        "retention_days": 30,
+        "daily_sweep": True,
+        "sweep_interval_seconds": 86400,
+    },
 }
 
 

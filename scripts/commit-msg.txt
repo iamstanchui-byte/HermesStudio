@@ -1,0 +1,24 @@
+Phase 4 template: fix Jinja selectattr(1) — use for loop instead
+
+Follow-up to 30312c3 + caed7ca. The template used
+
+  {% set true_caps = caps.items() | selectattr(1) | map(0) | list %}
+
+to filter true-valued capability entries. Jinja's selectattr(1)
+silently fails when applied to dict_items() tuples — the
+filter chain produces a result that doesn't materialize with
+| list, and the template crashes with 'str object has no
+attribute items' (because the deferred filter was being
+applied to the raw string output by a different path).
+
+Worse: the page worked for empty capabilities ({}) but
+CRASHED the moment any profile had {something: true} set.
+So a user editing the dashboard to add capabilities would
+trigger a 500 on the next page load.
+
+Fix: explicit for loop with if-else to track whether any
+true-valued capabilities exist, then render chips inline.
+Same display behavior, no filter magic.
+
+Verified with /agents page render: shows 'caps: mt5' chip
+on win-agent01 which has {"mt5": true} set.

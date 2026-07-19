@@ -1,0 +1,30 @@
+Dashboard: use inline styles for profile flex layout (bypass Tailwind)
+
+Follow-up to 39fdefe. The user reported that even after the flex
+class change, win-agent02 still stacks under win-agent01 in
+win-local-1's section (but linux-a-01 renders fine side-by-side).
+
+Most likely cause: Tailwind's `min-w-[20rem]` arbitrary value
+syntax isn't being picked up by the CDN's JIT compiler for
+this specific template. The classes are present in the HTML
+but the corresponding CSS rules aren't generated, so
+min-width defaults to 0 and the cards wrap to 1 column even
+when there's plenty of horizontal space.
+
+Fix: drop the Tailwind classes entirely and use inline styles
+on the layout containers. Inline styles don't depend on Tailwind
+JIT scanning the file — they always apply:
+
+  <div style="display:flex; flex-wrap:wrap; gap:8px;">
+    <div style="flex:1 1 320px; min-width:320px;">profile</div>
+    ...
+  </div>
+
+- display:flex + flex-wrap: row layout, wraps on overflow
+- flex:1 1 320px: grow to fill, basis 320px, shrink allowed
+- min-width:320px: same as flex-basis lower bound, prevents
+  cards from being too narrow
+
+The cards now reliably go side-by-side when 2*320 = 640px fits
+in the container (i.e. anywhere on a normal desktop viewport),
+and wrap to 1 column on narrow viewports.

@@ -1,0 +1,32 @@
+Dashboard: cap profile card width + add auto-refresh toggle
+
+Two UI improvements:
+
+1. Card width: profile cards had `flex:1 1 320px; min-width:0` so
+   they could grow to fill the container. On wide viewports each
+   card was ~600px which felt too sparse (single row of header +
+   tiny skill button on a 600px canvas). Capped at `max-width:32rem`
+   (~512px) so two cards side-by-side feel like normal compact
+   cards, not full-width panels.
+
+2. Auto-refresh toggle: button next to "LLM ready" status that
+   pauses/resumes the 10s page-reload polling. State persists in
+   localStorage so it survives navigation. Visual states:
+   - Active:   "10s polling" (blue badge, click to pause)
+   - Paused:   "paused"     (gray badge, click to resume)
+   The toggle is in the top bar, immediately left of where the
+   "5s polling" text used to be. (Also fixed the label: actual
+   interval has been 10s for months, the "5s" was a stale copy.)
+
+Implementation in base.html:
+- `userPaused` flag read from localStorage on load
+- `toggleAutoRefresh()` toggles the flag, persists, updates
+  the button label and color, starts/stops the polling timer
+- `startPolling()` checks `userPaused` and returns early
+  so the existing focus/edit-pause logic still works
+
+Out of scope: dark mode (user's suggestion #2). The toggle
+would be straightforward (one button + one body.dark class +
+a CSS block in base.html overriding colors), but every page's
+background/text colors would need to be re-verified. Park as
+a follow-up; the user can pick the palette first.

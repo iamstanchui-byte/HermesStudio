@@ -1,0 +1,22 @@
+=== proj-5a6f548a raw summaries ===
+
+--- t-dff1726c write fib script ---
+len: 1331 chars
+first 150: 'Initializing agent...\r\n[…]\r\n\na/fibonacci.py → b/fibonacci.py\r\n@@ -0,0 +1,30 @@\r\n+#!/usr/bin/env python3\r\n+"""Write the first N Fibonacci numbers to a '
+contains 'Query:': False
+contains 'PROJECT CONTEXT': False
+contains 'SKILL SELF-TEACHING': False
+
+--- t-07da8333 run script ---
+len: 1298 chars
+first 150: 'Initializing agent...\r\n↻ Resumed session 20260719_071626_ae4330 (1 user message, 6 total messages)\r\n[…]\r\n\na/fib_script.py → b/fib_script.py\r\n@@ -0,0 +'
+contains 'Query:': False
+contains 'PROJECT CONTEXT': False
+contains 'SKILL SELF-TEACHING': False
+
+--- t-8d6aa524 verify output ---
+len: 511 chars
+first 150: 'Initializing agent...\r\n↻ Resumed session 20260719_071626_ae4330 (2 user messages, 18 total messages)\r\n[…]\r\n\n    Verified fib_output.txt successfully.\r'
+contains 'Query:': False
+contains 'PROJECT CONTEXT': False
+contains 'SKILL SELF-TEACHING': False

@@ -1,0 +1,44 @@
+Dashboard: fix toggle CSS + dark mode form fields
+
+Two bugs from user feedback:
+
+1. Auto-refresh switch stayed gray in BOTH states. The CSS
+   selector was `.toggle-on .toggle-track` (descendant), but
+   the JS sets `toggle-on` class on the `.toggle-track` span
+   itself (same element), so the selector never matched and
+   the background never turned blue.
+
+   Fix: change selector to `.toggle-track.toggle-on` (both
+   classes on same element). The `.toggle-track.toggle-on
+   .toggle-knob` for the knob shift was already correct.
+
+2. Dark mode had unreadable form fields. The CSS overrides
+   for `bg-white`, `text-gray-*`, `border-gray-*` covered
+   most surfaces, but `input`, `select`, `textarea` use the
+   browser's default styling (white bg, black text), which
+   looks terrible on dark background. User-visible:
+   - History page dropdowns ("All", "All", "All", "Last 7d")
+     had white bg with light text — unreadable
+   - Tasks "Create new task" form: Project/Agent role/Action/
+     Params inputs all had white bg
+   - Projects "Generate plan" form: Goal/Coordinator role/etc.
+     all white
+   - pre block in Project memory (L2) dump: light gray on
+     light bg — unreadable
+
+Fix: comprehensive form-field CSS block for body.dark:
+
+  body.dark input, select, textarea {
+    background-color: #1f2937;
+    color: #f3f4f6;
+    border-color: #4b5563;
+  }
+  body.dark input::placeholder { color: #6b7280; }
+  body.dark input:focus { border-color: #60a5fa; ... }
+  body.dark select option { background: dark, color: light; }
+  body.dark input[type=checkbox/radio] { darker bg, light border }
+  body.dark pre { background: #0f172a; color: #e5e7eb; }
+  body.dark table th/td/tr:hover { dark variants }
+
+Now every form field, dropdown, checkbox, pre block, and
+table on every page renders readable in dark mode.

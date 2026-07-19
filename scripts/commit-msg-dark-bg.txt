@@ -1,0 +1,31 @@
+Dashboard: dark mode covers tinted bg-*50 / bg-*200 classes
+
+User feedback: in dark mode, two sections still rendered with
+light-tinted backgrounds that were unreadable:
+1. Settings page "LLM Provider" card: the connected-status
+   box uses `bg-green-50 border-green-200` — light green bg
+   with light green border. The "CONNECTED" badge inside
+   had `text-green-800` which I had already overridden to a
+   light green, but the underlying box stayed light green.
+2. Project page "Generate plan" modal: the "Project memory
+   (L2)" section uses `bg-blue-50 border-blue-200` — light
+   blue bg with light blue border. Same readability problem.
+
+Both classes were missing from my dark mode CSS override block
+(only `bg-white`, `bg-gray-*`, `bg-yellow-*`, `bg-green-100`,
+`bg-blue-100`, `bg-indigo-50` were there).
+
+Fix: add overrides for the *-50 (lightest tint) and *-200 (light
+border) variants of green, blue, yellow, mapping them to dark
+equivalents that match the rest of the dark theme.
+
+  body.dark .bg-green-50  -> #064e3b (dark green)
+  body.dark .bg-green-200 -> #047857 (medium green border)
+  body.dark .bg-blue-50   -> #1e3a8a (dark blue)
+  body.dark .bg-blue-200  -> #1d4ed8 (medium blue border)
+  body.dark .bg-yellow-50 -> #422006 (already there)
+  body.dark .bg-yellow-200 -> #78350f (new)
+
+Now the connected-status box on Settings and the project-memory
+section on Project memory modal both render dark with readable
+text and visible borders.

@@ -1,0 +1,60 @@
+Dashboard: soft-delete + bulk actions + auto-hide tasks
+
+User's design:
+- Soft delete (state='deleted'), like archive but stronger
+- Bulk select + bulk archive/delete from projects list
+- Tasks of archived/deleted projects auto-hide from default view
+- Future: settings-page cleanup job hard-deletes >30d old
+
+Implementation:
+
+1. api/projects.py — soft delete + bulk actions:
+   - POST /{id}/delete : state='deleted' (idempotent — noop if already)
+   - POST /{id}/undelete : restore to 'planning'
+   - POST /bulk-archive : body {project_ids: [...]} -> per-project state change
+   - POST /bulk-delete : body {project_ids: [...]} -> soft-delete all
+   - Shared helper _bulk_state_change: looks up current states,
+     filters noops, updates the rest in one batched SQL, writes
+     per-project audit_log entries. Returns {changed, noop,
+     not_found} so the UI can report "5 changed, 2 noop, 0 nf".
+   - Cap at 100 ids per call (defensive).
+
+2. api/tasks.py + api/dashboard.py — auto-hide tasks from
+   archived/deleted projects:
+   - list_tasks: added include_archived flag. Default joins
+     projects table and adds p.state NOT IN ('archived','deleted').
+     Pass include_archived=true to bypass.
+   - tasks_page (dashboard): same logic, same flag, same
+     "JOIN projects p ON t.project_id = p.id" prefix. Pass
+     ?include_archived=1 in URL.
+   - All column refs changed to t.column since we now join.
+
+3. templates/projects_list.html — bulk UI:
+   - Bulk toolbar: blue strip above the list, "0 selected" +
+     "Archive" + "Soft delete" + "Clear" buttons. Hidden until
+     at least one row is checked.
+   - Each row: checkbox on the left + the project link
+     (unchanged content) on the right.
+   - Filter bar: "Show archived projects" + "Show deleted
+     projects" toggles (preserved across toggles via query
+     params), plus a hint about 30d cleanup.
+   - "deleted" state shown in red badge (vs yellow for archived).
+
+4. templates/tasks.html — "Show archived projects" toggle:
+   - New link next to the Showing N of M counter. Default
+     hides tasks whose project is archived/deleted. Click
+     the link to add ?include_archived=1 to the URL.
+
+5. api/dashboard.py — projects_list_page:
+   - show_deleted query param added. Default hides both
+     archived and deleted; either toggle reveals them.
+   - Single WHERE clause that combines both exclusions.
+
+6. Future (TODO): settings page cleanup job. Parked —
+   needs a cron-like background runner and a UI to set
+   the retention days. Will add to a follow-up.
+
+Verified: bulk-archive endpoint returns 200 with correct
+{changed, noop, not_found} breakdown for non-existent
+test project ids. UI flow: select multiple -> toolbar
+shows -> click action -> confirm -> reload.

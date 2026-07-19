@@ -368,7 +368,7 @@ async def projects_list_page(
     show_archived: bool = False,
     show_deleted: bool = False,
     state: str | None = None,
-    days: int | None = None,
+    days: str | None = None,  # string to allow empty string; parse below
     limit: int = 50,
     offset: int = 0,
 ) -> HTMLResponse:
@@ -379,6 +379,14 @@ async def projects_list_page(
     (soft delete) — a future settings-page cleanup job hard-deletes
     after 30d.
     """
+    # Parse days manually (string param accepts "" from empty <select>)
+    days_int: int | None = None
+    if days and days.strip():
+        try:
+            days_int = int(days)
+        except ValueError:
+            days_int = None  # silently ignore non-numeric
+
     db = request.app.state.db
     where = []
     params: list[Any] = []
@@ -389,9 +397,9 @@ async def projects_list_page(
     if state:
         where.append("state = ?")
         params.append(state)
-    if days:
+    if days_int:
         from datetime import timedelta
-        cutoff = (now_aware() - timedelta(days=days)).isoformat()
+        cutoff = (now_aware() - timedelta(days=days_int)).isoformat()
         where.append("created_at >= ?")
         params.append(cutoff)
     where_sql = " WHERE " + " AND ".join(where) if where else ""
@@ -516,12 +524,25 @@ async def project_page(
 
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request) -> HTMLResponse:
-    """Settings page (LLM + Telegram)."""
+    """Settings page (LLM + Telegram + Project Storage + Cleanup)."""
     from hermes_orch.config import LLM_PROVIDERS
     cfg = request.app.state.config or {}
     llm = cfg.get("llm") or {}
     tg = cfg.get("telegram") or {}
+    cleanup = cfg.get("cleanup") or {}
     api_key = (llm.get("api_key") or "").strip()
+    try:
+        cleanup_rd = int(cleanup.get("retention_days", 30))
+    except (TypeError, ValueError):
+        cleanup_rd = 30
+    # Read last run info from the live job (more accurate than the
+    # in-memory config, which is only written on manual save).
+    cleanup_last_run_at = None
+    cleanup_last_result = None
+    job = getattr(request.app.state, "cleanup", None)
+    if job is not None:
+        cleanup_last_run_at = job.last_run_at
+        cleanup_last_result = job.last_run_result
     return templates.TemplateResponse(
         request=request,
         name="settings.html",
@@ -537,6 +558,10 @@ async def settings_page(request: Request) -> HTMLResponse:
             "tg_chat_id": (tg.get("chat_id") or "").strip() or None,
             "tg_enabled": bool(tg.get("enabled", False)),
             "project_storage": _project_storage_view(cfg),
+            "cleanup_retention_days": cleanup_rd,
+            "cleanup_daily_sweep": bool(cleanup.get("daily_sweep", True)),
+            "cleanup_last_run_at": cleanup_last_run_at,
+            "cleanup_last_result": cleanup_last_result,
         },
     )
 

@@ -132,8 +132,24 @@ class Supervisor:
         # Last time the session-cleanup sweep ran (None = never). Used
         # by _maybe_sweep_sessions to throttle to ~once per hour.
         self._last_sweep_at: "datetime | None" = None
+        # Last time the project-cleanup sweep ran (None = never). Used
+        # by _maybe_sweep_projects to throttle to once per ~24h.
+        self._last_project_sweep_at: "datetime | None" = None
+        # CleanupJob reference (set by main.py after construction).
+        # supervisor only invokes it; the same instance is also exposed
+        # via app.state.cleanup for the API endpoints.
+        self._cleanup_job: Any = None
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
+
+    def set_cleanup_job(self, job: Any) -> None:
+        """Inject the CleanupJob instance (called by main.py after
+        both objects are constructed). Lets the supervisor's daily
+        tick call job.run() without re-creating the job each time,
+        and ensures the API endpoints (which read app.state.cleanup)
+        and the supervisor share the same instance (and therefore
+        the same _last_run_at state)."""
+        self._cleanup_job = job
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -189,6 +205,13 @@ class Supervisor:
                 await self._maybe_sweep_sessions()
             except Exception as e:
                 log.exception(f"session sweep crashed: {e}")
+            # Daily project-cleanup sweep. Hard-deletes projects that
+            # have been in 'deleted' state longer than the configured
+            # retention. Off by default if cleanup.daily_sweep=false.
+            try:
+                await self._maybe_sweep_projects()
+            except Exception as e:
+                log.exception(f"project sweep crashed: {e}")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval)
             except asyncio.TimeoutError:
@@ -456,6 +479,47 @@ class Supervisor:
             await self.sweep_sessions(ttl_days=self._session_ttl_days())
         except Exception as e:
             log.exception(f"session sweep failed: {e}")
+
+    # ===== project cleanup sweeper =====
+
+    def _project_sweep_interval_seconds(self) -> int:
+        return int(
+            (self.cfg.get("cleanup") or {}).get("sweep_interval_seconds", 86400)
+        )
+
+    def _project_retention_days(self) -> int:
+        return int((self.cfg.get("cleanup") or {}).get("retention_days", 30))
+
+    def _project_daily_sweep_enabled(self) -> bool:
+        return bool((self.cfg.get("cleanup") or {}).get("daily_sweep", True))
+
+    async def _maybe_sweep_projects(self) -> None:
+        """Throttled daily project-cleanup sweep.
+
+        Hard-deletes projects in 'deleted' state older than the
+        configured retention days. Mirrors _maybe_sweep_sessions.
+        Disabled if cleanup.daily_sweep=false. Skipped cheaply when
+        not due.
+        """
+        if not self._project_daily_sweep_enabled():
+            return
+        if self._project_retention_days() <= 0:
+            return  # auto-cleanup disabled (retention_days=0)
+        interval = self._project_sweep_interval_seconds()
+        now = now_aware()
+        if (
+            self._last_project_sweep_at is not None
+            and (now - self._last_project_sweep_at).total_seconds() < interval
+        ):
+            return
+        self._last_project_sweep_at = now
+        job = getattr(self, "_cleanup_job", None)
+        if job is None:
+            return
+        try:
+            await job.run(trigger="auto")
+        except Exception as e:
+            log.exception(f"project sweep failed: {e}")
 
     async def sweep_sessions(self, *, ttl_days: int, dry_run: bool = False) -> dict:
         """Delete hermes sessions older than `ttl_days` from the

@@ -1,0 +1,28 @@
+Fix /tasks 500 after Phase-4-style JOIN: qualify `created_at`
+
+Follow-up to fda299e. Adding a JOIN to projects on the
+tasks_page route created a "ambiguous column name: created_at"
+error: both `tasks.created_at` and `projects.created_at` exist,
+and the WHERE filter `created_at >= ?` was unqualified.
+
+Same issue would have hit any other un-aliased column.
+Two fixes:
+1. Qualify as `t.created_at` (matches the alias the rest of
+   the query uses)
+2. The same JOIN is now always used (even when
+   include_archived=True) so the `t.` prefix is always
+   valid. Previously I was skipping the JOIN conditionally
+   but the column refs were always `t.`-prefixed, so the
+   include_archived=True path was broken (different bug
+   in the same hunk).
+
+Verified: GET /tasks, /tasks?include_archived=1, /projects,
+/projects?show_archived=true, /projects?show_deleted=true all
+return 200. Repro script (scripts/_test-tasks-page.py)
+passes.
+
+Lesson: when adding a JOIN to a query that wasn't using
+table aliases, either (a) qualify every column ref with
+the table prefix, or (b) drop the JOIN when not needed.
+Don't mix — partial qualification causes silent ambiguity
+errors.

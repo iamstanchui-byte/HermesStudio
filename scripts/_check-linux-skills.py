@@ -1,9 +1,9 @@
-"""Check skills on linux super agent."""
-import json
-import urllib.request
-
-r = urllib.request.urlopen("http://127.0.0.1:8765/api/agents/linux-a-01/profiles/super/skills", timeout=10)
-data = json.loads(r.read())
-print(f"super agent skills: {len(data)}")
-for s in data:
-    print(f"  {s['name']:<30} status={s['status']:<10} size={s['size']}")
+"""Verify Linux hermes skills folder state after delete."""
+import subprocess
+r = subprocess.run(
+    ['ssh', 'stanley@192.168.2.161',
+     "ls /home/stanley/.hermes/profiles/super/skills/ ; echo --- ; ls /home/stanley/.hermes/profiles/super/skills/ridge-multicollinearity-on-small-n/ 2>/dev/null && echo 'STILL THERE' || echo 'absent (good)'"],
+    capture_output=True, text=True, timeout=15
+)
+print(r.stdout)
+print('STDERR:', r.stderr)

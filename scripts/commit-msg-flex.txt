@@ -1,0 +1,32 @@
+Dashboard: switch profile grid to flex for reliable side-by-side
+
+Follow-up to 3ef7851. The user reported win-agent02 still stacking
+under win-agent01 in win-local-1's section even after restoring
+md:grid-cols-2. But linux-a-01's super/super-b rendered side-by-side
+correctly. Same template, same viewport, different rendering.
+
+Root cause (hypothesized): Tailwind's `md:grid-cols-2 lg:grid-cols-3`
+responsive variants may not be picked up by the JIT / CDN
+configuration for this template. Without responsive variants,
+grid stays at the base `grid-cols-1` (1 column) when the viewport
+is between md and lg, OR it works inconsistently depending on
+which Tailwind class is referenced. The class compiles fine
+when the user inspects elements (F12), but the rule doesn't
+actually apply — classic Tailwind config / purge edge case.
+
+Fix: drop the responsive grid entirely. Use flexbox with
+flex-wrap and flex-1 + min-width, which works regardless of
+Tailwind responsive variants:
+
+  <div class="mt-2 flex flex-wrap gap-2">
+    <div class="flex-1 min-w-[20rem]">profile card</div>
+    ...
+
+- flex-wrap: cards wrap to next row when total width > container
+- flex-1: each card grows to fill available space
+- min-w-[20rem]: each card is at least 20rem wide (~320px);
+  prevents two cards from being too narrow on a wide screen
+
+Result: 2 profiles on a wide agent section (>40rem) get
+side-by-side automatically. On narrow viewports they wrap
+to 1 column. No responsive breakpoints needed.

@@ -12,6 +12,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from hermes_orch.config import load_config
+from hermes_orch.core.cleanup import CleanupJob
 from hermes_orch.core.notifier import Notifier
 from hermes_orch.core.planner import Planner
 from hermes_orch.core.supervisor import Supervisor
@@ -35,10 +36,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     notifier = Notifier(cfg)
     planner = Planner(cfg)
     supervisor = Supervisor(db, cfg, notifier, planner)
+    # CleanupJob shared by supervisor (daily sweep) + API (manual run).
+    # Create BEFORE supervisor.start() so the supervisor can fire its
+    # first daily-sweep check on the next tick.
+    cleanup_job = CleanupJob(db, cfg)
+    supervisor.set_cleanup_job(cleanup_job)
     app.state.notifier = notifier
     app.state.planner = planner
     app.state.supervisor = supervisor
+    app.state.cleanup = cleanup_job
     supervisor.start()
+
+    # Fire-and-forget startup cleanup. Skip if retention is 0
+    # (disabled). Errors are logged by the job itself; we don't
+    # block server startup on cleanup.
+    import asyncio
+    if cleanup_job.enabled:
+        async def _startup_cleanup():
+            try:
+                await cleanup_job.run(trigger="auto")
+            except Exception as e:
+                logger.warning("startup cleanup crashed: %s", e)
+        asyncio.create_task(_startup_cleanup())
 
     logger.info("Hermes orchestrator started, db=%s", db_path)
     try:

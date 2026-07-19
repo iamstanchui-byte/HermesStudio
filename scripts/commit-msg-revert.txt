@@ -1,0 +1,18 @@
+Dashboard: restore side-by-side profiles (collapsed skills makes it work)
+
+Follow-up to 41bf5a4. I misread the previous request — user
+wanted the skills list collapsed AND the profiles side-by-side.
+The "joined" look was caused by the tall card (5 visible skills)
+overflowing into the next card's area, not the grid being
+1-column.
+
+With the skills list now collapsed (Show N skills button
+instead of inline rows), each card is just a few lines tall
+and side-by-side at md+ viewports reads cleanly:
+
+  - linux-a-01: super | super-b  (side-by-side)
+  - win-local-1: win-agent01 | win-agent02  (side-by-side)
+
+Revert the grid change: `grid-cols-1` -> `grid-cols-1 md:grid-cols-2
+lg:grid-cols-3`. The `grid-cols-1` baseline stays so phones
+(< 768px) still get a single column.

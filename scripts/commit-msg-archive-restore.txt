@@ -1,0 +1,44 @@
+Dashboard: project list filter/pagination + archive restore fix
+
+Three related UX improvements:
+
+1. Project list filter & pagination (was unbounded — could load
+   every project at once). Mirror the tasks page pattern:
+   - Filter form: state (planning/ready/running/completed/paused/
+     cancelled), days (1/7/30/90), per-page (10/25/50/100/200).
+     show_archived and show_deleted are preserved as hidden
+     inputs so toggling them + applying the form doesn't lose
+     state.
+   - Pagination: prev/next buttons with offset query param,
+     "Page X of Y" label.
+   - "Showing X-Y of N" counter in the header (matches tasks
+     page). "Clear filters" link when any filter is set.
+   - Limit cap: 1-200, default 50, defense-in-depth against
+     `?limit=99999`.
+
+2. "Show archived" / "Show deleted" links styled as buttons.
+   Previous version used `text-gray-500 hover:text-gray-700`
+   which in dark mode looked like plain text — users didn't
+   realize they were clickable. Now:
+   - Inactive: `px-2 py-0.5 bg-gray-100 text-gray-700 rounded
+     text-xs hover:bg-gray-200` (light pill)
+   - Active:   `px-2 py-0.5 bg-blue-100 text-blue-800 rounded
+     text-xs hover:bg-blue-200` (blue pill)
+   - tooltips explaining what the button does
+
+3. unarchive/undelete set state to 'completed' instead of
+   'planning'. The previous behavior re-triggered the
+   supervisor pipeline (state=planning → wake → re-plan →
+   re-run tasks), which is wrong for "restore from archive".
+   The user expects restore to bring the project back to a
+   viewable, run-once-finished state, not to restart it.
+   If the user wants to actually re-run, they can do it
+   explicitly via a "Re-run" button (not in this commit —
+   see future TODO). Both unarchive and undelete now go to
+   'completed' regardless of the prior state.
+
+Verified with E2E (scripts/_test-archive-flow.py):
+- proj-48b50520 (initial: completed)
+- POST /archive -> state='archived' (DB confirms)
+- POST /unarchive -> state='completed' (NOT 'planning')
+- Test asserts the DB state is 'completed' after unarchive.

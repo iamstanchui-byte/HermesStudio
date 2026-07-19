@@ -20,7 +20,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from hermes_orch.config import LLM_PROVIDERS, save_config_section
+from hermes_orch.config import LLM_PROVIDERS, load_config, save_config_section
 
 router = APIRouter()
 
@@ -390,3 +390,122 @@ async def open_project_storage(body: ProjectStorageOpenIn, request: Request) -> 
         return {"ok": False, "error": f"file manager not found: {e}"}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+# ===== Cleanup =====
+
+
+class CleanupConfigIn(BaseModel):
+    retention_days: int | None = None
+    daily_sweep: bool | None = None
+
+
+class CleanupConfigOut(BaseModel):
+    retention_days: int
+    daily_sweep: bool
+    last_run_at: str | None = None
+    last_run_result: dict[str, Any] | None = None
+
+
+def _cleanup_view(
+    request: Request,
+    *,
+    extra_result: dict[str, Any] | None = None,
+) -> CleanupConfigOut:
+    """Build the cleanup config view (current config + last run)."""
+    cfg = request.app.state.config
+    cleanup = cfg.get("cleanup") or {}
+    try:
+        rd = int(cleanup.get("retention_days", 30))
+    except (TypeError, ValueError):
+        rd = 30
+    out = CleanupConfigOut(
+        retention_days=rd,
+        daily_sweep=bool(cleanup.get("daily_sweep", True)),
+    )
+    job = getattr(request.app.state, "cleanup", None)
+    if job is not None:
+        out.last_run_at = job.last_run_at
+        # Use the freshest result — extra_result (just-finished run)
+        # beats the cached one.
+        out.last_run_result = extra_result or job.last_run_result
+    return out
+
+
+@router.get("/cleanup", response_model=CleanupConfigOut)
+async def get_cleanup(request: Request) -> CleanupConfigOut:
+    """Return current cleanup config + last run info."""
+    return _cleanup_view(request)
+
+
+@router.post("/cleanup", response_model=CleanupConfigOut)
+async def post_cleanup(
+    body: CleanupConfigIn, request: Request
+) -> CleanupConfigOut:
+    """Update cleanup config (retention_days + daily_sweep).
+
+    Persists to config.yaml and reloads in-memory config so the
+    supervisor's next tick sees the new value.
+    """
+    if body.retention_days is None and body.daily_sweep is None:
+        raise HTTPException(400, "retention_days or daily_sweep required")
+    if body.retention_days is not None:
+        if body.retention_days < 0 or body.retention_days > 3650:
+            raise HTTPException(
+                400, "retention_days must be in 0..3650 (0 = disable)"
+            )
+    updates: dict[str, Any] = {}
+    if body.retention_days is not None:
+        updates["retention_days"] = int(body.retention_days)
+    if body.daily_sweep is not None:
+        updates["daily_sweep"] = bool(body.daily_sweep)
+    save_config_section("cleanup", updates)
+    # Reload in-memory config
+    new_cfg = load_config()
+    request.app.state.config = new_cfg
+    job = getattr(request.app.state, "cleanup", None)
+    if job is not None:
+        job.update_config(new_cfg)
+    return _cleanup_view(request)
+
+
+class CleanupRunIn(BaseModel):
+    retention_days: int | None = None
+    dry_run: bool = False
+
+
+@router.post("/cleanup/run")
+async def post_cleanup_run(
+    body: CleanupRunIn, request: Request
+) -> dict[str, Any]:
+    """Manually trigger a cleanup run.
+
+    Returns the run result (scanned, deleted, errors, eligible list).
+    With dry_run=true, scans but does not delete (for the "Preview"
+    button on the settings page).
+    """
+    job = getattr(request.app.state, "cleanup", None)
+    if job is None:
+        raise HTTPException(503, "cleanup job not initialized")
+    if body.retention_days is not None:
+        if body.retention_days < 0 or body.retention_days > 3650:
+            raise HTTPException(400, "retention_days must be in 0..3650")
+    result = await job.run(
+        retention_days=body.retention_days,
+        trigger="manual",
+        dry_run=body.dry_run,
+    )
+    return result
+
+
+@router.get("/cleanup/preview")
+async def get_cleanup_preview(request: Request) -> dict[str, Any]:
+    """Preview-only: return how many projects are eligible right now.
+
+    Used by the settings page to show the user "N projects would be
+    deleted" before they hit "Run cleanup now".
+    """
+    job = getattr(request.app.state, "cleanup", None)
+    if job is None:
+        raise HTTPException(503, "cleanup job not initialized")
+    return await job.preview()
