@@ -892,12 +892,25 @@ def _skill_file_path(skill_name: str, fmt: str = "folder") -> str:
 
 
 async def _latest_skill_config(db: Any, profile_id: str, skill_name: str) -> dict[str, Any] | None:
-    """Return the newest profile_configs row for a skill, or None."""
-    rel = _skill_file_path(skill_name)
+    """Return the newest profile_configs row for a skill, or None.
+
+    Searches both the canonical folder path (skills/<name>/SKILL.md)
+    and the legacy flat path (skills/<name>.md) so that:
+    1. Pre-migration records (flat) are still addressable by name
+       (e.g. delete_skill still finds the user-uploaded mt5-bridge
+        even though the canonical record is now folder-path).
+    2. Latest is by created_at -- newest version wins regardless of layout.
+
+    After the migration, the canonical record will be folder-path
+    (the new default), so most calls return the folder row.
+    """
+    folder_path = _skill_file_path(skill_name)        # skills/<name>/SKILL.md
+    flat_path = _skill_file_path(skill_name, "file")  # skills/<name>.md
     return await db.fetchone(
-        "SELECT * FROM profile_configs WHERE profile_id = ? AND file_path = ? "
+        "SELECT * FROM profile_configs WHERE profile_id = ? "
+        "AND file_path IN (?, ?) "
         "ORDER BY created_at DESC LIMIT 1",
-        (profile_id, rel),
+        (profile_id, folder_path, flat_path),
     )
 
 
@@ -955,17 +968,34 @@ async def list_skills(
     rows = await db.fetchall(
         "SELECT * FROM profile_configs WHERE profile_id = ? "
         "AND file_path LIKE 'skills/%' "
-        "ORDER BY file_path ASC, created_at DESC",
+        "ORDER BY created_at DESC",
         (profile["id"],),
     )
     include_deleted = request.query_params.get("include_deleted") == "1"
-    # Keep only the newest per file_path
-    seen: set[str] = set()
-    out: list[SkillInfo] = []
+    # Group by skill name (not file_path) -- after the 2026-07-19 layout
+    # migration we have both flat (skills/<name>.md, legacy) and folder
+    # (skills/<name>/SKILL.md, current) records for many skills. We want
+    # to show ONE entry per skill, preferring the folder-path record
+    # because that's what hermes 0.17+ actually reads.
+    by_name: dict[str, dict] = {}
     for r in rows:
-        if r["file_path"] in seen:
+        name = r["file_path"]
+        if r["file_path"].endswith("/SKILL.md"):
+            name = r["file_path"][len("skills/"):-len("/SKILL.md")]
+        elif r["file_path"].startswith("skills/") and r["file_path"].endswith(".md"):
+            name = r["file_path"][len("skills/"):-len(".md")]
+        else:
             continue
-        seen.add(r["file_path"])
+        existing = by_name.get(name)
+        if existing is None:
+            by_name[name] = r
+        else:
+            # Prefer folder-path record (current canonical) over flat
+            if r["file_path"].endswith("/SKILL.md") and not existing["file_path"].endswith("/SKILL.md"):
+                by_name[name] = r
+    out: list[SkillInfo] = []
+    for name in sorted(by_name.keys()):
+        r = by_name[name]
         info = _row_to_skill(r, include_content=False)
         if info.status == "deleted" and not include_deleted:
             continue
