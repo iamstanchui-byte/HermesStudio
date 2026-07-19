@@ -300,10 +300,14 @@ async def tasks_page(
         # the comparison are now in the same ISO-8601-with-offset format.
         from datetime import timedelta
         cutoff = (now_aware() - timedelta(days=days)).isoformat()
-        where.append("created_at >= ?")
+        where.append("t.created_at >= ?")
         params.append(cutoff)
+    # Always JOIN projects — column refs use t.alias and the JOIN
+    # is cheap (indexed FK). The `p.state NOT IN (...)` filter below
+    # is only added when include_archived=False, so the same SQL
+    # works for both cases.
+    join_sql = " JOIN projects p ON t.project_id = p.id"
     where_sql = " WHERE " + " AND ".join(where) if where else ""
-    join_sql = "" if include_archived else " JOIN projects p ON t.project_id = p.id"
 
     # Total count for pagination
     total_row = await db.fetchone(
@@ -313,6 +317,8 @@ async def tasks_page(
 
     # Page rows
     sql = f"SELECT t.* FROM tasks t{join_sql}{where_sql} ORDER BY t.created_at DESC LIMIT ? OFFSET ?"
+    page_params = tuple(params) + (limit, offset)
+    raw_rows = await db.fetchall(sql, page_params)
     page_params = tuple(params) + (limit, offset)
     raw_rows = await db.fetchall(sql, page_params)
     tasks = []
