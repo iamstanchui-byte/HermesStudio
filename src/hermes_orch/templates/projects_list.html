@@ -4,7 +4,10 @@
 
 <div class="flex items-center justify-between mb-4">
     <h1 class="text-2xl font-bold text-gray-800">Projects</h1>
-    <div class="text-sm text-gray-500">{{ projects|length }} shown</div>
+    <div class="text-sm text-gray-500">
+        {% set end = (filter_offset + projects|length) if projects else filter_offset %}
+        Showing {{ filter_offset + 1 if total_count > 0 else 0 }}-{{ end }} of {{ total_count }}
+    </div>
 </div>
 
 <!-- Bulk action toolbar (visible when 1+ projects selected) -->
@@ -14,6 +17,43 @@
     <button onclick="bulkAction('delete')" class="px-2 py-1 bg-red-600 text-white rounded text-xs hover:bg-red-700">Soft delete</button>
     <button onclick="clearSelection()" class="ml-auto text-xs text-gray-500 hover:text-gray-800">Clear</button>
 </div>
+
+<!-- Filters -->
+<form method="get" action="/projects" class="mb-3 bg-white border rounded p-3 flex items-center gap-3 text-sm flex-wrap">
+    {% if show_archived %}<input type="hidden" name="show_archived" value="true">{% endif %}
+    {% if show_deleted %}<input type="hidden" name="show_deleted" value="true">{% endif %}
+    <div class="flex items-center gap-2">
+        <label class="text-xs text-gray-600">State:</label>
+        <select name="state" class="border rounded px-2 py-1 text-xs">
+            <option value="">All states</option>
+            {% for s in ['planning', 'ready', 'running', 'completed', 'paused', 'cancelled'] %}
+            <option value="{{ s }}" {% if filter_state == s %}selected{% endif %}>{{ s }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div class="flex items-center gap-2">
+        <label class="text-xs text-gray-600">Created in last:</label>
+        <select name="days" class="border rounded px-2 py-1 text-xs">
+            <option value="">Any time</option>
+            <option value="1" {% if filter_days == 1 %}selected{% endif %}>1 day</option>
+            <option value="7" {% if filter_days == 7 %}selected{% endif %}>7 days</option>
+            <option value="30" {% if filter_days == 30 %}selected{% endif %}>30 days</option>
+            <option value="90" {% if filter_days == 90 %}selected{% endif %}>90 days</option>
+        </select>
+    </div>
+    <div class="flex items-center gap-2">
+        <label class="text-xs text-gray-600">Per page:</label>
+        <select name="limit" class="border rounded px-2 py-1 text-xs">
+            {% for n in [10, 25, 50, 100, 200] %}
+            <option value="{{ n }}" {% if filter_limit == n %}selected{% endif %}>{{ n }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <button type="submit" class="px-3 py-1 bg-blue-600 text-white rounded text-xs hover:bg-blue-700">Apply</button>
+    {% if filter_state or filter_days %}
+    <a href="/projects{% if show_archived %}?show_archived=true{% endif %}{% if show_deleted %}&show_deleted=true{% endif %}" class="text-xs text-gray-500 hover:text-gray-800">Clear filters</a>
+    {% endif %}
+</form>
 
 <!-- Create new project (collapsed) -->
 <button onclick="toggleForm('new-project-form')" class="mb-3 text-sm text-blue-600 hover:underline">
@@ -78,23 +118,48 @@
 </form>
 
 <!-- Filter: show archived / deleted -->
-<div class="mb-3 text-sm flex items-center gap-3">
+<div class="mb-3 text-sm flex items-center gap-3 flex-wrap">
     {% if show_archived %}
-    <a href="/projects" class="text-blue-600 hover:underline">Hide archived projects</a>
+    <a href="/projects" class="px-2 py-0.5 bg-blue-100 text-blue-800 rounded text-xs hover:bg-blue-200" title="Click to hide archived projects from the list">Hide archived</a>
     {% else %}
-    <a href="/projects?show_archived=true" class="text-gray-500 hover:text-gray-700">Show archived projects</a>
+    <a href="/projects?show_archived=true" class="px-2 py-0.5 bg-gray-100 text-gray-700 rounded text-xs hover:bg-gray-200" title="Click to show projects in archived state">Show archived</a>
     {% endif %}
     {% if show_deleted %}
-    <a href="/projects{% if show_archived %}?show_archived=true{% endif %}" class="text-blue-600 hover:underline">Hide deleted projects</a>
+    <a href="/projects{% if show_archived %}?show_archived=true{% endif %}" class="px-2 py-0.5 bg-blue-100 text-blue-800 rounded text-xs hover:bg-blue-200" title="Click to hide soft-deleted projects from the list">Hide deleted</a>
     {% else %}
-    <a href="/projects?show_deleted=true{% if show_archived %}&show_archived=true{% endif %}" class="text-gray-500 hover:text-gray-700">Show deleted projects</a>
+    <a href="/projects?show_deleted=true{% if show_archived %}&show_archived=true{% endif %}" class="px-2 py-0.5 bg-gray-100 text-gray-700 rounded text-xs hover:bg-gray-200" title="Click to show soft-deleted projects (can be undeleted)">Show deleted</a>
     {% endif %}
-    <span class="text-xs text-gray-400">(soft-deleted projects can be restored via unarchive in 30d, then hard-deleted by settings cleanup job)</span>
+    <span class="text-xs text-gray-400">(soft-deleted projects can be undeleted in 30d, then hard-deleted by settings cleanup job)</span>
 </div>
 
 {% if not projects %}
 <div class="bg-yellow-50 border border-yellow-200 rounded p-4 text-sm text-yellow-800">
-    No projects yet. Use the form above.
+    {% if total_count == 0 %}No projects yet. Use the form above.
+    {% else %}No projects match the current filter. <a href="/projects" class="underline">Clear filter</a>.
+    {% endif %}
+</div>
+{% endif %}
+
+<!-- Pagination -->
+{% if total_count > filter_limit %}
+<div class="mt-3 flex items-center justify-between text-sm">
+    <div class="text-gray-500">
+        Page {{ (filter_offset // filter_limit) + 1 }} of {{ ((total_count - 1) // filter_limit) + 1 }}
+    </div>
+    <div class="flex items-center gap-2">
+        {% set base_qs = [] %}
+        {% if show_archived %}{% set _ = base_qs.append("show_archived=true") %}{% endif %}
+        {% if show_deleted %}{% set _ = base_qs.append("show_deleted=true") %}{% endif %}
+        {% if filter_state %}{% set _ = base_qs.append("state=" ~ filter_state) %}{% endif %}
+        {% if filter_days %}{% set _ = base_qs.append("days=" ~ filter_days) %}{% endif %}
+        {% set _ = base_qs.append("limit=" ~ filter_limit) %}
+        {% if filter_offset > 0 %}
+        <a href="/projects?{{ base_qs|join('&') }}&offset={{ [filter_offset - filter_limit, 0]|max }}" class="px-2 py-0.5 bg-gray-100 text-gray-700 rounded text-xs hover:bg-gray-200">Prev</a>
+        {% endif %}
+        {% if filter_offset + filter_limit < total_count %}
+        <a href="/projects?{{ base_qs|join('&') }}&offset={{ filter_offset + filter_limit }}" class="px-2 py-0.5 bg-gray-100 text-gray-700 rounded text-xs hover:bg-gray-200">Next</a>
+        {% endif %}
+    </div>
 </div>
 {% endif %}
 

@@ -436,7 +436,15 @@ async def archive_project(project_id: str, request: Request) -> dict:
 
 @router.post("/{project_id}/unarchive")
 async def unarchive_project(project_id: str, request: Request) -> dict:
-    """Restore an archived project back to 'planning'."""
+    """Restore an archived project.
+
+    Sets state to 'completed' (NOT 'planning') so the supervisor
+    doesn't re-run the task pipeline. If you want to re-run,
+    manually transition the project (e.g. via a "re-run" button
+    on the project page) — restoring from archive is meant to
+    bring the project back to a viewable, run-once-finished
+    state, not to restart it.
+    """
     db = request.app.state.db
     project = await db.fetchone("SELECT id, state FROM projects WHERE id = ?", (project_id,))
     if not project:
@@ -444,11 +452,11 @@ async def unarchive_project(project_id: str, request: Request) -> dict:
     if project["state"] != "archived":
         raise HTTPException(400, f"Project not archived: {project['state']}")
     await db.execute(
-        "UPDATE projects SET state = 'planning', updated_at = ? WHERE id = ?",
+        "UPDATE projects SET state = 'completed', updated_at = ? WHERE id = ?",
         (_now_iso(), project_id),
     )
     await audit_log(db, "project.unarchived", actor="operator", project_id=project_id)
-    return {"project_id": project_id, "state": "planning"}
+    return {"project_id": project_id, "state": "completed"}
 
 
 @router.post("/{project_id}/delete")
@@ -479,7 +487,12 @@ async def soft_delete_project(project_id: str, request: Request) -> dict:
 
 @router.post("/{project_id}/undelete")
 async def undelete_project(project_id: str, request: Request) -> dict:
-    """Restore a soft-deleted project back to 'planning'."""
+    """Restore a soft-deleted project.
+
+    Sets state to 'completed' (NOT 'planning') so the supervisor
+    doesn't re-run the task pipeline — see unarchive_project for
+    the same rationale.
+    """
     db = request.app.state.db
     project = await db.fetchone("SELECT id, state FROM projects WHERE id = ?", (project_id,))
     if not project:
@@ -487,11 +500,11 @@ async def undelete_project(project_id: str, request: Request) -> dict:
     if project["state"] != "deleted":
         raise HTTPException(400, f"Project not deleted: {project['state']}")
     await db.execute(
-        "UPDATE projects SET state = 'planning', updated_at = ? WHERE id = ?",
+        "UPDATE projects SET state = 'completed', updated_at = ? WHERE id = ?",
         (_now_iso(), project_id),
     )
     await audit_log(db, "project.undeleted", actor="operator", project_id=project_id)
-    return {"project_id": project_id, "state": "planning"}
+    return {"project_id": project_id, "state": "completed"}
 
 
 # ===== Bulk actions (multi-select from projects list page) =====

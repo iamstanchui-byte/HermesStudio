@@ -367,8 +367,12 @@ async def projects_list_page(
     request: Request,
     show_archived: bool = False,
     show_deleted: bool = False,
+    state: str | None = None,
+    days: int | None = None,
+    limit: int = 50,
+    offset: int = 0,
 ) -> HTMLResponse:
-    """Projects list.
+    """Projects list. Filterable by state, date range, paginated.
 
     Default: hide archived AND soft-deleted. Both have toggleable
     filters in the page UI. Hidden states are still in the DB
@@ -382,11 +386,33 @@ async def projects_list_page(
         where.append("state != 'archived'")
     if not show_deleted:
         where.append("state != 'deleted'")
-    sql = "SELECT * FROM projects"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY created_at DESC"
-    projects = await db.fetchall(sql, tuple(params))
+    if state:
+        where.append("state = ?")
+        params.append(state)
+    if days:
+        from datetime import timedelta
+        cutoff = (now_aware() - timedelta(days=days)).isoformat()
+        where.append("created_at >= ?")
+        params.append(cutoff)
+    where_sql = " WHERE " + " AND ".join(where) if where else ""
+    # Total count for pagination
+    total_row = await db.fetchone(
+        f"SELECT COUNT(*) as c FROM projects{where_sql}", tuple(params)
+    )
+    total = total_row["c"] if total_row else 0
+    # Cap limit
+    if limit < 1:
+        limit = 50
+    if limit > 200:
+        limit = 200
+    if offset < 0:
+        offset = 0
+    # Page rows
+    page_params = tuple(params) + (limit, offset)
+    projects = await db.fetchall(
+        f"SELECT * FROM projects{where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        page_params,
+    )
     # Profiles for the "Coordinator role" dropdown in the create form
     profile_rows = await db.fetchall(
         "SELECT agent_id, name FROM agent_profiles ORDER BY agent_id, name"
@@ -402,6 +428,11 @@ async def projects_list_page(
             "projects": projects,
             "show_archived": show_archived,
             "show_deleted": show_deleted,
+            "filter_state": state,
+            "filter_days": days,
+            "filter_limit": limit,
+            "filter_offset": offset,
+            "total_count": total,
             "all_profiles": all_profiles,
         },
     )
