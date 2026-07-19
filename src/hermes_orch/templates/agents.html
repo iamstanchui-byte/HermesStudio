@@ -118,13 +118,9 @@
                     {% if p.description %}
                     <div class="text-xs text-gray-600 mt-1">{{ p.description }}</div>
                     {% endif %}
-                    {% set caps = p.capabilities or {} %}
-                    {% set true_caps = caps.items() | selectattr(1) | map(0) | list %}
-                    {% if true_caps %}
-                    <div class="text-xs text-gray-600 mt-1" title="Capabilities (Phase 4 smart dispatch). Tasks with required_capability that this profile lacks will fail with dispatch.mismatch.">
-                        <span class="font-mono">caps:</span>
-                        {% for k in true_caps %}<span class="px-1 bg-indigo-50 text-indigo-700 rounded">{{ k }}</span> {% endfor %}
-                    </div>
+                    {% if p.capabilities %}
+                    {% set any_caps = false %}
+                    {% for k, v in p.capabilities.items() %}{% if v %}{% if not any_caps %}<div class="text-xs text-gray-600 mt-1" title="Capabilities (Phase 4 smart dispatch). Tasks with required_capability that this profile lacks will fail with dispatch.mismatch."><span class="font-mono">caps:</span> {% endif %}<span class="px-1 bg-indigo-50 text-indigo-700 rounded">{{ k }}</span> {% set any_caps = true %}{% endif %}{% endfor %}{% if any_caps %}</div>{% endif %}
                     {% endif %}
                     <form id="edit-profile-{{ agent.id }}-{{ p.name }}" class="hidden mt-2 p-2 bg-white border rounded" onsubmit="saveProfileEdit(event, '{{ agent.id }}', '{{ p.name }}')">
                         <textarea name="description" class="w-full text-xs border rounded p-1" rows="2" placeholder="description (optional)">{{ p.description or '' }}</textarea>
