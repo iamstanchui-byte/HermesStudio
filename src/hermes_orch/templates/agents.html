@@ -98,9 +98,9 @@
                 </div>
             </form>
 
-            <div class="mt-2 flex flex-wrap gap-2">
+            <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;">
                 {% for p in agent.profiles %}
-                <div class="border rounded p-3 bg-gray-50 flex-1 min-w-[20rem]" id="profile-card-{{ agent.id }}-{{ p.name }}">
+                <div class="border rounded p-3 bg-gray-50" style="flex:1 1 320px; min-width:320px;" id="profile-card-{{ agent.id }}-{{ p.name }}">
                     <div class="flex items-center justify-between">
                         <span class="font-mono text-sm font-semibold">{{ p.name }}</span>
                         <div class="flex items-center gap-1">
