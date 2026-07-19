@@ -155,7 +155,7 @@
                             {% for s in p.skills %}
                             <div class="flex items-center justify-between text-xs bg-white border rounded px-2 py-1 {% if loop.index > 5 %}hidden skills-extra-{{ agent.id }}-{{ p.name }}{% endif %}">
                                 <div class="flex items-center gap-2 flex-1 min-w-0">
-                                    <span class="font-mono text-gray-700 truncate" title="skills/{{ s.name }}/SKILL.md">{{ s.name }}/SKILL.md</span>
+                                    <span class="font-mono text-gray-700 truncate" title="{{ s.file_path }}">{{ s.name }}</span>
                                     <span class="px-1 rounded text-[10px]
                                         {% if s.status == 'applied' %}bg-green-100 text-green-800
                                         {% elif s.status == 'pending' or s.status == 'applying' %}bg-yellow-100 text-yellow-800

@@ -57,6 +57,25 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Cache-Control: no-store for the agents router. The dashboard's
+    # 10s polling does location.reload() which can keep serving stale
+    # page-cached JSON responses (e.g. after we fixed the skill layout
+    # bug, users kept seeing the old /SKILL/SKILL.md rendering because
+    # their browser had cached the previous API response). Setting
+    # no-store on the skills endpoints forces a fresh fetch every time,
+    # so the dashboard always shows the current server state.
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request as StarletteRequest
+
+    class _NoStoreOnSkills(BaseHTTPMiddleware):
+        async def dispatch(self, request: StarletteRequest, call_next):
+            response = await call_next(request)
+            if request.url.path.startswith("/api/agents/") and "/skills" in request.url.path:
+                response.headers["Cache-Control"] = "no-store"
+            return response
+
+    app.add_middleware(_NoStoreOnSkills)
+
     # Health check
     @app.get("/api/health")
     async def health() -> dict[str, str]:
