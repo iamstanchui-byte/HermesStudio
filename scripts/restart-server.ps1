@@ -21,6 +21,19 @@ $Port    = 8765
 
 function Stop-Server {
     Write-Host "[stop] finding hermes-orch processes..." -ForegroundColor Yellow
+    # Kill by image name first as a blanket fallback -- this catches
+    # hermes-orch.exe launchers that may have escaped the cmdline-match
+    # filter (e.g. a launcher that already lost its children but is
+    # still holding port 8765 in a zombie state). The /T flag kills the
+    # process tree so any children go too. Safe to call when nothing
+    # matches -- the kernel just returns "process not found".
+    try {
+        $null = taskkill /F /IM hermes-orch.exe /T 2>&1
+    } catch { }
+    try {
+        $null = taskkill /F /IM "hermes-orch-agent.exe" /T 2>&1
+    } catch { }
+    Start-Sleep -Milliseconds 500
     $procs = Get-CimInstance Win32_Process | Where-Object {
         # Match the venv python running the orchestrator (cmdline has
         # "hermes-orch" + "serve") OR the hermes-orch.exe launcher itself
@@ -69,7 +82,7 @@ function Stop-Server {
 }
 
 function Wait-Port-Free {
-    param([int]$Port, [int]$TimeoutSec = 5)
+    param([int]$Port, [int]$TimeoutSec = 10)
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
         $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
