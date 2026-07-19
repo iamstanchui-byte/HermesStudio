@@ -39,7 +39,8 @@ Output format (STRICT — output ONLY this JSON object, no prose, no markdown):
       "agent_role": "<must be one of the available roles>",
       "depends_on": ["<name of an earlier task>", ...],
       "action": "<verb or function name the agent will run>",
-      "params": { "<key>": "<value>", ... }
+      "params": { "<key>": "<value>", ... },
+      "required_capability": "<capability key the role MUST have, or null>"
     },
     ...
   ]
@@ -82,12 +83,23 @@ Available agent roles: {roles}
 Role skills (what each role has been taught how to do):
 {role_skills_block}
 
+{capabilities_block}
+
 {recent_block}
 
 Produce a JSON plan. Pick the role whose skills best match each step.
 If recent activity shows the user has been working on related goals, lean on
 those patterns (e.g. "browser_fetch_X then ridge_predict then finalize")
 instead of inventing new ones from scratch. The user prefers continuity.
+
+For each task, set `required_capability` ONLY if the step genuinely requires
+a specific tool/integration (e.g. "mt5", "xauusd_feed", "fred_csv").
+A task that just needs general research or web browsing should leave
+`required_capability` unset — don't over-constrain. The supervisor will
+fail the task with `dispatch.mismatch` if the chosen role lacks the
+required capability, so only set it when "wrong tool = wrong answer"
+(e.g. the XAUUSD case: Linux super must use the MT5 bridge, not
+Yahoo's free feed, or the analysis is built on stale/wrong prices).
 """
 
 
@@ -109,12 +121,22 @@ class Planner:
         goal: str,
         available_roles: list[str],
         role_skills: dict[str, list[str]] | None = None,
+        role_capabilities: dict[str, dict[str, bool]] | None = None,
     ) -> list[dict[str, Any]]:
         """Return list of task plans. Raises on error.
 
         `role_skills` is an optional map of role-name -> list of skill names
         the role has been taught. When provided, the LLM planner uses it to
         pick the right role for each step. The mock planner ignores it.
+
+        `role_capabilities` (Phase 4) is an optional map of role-name ->
+        {capability_name: true}. The LLM planner uses this to decide
+        whether to set `required_capability` on a task. A task that needs
+        a specific integration (e.g. "mt5", "xauusd_feed") should set
+        `required_capability` so the supervisor can fail-fast with
+        `dispatch.mismatch` if no matching profile exists, instead of
+        silently using a fallback (the XAUUSD case: Linux super picked
+        Yahoo data instead of the MT5 bridge, producing wrong analysis).
 
         If the LLM planner fails (network, parse error, truncated response,
         etc.), we fall back to the mock plan so the project doesn't get
@@ -132,7 +154,7 @@ class Planner:
         if self.mock:
             return self._plan_mock(goal, available_roles, role_skills)
         try:
-            return await self._plan_llm(goal, available_roles, role_skills)
+            return await self._plan_llm(goal, available_roles, role_skills, role_capabilities)
         except Exception as e:
             # Distinguish truncation from other failures so operators can
             # tell at a glance whether the M3 cap was the cause. The
@@ -194,6 +216,36 @@ class Planner:
             else:
                 lines.append(f"- {r}: (no skills yet)")
         return "\n".join(lines) if lines else "(no roles)"
+
+    def _format_capabilities_block(
+        available_roles: list[str],
+        role_capabilities: dict[str, dict[str, bool]] | None,
+    ) -> str:
+        """Render a role->capabilities map for the prompt.
+
+        Capabilities are operator-curated flags like {"mt5": true,
+        "xauusd_feed": true}. They're the "hard" version of skills:
+        if a task needs `mt5` and the profile doesn't have it, the
+        supervisor will fail the task with `dispatch.mismatch` rather
+        than silently letting the agent use a fallback (e.g. yahoo data).
+
+        If no capabilities are configured for any role, returns an empty
+        string (don't bother the LLM with an empty block).
+        """
+        if not role_capabilities:
+            return ""
+        has_any = any(role_capabilities.get(r) for r in available_roles)
+        if not has_any:
+            return ""
+        lines = ["Role capabilities (operator-curated; if a task needs a specific capability, set required_capability to the missing key, e.g. \"mt5\"):"]
+        for r in available_roles:
+            caps = role_capabilities.get(r) or {}
+            true_caps = sorted(k for k, v in caps.items() if v)
+            if true_caps:
+                lines.append(f"- {r}: {', '.join(true_caps)}")
+            else:
+                lines.append(f"- {r}: (no capabilities set)")
+        return "\n".join(lines)
 
     # ===== mock =====
 
@@ -340,6 +392,7 @@ class Planner:
         goal: str,
         available_roles: list[str],
         role_skills: dict[str, list[str]] | None = None,
+        role_capabilities: dict[str, dict[str, bool]] | None = None,
     ) -> list[dict[str, Any]]:
         """Call MiniMax (OpenAI-compatible) with strict JSON mode.
 
@@ -370,6 +423,7 @@ class Planner:
             goal=goal_for_prompt,
             roles=available_roles,
             role_skills_block=self._format_role_skills(available_roles, role_skills),
+            capabilities_block=self._format_capabilities_block(available_roles, role_capabilities),
             recent_block=self._format_recent_block(),
         )
         # Generous max_tokens because thinking models (MiniMax M3, DeepSeek R1)

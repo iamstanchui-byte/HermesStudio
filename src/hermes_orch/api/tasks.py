@@ -48,6 +48,13 @@ class TaskCreate(BaseModel):
     max_retries: int = 2
     timeout_seconds: int = 1800
     output_path: str | None = None  # NEW: relative path under project folder (e.g. "raw/weather.json")
+    # Phase 4 (smart dispatch): if set, the supervisor will only assign
+    # this task to a profile whose `capabilities[required_capability] = true`.
+    # If no profile with that role has the capability, the task is marked
+    # failed with reason "dispatch.mismatch: profile <X> lacks capability <Y>"
+    # and a `dispatch.mismatch` audit event is written. This is the fix
+    # for the "Linux super picked Yahoo data instead of MT5" case.
+    required_capability: str | None = None
 
 
 class Task(BaseModel):
@@ -70,6 +77,7 @@ class Task(BaseModel):
     last_liveness_at: str | None = None
     error: str | None = None
     result: dict[str, Any] | None = None
+    required_capability: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -166,6 +174,7 @@ async def create_task(body: TaskCreate, request: Request) -> Task:
             "max_retries": body.max_retries,
             "timeout_seconds": body.timeout_seconds,
             "output_path": body.output_path,
+            "required_capability": body.required_capability,
         },
     )
 

@@ -118,8 +118,18 @@
                     {% if p.description %}
                     <div class="text-xs text-gray-600 mt-1">{{ p.description }}</div>
                     {% endif %}
+                    {% set caps = p.capabilities or {} %}
+                    {% set true_caps = caps.items() | selectattr(1) | map(0) | list %}
+                    {% if true_caps %}
+                    <div class="text-xs text-gray-600 mt-1" title="Capabilities (Phase 4 smart dispatch). Tasks with required_capability that this profile lacks will fail with dispatch.mismatch.">
+                        <span class="font-mono">caps:</span>
+                        {% for k in true_caps %}<span class="px-1 bg-indigo-50 text-indigo-700 rounded">{{ k }}</span> {% endfor %}
+                    </div>
+                    {% endif %}
                     <form id="edit-profile-{{ agent.id }}-{{ p.name }}" class="hidden mt-2 p-2 bg-white border rounded" onsubmit="saveProfileEdit(event, '{{ agent.id }}', '{{ p.name }}')">
                         <textarea name="description" class="w-full text-xs border rounded p-1" rows="2" placeholder="description (optional)">{{ p.description or '' }}</textarea>
+                        <label class="block text-[10px] text-gray-500 mt-1 mb-0.5">Capabilities (JSON, e.g. <code>{"mt5": true, "xauusd_feed": true}</code>):</label>
+                        <textarea name="capabilities" class="w-full text-xs border rounded p-1 font-mono" rows="2" placeholder='{"mt5": true, "xauusd_feed": false}'>{{ p.capabilities | tojson(indent=2) if p.capabilities else '{}' }}</textarea>
                         <div class="mt-1 flex gap-1">
                             <button type="submit" class="text-xs px-2 py-0.5 bg-blue-600 text-white rounded">Save</button>
                             <button type="button" onclick="editProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs px-2 py-0.5 bg-gray-200 rounded">Cancel</button>
@@ -296,11 +306,25 @@ async function saveProfileEdit(event, agentId, profileName) {
     event.preventDefault();
     const form = event.target;
     const desc = form.description.value;
+    // Parse capabilities JSON. If empty or `{}`, send as `{}` (permissive
+    // default = "can do anything"). If malformed, surface a friendly error
+    // before the API call so the user doesn't get a generic 500.
+    const capsRaw = (form.capabilities.value || '').trim() || '{}';
+    let caps;
+    try {
+        caps = JSON.parse(capsRaw);
+        if (typeof caps !== 'object' || Array.isArray(caps)) {
+            throw new Error('capabilities must be a JSON object');
+        }
+    } catch (e) {
+        alert('Capabilities JSON invalid: ' + e.message);
+        return;
+    }
     try {
         const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}`, {
             method: 'PATCH',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({description: desc}),
+            body: JSON.stringify({description: desc, capabilities: caps}),
         });
         if (r.ok) location.reload();
         else {

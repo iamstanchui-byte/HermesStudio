@@ -26,6 +26,7 @@ For MVP, heartbeat verifies presence of headers (real HMAC check TODO).
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -59,10 +60,12 @@ class AgentUpdate(BaseModel):
 class AgentProfileCreate(BaseModel):
     name: str
     description: str | None = None
+    capabilities: dict[str, bool] = Field(default_factory=dict)
 
 
 class AgentProfileUpdate(BaseModel):
     description: str | None = None
+    capabilities: dict[str, bool] | None = None
 
 
 class HeartbeatBody(BaseModel):
@@ -76,6 +79,7 @@ class AgentProfile(BaseModel):
     description: str | None = None
     status: str = "idle"
     current_task_id: str | None = None
+    capabilities: dict[str, bool] = Field(default_factory=dict)
     created_at: str | None = None
 
 
@@ -159,6 +163,16 @@ def _hash_secret(secret: str) -> str:
 
 
 def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
+    # capabilities stored as JSON text. Defensive: handle missing/malformed.
+    caps_raw = row.get("capabilities")
+    caps: dict[str, bool] = {}
+    if caps_raw:
+        try:
+            parsed = json.loads(caps_raw) if isinstance(caps_raw, str) else caps_raw
+            if isinstance(parsed, dict):
+                caps = {str(k): bool(v) for k, v in parsed.items()}
+        except (json.JSONDecodeError, TypeError):
+            pass
     return AgentProfile(
         id=row["id"],
         agent_id=row["agent_id"],
@@ -166,6 +180,7 @@ def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
         description=row.get("description"),
         status=row["status"],
         current_task_id=row.get("current_task_id"),
+        capabilities=caps,
         created_at=row.get("created_at"),
     )
 
@@ -536,6 +551,7 @@ async def add_profile(
             "name": body.name,
             "description": body.description,
             "status": "idle",
+            "capabilities": json.dumps(body.capabilities or {}),
         },
     )
     row = await db.fetchone("SELECT * FROM agent_profiles WHERE id = ?", (profile_id,))
@@ -543,7 +559,11 @@ async def add_profile(
         db, "agent.profile_added",
         actor="operator",
         agent_id=agent_id,
-        payload={"profile_name": body.name, "description": body.description},
+        payload={
+            "profile_name": body.name,
+            "description": body.description,
+            "capabilities": body.capabilities or {},
+        },
     )
     return _row_to_profile(row)
 
@@ -597,12 +617,21 @@ async def update_profile(
             "UPDATE agent_profiles SET description = ? WHERE id = ?",
             (body.description, profile["id"]),
         )
+    if body.capabilities is not None:
+        await db.execute(
+            "UPDATE agent_profiles SET capabilities = ? WHERE id = ?",
+            (json.dumps(body.capabilities), profile["id"]),
+        )
     row = await db.fetchone("SELECT * FROM agent_profiles WHERE id = ?", (profile["id"],))
     await audit_log(
         db, "agent.profile_updated",
         actor="operator",
         agent_id=agent_id,
-        payload={"profile_name": profile_name, "description": body.description},
+        payload={
+            "profile_name": profile_name,
+            "description": body.description,
+            "capabilities": body.capabilities,
+        },
     )
     return _row_to_profile(row)
 

@@ -70,6 +70,57 @@ async def _load_role_skills(db: Any) -> dict[str, list[str]]:
     return out
 
 
+async def _load_role_capabilities(db: Any) -> dict[str, dict[str, bool]]:
+    """Build a {role_name: {capability: bool}} map from agent_profiles.capabilities.
+
+    Phase 4 (smart dispatch): operators curate a JSON map per profile like
+    `{"mt5": true, "xauusd_feed": true, "fred_csv": false}`. The planner
+    uses this to decide whether to set `required_capability` on a task.
+    The supervisor uses this to fail-fast with `dispatch.mismatch` if a
+    task with `required_capability=X` lands on a profile without X.
+
+    Profiles with empty `{}` capabilities default to "can do anything"
+    (we return `{}` and the supervisor treats that as permissive). To
+    actually enforce, the operator must explicitly set `false` for the
+    capabilities the role should NOT have.
+
+    Important: we KEEP false-valued entries in the union. If profile X
+    has `{"mt5": false}` and the operator's intent is "X cannot do mt5",
+    we must propagate that. If we filtered false (the v-if-trick), then
+    `{"mt5": false}` would collapse to `{}` and the supervisor would
+    treat the role as permissive — silent failure. The planner also
+    needs to see the explicit false to avoid assigning mt5 tasks to X.
+    """
+    rows = await db.fetchall("SELECT name, capabilities FROM agent_profiles")
+    out: dict[str, dict[str, bool]] = {}
+    for r in rows:
+        caps_raw = r.get("capabilities")
+        if not caps_raw:
+            continue
+        try:
+            parsed = json.loads(caps_raw) if isinstance(caps_raw, str) else caps_raw
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        # Union across all profiles of the same role. If ANY profile of
+        # a role has capability X=true, the role "has" it (supervisor may
+        # dispatch to one of those profiles). If ALL profiles have X=false,
+        # the role doesn't have it (dispatch.mismatch).
+        role_caps = out.setdefault(r["name"], {})
+        for k, v in parsed.items():
+            k = str(k)
+            v = bool(v)
+            if v:
+                # Any true wins. Don't overwrite an existing false.
+                role_caps[k] = True
+            elif k not in role_caps:
+                # Only set false if we haven't seen a true from another
+                # profile of the same role.
+                role_caps[k] = False
+    return out
+
+
 class Supervisor:
     def __init__(self, db: Any, cfg: dict[str, Any], notifier: Notifier, planner: Planner):
         self.db = db
@@ -208,11 +259,16 @@ class Supervisor:
         # Fetch role -> skills map so the planner picks the right role for
         # each step based on what the user has taught each agent.
         role_skills = await _load_role_skills(self.db)
+        # Phase 4: fetch role -> capabilities map. The planner injects
+        # this into the prompt so it knows which roles can do what, and
+        # uses it to set `required_capability` on tasks that need a
+        # specific integration (e.g. "mt5", "xauusd_feed").
+        role_capabilities = await _load_role_capabilities(self.db)
         # Warn if stuck in planning too long
         await self._maybe_warn_stuck(proj)
         # Call planner
         try:
-            plan = await self.planner.plan(goal, available_roles, role_skills)
+            plan = await self.planner.plan(goal, available_roles, role_skills, role_capabilities)
         except Exception as e:
             log.warning(f"planner failed for {pid}: {e}")
             # Reset state to 'ready' (manual mode default) so the supervisor
@@ -909,7 +965,7 @@ class Supervisor:
             return False
         # Find an idle profile for this role (prefer verified agents)
         prof = await self.db.fetchone(
-            "SELECT ap.id, ap.agent_id FROM agent_profiles ap "
+            "SELECT ap.id, ap.agent_id, ap.capabilities FROM agent_profiles ap "
             "JOIN agents a ON a.id = ap.agent_id "
             "WHERE ap.name = ? AND a.status = 'verified' "
             "ORDER BY ap.agent_id LIMIT 1",
@@ -918,11 +974,64 @@ class Supervisor:
         if not prof:
             # Fall back to any profile (even un-verified) so demo still flows
             prof = await self.db.fetchone(
-                "SELECT id, agent_id FROM agent_profiles WHERE name = ? LIMIT 1",
+                "SELECT id, agent_id, capabilities FROM agent_profiles WHERE name = ? LIMIT 1",
                 (role,),
             )
             if not prof:
                 log.info(f"task {tid} (role={role}): no agent has this role")
+                return False
+        # Phase 4 (smart dispatch): if the task requires a capability the
+        # chosen profile doesn't have, fail the task with dispatch.mismatch
+        # instead of silently letting the agent fall back to a worse tool
+        # (the XAUUSD case: Linux super must use the MT5 bridge, not
+        # Yahoo's free feed, or the analysis is built on stale/wrong prices).
+        required = task.get("required_capability")
+        if required:
+            caps_raw = prof.get("capabilities")
+            profile_caps: dict[str, bool] = {}
+            if caps_raw:
+                try:
+                    parsed = json.loads(caps_raw) if isinstance(caps_raw, str) else caps_raw
+                    if isinstance(parsed, dict):
+                        profile_caps = {str(k): bool(v) for k, v in parsed.items()}
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # If the profile has an explicit capabilities map AND the required
+            # capability is not in it (or set to false), fail. We don't fail
+            # when capabilities is empty `{}` because the operator hasn't
+            # curated it yet — that's the permissive default, intentional
+            # so adding a new profile doesn't break old flows.
+            if profile_caps and not profile_caps.get(required, False):
+                now = _now_iso()
+                err_msg = (
+                    f"dispatch.mismatch: profile '{role}' (agent {prof['agent_id']}) "
+                    f"lacks capability '{required}' "
+                    f"(profile has: {sorted(k for k, v in profile_caps.items() if v)})"
+                )
+                await self.db.execute(
+                    "UPDATE tasks SET status = 'failed', error = ?, updated_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (err_msg, now, tid),
+                )
+                await audit_log(
+                    self.db, "dispatch.mismatch",
+                    actor="supervisor",
+                    project_id=task["project_id"],
+                    task_id=tid,
+                    agent_id=prof["agent_id"],
+                    payload={
+                        "role": role,
+                        "profile_id": prof["id"],
+                        "required_capability": required,
+                        "profile_capabilities": profile_caps,
+                        "error": err_msg,
+                    },
+                )
+                log.warning(
+                    "task %s (%r) FAILED: required_capability=%r but profile %s has %s",
+                    tid, task.get("name"), required, prof["id"],
+                    sorted(k for k, v in profile_caps.items() if v),
+                )
                 return False
         now = _now_iso()
         await self.db.execute(
@@ -943,7 +1052,11 @@ class Supervisor:
             project_id=task["project_id"],
             task_id=tid,
             agent_id=prof["agent_id"],
-            payload={"profile_id": prof["id"], "role": role},
+            payload={
+                "profile_id": prof["id"],
+                "role": role,
+                "required_capability": required,  # Phase 4
+            },
         )
         log.info(f"task {tid} ({task.get('name')!r}, role={role}) -> agent {prof['agent_id']}, profile busy")
         return True

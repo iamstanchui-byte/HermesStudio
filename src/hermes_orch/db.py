@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     description TEXT,
     status TEXT NOT NULL DEFAULT 'idle',
     current_task_id TEXT,
+    capabilities TEXT NOT NULL DEFAULT '{}',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_liveness_at TIMESTAMP,
     error TEXT,
     result TEXT,
+    required_capability TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -202,6 +204,17 @@ MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN max_iterations INTEGER DEFAULT 0",
     "ALTER TABLE projects ADD COLUMN current_iteration INTEGER DEFAULT 0",
     "ALTER TABLE projects ADD COLUMN last_iteration_summary TEXT DEFAULT ''",
+    # Phase 4 (smart dispatch): per-profile capability map. JSON object of
+    # `{capability_name: true}`. The supervisor checks this against
+    # `tasks.required_capability` before assigning — if a task needs
+    # capability X and the chosen profile doesn't have X, the task fails
+    # with `dispatch.mismatch` (no silent fallback to the wrong tool).
+    # Default '{}' = "can do anything", which preserves current behavior
+    # for old profiles. Empty `{}` is the safer default (must list
+    # explicitly), but we ship the permissive default to avoid breaking
+    # existing flows — operators opt in by editing the JSON.
+    "ALTER TABLE agent_profiles ADD COLUMN capabilities TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE tasks ADD COLUMN required_capability TEXT",
     # project_soul_presets is a new table; created in CREATE TABLE block above.
     # No ALTER needed for it on existing DBs — IF NOT EXISTS handles it.
     # project_sessions is a new table; created in CREATE TABLE block above.
