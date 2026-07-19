@@ -451,6 +451,127 @@ async def unarchive_project(project_id: str, request: Request) -> dict:
     return {"project_id": project_id, "state": "planning"}
 
 
+@router.post("/{project_id}/delete")
+async def soft_delete_project(project_id: str, request: Request) -> dict:
+    """Soft-delete a project (state='deleted').
+
+    Same as archive in mechanism (just a state change, DB rows preserved)
+    but semantically stronger: archive = "park for later", delete =
+    "going to cleanup". A future settings-page cleanup job can hard-delete
+    projects in archived+deleted state older than 30 days.
+
+    Tasks belonging to this project are NOT auto-archived; the task list
+    just filters them out by default (see list_tasks include_archived flag).
+    """
+    db = request.app.state.db
+    project = await db.fetchone("SELECT id, state FROM projects WHERE id = ?", (project_id,))
+    if not project:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    if project["state"] == "deleted":
+        return {"project_id": project_id, "state": "deleted", "noop": True}
+    await db.execute(
+        "UPDATE projects SET state = 'deleted', updated_at = ? WHERE id = ?",
+        (_now_iso(), project_id),
+    )
+    await audit_log(db, "project.deleted", actor="operator", project_id=project_id)
+    return {"project_id": project_id, "state": "deleted"}
+
+
+@router.post("/{project_id}/undelete")
+async def undelete_project(project_id: str, request: Request) -> dict:
+    """Restore a soft-deleted project back to 'planning'."""
+    db = request.app.state.db
+    project = await db.fetchone("SELECT id, state FROM projects WHERE id = ?", (project_id,))
+    if not project:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    if project["state"] != "deleted":
+        raise HTTPException(400, f"Project not deleted: {project['state']}")
+    await db.execute(
+        "UPDATE projects SET state = 'planning', updated_at = ? WHERE id = ?",
+        (_now_iso(), project_id),
+    )
+    await audit_log(db, "project.undeleted", actor="operator", project_id=project_id)
+    return {"project_id": project_id, "state": "planning"}
+
+
+# ===== Bulk actions (multi-select from projects list page) =====
+
+
+async def _bulk_state_change(db, project_ids: list[str], new_state: str, audit_event: str) -> dict:
+    """Apply the same state change to multiple projects.
+
+    Each project gets its own audit_log entry (so the history shows per-
+    project cause). All updates are batched in one execute() for speed.
+    Returns per-project results (ok / not_found / already_in_state).
+    """
+    if not project_ids:
+        raise HTTPException(400, "project_ids is required")
+    if len(project_ids) > 100:
+        raise HTTPException(400, f"too many project_ids ({len(project_ids)}); max 100")
+    # Look up current state to skip no-ops and to report not_found
+    placeholders = ",".join("?" for _ in project_ids)
+    rows = await db.fetchall(
+        f"SELECT id, state FROM projects WHERE id IN ({placeholders})",
+        tuple(project_ids),
+    )
+    by_id = {r["id"]: r["state"] for r in rows}
+    not_found = [pid for pid in project_ids if pid not in by_id]
+    to_change = [
+        pid for pid in project_ids
+        if pid in by_id and by_id[pid] != new_state
+    ]
+    if to_change:
+        now = _now_iso()
+        ph = ",".join("?" for _ in to_change)
+        await db.execute(
+            f"UPDATE projects SET state = ?, updated_at = ? WHERE id IN ({ph})",
+            tuple([new_state, now] + to_change),
+        )
+        for pid in to_change:
+            await audit_log(db, audit_event, actor="operator", project_id=pid)
+    return {
+        "changed": to_change,
+        "noop": [pid for pid in project_ids if pid in by_id and by_id[pid] == new_state],
+        "not_found": not_found,
+    }
+
+
+@router.post("/bulk-archive")
+async def bulk_archive_projects(request: Request) -> dict:
+    """Archive multiple projects in one call.
+
+    Body: {project_ids: ['proj-1', 'proj-2', ...]}
+    """
+    import json
+    db = request.app.state.db
+    body = await request.body()
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON body")
+    return await _bulk_state_change(
+        db, data.get("project_ids", []), "archived", "project.archived"
+    )
+
+
+@router.post("/bulk-delete")
+async def bulk_delete_projects(request: Request) -> dict:
+    """Soft-delete multiple projects in one call.
+
+    Body: {project_ids: ['proj-1', 'proj-2', ...]}
+    """
+    import json
+    db = request.app.state.db
+    body = await request.body()
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON body")
+    return await _bulk_state_change(
+        db, data.get("project_ids", []), "deleted", "project.deleted"
+    )
+
+
 @router.post("/{project_id}/session")
 async def set_project_session(project_id: str, request: Request) -> dict:
     """Set the project's session for the calling role (wrapper after each task).

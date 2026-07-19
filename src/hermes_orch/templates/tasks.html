@@ -8,6 +8,11 @@
         <button id="collapse-all-btn" onclick="collapseAllResults()" class="text-xs text-gray-500 hover:text-gray-800" title="Hide all expanded result panels. Without this, the 10s auto-refresh pauses because the polling script skips reloads while a result panel is open.">
             Collapse all
         </button>
+        {% if filter_include_archived %}
+        <a href="/tasks" class="text-blue-600 hover:underline">Hide archived projects</a>
+        {% else %}
+        <a href="/tasks?include_archived=1" class="text-gray-500 hover:text-gray-700">Show archived projects</a>
+        {% endif %}
         <div class="text-gray-500">
             {% set end = (filter_offset + tasks|length) if tasks else filter_offset %}
             Showing {{ filter_offset + 1 if total_count > 0 else 0 }}-{{ end }} of {{ total_count }}

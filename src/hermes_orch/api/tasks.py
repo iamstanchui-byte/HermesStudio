@@ -196,27 +196,41 @@ async def list_tasks(
     status: str | None = None,
     agent_id: str | None = None,
     role: str | None = None,
+    include_archived: bool = False,
 ) -> dict:
-    """List tasks (filterable)."""
+    """List tasks (filterable).
+
+    By default, tasks whose project is in 'archived' or 'deleted' state
+    are hidden (joined filter on projects table). Pass
+    `include_archived=true` to see them (e.g. for a "Show archived
+    projects" toggle on the task page).
+    """
     db = request.app.state.db
     where = []
     params: list[Any] = []
     if project_id:
-        where.append("project_id = ?")
+        where.append("t.project_id = ?")
         params.append(project_id)
     if status:
-        where.append("status = ?")
+        where.append("t.status = ?")
         params.append(status)
     if agent_id:
-        where.append("assigned_agent_id = ?")
+        where.append("t.assigned_agent_id = ?")
         params.append(agent_id)
     if role:
-        where.append("agent_role = ?")
+        where.append("t.agent_role = ?")
         params.append(role)
-    sql = "SELECT * FROM tasks"
+    # JOIN projects so we can filter by project state. Only when we
+    # need to (avoid the JOIN cost when not filtering by project).
+    join_projects = not include_archived
+    if join_projects:
+        where.append("p.state NOT IN ('archived', 'deleted')")
+    sql = "SELECT t.* FROM tasks t"
+    if join_projects:
+        sql += " JOIN projects p ON t.project_id = p.id"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY created_at DESC"
+    sql += " ORDER BY t.created_at DESC"
     rows = await db.fetchall(sql, tuple(params))
     return {"tasks": [_row_to_task(r).model_dump() for r in rows]}
 

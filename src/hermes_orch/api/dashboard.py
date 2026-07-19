@@ -272,14 +272,22 @@ async def tasks_page(
     days: int | None = 7,
     limit: int = 50,
     offset: int = 0,
+    include_archived: bool = False,
 ) -> HTMLResponse:
-    """Tasks page (filterable by status, date range, limit, paginated)."""
+    """Tasks page (filterable by status, date range, limit, paginated).
+
+    By default hides tasks from archived/deleted projects. Pass
+    include_archived=true (via ?include_archived=1 in URL) to see them.
+    """
     db = request.app.state.db
     where = []
     params: list[Any] = []
     if status:
-        where.append("status = ?")
+        where.append("t.status = ?")
         params.append(status)
+    if not include_archived:
+        # JOIN projects and hide tasks whose project is archived/deleted
+        where.append("p.state NOT IN ('archived', 'deleted')")
     if days:
         # Compute the cutoff in local time with offset, matching the
         # format that db.insert / audit_log now writes. SQLite's
@@ -295,15 +303,16 @@ async def tasks_page(
         where.append("created_at >= ?")
         params.append(cutoff)
     where_sql = " WHERE " + " AND ".join(where) if where else ""
+    join_sql = "" if include_archived else " JOIN projects p ON t.project_id = p.id"
 
     # Total count for pagination
     total_row = await db.fetchone(
-        f"SELECT COUNT(*) as c FROM tasks{where_sql}", tuple(params)
+        f"SELECT COUNT(*) as c FROM tasks t{join_sql}{where_sql}", tuple(params)
     )
     total = total_row["c"] if total_row else 0
 
     # Page rows
-    sql = f"SELECT * FROM tasks{where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    sql = f"SELECT t.* FROM tasks t{join_sql}{where_sql} ORDER BY t.created_at DESC LIMIT ? OFFSET ?"
     page_params = tuple(params) + (limit, offset)
     raw_rows = await db.fetchall(sql, page_params)
     tasks = []
@@ -341,6 +350,7 @@ async def tasks_page(
             "filter_days": days,
             "filter_limit": limit,
             "filter_offset": offset,
+            "filter_include_archived": include_archived,
             "total_count": total,
         },
     )
@@ -348,19 +358,29 @@ async def tasks_page(
 
 @router.get("/projects", response_class=HTMLResponse)
 async def projects_list_page(
-    request: Request, show_archived: bool = False
+    request: Request,
+    show_archived: bool = False,
+    show_deleted: bool = False,
 ) -> HTMLResponse:
-    """Projects list. Default: hide archived. Pass show_archived=true to include."""
+    """Projects list.
+
+    Default: hide archived AND soft-deleted. Both have toggleable
+    filters in the page UI. Hidden states are still in the DB
+    (soft delete) — a future settings-page cleanup job hard-deletes
+    after 30d.
+    """
     db = request.app.state.db
-    if show_archived:
-        projects = await db.fetchall(
-            "SELECT * FROM projects ORDER BY created_at DESC"
-        )
-    else:
-        projects = await db.fetchall(
-            "SELECT * FROM projects WHERE state != 'archived' "
-            "ORDER BY created_at DESC"
-        )
+    where = []
+    params: list[Any] = []
+    if not show_archived:
+        where.append("state != 'archived'")
+    if not show_deleted:
+        where.append("state != 'deleted'")
+    sql = "SELECT * FROM projects"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC"
+    projects = await db.fetchall(sql, tuple(params))
     # Profiles for the "Coordinator role" dropdown in the create form
     profile_rows = await db.fetchall(
         "SELECT agent_id, name FROM agent_profiles ORDER BY agent_id, name"
@@ -375,6 +395,7 @@ async def projects_list_page(
             **_base_context(request, "projects"),
             "projects": projects,
             "show_archived": show_archived,
+            "show_deleted": show_deleted,
             "all_profiles": all_profiles,
         },
     )

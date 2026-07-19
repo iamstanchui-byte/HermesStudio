@@ -7,6 +7,14 @@
     <div class="text-sm text-gray-500">{{ projects|length }} shown</div>
 </div>
 
+<!-- Bulk action toolbar (visible when 1+ projects selected) -->
+<div id="bulk-toolbar" class="hidden mb-3 bg-blue-50 border border-blue-200 rounded p-2 flex items-center gap-3 text-sm">
+    <span id="bulk-selected-count" class="text-blue-800">0 selected</span>
+    <button onclick="bulkAction('archive')" class="px-2 py-1 bg-yellow-600 text-white rounded text-xs hover:bg-yellow-700">Archive</button>
+    <button onclick="bulkAction('delete')" class="px-2 py-1 bg-red-600 text-white rounded text-xs hover:bg-red-700">Soft delete</button>
+    <button onclick="clearSelection()" class="ml-auto text-xs text-gray-500 hover:text-gray-800">Clear</button>
+</div>
+
 <!-- Create new project (collapsed) -->
 <button onclick="toggleForm('new-project-form')" class="mb-3 text-sm text-blue-600 hover:underline">
     + Create new project
@@ -69,13 +77,19 @@
     </div>
 </form>
 
-<!-- Filter: show archived -->
-<div class="mb-3 text-sm">
+<!-- Filter: show archived / deleted -->
+<div class="mb-3 text-sm flex items-center gap-3">
     {% if show_archived %}
     <a href="/projects" class="text-blue-600 hover:underline">Hide archived projects</a>
     {% else %}
     <a href="/projects?show_archived=true" class="text-gray-500 hover:text-gray-700">Show archived projects</a>
     {% endif %}
+    {% if show_deleted %}
+    <a href="/projects{% if show_archived %}?show_archived=true{% endif %}" class="text-blue-600 hover:underline">Hide deleted projects</a>
+    {% else %}
+    <a href="/projects?show_deleted=true{% if show_archived %}&show_archived=true{% endif %}" class="text-gray-500 hover:text-gray-700">Show deleted projects</a>
+    {% endif %}
+    <span class="text-xs text-gray-400">(soft-deleted projects can be restored via unarchive in 30d, then hard-deleted by settings cleanup job)</span>
 </div>
 
 {% if not projects %}
@@ -86,26 +100,30 @@
 
 <div class="space-y-2" id="projects-list">
     {% for p in projects %}
-    <a href="/projects/{{ p.id }}" class="block bg-white border rounded-lg p-4 shadow-sm hover:bg-gray-50">
-        <div class="flex items-center justify-between">
-            <div>
-                <div class="font-mono text-sm text-gray-500">{{ p.id }}</div>
-                <div class="font-semibold text-gray-800">{{ p.name or '(unnamed)' }}</div>
-                <div class="text-sm text-gray-600 mt-1">{{ p.goal or '-' }}</div>
+    <div class="bg-white border rounded-lg p-4 shadow-sm hover:bg-gray-50 flex items-start gap-3">
+        <input type="checkbox" class="project-checkbox mt-2" data-project-id="{{ p.id }}" onclick="updateBulkToolbar()" title="Select for bulk action">
+        <a href="/projects/{{ p.id }}" class="flex-1 min-w-0">
+            <div class="flex items-center justify-between">
+                <div>
+                    <div class="font-mono text-sm text-gray-500">{{ p.id }}</div>
+                    <div class="font-semibold text-gray-800">{{ p.name or '(unnamed)' }}</div>
+                    <div class="text-sm text-gray-600 mt-1">{{ p.goal or '-' }}</div>
+                </div>
+                <div class="text-right">
+                    <span class="px-2 py-0.5 text-xs rounded
+                        {% if p.state == 'running' %}bg-blue-100 text-blue-800
+                        {% elif p.state == 'completed' %}bg-green-100 text-green-800
+                        {% elif p.state == 'cancelled' %}bg-gray-200 text-gray-700
+                        {% elif p.state == 'archived' %}bg-yellow-100 text-yellow-800
+                        {% elif p.state == 'deleted' %}bg-red-100 text-red-800
+                        {% else %}bg-yellow-100 text-yellow-800{% endif %}">
+                        {{ p.state }}
+                    </span>
+                    <div class="text-xs text-gray-500 mt-1">{{ p.created_at }}</div>
+                </div>
             </div>
-            <div class="text-right">
-                <span class="px-2 py-0.5 text-xs rounded
-                    {% if p.state == 'running' %}bg-blue-100 text-blue-800
-                    {% elif p.state == 'completed' %}bg-green-100 text-green-800
-                    {% elif p.state == 'cancelled' %}bg-gray-200 text-gray-700
-                    {% elif p.state == 'archived' %}bg-yellow-100 text-yellow-800
-                    {% else %}bg-yellow-100 text-yellow-800{% endif %}">
-                    {{ p.state }}
-                </span>
-                <div class="text-xs text-gray-500 mt-1">{{ p.created_at }}</div>
-            </div>
-        </div>
-    </a>
+        </a>
+    </div>
     {% endfor %}
 </div>
 
@@ -151,6 +169,50 @@ document.getElementById('new-project-form').addEventListener('submit', async (e)
         status.className = 'text-sm text-red-600';
     }
 });
+
+// ===== Bulk action toolbar =====
+function getSelectedIds() {
+    const boxes = document.querySelectorAll('.project-checkbox:checked');
+    return Array.from(boxes).map(b => b.getAttribute('data-project-id'));
+}
+function updateBulkToolbar() {
+    const ids = getSelectedIds();
+    const toolbar = document.getElementById('bulk-toolbar');
+    const count = document.getElementById('bulk-selected-count');
+    if (ids.length > 0) {
+        toolbar.classList.remove('hidden');
+        count.textContent = ids.length + ' selected';
+    } else {
+        toolbar.classList.add('hidden');
+    }
+}
+function clearSelection() {
+    document.querySelectorAll('.project-checkbox').forEach(b => { b.checked = false; });
+    updateBulkToolbar();
+}
+async function bulkAction(action) {
+    // action: 'archive' or 'delete'
+    const ids = getSelectedIds();
+    if (ids.length === 0) return;
+    const verb = action === 'archive' ? 'archive' : 'soft-delete';
+    if (!confirm(`${verb} ${ids.length} project(s)? Tasks will hide from default view (use "Show archived projects" toggle to see).`)) return;
+    try {
+        const r = await fetch('/api/projects/bulk-' + action, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({project_ids: ids}),
+        });
+        const data = await r.json();
+        if (r.ok) {
+            alert(`${data.changed.length} changed, ${data.noop.length} noop, ${data.not_found.length} not found.`);
+            location.reload();
+        } else {
+            alert('Failed: ' + (data.detail || r.status));
+        }
+    } catch (err) {
+        alert('Network error: ' + err.message);
+    }
+}
 </script>
 
 {% endblock %}
