@@ -114,6 +114,13 @@
     <div class="bg-white border rounded-lg p-4 shadow-sm">
         <div class="flex items-center justify-between">
             <div class="flex items-center gap-3">
+                <a href="/projects/{{ task.project_id }}" class="font-mono text-sm text-blue-600 hover:underline">{{ task.id }}</a>
+                <span class="font-medium text-gray-800">{{ task.name or '(unnamed)' }}</span>
+                <a href="/projects/{{ task.project_id }}" class="px-2 py-0.5 bg-gray-100 text-gray-700 text-xs rounded hover:bg-gray-200" title="{{ task.project_id }}">
+                    {{ task.project_name }}
+                </a>
+            </div>
+            <div class="flex items-center gap-2">
                 <span class="px-2 py-0.5 text-xs rounded font-mono
                     {% if task.status == 'completed' %}bg-green-100 text-green-800
                     {% elif task.status == 'failed' %}bg-red-100 text-red-800
@@ -124,13 +131,6 @@
                     {% else %}bg-gray-100 text-gray-800{% endif %}">
                     {{ task.status }}
                 </span>
-                <a href="/projects/{{ task.project_id }}" class="font-mono text-sm text-blue-600 hover:underline">{{ task.id }}</a>
-                <span class="font-medium text-gray-800">{{ task.name or '(unnamed)' }}</span>
-                <a href="/projects/{{ task.project_id }}" class="px-2 py-0.5 bg-gray-100 text-gray-700 text-xs rounded hover:bg-gray-200" title="{{ task.project_id }}">
-                    {{ task.project_name }}
-                </a>
-            </div>
-            <div class="flex items-center gap-2">
                 {% if task.status in ['pending', 'assigned', 'running'] %}
                 <button onclick="cancelTask('{{ task.id }}')" class="px-2 py-1 text-xs bg-yellow-100 text-yellow-800 rounded hover:bg-yellow-200">Cancel</button>
                 {% endif %}
