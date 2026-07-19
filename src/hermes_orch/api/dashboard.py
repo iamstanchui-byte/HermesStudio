@@ -188,14 +188,15 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
 async def _load_profile_skills(db: Any, profile_id: str) -> list[dict[str, Any]]:
     """Return latest version of each skill for a profile, ordered by name.
 
-    A skill is `profile_configs.file_path` starting with 'skills/'. We only
-    keep the newest row per file_path (created_at DESC), and we treat empty
-    applied content as a deletion — those entries are filtered out so the
-    dashboard shows what's actually on the host.
+    A skill is `profile_configs.file_path` of the form `skills/<name>/SKILL.md`
+    (hermes 0.17+ folder layout; flat `skills/<name>.md` was dropped in
+    commit 5e69bdb). We only keep the newest row per file_path (created_at
+    DESC), and we treat empty applied content as a deletion — those entries
+    are filtered out so the dashboard shows what's actually on the host.
     """
     rows = await db.fetchall(
         "SELECT * FROM profile_configs WHERE profile_id = ? "
-        "AND file_path LIKE 'skills/%' "
+        "AND file_path LIKE 'skills/%/SKILL.md' "
         "ORDER BY file_path ASC, created_at DESC",
         (profile_id,),
     )
@@ -208,7 +209,8 @@ async def _load_profile_skills(db: Any, profile_id: str) -> list[dict[str, Any]]
         # Treat applied-with-empty-content as deleted; skip from list
         if r["status"] == "applied" and (r["desired_content"] or "") == "":
             continue
-        name = r["file_path"].removeprefix("skills/").removesuffix(".md")
+        # Path is skills/<name>/SKILL.md — strip both ends
+        name = r["file_path"][len("skills/"):-len("/SKILL.md")]
         out.append({
             "name": name,
             "file_path": r["file_path"],
