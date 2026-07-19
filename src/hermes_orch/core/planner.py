@@ -82,7 +82,12 @@ Available agent roles: {roles}
 Role skills (what each role has been taught how to do):
 {role_skills_block}
 
+{recent_block}
+
 Produce a JSON plan. Pick the role whose skills best match each step.
+If recent activity shows the user has been working on related goals, lean on
+those patterns (e.g. "browser_fetch_X then ridge_predict then finalize")
+instead of inventing new ones from scratch. The user prefers continuity.
 """
 
 
@@ -149,7 +154,27 @@ class Planner:
             self.last_plan_was_fallback = True
             return self._plan_mock(goal, available_roles, role_skills)
 
-    @staticmethod
+    def _format_recent_block(self) -> str:
+        """Read user-level recent.md and format as a prompt block.
+
+        Returns the recent context as a "Recent user activity" section
+        that the LLM planner can use to bias the plan toward patterns
+        the user has been using. Returns an empty string if recent.md
+        is missing (e.g. on first project ever).
+        """
+        try:
+            from hermes_orch.core.memory import get_memory_writer
+            text = get_memory_writer().read_recent_tail(max_bytes=2048)
+            if not text:
+                return ""
+            return (
+                "Recent user activity (last 7 days, L3 cross-project summary):\n"
+                + text
+            )
+        except Exception as e:
+            log.warning(f"planner: failed to load recent.md: {e}")
+            return ""
+
     def _format_role_skills(
         available_roles: list[str],
         role_skills: dict[str, list[str]] | None,
@@ -345,6 +370,7 @@ class Planner:
             goal=goal_for_prompt,
             roles=available_roles,
             role_skills_block=self._format_role_skills(available_roles, role_skills),
+            recent_block=self._format_recent_block(),
         )
         # Generous max_tokens because thinking models (MiniMax M3, DeepSeek R1)
         # burn tokens on reasoning before producing JSON. Default would truncate.

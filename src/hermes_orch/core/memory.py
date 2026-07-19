@@ -35,6 +35,10 @@ ARCHIVE_FILENAME = "facts_archive.md"
 STATE_FILENAME = "state.md"
 STATE_ARCHIVE_DIRNAME = "state_archive"
 
+# User-level file names (Phase 3: cross-project L3)
+RECENT_FILENAME = "recent.md"
+RECENT_ARCHIVE_DIRNAME = "recent_archive"
+
 
 def _project_dir(project_id: str, projects_root: Path) -> Path:
     """Path to the project's directory under projects storage root."""
@@ -415,6 +419,71 @@ class MemoryWriter:
             return True
         except Exception as e:
             log.warning(f"L3 state write failed (project={project_id}): {e}")
+            return False
+
+    # ===== L3 user-level (recent.md) — Phase 3 =====
+    #
+    # recent.md is the user-level L3 synthesis: 7-day rolling summary
+    # of all projects, patterns, and recurring failures. Lives in
+    # `~/.hermes-orchestrator/memory/recent.md` (under memory_root,
+    # NOT under a project's directory). Auto-regenerated daily by
+    # scheduler, or manually via POST /memory/recent/regenerate.
+    # Delete-aware: project.deleted audit hook triggers a rebuild so
+    # deleted projects don't linger in the summary.
+
+    def read_recent(self) -> str | None:
+        """Read recent.md (user-level L3). None if missing."""
+        p = self.memory_root / RECENT_FILENAME
+        if not p.exists():
+            return None
+        try:
+            return p.read_text(encoding="utf-8")
+        except Exception:
+            return None
+
+    def read_recent_tail(self, max_bytes: int = 4096) -> str | None:
+        """Read recent.md, truncating to max_bytes for prompt injection.
+
+        recent.md is auto-capped at 4KB by the synthesis module, so
+        in practice this is just a read with a safety truncation.
+        """
+        text = self.read_recent()
+        if text is None:
+            return None
+        encoded = text.encode("utf-8")
+        if len(encoded) > max_bytes:
+            head = encoded[:max_bytes].decode("utf-8", errors="replace")
+            return head + "\n[…recent truncated…]"
+        return text
+
+    def write_recent(self, content: str) -> bool:
+        """Write recent.md, archiving the previous version first.
+
+        Archives to `<memory_root>/recent_archive/<timestamp>.md` so
+        the diff between daily regenerations is visible. Returns
+        True on success.
+        """
+        p = self.memory_root / RECENT_FILENAME
+        p.parent.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime as _dt
+        try:
+            with self._lock:
+                if p.exists():
+                    try:
+                        archive_dir = p.parent / RECENT_ARCHIVE_DIRNAME
+                        archive_dir.mkdir(parents=True, exist_ok=True)
+                        ts = _dt.now().strftime("%Y%m%dT%H%M%S")
+                        old = p.read_text(encoding="utf-8")
+                        (archive_dir / f"{ts}.md").write_text(
+                            old, encoding="utf-8"
+                        )
+                    except Exception as e:
+                        # Archive failure is non-fatal
+                        log.warning(f"L3 recent archive failed: {e}")
+                p.write_text(content, encoding="utf-8")
+            return True
+        except Exception as e:
+            log.warning(f"L3 recent write failed: {e}")
             return False
 
 

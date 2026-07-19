@@ -753,6 +753,25 @@ async def delete_project(project_id: str, request: Request):
     )
     from fastapi import Response
 
+    # Phase 3 hook: when a project is deleted, kick off a recent.md
+    # rebuild so the deleted project doesn't linger in the user's
+    # 7-day summary. Fire-and-forget (don't block the DELETE
+    # response on a 2-5s LLM call).
+    try:
+        from hermes_orch.core.memory import get_memory_writer
+        from hermes_orch.core.synthesis import get_recent_generator
+        db = request.app.state.db
+        recent_gen = get_recent_generator(db=db)
+        memory = get_memory_writer()
+        import asyncio
+        asyncio.create_task(
+            recent_gen.regenerate_recent_async(
+                memory_writer=memory, trigger=f"project.deleted:{project_id}"
+            ),
+            name=f"hermes-recent-rebuild-{project_id}",
+        )
+    except Exception as e:
+        log.warning(f"delete-triggered recent regen failed: {e}")
     return Response(status_code=204)
 
 
@@ -760,6 +779,62 @@ async def delete_project(project_id: str, request: Request):
 # See docs/design/3-tier-memory.md. Phase 1 implements L1 (trace.jsonl)
 # and L2 (facts.md); both are auto-written by the system. L3 (state.md)
 # is Phase 2.
+
+
+# ===== User-level memory endpoints (Phase 3) =====
+#
+# recent.md is the user-level L3 synthesis (7-day cross-project summary).
+# Lives at ~/.hermes-orchestrator/memory/recent.md (not per-project).
+# Auto-regenerated at supervisor startup and on project deletion;
+# manually triggerable here for the dashboard "Refresh" button.
+
+@router.get("/memory/recent")
+async def get_recent(request: Request) -> dict:
+    """Return the user-level L3 (recent.md) content + size + archive count."""
+    from hermes_orch.core.memory import get_memory_writer
+    writer = get_memory_writer()
+    content = writer.read_recent()
+    archive_dir = writer.memory_root / "recent_archive"
+    archive_size = 0
+    archive_count = 0
+    if archive_dir.exists():
+        try:
+            files = [f for f in archive_dir.iterdir() if f.is_file()]
+            archive_count = len(files)
+            archive_size = sum(f.stat().st_size for f in files)
+        except Exception:
+            pass
+    rpath = writer.memory_root / "recent.md"
+    return {
+        "content": content,
+        "exists": content is not None,
+        "size_bytes": rpath.stat().st_size if rpath.exists() else 0,
+        "archive_count": archive_count,
+        "archive_size_bytes": archive_size,
+    }
+
+
+@router.post("/memory/recent/regenerate")
+async def regenerate_recent(request: Request) -> dict:
+    """Manually trigger user-level L3 (recent.md) regeneration.
+
+    Returns immediately with {ok: true, regenerating: true} since
+    the LLM call takes 2-5s. The endpoint is fire-and-forget; poll
+    GET /memory/recent to see when the new content lands.
+    """
+    from hermes_orch.core.memory import get_memory_writer
+    from hermes_orch.core.synthesis import get_recent_generator
+    db = request.app.state.db
+    writer = get_memory_writer()
+    recent_gen = get_recent_generator(db=db)
+    import asyncio
+    asyncio.create_task(
+        recent_gen.regenerate_recent_async(
+            memory_writer=writer, trigger="manual"
+        ),
+        name="hermes-recent-regen-manual",
+    )
+    return {"ok": True, "regenerating": True}
 
 
 @router.get("/{project_id}/memory/state")

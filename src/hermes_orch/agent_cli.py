@@ -169,6 +169,37 @@ def _fetch_project_state_http(
     return content
 
 
+def _fetch_user_recent_http(
+    orchestrator_url: str, agent_id: str, secret: str
+) -> str | None:
+    """Fetch the user-level L3 (recent.md) via HTTP API. None if missing.
+
+    Returns the recent.md content (4KB cap). Used for cross-project
+    context: "what has the user been up to lately".
+    """
+    try:
+        r = httpx.get(
+            f"{orchestrator_url}/api/memory/recent",
+            headers=_hmac_headers(agent_id, secret),
+            timeout=10,
+        )
+    except Exception as e:
+        click.echo(f"[daemon] recent fetch HTTP error: {e}")
+        return None
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    if not data.get("exists"):
+        return None
+    content = data.get("content")
+    if not content:
+        return None
+    if len(content.encode("utf-8")) > 2048:
+        content = content.encode("utf-8")[:2048].decode("utf-8", errors="replace")
+        content += "\n[…recent truncated…]"
+    return content
+
+
 def _fetch_project_facts_http(
     orchestrator_url: str, agent_id: str, secret: str, project_id: str
 ) -> str | None:
@@ -935,6 +966,20 @@ def start(
         # nothing. Going through the orchestrator's HTTP API works
         # regardless of where the wrapper is running.
         try:
+            # Phase 3: also inject user-level L3 (recent.md) ABOVE all
+            # project-level context. recent.md is the cross-project 7-day
+            # summary so the agent knows what the user has been up to.
+            # Falls through silently if missing (first project ever).
+            recent_text = _fetch_user_recent_http(
+                orchestrator_url, agent_id, secret
+            )
+            if recent_text:
+                context_block = (
+                    "--- USER RECENT (L3: recent.md, last 7 days) ---\n"
+                    + recent_text
+                    + "\n--- END USER RECENT ---\n\n"
+                    + context_block
+                )
             # Phase 2: also inject L3 (state.md) ABOVE L2. L3 is the
             # LLM-synthesized high-level view; L2 is the cite-able
             # raw facts. Order matters: the agent sees the synthesis

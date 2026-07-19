@@ -89,6 +89,23 @@ class Supervisor:
             return
         self._stop.clear()
         self._task = asyncio.create_task(self._run(), name="hermes-supervisor")
+        # Phase 3: fire-and-forget user-level recent.md regen at startup
+        # so the planner has a fresh cross-project summary from the
+        # first goal it sees. Non-blocking -- if it fails, the manual
+        # POST /memory/recent/regenerate endpoint is the fallback.
+        try:
+            from hermes_orch.core.memory import get_memory_writer
+            from hermes_orch.core.synthesis import get_recent_generator
+            recent_gen = get_recent_generator(db=self.db)
+            memory = get_memory_writer()
+            asyncio.create_task(
+                recent_gen.regenerate_recent_async(
+                    memory_writer=memory, trigger="startup"
+                ),
+                name="hermes-recent-regen",
+            )
+        except Exception as e:
+            log.warning(f"startup recent regen trigger failed: {e}")
         log.info(f"supervisor started; interval={self.interval}s")
 
     async def stop(self) -> None:
