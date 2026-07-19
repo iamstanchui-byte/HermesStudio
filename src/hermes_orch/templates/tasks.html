@@ -4,19 +4,9 @@
 
 <div class="flex items-center justify-between mb-4">
     <h1 class="text-2xl font-bold text-gray-800">Tasks</h1>
-    <div class="flex items-center gap-4 text-sm">
-        <button id="collapse-all-btn" onclick="collapseAllResults()" class="text-xs text-gray-500 hover:text-gray-800" title="Hide all expanded result panels. Without this, the 10s auto-refresh pauses because the polling script skips reloads while a result panel is open.">
-            Collapse all
-        </button>
-        {% if filter_include_archived %}
-        <a href="/tasks" class="text-blue-600 hover:underline">Hide archived projects</a>
-        {% else %}
-        <a href="/tasks?include_archived=1" class="text-gray-500 hover:text-gray-700">Show archived projects</a>
-        {% endif %}
-        <div class="text-gray-500">
-            {% set end = (filter_offset + tasks|length) if tasks else filter_offset %}
-            Showing {{ filter_offset + 1 if total_count > 0 else 0 }}-{{ end }} of {{ total_count }}
-        </div>
+    <div class="text-sm text-gray-500">
+        {% set end = (filter_offset + tasks|length) if tasks else filter_offset %}
+        Showing {{ filter_offset + 1 if total_count > 0 else 0 }}-{{ end }} of {{ total_count }}
     </div>
 </div>
 
@@ -102,6 +92,20 @@
         <a href="/tasks?status={{ filter_status or '' }}&days={{ filter_days }}&limit=20" class="px-2 py-1 rounded {% if filter_limit == 20 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">20</a>
         <a href="/tasks?status={{ filter_status or '' }}&days={{ filter_days }}&limit=50" class="px-2 py-1 rounded {% if filter_limit == 50 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">50</a>
         <a href="/tasks?status={{ filter_status or '' }}&days={{ filter_days }}&limit=100" class="px-2 py-1 rounded {% if filter_limit == 100 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">100</a>
+    </div>
+    <div class="flex items-center gap-1 ml-auto">
+        <button id="collapse-all-btn" onclick="collapseAllResults()" class="px-2 py-1 rounded bg-white border text-gray-700 hover:bg-gray-50" title="Hide all expanded result panels. Without this, the 10s auto-refresh pauses because the polling script skips reloads while a result panel is open.">
+            Collapse all
+        </button>
+        {% if filter_include_archived %}
+        <a href="/tasks" class="px-2 py-1 rounded bg-blue-100 text-blue-800 border border-blue-200 hover:bg-blue-200" title="Hide tasks from archived/deleted projects">
+            Hide archived
+        </a>
+        {% else %}
+        <a href="/tasks?include_archived=1" class="px-2 py-1 rounded bg-white border text-gray-700 hover:bg-gray-50" title="Show tasks from archived/deleted projects too">
+            Show archived
+        </a>
+        {% endif %}
     </div>
 </div>
 
@@ -272,8 +276,6 @@ function collapseAllResults() {
         btn.textContent = count > 0 ? `Collapsed ${count}` : 'Nothing open';
         setTimeout(() => { btn.textContent = orig; }, 1200);
     }
-    if (el.classList.contains('hidden')) s.delete(taskId); else s.add(taskId);
-    saveOpenResults(s);
 }
 // Restore on page load
 getOpenResults().forEach(taskId => {
