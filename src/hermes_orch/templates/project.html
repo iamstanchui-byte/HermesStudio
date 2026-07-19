@@ -498,7 +498,7 @@ async function deleteProject(projectId) {
 // Re-trigger the LLM planner. If the project has no goal yet, prompt for one.
 // ===== Generate plan modal =====
 
-function openReplanModal(projectId) {
+async function openReplanModal(projectId) {
     // Pre-fill the modal fields from the project values stored in
     // hidden inputs next to the Generate button. We use a fresh form
     // instance each open so the user can change just one field without
@@ -521,6 +521,37 @@ function openReplanModal(projectId) {
         const ta = document.getElementById('replan-goal-input');
         if (ta) ta.focus();
     }, 50);
+    // Phase 1 of 3-tier memory: load the project's L2 (facts.md) into
+    // the modal so the user can see what prior work already exists
+    // before writing a new goal. Best-effort: failure does not block
+    // the modal.
+    try {
+        const memResp = await fetch(`/api/projects/${projectId}/memory/facts`);
+        if (memResp.ok) {
+            const mem = await memResp.json();
+            const memBox = document.getElementById('replan-memory-content');
+            const memWrap = document.getElementById('replan-memory-wrap');
+            if (memBox && memWrap) {
+                if (mem.content && mem.content.trim()) {
+                    memBox.textContent = mem.content;
+                    memBox.classList.add('font-mono', 'whitespace-pre-wrap');
+                    memWrap.classList.remove('hidden');
+                    const memMeta = document.getElementById('replan-memory-meta');
+                    if (memMeta) {
+                        memMeta.textContent =
+                            `${mem.size_bytes} bytes` +
+                            (mem.archive_size_bytes > 0
+                             ? ` (+ ${mem.archive_size_bytes} archived)`
+                             : '');
+                    }
+                } else {
+                    memWrap.classList.add('hidden');
+                }
+            }
+        }
+    } catch (e) {
+        // Silent — facts are best-effort
+    }
 }
 
 function closeReplanModal() {
@@ -721,6 +752,20 @@ async function deletePreset(agentId, profileName, btn) {
             </p>
 
             <div class="grid grid-cols-1 gap-3">
+                <div id="replan-memory-wrap" class="hidden mb-2">
+                    <details class="bg-blue-50 border border-blue-200 rounded p-2">
+                        <summary class="text-xs font-medium text-blue-800 cursor-pointer">
+                            📋 Project memory (L2) — what's been done
+                            <span id="replan-memory-meta" class="text-gray-500 font-normal"></span>
+                        </summary>
+                        <div id="replan-memory-content" class="mt-2 max-h-48 overflow-auto text-xs text-gray-700"></div>
+                        <p class="mt-1 text-xs text-gray-500">
+                            New tasks will see this automatically via the wrapper's prompt
+                            injection. Each fact cites an L1 (trace.jsonl) event.
+                        </p>
+                    </details>
+                </div>
+
                 <div>
                     <label class="block text-xs font-medium text-gray-700">
                         Goal <span class="text-red-500">*</span>

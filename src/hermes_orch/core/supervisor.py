@@ -265,6 +265,27 @@ class Supervisor:
                     "planner": self._plan_source_label(),
                 },
             )
+            # Phase 1 of 3-tier memory: append to L2 (facts.md) Plan
+            # History section. Best-effort — failure does not affect
+            # the audit log or plan save.
+            try:
+                from hermes_orch.core.memory import get_memory_writer
+                action_list = ", ".join(
+                    f"{t.get('name','?')}({t.get('action','?')})"
+                    for t in plan
+                )
+                get_memory_writer().append_fact_L2(
+                    project_id=pid,
+                    section="## Plan History",
+                    fact_text=(
+                        f"Plan N: {len(plan)} tasks "
+                        f"[{action_list[:300]}]"
+                        f" — planner={self._plan_source_label()}"
+                    ),
+                    cite_id=f"plan_generated@pid",
+                )
+            except Exception:
+                pass
             log.info(
                 f"project {pid}: plan generated ({self._plan_source_label()}), "
                 f"{len(plan)} tasks -> state=ready"
@@ -719,6 +740,26 @@ class Supervisor:
                 "summary": summary,
             },
         )
+        # Phase 1 of 3-tier memory: append verdict to L2 (facts.md) Coord
+        # Verdicts section. Best-effort.
+        try:
+            from hermes_orch.core.memory import get_memory_writer
+            verdict = "PASS" if decision_pass else "FAIL"
+            short_summary = (summary or "").replace("\n", " ").replace("\r", " ")
+            if len(short_summary) > 200:
+                short_summary = short_summary[:200] + "..."
+            get_memory_writer().append_fact_L2(
+                project_id=pid,
+                section="## Coord Verdicts",
+                fact_text=(
+                    f"Iter {cur_iter}/{max_iter} ({new_state}): "
+                    f"DECISION: {verdict}"
+                    + (f" -- {short_summary}" if short_summary else "")
+                ),
+                cite_id=f"iteration_completed@iter={cur_iter}",
+            )
+        except Exception:
+            pass
         # Unlink decision.md after consuming. The wrapper's auto-upload
         # skips decision.md, so this stays unlinked until a future review
         # task writes a fresh verdict. Without this, the file lingers and

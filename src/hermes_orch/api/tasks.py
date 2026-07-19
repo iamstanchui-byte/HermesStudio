@@ -427,6 +427,43 @@ async def submit_result(task_id: str, body: TaskResult, request: Request) -> Tas
             agent_id=task["assigned_agent_id"],
             payload={"summary": body.summary, "session_id": body.session_id},
         )
+        # Phase 1 of 3-tier memory (docs/design/3-tier-memory.md):
+        # append a 1-line summary of the task to L2 (facts.md) Task
+        # Results section, citing the L1 event. Best-effort.
+        try:
+            from hermes_orch.core.memory import get_memory_writer
+            # Extract a 1-line summary (first 200 chars, single line)
+            summary = (body.summary or "").replace("\n", " ").replace("\r", " ")
+            if len(summary) > 200:
+                summary = summary[:200] + "..."
+            artifacts = body.artifacts or []
+            artifact_names = [a.get("name") or a.get("path", "?") for a in artifacts]
+            fact_text = (
+                f"[{task_id}] {task.get('name', '?')} "
+                f"({task.get('agent_role', '?')})"
+            )
+            if summary:
+                fact_text += f" -- {summary}"
+            if artifact_names:
+                fact_text += f" (artifacts: {', '.join(artifact_names[:3])})"
+            get_memory_writer().append_fact_L2(
+                project_id=task["project_id"],
+                section="## Task Results",
+                fact_text=fact_text,
+                cite_id=f"task.completed@{task_id}",
+            )
+            # Track artifacts in the Files section
+            for a in artifacts:
+                aname = a.get("name") or a.get("path", "?")
+                asize = a.get("size_bytes", 0)
+                get_memory_writer().append_fact_L2(
+                    project_id=task["project_id"],
+                    section="## Files (artifacts)",
+                    fact_text=f"{aname} ({asize} bytes)",
+                    cite_id=f"task.completed@{task_id}",
+                )
+        except Exception:
+            pass
     else:  # failed
         await audit_log(
             db, "task.failed",

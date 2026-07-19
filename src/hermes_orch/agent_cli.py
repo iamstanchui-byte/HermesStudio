@@ -806,6 +806,19 @@ def start(
                     context_lines.append(f"PREVIOUS TASK {parent_id}: (could not fetch: {e})")
         context_block = "\n".join(context_lines)
 
+        # Phase 1 of 3-tier memory (docs/design/3-tier-memory.md): inject
+        # the project's L2 (facts.md) tail into the prompt so the new
+        # task knows what prior work already exists. Read is best-effort;
+        # if facts.md is missing or unreadable, fall through to the
+        # normal prompt.
+        try:
+            from hermes_orch.core.memory import get_memory_writer
+            facts_text = get_memory_writer().read_facts_tail(project_id, max_bytes=4096)
+            if facts_text:
+                context_block += "\n\n--- PROJECT MEMORY (L2: facts.md) ---\n" + facts_text + "\n--- END PROJECT MEMORY ---"
+        except Exception as e:
+            click.echo(f"[daemon] failed to load project memory: {e}")
+
         # Build prompt for hermes
         params_str = json.dumps(params, ensure_ascii=False) if params else "{}"
         if context_block:

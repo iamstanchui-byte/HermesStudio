@@ -60,4 +60,22 @@ async def audit_log(
         data["payload"] = payload
     data["created_at"] = created_at if created_at is not None else _now_iso()
     await db.insert("audit_log", data)
+    # Mirror to L1 (append-only JSONL trace) — best-effort. The audit_log
+    # table is the source of truth; L1 is a derived view that powers
+    # the project memory system (3-tier memory design, Phase 1).
+    try:
+        from hermes_orch.core.memory import get_memory_writer
+        get_memory_writer().append_event_L1(
+            event_type=event_type,
+            actor=actor or "unknown",
+            project_id=project_id,
+            task_id=task_id,
+            payload=payload if isinstance(payload, (dict, list)) else ({"raw": payload} if payload else {}),
+        )
+    except Exception as e:
+        # Don't fail the audit if memory write fails.
+        import logging
+        logging.getLogger("hermes_orch.core.audit").warning(
+            f"L1 trace write failed (event={event_type}): {e}"
+        )
 

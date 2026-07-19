@@ -219,6 +219,28 @@ async def create_project(body: ProjectCreate, request: Request) -> Project:
         _serialize_plan_md(decisions_fm, "\n# Decisions\n\n"), encoding="utf-8"
     )
 
+    # Phase 1 of 3-tier memory (docs/design/3-tier-memory.md): bootstrap
+    # facts.md for L2 (curated facts). The L1 (trace.jsonl) bootstrap
+    # happens automatically when audit_log() runs below — it mirrors
+    # every event to the per-project trace file.
+    try:
+        from hermes_orch.core.memory import get_memory_writer
+        memory = get_memory_writer()
+        memory.init_facts_file(project_id, project_name=body.name or project_id)
+        if initial_goal:
+            memory.append_fact_L2(
+                project_id=project_id,
+                section="## Goal",
+                fact_text=initial_goal,
+                cite_id="project.created",
+            )
+    except Exception as e:
+        # Don't fail project creation on memory init failure.
+        import logging
+        logging.getLogger("hermes_orch.api.projects").warning(
+            f"facts.md bootstrap failed: {e}"
+        )
+
     await audit_log(
         db, "project.created",
         actor="operator",
@@ -732,6 +754,89 @@ async def delete_project(project_id: str, request: Request):
     from fastapi import Response
 
     return Response(status_code=204)
+
+
+# ===== Memory endpoints (Phase 1 of 3-tier memory) =====
+# See docs/design/3-tier-memory.md. Phase 1 implements L1 (trace.jsonl)
+# and L2 (facts.md); both are auto-written by the system. L3 (state.md)
+# is Phase 2.
+
+
+@router.get("/{project_id}/memory/facts")
+async def get_project_facts(project_id: str, request: Request) -> dict:
+    """Return the project's L2 (facts.md) content for dashboard / replan modal."""
+    from hermes_orch.core.memory import get_memory_writer
+    pdir = _project_dir(request, project_id)
+    if not pdir.exists():
+        raise HTTPException(404, f"Project not found: {project_id}")
+    writer = get_memory_writer()
+    content = writer.read_facts_full(project_id)
+    fpath = pdir / "facts.md"
+    archive_path = pdir / "facts_archive.md"
+    return {
+        "project_id": project_id,
+        "content": content,
+        "size_bytes": fpath.stat().st_size if fpath.exists() else 0,
+        "archive_size_bytes": archive_path.stat().st_size if archive_path.exists() else 0,
+    }
+
+
+@router.get("/{project_id}/memory/trace")
+async def get_project_trace(
+    project_id: str,
+    request: Request,
+    since: str | None = None,
+    event_type: str | None = None,
+    limit: int = 200,
+) -> dict:
+    """Return filtered L1 (trace.jsonl) entries for audit / debug."""
+    pdir = _project_dir(request, project_id)
+    if not pdir.exists():
+        raise HTTPException(404, f"Project not found: {project_id}")
+    from hermes_orch.core.memory import get_memory_writer
+    writer = get_memory_writer()
+    entries = writer.read_trace(
+        project_id=project_id, since=since, event_type=event_type, limit=limit
+    )
+    return {
+        "project_id": project_id,
+        "entries": entries,
+        "count": len(entries),
+    }
+
+
+@router.patch("/{project_id}/memory/facts")
+async def append_project_fact(
+    project_id: str, body: dict, request: Request
+) -> dict:
+    """Append a human-edited fact to L2 (facts.md).
+
+    Body shape:
+        {
+            "section": "## Notes",     # any of FACTS_SECTIONS
+            "fact": "free-form text",
+            "cite_id": "optional L1 event_id",
+        }
+    """
+    pdir = _project_dir(request, project_id)
+    if not pdir.exists():
+        raise HTTPException(404, f"Project not found: {project_id}")
+    section = body.get("section", "## Human Notes")
+    fact_text = body.get("fact", "").strip()
+    cite_id = body.get("cite_id", "human_edit@now")
+    if not fact_text:
+        raise HTTPException(400, "fact is required")
+    from hermes_orch.core.memory import get_memory_writer
+    get_memory_writer().append_fact_L2(
+        project_id=project_id, section=section, fact_text=fact_text, cite_id=cite_id
+    )
+    await audit_log(
+        request.app.state.db, "project.fact_appended",
+        actor="operator",
+        project_id=project_id,
+        payload={"section": section, "fact": fact_text[:200]},
+    )
+    return {"ok": True, "project_id": project_id, "section": section}
 
 
 # ===== SOUL presets (§ — per-project agent identity) =====
