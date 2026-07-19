@@ -4,9 +4,14 @@
 
 <div class="flex items-center justify-between mb-4">
     <h1 class="text-2xl font-bold text-gray-800">Tasks</h1>
-    <div class="text-sm text-gray-500">
-        {% set end = (filter_offset + tasks|length) if tasks else filter_offset %}
-        Showing {{ filter_offset + 1 if total_count > 0 else 0 }}-{{ end }} of {{ total_count }}
+    <div class="flex items-center gap-4 text-sm">
+        <button id="collapse-all-btn" onclick="collapseAllResults()" class="text-xs text-gray-500 hover:text-gray-800" title="Hide all expanded result panels. Without this, the 10s auto-refresh pauses because the polling script skips reloads while a result panel is open.">
+            Collapse all
+        </button>
+        <div class="text-gray-500">
+            {% set end = (filter_offset + tasks|length) if tasks else filter_offset %}
+            Showing {{ filter_offset + 1 if total_count > 0 else 0 }}-{{ end }} of {{ total_count }}
+        </div>
     </div>
 </div>
 
@@ -156,11 +161,6 @@
             <button onclick="toggleResultPersist('{{ task.id }}')" class="text-blue-600 hover:underline">
                 View result
             </button>
-            {% if task.result.summary and task.result.summary|length > 300 %}
-            <button onclick="toggleFull('{{ task.id }}')" id="full-btn-{{ task.id }}" class="text-blue-600 hover:underline">
-                Show full
-            </button>
-            {% endif %}
             {% if task.result.summary %}
             <button onclick="copyResult('{{ task.id }}')" class="text-blue-600 hover:underline">
                 Copy
@@ -182,7 +182,7 @@
                 <span class="text-gray-500">Summary:</span>
                 <span class="text-gray-400">({{ task.result.summary|length }} chars)</span>
             </div>
-            <pre id="full-{{ task.id }}" class="hidden whitespace-pre-wrap break-words text-xs bg-white border rounded p-2 mt-1 max-h-96 overflow-auto">{{ task.result.summary }}</pre>
+            <pre id="full-{{ task.id }}" class="whitespace-pre-wrap break-words text-xs bg-white border rounded p-2 mt-1 max-h-96 overflow-auto">{{ task.result.summary }}</pre>
             {% endif %}
             {% if task.result.session_id %}
             <div class="mb-1"><span class="text-gray-500">Session ID:</span> <span class="font-mono">{{ task.result.session_id }}</span></div>
@@ -238,6 +238,35 @@ function toggleResultPersist(taskId) {
     if (!el) return;
     el.classList.toggle('hidden');
     const s = getOpenResults();
+    if (el.classList.contains('hidden')) {
+        s.delete(taskId);
+    } else {
+        s.add(taskId);
+    }
+    saveOpenResults(s);
+}
+
+// Close all open result panels at once. The 10s auto-refresh script
+// pauses whenever a result panel is visible, so this is the
+// "I'm done reading, resume polling" button.
+function collapseAllResults() {
+    const s = getOpenResults();
+    let count = 0;
+    s.forEach(taskId => {
+        const el = document.getElementById('result-' + taskId);
+        if (el) {
+            el.classList.add('hidden');
+            count++;
+        }
+    });
+    saveOpenResults(new Set());
+    // Visual feedback: briefly change the button text
+    const btn = document.getElementById('collapse-all-btn');
+    if (btn) {
+        const orig = btn.textContent;
+        btn.textContent = count > 0 ? `Collapsed ${count}` : 'Nothing open';
+        setTimeout(() => { btn.textContent = orig; }, 1200);
+    }
     if (el.classList.contains('hidden')) s.delete(taskId); else s.add(taskId);
     saveOpenResults(s);
 }
