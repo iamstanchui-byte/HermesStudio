@@ -98,7 +98,7 @@
                 </div>
             </form>
 
-            <div class="mt-2 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+            <div class="mt-2 grid grid-cols-1 gap-2">
                 {% for p in agent.profiles %}
                 <div class="border rounded p-3 bg-gray-50" id="profile-card-{{ agent.id }}-{{ p.name }}">
                     <div class="flex items-center justify-between">
@@ -157,30 +157,30 @@
                             </div>
                         </div>
                         {% if p.skills %}
-                        <div class="mt-1 space-y-1" id="skills-list-{{ agent.id }}-{{ p.name }}">
-                            {% for s in p.skills %}
-                            <div class="flex items-center justify-between text-xs bg-white border rounded px-2 py-1 {% if loop.index > 5 %}hidden skills-extra-{{ agent.id }}-{{ p.name }}{% endif %}">
-                                <div class="flex items-center gap-2 flex-1 min-w-0">
-                                    <span class="font-mono text-gray-700 truncate" title="{{ s.file_path }}">{{ s.name }}</span>
-                                    <span class="px-1 rounded text-[10px]
-                                        {% if s.status == 'applied' %}bg-green-100 text-green-800
-                                        {% elif s.status == 'pending' or s.status == 'applying' %}bg-yellow-100 text-yellow-800
-                                        {% elif s.status == 'failed' %}bg-red-100 text-red-800
-                                        {% else %}bg-gray-100 text-gray-700{% endif %}">
-                                        {{ s.status }}
-                                    </span>
-                                    <span class="text-gray-400">{{ s.size }}b</span>
-                                </div>
-                                <div class="flex items-center gap-1 flex-shrink-0">
-                                    <button onclick="deleteSkill('{{ agent.id }}', '{{ p.name }}', '{{ s.name }}')" class="text-red-600 hover:underline" title="Delete this skill (wrapper will remove the folder)">&times;</button>
-                                </div>
-                            </div>
-                            {% endfor %}
-                            {% if p.skills|length > 5 %}
-                            <button id="skills-toggle-{{ agent.id }}-{{ p.name }}" onclick="toggleSkillsList('{{ agent.id }}-{{ p.name }}', {{ p.skills|length }})" class="text-xs text-blue-600 hover:underline mt-1">
-                                Show all {{ p.skills|length }} skills &#x25BC;
+                        <div class="mt-1">
+                            <button id="skills-toggle-{{ agent.id }}-{{ p.name }}" onclick="toggleSkillsList('{{ agent.id }}-{{ p.name }}', {{ p.skills|length }})" class="text-xs text-blue-600 hover:underline">
+                                Show {{ p.skills|length }} skill{{ '' if p.skills|length == 1 else 's' }} &#x25BC;
                             </button>
-                            {% endif %}
+                            <div class="mt-1 space-y-1 hidden" id="skills-list-{{ agent.id }}-{{ p.name }}">
+                                {% for s in p.skills %}
+                                <div class="flex items-center justify-between text-xs bg-white border rounded px-2 py-1">
+                                    <div class="flex items-center gap-2 flex-1 min-w-0">
+                                        <span class="font-mono text-gray-700 truncate" title="{{ s.file_path }}">{{ s.name }}</span>
+                                        <span class="px-1 rounded text-[10px]
+                                            {% if s.status == 'applied' %}bg-green-100 text-green-800
+                                            {% elif s.status == 'pending' or s.status == 'applying' %}bg-yellow-100 text-yellow-800
+                                            {% elif s.status == 'failed' %}bg-red-100 text-red-800
+                                            {% else %}bg-gray-100 text-gray-700{% endif %}">
+                                            {{ s.status }}
+                                        </span>
+                                        <span class="text-gray-400">{{ s.size }}b</span>
+                                    </div>
+                                    <div class="flex items-center gap-1 flex-shrink-0">
+                                        <button onclick="deleteSkill('{{ agent.id }}', '{{ p.name }}', '{{ s.name }}')" class="text-red-600 hover:underline" title="Delete this skill (wrapper will remove the folder)">&times;</button>
+                                    </div>
+                                </div>
+                                {% endfor %}
+                            </div>
                         </div>
                         {% else %}
                         <div class="mt-1 text-xs text-gray-400">No skills yet. Skills are created by agents (via task → write SKILL.md to the agent's skills folder); this list shows what's been synced. Use "Sync from disk" to pull in new ones.</div>
@@ -474,21 +474,19 @@ function startSoulPolling(agentId, profileName, cfgId) {
 // can pick the right role for each task.
 
 function toggleSkillsList(key, total) {
-    const extras = document.querySelectorAll('.skills-extra-' + key);
-    if (extras.length === 0) return;
-    // Detect current state by looking at the first extra row
-    const firstHidden = extras[0].classList.contains('hidden');
-    extras.forEach(row => {
-        if (firstHidden) row.classList.remove('hidden');
-        else row.classList.add('hidden');
-    });
+    // The skills list is one hidden div, not a "first 5 + extras" pattern.
+    // Default: list collapsed, button reads "Show N skills ▼".
+    // Click:   list expanded, button reads "Hide N skills ▲".
+    const list = document.getElementById('skills-list-' + key);
     const btn = document.getElementById('skills-toggle-' + key);
-    if (btn) {
-        if (firstHidden) {
-            btn.innerHTML = 'Show less &#x25B2;';
-        } else {
-            btn.innerHTML = 'Show all ' + total + ' skills &#x25BC;';
-        }
+    if (!list || !btn) return;
+    const isHidden = list.classList.contains('hidden');
+    if (isHidden) {
+        list.classList.remove('hidden');
+        btn.innerHTML = 'Hide ' + total + ' skill' + (total === 1 ? '' : 's') + ' &#x25B2;';
+    } else {
+        list.classList.add('hidden');
+        btn.innerHTML = 'Show ' + total + ' skill' + (total === 1 ? '' : 's') + ' &#x25BC;';
     }
 }
 
