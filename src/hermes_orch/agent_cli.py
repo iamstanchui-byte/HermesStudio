@@ -1415,7 +1415,10 @@ def start(
                         **_auth_headers(),
                         "X-Skill-Source": "self-taught",
                     },
-                    json={"name": name, "content": content_text},
+                    # format="folder" → hermes 0.17+ will actually read
+                    # this. Without it, the file gets written flat and
+                    # hermes ignores it (see 2026-07-19 layout migration).
+                    json={"name": name, "content": content_text, "format": "folder"},
                     timeout=15,
                 )
                 if r.status_code == 201:

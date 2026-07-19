@@ -876,15 +876,19 @@ def _validate_skill_name(name: str) -> str:
     return name
 
 
-def _skill_file_path(skill_name: str, fmt: str = "file") -> str:
+def _skill_file_path(skill_name: str, fmt: str = "folder") -> str:
     """Map a skill name to its canonical file_path in profile_configs.
 
-    fmt="file"   → skills/<name>.md       (flat, backward compatible)
-    fmt="folder" → skills/<name>/SKILL.md (hermes convention with refs/scripts)
+    fmt="folder" → skills/<name>/SKILL.md (hermes 0.17+ convention; this is
+                    what hermes actually reads on the agent host. We made
+                    this the default on 2026-07-19 after discovering that
+                    hermes 0.17+ does NOT read flat .md files -- every
+                    wrapper-uploaded skill was silently a no-op).
+    fmt="file"   → skills/<name>.md       (flat, legacy / pre-0.17)
     """
-    if fmt == "folder":
-        return f"skills/{skill_name}/SKILL.md"
-    return f"skills/{skill_name}.md"
+    if fmt == "file":
+        return f"skills/{skill_name}.md"
+    return f"skills/{skill_name}/SKILL.md"
 
 
 async def _latest_skill_config(db: Any, profile_id: str, skill_name: str) -> dict[str, Any] | None:
@@ -1010,7 +1014,9 @@ async def create_or_update_skill(
     profile = await _find_profile(db, agent_id, profile_name)
     name = _validate_skill_name(body.name)
     content = body.content or ""
-    fmt = (body.format or "file").strip().lower()
+    # Default to "folder" because hermes 0.17+ actually reads SKILL.md
+    # inside skills/<name>/ — flat .md files are silently ignored.
+    fmt = (body.format or "folder").strip().lower()
     if fmt not in ("file", "folder"):
         raise HTTPException(400, f"invalid format {fmt!r}: must be 'file' or 'folder'")
     cfg_id = str(uuid.uuid4())
