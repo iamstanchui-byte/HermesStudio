@@ -60,10 +60,14 @@
                 <input type="hidden" id="replan-deliverable" value="{{ project.deliverable_path or '' }}">
                 {% if project.state == 'archived' %}
                 <button onclick="unarchiveProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-blue-100 text-blue-800 rounded hover:bg-blue-200">Unarchive</button>
+                {% elif project.state == 'deleted' %}
+                <button onclick="undeleteProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-green-100 text-green-800 rounded hover:bg-green-200" title="Restore this soft-deleted project. Goes back to its prior state (e.g. 'completed'). Does NOT re-run any tasks.">Undelete</button>
                 {% else %}
                 <button onclick="archiveProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-yellow-100 text-yellow-800 rounded hover:bg-yellow-200">Archive</button>
                 {% endif %}
+                {% if project.state != 'deleted' %}
                 <button onclick="deleteProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-red-100 text-red-800 rounded hover:bg-red-200">Delete</button>
+                {% endif %}
             </div>
         </div>
     </div>
@@ -501,6 +505,20 @@ async function unarchiveProject(projectId) {
         const r = await fetch('/api/projects/' + projectId + '/unarchive', {method: 'POST'});
         if (r.ok) location.reload();
         else alert('Failed: ' + r.status);
+    } catch (err) {
+        alert('Error: ' + err.message);
+    }
+}
+
+async function undeleteProject(projectId) {
+    if (!confirm('Restore this soft-deleted project? State will go back to its prior value (e.g. "completed"). No tasks will be re-run.')) return;
+    try {
+        const r = await fetch('/api/projects/' + projectId + '/undelete', {method: 'POST'});
+        if (r.ok) location.reload();
+        else {
+            const err = await r.json().catch(() => ({}));
+            alert('Failed: ' + (err.detail || r.status));
+        }
     } catch (err) {
         alert('Error: ' + err.message);
     }
