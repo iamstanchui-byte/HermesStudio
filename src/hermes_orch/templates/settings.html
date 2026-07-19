@@ -7,7 +7,11 @@
 </div>
 
 <h1 class="text-2xl font-bold text-gray-800 mb-1">Settings</h1>
-<p class="text-sm text-gray-500 mb-6">Connect an LLM provider to enable natural-language project planning.</p>
+<p class="text-sm text-gray-500 mb-2">Connect an LLM provider to enable natural-language project planning.</p>
+<p class="text-xs text-gray-500 mb-6">
+    Settings are saved to <code>~/.hermes-orchestrator/config.yaml</code>.
+    After changing LLM settings, the next planning call will use the new configuration automatically.
+</p>
 
 <!-- LLM Settings Card -->
 <div class="bg-white border rounded-lg p-6 shadow-sm mb-4">
@@ -167,83 +171,6 @@
     </form>
 </div>
 
-<!-- Telegram Settings Card -->
-<div class="bg-white border rounded-lg p-6 shadow-sm mb-4">
-    <h2 class="text-lg font-semibold text-gray-800 mb-3">Telegram Notifications <span class="text-xs text-gray-500 font-normal">(optional)</span></h2>
-
-    {% if tg_enabled and tg_token_set %}
-    <div class="bg-green-50 border border-green-200 rounded p-4 mb-4">
-        <div class="flex items-center gap-2 mb-2">
-            <span class="px-2 py-0.5 bg-green-600 text-white rounded text-xs font-semibold">ENABLED</span>
-            <span class="text-sm text-green-800">Will send alerts to your Telegram</span>
-        </div>
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1 text-sm">
-            <div><span class="text-gray-500">Bot token:</span> <span class="font-mono">ending in {{ tg_token_last4 }}</span></div>
-            <div><span class="text-gray-500">Chat ID:</span> <span class="font-mono font-semibold">{{ tg_chat_id }}</span></div>
-        </div>
-    </div>
-    {% elif tg_token_set or tg_chat_id %}
-    <div class="bg-yellow-50 border border-yellow-200 rounded p-4 mb-4">
-        <div class="flex items-center gap-2 mb-1">
-            <span class="px-2 py-0.5 bg-yellow-600 text-white rounded text-xs font-semibold">CONFIGURED BUT NOT ENABLED</span>
-        </div>
-        <p class="text-sm text-yellow-700">
-            Bot token saved, but notifications are disabled. Check the "Enable" box below and Save.
-        </p>
-    </div>
-    {% else %}
-    <div class="bg-gray-50 border border-gray-200 rounded p-4 mb-4">
-        <div class="flex items-center gap-2 mb-1">
-            <span class="px-2 py-0.5 bg-gray-500 text-white rounded text-xs font-semibold">NOT SET UP</span>
-            <span class="text-sm text-gray-700">No Telegram bot configured</span>
-        </div>
-        <p class="text-sm text-gray-600">
-            Optional. Get notified when the supervisor needs your attention.
-        </p>
-    </div>
-    {% endif %}
-
-    <p class="text-sm text-gray-500 mb-4">
-        Get notified when the supervisor needs your attention (planner failure, stuck project, project completed).
-    </p>
-
-    <form id="tg-form" class="space-y-3">
-        <div>
-            <label class="block text-xs font-medium text-gray-700 mb-1">Bot Token <span class="text-gray-400">(from @BotFather)</span></label>
-            <input id="tg-token" type="password" class="block w-full border rounded px-2 py-1 text-sm font-mono"
-                placeholder="{% if tg_token_last4 %}Current: ending in {{ tg_token_last4 }}{% else %}e.g. 123456789:ABCdef...{% endif %}"
-                autocomplete="off">
-        </div>
-        <div>
-            <label class="block text-xs font-medium text-gray-700 mb-1">Chat ID <span class="text-gray-400">(your personal or group chat ID)</span></label>
-            <input id="tg-chat" type="text" class="block w-full border rounded px-2 py-1 text-sm font-mono"
-                value="{{ tg_chat_id or '' }}">
-            <div class="text-xs text-gray-500 mt-1">
-                Tip: send a message to your bot, then check <code>getUpdates</code> at
-                <code>https://api.telegram.org/bot&lt;token&gt;/getUpdates</code> to find your chat ID.
-            </div>
-        </div>
-        <div class="flex items-center gap-2">
-            <input id="tg-enabled" type="checkbox" {% if tg_enabled %}checked{% endif %} class="rounded">
-            <label for="tg-enabled" class="text-sm text-gray-700">Enable Telegram notifications</label>
-        </div>
-        <div class="flex items-center gap-2 pt-2">
-            <button type="button" onclick="testTelegram()" class="px-4 py-2 bg-gray-700 text-white rounded text-sm hover:bg-gray-800">
-                Send test message
-            </button>
-            <button type="button" onclick="saveTelegram()" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
-                Save
-            </button>
-            <span id="tg-status" class="text-sm text-gray-500"></span>
-        </div>
-    </form>
-</div>
-
-<div class="text-xs text-gray-500">
-    <p>Settings are saved to <code>~/.hermes-orchestrator/config.yaml</code>.</p>
-    <p class="mt-1">After changing LLM settings, the next planning call will use the new configuration automatically.</p>
-</div>
-
 <!-- Cleanup Job Card -->
 <div class="bg-white border rounded-lg p-6 shadow-sm mb-4">
     <h2 class="text-lg font-semibold text-gray-800 mb-1">
@@ -315,6 +242,78 @@
             {% else %}
             <em>Never run yet.</em> Will run automatically on next server start, or click "Preview" to see what would be deleted.
             {% endif %}
+        </div>
+    </form>
+</div>
+
+<!-- Telegram Settings Card -->
+<div class="bg-white border rounded-lg p-6 shadow-sm mb-4">
+    <h2 class="text-lg font-semibold text-gray-800 mb-3">Telegram Notifications <span class="text-xs text-gray-500 font-normal">(optional)</span></h2>
+
+    {% if tg_enabled and tg_token_set %}
+    <div class="bg-green-50 border border-green-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-2">
+            <span class="px-2 py-0.5 bg-green-600 text-white rounded text-xs font-semibold">ENABLED</span>
+            <span class="text-sm text-green-800">Will send alerts to your Telegram</span>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1 text-sm">
+            <div><span class="text-gray-500">Bot token:</span> <span class="font-mono">ending in {{ tg_token_last4 }}</span></div>
+            <div><span class="text-gray-500">Chat ID:</span> <span class="font-mono font-semibold">{{ tg_chat_id }}</span></div>
+        </div>
+    </div>
+    {% elif tg_token_set or tg_chat_id %}
+    <div class="bg-yellow-50 border border-yellow-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-1">
+            <span class="px-2 py-0.5 bg-yellow-600 text-white rounded text-xs font-semibold">CONFIGURED BUT NOT ENABLED</span>
+        </div>
+        <p class="text-sm text-yellow-700">
+            Bot token saved, but notifications are disabled. Check the "Enable" box below and Save.
+        </p>
+    </div>
+    {% else %}
+    <div class="bg-gray-50 border border-gray-200 rounded p-4 mb-4">
+        <div class="flex items-center gap-2 mb-1">
+            <span class="px-2 py-0.5 bg-gray-500 text-white rounded text-xs font-semibold">NOT SET UP</span>
+            <span class="text-sm text-gray-700">No Telegram bot configured</span>
+        </div>
+        <p class="text-sm text-gray-600">
+            Optional. Get notified when the supervisor needs your attention.
+        </p>
+    </div>
+    {% endif %}
+
+    <p class="text-sm text-gray-500 mb-4">
+        Get notified when the supervisor needs your attention (planner failure, stuck project, project completed).
+    </p>
+
+    <form id="tg-form" class="space-y-3">
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">Bot Token <span class="text-gray-400">(from @BotFather)</span></label>
+            <input id="tg-token" type="password" class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                placeholder="{% if tg_token_last4 %}Current: ending in {{ tg_token_last4 }}{% else %}e.g. 123456789:ABCdef...{% endif %}"
+                autocomplete="off">
+        </div>
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">Chat ID <span class="text-gray-400">(your personal or group chat ID)</span></label>
+            <input id="tg-chat" type="text" class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                value="{{ tg_chat_id or '' }}">
+            <div class="text-xs text-gray-500 mt-1">
+                Tip: send a message to your bot, then check <code>getUpdates</code> at
+                <code>https://api.telegram.org/bot&lt;token&gt;/getUpdates</code> to find your chat ID.
+            </div>
+        </div>
+        <div class="flex items-center gap-2">
+            <input id="tg-enabled" type="checkbox" {% if tg_enabled %}checked{% endif %} class="rounded">
+            <label for="tg-enabled" class="text-sm text-gray-700">Enable Telegram notifications</label>
+        </div>
+        <div class="flex items-center gap-2 pt-2">
+            <button type="button" onclick="testTelegram()" class="px-4 py-2 bg-gray-700 text-white rounded text-sm hover:bg-gray-800">
+                Send test message
+            </button>
+            <button type="button" onclick="saveTelegram()" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                Save
+            </button>
+            <span id="tg-status" class="text-sm text-gray-500"></span>
         </div>
     </form>
 </div>
