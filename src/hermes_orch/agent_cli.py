@@ -166,9 +166,42 @@ def _clean_hermes_output(stdout: str) -> str:
         s,
         flags=re.MULTILINE | re.DOTALL,
     )
+    # Strip the prompt-template echo that hermes prepends to its output
+    # (Query: ... --- PROJECT CONTEXT --- ... --- END CONTEXT ---). Without
+    # this, L2 (facts.md) Task Results entries get polluted with
+    # "Query: create_file(...) LOCAL WORKING DIR: ... SKILL SELF-TEACHING
+    # ..." which is the wrapper's own prompt text echoed back.
+    s = _strip_prompt_echo(s)
     # Collapse 3+ blank lines into 1.
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
+
+
+def _strip_prompt_echo(s: str) -> str:
+    """Strip the prompt template echo that hermes prepends to its output.
+
+    The wrapper builds the prompt as:
+        {action}({params})\\n\\n--- PROJECT CONTEXT ---\\n{context_block}\\n--- END CONTEXT ---
+
+    Hermes echoes this prompt at the top of its stdout (because it was the
+    system message it received), so without stripping, the orchestrator's
+    task summary contains "Query: create_file(...) --- PROJECT CONTEXT ---
+    LOCAL WORKING DIR: ... SKILL SELF-TEACHING..." which is just noise
+    from the human reader's perspective and pollutes the L2 (facts.md)
+    Task Results section that gets injected into future task prompts.
+
+    Strategy: only strip if the markers are near the start (first ~1500
+    chars) -- if the body of the analysis references these strings later
+    in the output, we leave them alone.
+    """
+    head = s[:1500]
+    # If we find the closing marker near the start, drop everything up to it
+    m = re.search(r"\s*--- END CONTEXT ---\s*\n", head)
+    if m:
+        return s[m.end():].lstrip()
+    # If only "Query: ..." is at the start, drop that single line
+    s = re.sub(r"^Query:[^\n]*\n\n?", "", s, count=1)
+    return s
 
 
 def _load_wrapper_config(config_path: Path) -> dict:

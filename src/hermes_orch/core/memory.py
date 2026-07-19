@@ -321,15 +321,32 @@ class MemoryWriter:
             return "[earlier entries truncated]\n" + tail
         return text
 
-    def read_facts_full(self, project_id: str) -> str | None:
-        """Read the full facts.md (no truncation)."""
+    def read_facts_full(self, project_id: str, section: str | None = None) -> str | None:
+        """Read the full facts.md (no truncation), or a single section's body.
+
+        If `section` is provided (e.g. "## Files (artifacts)"), returns
+        just the body of that section, with the heading stripped and
+        surrounding blank lines trimmed. Returns None if section missing.
+        """
         p = _project_facts_path(project_id, self.projects_root)
         if not p.exists():
             return None
         try:
-            return p.read_text(encoding="utf-8")
+            full = p.read_text(encoding="utf-8")
         except Exception:
             return None
+        if not section:
+            return full
+        if f"{section}\n" not in full and not full.startswith(section):
+            return None
+        # Split at the section heading
+        after = full.split(section, 1)[1]
+        # Strip the section's trailing block: up to next "## " heading
+        import re as _re
+        m = _re.search(r"^## ", after, flags=_re.MULTILINE)
+        if m:
+            after = after[: m.start()]
+        return after.strip()
 
 
 # ===== Singleton =====

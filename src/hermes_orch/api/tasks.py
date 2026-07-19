@@ -452,10 +452,28 @@ async def submit_result(task_id: str, body: TaskResult, request: Request) -> Tas
                 fact_text=fact_text,
                 cite_id=f"task.completed@{task_id}",
             )
-            # Track artifacts in the Files section
+            # Track artifacts in the Files section. DEDUP: a given
+            # (name, size) pair only appears once per project even if
+            # multiple tasks read the same artifact (which is common --
+            # downstream tasks all auto-report upstream files in their
+            # body.artifacts list). Without dedup, "## Files" grows
+            # linearly with task count and is hard to read.
+            import re as _re
+            existing_files = get_memory_writer().read_facts_full(
+                project_id=task["project_id"],
+                section="## Files (artifacts)",
+            )
+            seen: set[tuple[str, int]] = set()
+            for line in existing_files.splitlines():
+                fm = _re.match(r"^- \[cite:[^]]+\] (.+) \((\d+) bytes\)$", line.strip())
+                if fm:
+                    seen.add((fm.group(1), int(fm.group(2))))
             for a in artifacts:
                 aname = a.get("name") or a.get("path", "?")
                 asize = a.get("size_bytes", 0)
+                if (aname, asize) in seen:
+                    continue
+                seen.add((aname, asize))
                 get_memory_writer().append_fact_L2(
                     project_id=task["project_id"],
                     section="## Files (artifacts)",

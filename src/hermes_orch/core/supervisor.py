@@ -282,7 +282,13 @@ class Supervisor:
                         f"[{action_list[:300]}]"
                         f" — planner={self._plan_source_label()}"
                     ),
-                    cite_id=f"plan_generated@pid",
+                    # Use a timestamp in the cite so multiple plans
+                    # (initial + replans) for the same project each get
+                    # a distinct, traceable cite_id. The literal "pid"
+                    # placeholder was never replaced -- every plan cite
+                    # said "@pid" which is uninformative and identical
+                    # across plans.
+                    cite_id=f"plan_generated@{_now_iso()}",
                 )
             except Exception:
                 pass
