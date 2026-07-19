@@ -36,8 +36,10 @@
             box-shadow: 0 1px 2px rgba(0,0,0,0.2);
             transition: left 0.15s;
         }
-        .toggle-on .toggle-track { background: #3b82f6; }
-        .toggle-on .toggle-knob { left: 16px; }
+        /* Both classes on the same element — the JS sets toggle-on
+           on the .toggle-track span itself. */
+        .toggle-track.toggle-on { background: #3b82f6; }
+        .toggle-track.toggle-on .toggle-knob { left: 16px; }
 
         /* Dark mode overrides. When body has .dark class, override the
            most common Tailwind colors used across templates. */
@@ -71,6 +73,48 @@
         body.dark .bg-yellow-50 { background-color: #422006; border-color: #78350f; }
         /* link in nav: keep accent */
         body.dark a.text-blue-600 { color: #60a5fa; }
+        /* Form fields (input, select, textarea) — browser default is
+           white bg / black text, which is unreadable on dark theme.
+           Override background, text, border, and focus ring. */
+        body.dark input,
+        body.dark select,
+        body.dark textarea {
+            background-color: #1f2937;
+            color: #f3f4f6;
+            border-color: #4b5563;
+        }
+        body.dark input::placeholder,
+        body.dark textarea::placeholder {
+            color: #6b7280;
+        }
+        body.dark input:focus,
+        body.dark select:focus,
+        body.dark textarea:focus {
+            border-color: #60a5fa;
+            outline: none;
+            box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.2);
+        }
+        /* Select dropdown options inherit the dark background in
+           most browsers, but on Windows Chrome the popup menu may
+           still render light. Force dark on the option list too. */
+        body.dark select option { background-color: #1f2937; color: #f3f4f6; }
+        /* Checkbox/radio also need explicit styling */
+        body.dark input[type="checkbox"],
+        body.dark input[type="radio"] {
+            background-color: #374151;
+            border-color: #6b7280;
+        }
+        /* <pre> blocks (project memory L2 dump, agent output, etc.) */
+        body.dark pre {
+            background-color: #0f172a !important;
+            color: #e5e7eb !important;
+            border-color: #4b5563 !important;
+        }
+        body.dark pre code { color: #fbbf24; }
+        /* Tables (history, projects list) — invert header + row colors */
+        body.dark table th { background-color: #1f2937; color: #f3f4f6; }
+        body.dark table td { border-color: #4b5563; }
+        body.dark table tr:hover { background-color: #1f2937; }
         .dot-verifying { background: #f59e0b; }
     </style>
 </head>
