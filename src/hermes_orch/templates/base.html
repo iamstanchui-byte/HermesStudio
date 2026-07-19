@@ -13,6 +13,64 @@
         .dot-running { background: #10b981; }
         .dot-idle { background: #9ca3af; }
         .dot-error { background: #ef4444; }
+
+        /* Toggle switch (used by auto-refresh + theme buttons) */
+        .toggle-track {
+            position: relative;
+            display: inline-block;
+            width: 32px;
+            height: 18px;
+            background: #cbd5e1;
+            border-radius: 9px;
+            transition: background 0.15s;
+            vertical-align: middle;
+        }
+        .toggle-knob {
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 14px;
+            height: 14px;
+            background: #fff;
+            border-radius: 50%;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+            transition: left 0.15s;
+        }
+        .toggle-on .toggle-track { background: #3b82f6; }
+        .toggle-on .toggle-knob { left: 16px; }
+
+        /* Dark mode overrides. When body has .dark class, override the
+           most common Tailwind colors used across templates. */
+        body.dark { background: #111827; color: #f3f4f6; }
+        body.dark .bg-white { background-color: #1f2937; }
+        body.dark .bg-gray-50 { background-color: #374151; }
+        body.dark .bg-gray-100 { background-color: #374151; }
+        body.dark .bg-gray-200 { background-color: #4b5563; }
+        body.dark .bg-yellow-50 { background-color: #422006; }
+        body.dark .bg-yellow-100 { background-color: #422006; }
+        body.dark .bg-green-100 { background-color: #064e3b; }
+        body.dark .bg-blue-100 { background-color: #1e3a8a; }
+        body.dark .bg-indigo-50 { background-color: #312e81; }
+        body.dark .text-gray-800 { color: #f3f4f6; }
+        body.dark .text-gray-700 { color: #e5e7eb; }
+        body.dark .text-gray-600 { color: #d1d5db; }
+        body.dark .text-gray-500 { color: #9ca3af; }
+        body.dark .text-gray-400 { color: #9ca3af; }
+        body.dark .text-yellow-800 { color: #fde68a; }
+        body.dark .text-green-800 { color: #6ee7b7; }
+        body.dark .text-blue-800 { color: #93c5fd; }
+        body.dark .text-blue-600 { color: #60a5fa; }
+        body.dark .text-indigo-700 { color: #a5b4fc; }
+        body.dark .border-gray-200 { border-color: #4b5563; }
+        body.dark .border { border-color: #4b5563; }
+        body.dark .border-b { border-color: #4b5563; }
+        body.dark pre { background: #0f172a !important; color: #e5e7eb; }
+        body.dark code { background: #374151; color: #fbbf24; }
+        /* Nav stays slightly elevated */
+        body.dark nav.bg-white { background-color: #1f2937; border-color: #374151; }
+        body.dark .bg-yellow-50 { background-color: #422006; border-color: #78350f; }
+        /* link in nav: keep accent */
+        body.dark a.text-blue-600 { color: #60a5fa; }
         .dot-verifying { background: #f59e0b; }
     </style>
 </head>
@@ -27,14 +85,23 @@
                 <a href="/history" class="{% if active_page == 'history' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">History</a>
                 <a href="/settings" class="{% if active_page == 'settings' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Settings</a>
             </div>
-            <div class="ml-auto flex items-center gap-3 text-xs">
+            <div class="ml-auto flex items-center gap-4 text-xs">
                 {% if llm_configured %}
                 <span class="px-2 py-0.5 bg-green-100 text-green-800 rounded">LLM ready</span>
                 {% else %}
                 <span class="px-2 py-0.5 bg-yellow-100 text-yellow-800 rounded">Mock mode</span>
                 {% endif %}
-                <button id="auto-refresh-toggle" onclick="toggleAutoRefresh()" class="px-2 py-0.5 bg-blue-100 text-blue-800 rounded hover:bg-blue-200" title="Pause/resume the 10s auto-refresh polling. Persists across page reloads via localStorage.">
-                    <span id="auto-refresh-label">10s polling</span>
+                {# Auto-refresh toggle: switch UI. Click anywhere to toggle. #}
+                <button id="auto-refresh-toggle" onclick="toggleAutoRefresh()" class="flex items-center gap-2" title="Pause/resume 10s page auto-refresh. Persists in localStorage.">
+                    <span id="auto-refresh-label" class="text-gray-500">Auto-refresh</span>
+                    <span id="auto-refresh-switch" class="toggle-track">
+                        <span class="toggle-knob"></span>
+                    </span>
+                </button>
+                {# Dark mode toggle #}
+                <button id="theme-toggle" onclick="toggleTheme()" class="flex items-center gap-2" title="Toggle dark mode. Persists in localStorage.">
+                    <span id="theme-label" class="text-gray-500">Light</span>
+                    <span id="theme-icon">&#9728;</span>
                 </button>
             </div>
         </div>
@@ -81,32 +148,47 @@
     function stopPolling() {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     }
+    function setAutoRefreshUI(paused) {
+        const sw = document.getElementById('auto-refresh-switch');
+        if (sw) sw.classList.toggle('toggle-on', !paused);
+        const btn = document.getElementById('auto-refresh-toggle');
+        if (btn) btn.title = paused
+            ? 'Auto-refresh paused. Click to resume (10s).'
+            : 'Auto-refresh on (every 10s). Click to pause.';
+    }
     function toggleAutoRefresh() {
         userPaused = !userPaused;
         localStorage.setItem('orch.autoRefresh', userPaused ? 'off' : 'on');
-        const btn = document.getElementById('auto-refresh-toggle');
-        const label = document.getElementById('auto-refresh-label');
-        if (userPaused) {
-            stopPolling();
-            btn.className = 'px-2 py-0.5 bg-gray-200 text-gray-600 rounded hover:bg-gray-300';
-            label.textContent = 'paused';
-            btn.title = 'Auto-refresh paused. Click to resume.';
-        } else {
-            startPolling();
-            btn.className = 'px-2 py-0.5 bg-blue-100 text-blue-800 rounded hover:bg-blue-200';
-            label.textContent = '10s polling';
-            btn.title = 'Pause/resume the 10s auto-refresh polling. Persists across page reloads via localStorage.';
-        }
+        setAutoRefreshUI(userPaused);
+        if (userPaused) stopPolling();
+        else startPolling();
     }
-    // Apply persisted state on load
-    (function initRefreshToggle() {
-        if (!userPaused) return;
-        const btn = document.getElementById('auto-refresh-toggle');
-        const label = document.getElementById('auto-refresh-label');
-        if (btn) { btn.className = 'px-2 py-0.5 bg-gray-200 text-gray-600 rounded hover:bg-gray-300'; }
-        if (label) { label.textContent = 'paused'; }
-        if (btn) { btn.title = 'Auto-refresh paused. Click to resume.'; }
+
+    // ===== Theme (light / dark) =====
+    function setTheme(dark) {
+        document.body.classList.toggle('dark', dark);
+        const label = document.getElementById('theme-label');
+        const icon = document.getElementById('theme-icon');
+        if (label) label.textContent = dark ? 'Dark' : 'Light';
+        if (icon) icon.innerHTML = dark ? '&#9789;' : '&#9728;';  // moon / sun
+        const btn = document.getElementById('theme-toggle');
+        if (btn) btn.title = dark ? 'Dark mode on. Click to switch to light.'
+                                  : 'Light mode on. Click to switch to dark.';
+    }
+    function toggleTheme() {
+        const dark = !document.body.classList.contains('dark');
+        localStorage.setItem('orch.theme', dark ? 'dark' : 'light');
+        setTheme(dark);
+    }
+    // Apply persisted theme on load (before polling to avoid a flash)
+    (function initTheme() {
+        const dark = localStorage.getItem('orch.theme') === 'dark';
+        if (dark) document.body.classList.add('dark');
+        setTheme(dark);
     })();
+
+    // Initialize refresh toggle visual state from persisted value
+    setAutoRefreshUI(userPaused);
     startPolling();
     // Also explicitly pause when focusing inputs (extra safety)
     document.addEventListener('focusin', (e) => {
