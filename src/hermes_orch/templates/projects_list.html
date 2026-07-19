@@ -19,14 +19,14 @@
 </div>
 
 <!-- Filters -->
-<form method="get" action="/projects" class="mb-3 bg-white border rounded p-3 flex items-center gap-3 text-sm flex-wrap">
+<form method="get" action="/projects" id="filter-form" class="mb-3 bg-white border rounded p-3 flex items-center gap-3 text-sm flex-wrap">
     {% if show_archived %}<input type="hidden" name="show_archived" value="true">{% endif %}
     {% if show_deleted %}<input type="hidden" name="show_deleted" value="true">{% endif %}
     <div class="flex items-center gap-2">
         <label class="text-xs text-gray-600">State:</label>
         <select name="state" class="border rounded px-2 py-1 text-xs">
             <option value="">All states</option>
-            {% for s in ['planning', 'ready', 'running', 'completed', 'paused', 'cancelled'] %}
+            {% for s in ['planning', 'ready', 'running', 'completed', 'paused', 'cancelled', 'archived', 'deleted'] %}
             <option value="{{ s }}" {% if filter_state == s %}selected{% endif %}>{{ s }}</option>
             {% endfor %}
         </select>
@@ -35,10 +35,10 @@
         <label class="text-xs text-gray-600">Created in last:</label>
         <select name="days" class="border rounded px-2 py-1 text-xs">
             <option value="">Any time</option>
-            <option value="1" {% if filter_days == 1 %}selected{% endif %}>1 day</option>
-            <option value="7" {% if filter_days == 7 %}selected{% endif %}>7 days</option>
-            <option value="30" {% if filter_days == 30 %}selected{% endif %}>30 days</option>
-            <option value="90" {% if filter_days == 90 %}selected{% endif %}>90 days</option>
+            <option value="1" {% if filter_days == '1' %}selected{% endif %}>1 day</option>
+            <option value="7" {% if filter_days == '7' %}selected{% endif %}>7 days</option>
+            <option value="30" {% if filter_days == '30' %}selected{% endif %}>30 days</option>
+            <option value="90" {% if filter_days == '90' %}selected{% endif %}>90 days</option>
         </select>
     </div>
     <div class="flex items-center gap-2">
@@ -54,6 +54,17 @@
     <a href="/projects{% if show_archived %}?show_archived=true{% endif %}{% if show_deleted %}&show_deleted=true{% endif %}" class="text-xs text-gray-500 hover:text-gray-800">Clear filters</a>
     {% endif %}
 </form>
+<script>
+// Strip empty selects from form before submit so URL stays clean
+// (e.g. no "?state=&days=&limit=50"). This avoids 422s from any
+// backend that hasn't been updated to accept empty-string params.
+document.getElementById('filter-form').addEventListener('submit', (e) => {
+    const form = e.target;
+    form.querySelectorAll('select').forEach(s => {
+        if (s.value === '' || s.value == null) s.disabled = true;
+    });
+});
+</script>
 
 <!-- Create new project (collapsed) -->
 <button onclick="toggleForm('new-project-form')" class="mb-3 text-sm text-blue-600 hover:underline">
