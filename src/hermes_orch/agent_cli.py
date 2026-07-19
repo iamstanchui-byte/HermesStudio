@@ -109,10 +109,20 @@ MAX_SUMMARY_CHARS = 32_000
 
 
 def _atomic_write(target: Path, content: str) -> None:
-    """Atomic write: write to .tmp then rename. Survives partial writes."""
+    """Atomic write: write to .tmp then rename. Survives partial writes.
+
+    IMPORTANT: pass ``newline=""`` to write_text. On Windows, the default
+    ``newline=None`` translates ``\n`` to ``os.linesep`` (``\r\n``) on every
+    write. Combined with the wrapper's self-taught reverse-sync (read disk,
+    POST content, apply back), this creates a runaway loop: each round adds
+    one more ``\r`` before every ``\n``, so skill files grow by ~N bytes
+    per round where N is the line count. Setting ``newline=""`` keeps the
+    bytes-on-disk identical to ``content.encode("utf-8")``, so file SHA ==
+    desired_sha and the auto-sync dedup holds.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
+    tmp.write_text(content, encoding="utf-8", newline="")
     # On Windows, Path.replace is atomic if both files on same volume.
     tmp.replace(target)
 

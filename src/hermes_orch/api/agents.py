@@ -1058,7 +1058,6 @@ async def create_or_update_skill(
             "size": len(content),
             "operation": "delete" if content == "" else "upsert",
             "source": skill_source or "operator",
-            "format": fmt,
         },
     )
     return _row_to_config(row)
