@@ -169,8 +169,23 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
         )
         profile_list = [dict(p) for p in profiles]
         # Augment each profile with its current skills (latest version per name).
+        # Also parse the `capabilities` JSON column to a dict — the DB stores
+        # it as a string, but the template (and the Pydantic model in the API
+        # path) expects a dict. Without this parse, the template chokes with
+        # "str object has no attribute 'items'" when a profile has any
+        # capabilities set. Phase 4 (smart dispatch).
         for p in profile_list:
             p["skills"] = await _load_profile_skills(db, p["id"])
+            caps_raw = p.get("capabilities")
+            caps: dict[str, bool] = {}
+            if caps_raw:
+                try:
+                    parsed = json.loads(caps_raw) if isinstance(caps_raw, str) else caps_raw
+                    if isinstance(parsed, dict):
+                        caps = {str(k): bool(v) for k, v in parsed.items()}
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            p["capabilities"] = caps
         agents.append(
             {
                 "id": row["id"],
