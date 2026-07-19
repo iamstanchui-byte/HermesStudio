@@ -117,6 +117,88 @@ def _atomic_write(target: Path, content: str) -> None:
     tmp.replace(target)
 
 
+# ===== Project memory fetch (HTTP) =====
+#
+# The wrapper needs to read the project's L2 (facts.md) and L3 (state.md)
+# for prompt injection. We do this via the orchestrator's HTTP API rather
+# than reading from disk because the wrapper runs on a different machine
+# than the orchestrator (e.g. linux-a-01 vs the Windows server), so its
+# local filesystem doesn't have the projects_root path. Going through HTTP
+# works regardless of where the wrapper is running.
+
+def _hmac_headers(agent_id: str, secret: str) -> dict:
+    import time as _t
+    import hashlib as _h
+    return {
+        "X-Agent-Id": agent_id,
+        "X-Timestamp": str(int(_t.time())),
+        "X-Signature": _h.sha256(secret.encode()).hexdigest(),
+    }
+
+
+def _fetch_project_state_http(
+    orchestrator_url: str, agent_id: str, secret: str, project_id: str
+) -> str | None:
+    """Fetch the project's L3 (state.md) via HTTP API. None if missing.
+
+    Returns the full state.md content (no truncation; we apply 2KB cap
+    client-side via simple char count, since L3 is already capped at
+    2KB by the synthesis module).
+    """
+    try:
+        r = httpx.get(
+            f"{orchestrator_url}/api/projects/{project_id}/memory/state",
+            headers=_hmac_headers(agent_id, secret),
+            timeout=10,
+        )
+    except Exception as e:
+        click.echo(f"[daemon] state fetch HTTP error: {e}")
+        return None
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    if not data.get("exists"):
+        return None
+    content = data.get("content")
+    if not content:
+        return None
+    # Cap at 2KB client-side
+    if len(content.encode("utf-8")) > 2048:
+        content = content.encode("utf-8")[:2048].decode("utf-8", errors="replace")
+        content += "\n[…truncated…]"
+    return content
+
+
+def _fetch_project_facts_http(
+    orchestrator_url: str, agent_id: str, secret: str, project_id: str
+) -> str | None:
+    """Fetch the project's L2 (facts.md) tail via HTTP API. None if missing.
+
+    Returns the last 4KB of facts.md, matching what the LLM will benefit
+    from seeing (recent task results > old goal text). Truncation marker
+    is prepended if the file is larger.
+    """
+    try:
+        r = httpx.get(
+            f"{orchestrator_url}/api/projects/{project_id}/memory/facts",
+            headers=_hmac_headers(agent_id, secret),
+            timeout=10,
+        )
+    except Exception as e:
+        click.echo(f"[daemon] facts fetch HTTP error: {e}")
+        return None
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    content = data.get("content")
+    if not content:
+        return None
+    if len(content.encode("utf-8")) > 4096:
+        tail = content.encode("utf-8")[-4096:].decode("utf-8", errors="replace")
+        return "[earlier entries truncated]\n" + tail
+    return content
+
+
 def _clean_hermes_output(stdout: str) -> str:
     """Strip noise from hermes stdout before storing as task summary.
 
@@ -844,9 +926,32 @@ def start(
         # task knows what prior work already exists. Read is best-effort;
         # if facts.md is missing or unreadable, fall through to the
         # normal prompt.
+        #
+        # IMPORTANT: read via HTTP API, NOT via MemoryWriter disk read.
+        # The wrapper runs on a different machine (e.g. linux-a-01) than
+        # the orchestrator (Windows), so its local filesystem doesn't have
+        # the projects_root path. MemoryWriter on the wrapper would fall
+        # back to a default path that doesn't exist, silently injecting
+        # nothing. Going through the orchestrator's HTTP API works
+        # regardless of where the wrapper is running.
         try:
-            from hermes_orch.core.memory import get_memory_writer
-            facts_text = get_memory_writer().read_facts_tail(project_id, max_bytes=4096)
+            # Phase 2: also inject L3 (state.md) ABOVE L2. L3 is the
+            # LLM-synthesized high-level view; L2 is the cite-able
+            # raw facts. Order matters: the agent sees the synthesis
+            # first (faster orientation), then the supporting evidence.
+            state_text = _fetch_project_state_http(
+                orchestrator_url, agent_id, secret, project_id
+            )
+            if state_text:
+                context_block = (
+                    "--- PROJECT STATE (L3: state.md) ---\n"
+                    + state_text
+                    + "\n--- END PROJECT STATE ---\n\n"
+                    + context_block
+                )
+            facts_text = _fetch_project_facts_http(
+                orchestrator_url, agent_id, secret, project_id
+            )
             if facts_text:
                 context_block += "\n\n--- PROJECT MEMORY (L2: facts.md) ---\n" + facts_text + "\n--- END PROJECT MEMORY ---"
         except Exception as e:

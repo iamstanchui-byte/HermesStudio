@@ -766,6 +766,45 @@ class Supervisor:
             )
         except Exception:
             pass
+        # Phase 2 of 3-tier memory: trigger L3 (state.md) regeneration.
+        # Best-effort — LLM call failures are logged but don't affect
+        # the project's iter state. Triggered here (per spec:
+        # "regenerated on every iteration_completed") because that's
+        # when the project state is most useful for downstream tasks.
+        try:
+            from hermes_orch.core.memory import get_memory_writer
+            from hermes_orch.core.synthesis import get_state_generator
+            memory = get_memory_writer()
+            facts_text = memory.read_facts_full(pid) or ""
+            state_gen = get_state_generator()
+            regen_ok = await state_gen.regenerate_state_async(
+                project_id=pid,
+                project_meta={
+                    "id": pid,
+                    "name": proj.get("name", pid),
+                    "state": new_state,
+                    "current_iteration": cur_iter,
+                    "max_iterations": max_iter,
+                },
+                facts_text=facts_text,
+                memory_writer=memory,
+                trigger="iteration_completed",
+            )
+            if regen_ok:
+                try:
+                    await audit_log(
+                        self.db, "project.state_regenerated",
+                        actor="synthesis",
+                        project_id=pid,
+                        payload={
+                            "trigger": "iteration_completed",
+                            "iter": cur_iter,
+                        },
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"L3 state regen failed for {pid}: {e}")
         # Unlink decision.md after consuming. The wrapper's auto-upload
         # skips decision.md, so this stays unlinked until a future review
         # task writes a fresh verdict. Without this, the file lingers and

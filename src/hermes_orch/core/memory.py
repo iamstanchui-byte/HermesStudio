@@ -32,6 +32,8 @@ DEFAULT_MEMORY_ROOT = Path.home() / ".hermes-orchestrator" / "memory"
 TRACE_FILENAME = "trace.jsonl"
 FACTS_FILENAME = "facts.md"
 ARCHIVE_FILENAME = "facts_archive.md"
+STATE_FILENAME = "state.md"
+STATE_ARCHIVE_DIRNAME = "state_archive"
 
 
 def _project_dir(project_id: str, projects_root: Path) -> Path:
@@ -49,6 +51,14 @@ def _project_facts_path(project_id: str, projects_root: Path) -> Path:
 
 def _project_archive_path(project_id: str, projects_root: Path) -> Path:
     return _project_dir(project_id, projects_root) / ARCHIVE_FILENAME
+
+
+def _project_state_path(project_id: str, projects_root: Path) -> Path:
+    return _project_dir(project_id, projects_root) / STATE_FILENAME
+
+
+def _project_state_archive_dir(project_id: str, projects_root: Path) -> Path:
+    return _project_dir(project_id, projects_root) / STATE_ARCHIVE_DIRNAME
 
 
 # Standard section headers in facts.md (canonical ordering)
@@ -347,6 +357,65 @@ class MemoryWriter:
         if m:
             after = after[: m.start()]
         return after.strip()
+
+    # ===== L3 (state.md) — Phase 2 =====
+
+    def read_state(self, project_id: str) -> str | None:
+        """Read state.md. Returns None if missing/unreadable."""
+        p = _project_state_path(project_id, self.projects_root)
+        if not p.exists():
+            return None
+        try:
+            return p.read_text(encoding="utf-8")
+        except Exception:
+            return None
+
+    def read_state_tail(
+        self, project_id: str, max_bytes: int = 2048
+    ) -> str | None:
+        """Read state.md, truncating to max_bytes for prompt injection.
+
+        Returns None if state.md doesn't exist. Truncation is byte-aware
+        to avoid breaking multi-byte UTF-8 (e.g. CJK).
+        """
+        text = self.read_state(project_id)
+        if text is None:
+            return None
+        encoded = text.encode("utf-8")
+        if len(encoded) > max_bytes:
+            head = encoded[:max_bytes].decode("utf-8", errors="replace")
+            return head + "\n[…state truncated…]"
+        return text
+
+    def write_state(self, project_id: str, content: str) -> bool:
+        """Write state.md, archiving the previous version first.
+
+        Archives to `<project_dir>/state_archive/<timestamp>.md` so the
+        diff between iterations is visible (each regen leaves a
+        breadcrumb). Returns True on success.
+        """
+        p = _project_state_path(project_id, self.projects_root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime as _dt
+        try:
+            with self._lock:
+                if p.exists():
+                    try:
+                        archive_dir = p.parent / STATE_ARCHIVE_DIRNAME
+                        archive_dir.mkdir(parents=True, exist_ok=True)
+                        ts = _dt.now().strftime("%Y%m%dT%H%M%S")
+                        old = p.read_text(encoding="utf-8")
+                        (archive_dir / f"{ts}.md").write_text(
+                            old, encoding="utf-8"
+                        )
+                    except Exception as e:
+                        # Archive failure is non-fatal
+                        log.warning(f"L3 state archive failed: {e}")
+                p.write_text(content, encoding="utf-8")
+            return True
+        except Exception as e:
+            log.warning(f"L3 state write failed (project={project_id}): {e}")
+            return False
 
 
 # ===== Singleton =====
