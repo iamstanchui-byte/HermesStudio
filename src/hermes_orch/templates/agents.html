@@ -100,27 +100,27 @@
 
             <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;">
                 {% for p in agent.profiles %}
-                <div class="border rounded p-3 bg-gray-50" style="flex:1 1 320px; min-width:320px;" id="profile-card-{{ agent.id }}-{{ p.name }}">
-                    <div class="flex items-center justify-between">
-                        <span class="font-mono text-sm font-semibold">{{ p.name }}</span>
-                        <div class="flex items-center gap-1">
-                            <span class="px-2 py-0.5 text-xs rounded
+                <div class="border rounded p-3 bg-gray-50" style="flex:1 1 320px; min-width:0;" id="profile-card-{{ agent.id }}-{{ p.name }}">
+                    {# Header row: name + status (left) | caps + edit + SOUL + × (right) #}
+                    <div class="flex items-center justify-between gap-2 flex-wrap">
+                        <div class="flex items-center gap-2 min-w-0">
+                            <span class="font-mono text-sm font-semibold">{{ p.name }}</span>
+                            <span class="px-1.5 py-0.5 text-[10px] rounded
                                 {% if p.status == 'busy' %}bg-red-100 text-red-800
                                 {% elif p.status == 'idle' %}bg-gray-200 text-gray-700
                                 {% else %}bg-yellow-100 text-yellow-800{% endif %}">
                                 {{ p.status }}
                             </span>
-                            <button onclick="editProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-blue-600 hover:underline ml-1" title="Edit description">&#9998;</button>
-                            <button onclick="toggleSoulEditor('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-purple-600 hover:underline ml-1" title="Edit SOUL.md (wrapper-mediated). On Linux, the file is SOUL.md (uppercase) — match the case for the agent to pick it up.">SOUL.md</button>
-                            <button onclick="removeProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-red-600 hover:underline ml-1" title="Remove profile">&times;</button>
+                        </div>
+                        <div class="flex items-center gap-1 flex-shrink-0">
+                            {% for k, v in p.capabilities.items() %}{% if v %}<span class="px-1 bg-indigo-50 text-indigo-700 rounded text-[10px]" title="capability">{{ k }}</span>{% endif %}{% endfor %}
+                            <button onclick="editProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-blue-600 hover:underline" title="Edit description">&#9998;</button>
+                            <button onclick="toggleSoulEditor('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-purple-600 hover:underline" title="Edit SOUL.md (wrapper-mediated). On Linux, the file is SOUL.md (uppercase) — match the case for the agent to pick it up.">SOUL.md</button>
+                            <button onclick="removeProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-red-600 hover:underline" title="Remove profile">&times;</button>
                         </div>
                     </div>
                     {% if p.description %}
                     <div class="text-xs text-gray-600 mt-1">{{ p.description }}</div>
-                    {% endif %}
-                    {% if p.capabilities %}
-                    {% set any_caps = false %}
-                    {% for k, v in p.capabilities.items() %}{% if v %}{% if not any_caps %}<div class="text-xs text-gray-600 mt-1" title="Capabilities (Phase 4 smart dispatch). Tasks with required_capability that this profile lacks will fail with dispatch.mismatch."><span class="font-mono">caps:</span> {% endif %}<span class="px-1 bg-indigo-50 text-indigo-700 rounded">{{ k }}</span> {% set any_caps = true %}{% endif %}{% endfor %}{% if any_caps %}</div>{% endif %}
                     {% endif %}
                     <form id="edit-profile-{{ agent.id }}-{{ p.name }}" class="hidden mt-2 p-2 bg-white border rounded" onsubmit="saveProfileEdit(event, '{{ agent.id }}', '{{ p.name }}')">
                         <textarea name="description" class="w-full text-xs border rounded p-1" rows="2" placeholder="description (optional)">{{ p.description or '' }}</textarea>
