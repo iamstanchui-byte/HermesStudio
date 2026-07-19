@@ -148,7 +148,6 @@
                             </div>
                             <div class="flex items-center gap-3">
                                 <button onclick="syncSkillsFromDisk('{{ agent.id }}', '{{ p.name }}', this)" class="text-xs text-green-700 hover:underline" title="Trigger the wrapper to scan &lt;profile&gt;/skills/ on the agent host and register any files the orchestrator doesn't know about yet (e.g. skills you copied in via the file manager, or skills the agent taught itself).">&#x21bb; Sync from disk</button>
-                                <button onclick="toggleSkillEditor('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-blue-600 hover:underline" title="Add or edit skill files. Skills are written to &lt;profile&gt;/skills/&lt;name&gt;.md on the agent host and are visible to the agent as documentation. The planner uses this list to pick the right role for each task.">+ Add skill</button>
                             </div>
                         </div>
                         {% if p.skills %}
@@ -156,7 +155,7 @@
                             {% for s in p.skills %}
                             <div class="flex items-center justify-between text-xs bg-white border rounded px-2 py-1 {% if loop.index > 5 %}hidden skills-extra-{{ agent.id }}-{{ p.name }}{% endif %}">
                                 <div class="flex items-center gap-2 flex-1 min-w-0">
-                                    <span class="font-mono text-gray-700 truncate" title="skills/{{ s.name }}.md">{{ s.name }}.md</span>
+                                    <span class="font-mono text-gray-700 truncate" title="skills/{{ s.name }}/SKILL.md">{{ s.name }}/SKILL.md</span>
                                     <span class="px-1 rounded text-[10px]
                                         {% if s.status == 'applied' %}bg-green-100 text-green-800
                                         {% elif s.status == 'pending' or s.status == 'applying' %}bg-yellow-100 text-yellow-800
@@ -167,8 +166,7 @@
                                     <span class="text-gray-400">{{ s.size }}b</span>
                                 </div>
                                 <div class="flex items-center gap-1 flex-shrink-0">
-                                    <button onclick="editSkill('{{ agent.id }}', '{{ p.name }}', '{{ s.name }}')" class="text-blue-600 hover:underline" title="Edit this skill">&#9998;</button>
-                                    <button onclick="deleteSkill('{{ agent.id }}', '{{ p.name }}', '{{ s.name }}')" class="text-red-600 hover:underline" title="Delete this skill (wrapper will remove the file)">&times;</button>
+                                    <button onclick="deleteSkill('{{ agent.id }}', '{{ p.name }}', '{{ s.name }}')" class="text-red-600 hover:underline" title="Delete this skill (wrapper will remove the folder)">&times;</button>
                                 </div>
                             </div>
                             {% endfor %}
@@ -179,36 +177,8 @@
                             {% endif %}
                         </div>
                         {% else %}
-                        <div class="mt-1 text-xs text-gray-400">No skills yet. Click "+ Add skill" to teach this agent a new capability (e.g. how to call a specific API).</div>
+                        <div class="mt-1 text-xs text-gray-400">No skills yet. Skills are created by agents (via task → write SKILL.md to the agent's skills folder); this list shows what's been synced. Use "Sync from disk" to pull in new ones.</div>
                         {% endif %}
-
-                        <!-- Skill editor (hidden by default) -->
-                        <div id="skill-editor-{{ agent.id }}-{{ p.name }}" class="hidden mt-2 p-2 bg-white border rounded">
-                            <div class="text-xs text-gray-500 mb-1">
-                                Skill name (no spaces, no <code>/</code>). Format controls on-disk layout.
-                            </div>
-                            <div class="flex items-center gap-2 mb-1">
-                                <input id="skill-name-{{ agent.id }}-{{ p.name }}" type="text" class="flex-1 text-xs border rounded p-1 font-mono" placeholder="skill name (e.g. mt5, telegram-direct)">
-                                <select id="skill-format-{{ agent.id }}-{{ p.name }}" class="text-xs border rounded p-1" title="Layout on the agent host. Use 'folder' to match hermes convention (skills/<name>/SKILL.md with optional references/ and scripts/ siblings).">
-                                    <option value="file" selected>.md file</option>
-                                    <option value="folder">folder (SKILL.md)</option>
-                                </select>
-                            </div>
-                            <textarea id="skill-text-{{ agent.id }}-{{ p.name }}" class="w-full text-xs border rounded p-1 font-mono" rows="8" placeholder="# MT5 Bridge
-
-Use these endpoints to query market data from the local MT5 bridge:
-
-- GET http://localhost:5001/candles/XAUUSD?tf=M15&count=200
-- GET http://localhost:5001/positions
-- POST http://localhost:5001/order  {symbol, side, volume, sl, tp}
-
-Always check positions before placing new orders."></textarea>
-                            <div class="mt-1 flex items-center gap-2">
-                                <button onclick="submitSkill('{{ agent.id }}', '{{ p.name }}')" class="text-xs px-2 py-0.5 bg-blue-600 text-white rounded">Apply</button>
-                                <button onclick="toggleSkillEditor('{{ agent.id }}', '{{ p.name }}')" class="text-xs px-2 py-0.5 bg-gray-200 rounded">Cancel</button>
-                                <span id="skill-status-{{ agent.id }}-{{ p.name }}" class="text-xs text-gray-500"></span>
-                            </div>
-                        </div>
                     </div>
                 </div>
                 {% endfor %}
@@ -483,106 +453,6 @@ function startSoulPolling(agentId, profileName, cfgId) {
 // wrapper applies on its next tick. The planner reads the same list so it
 // can pick the right role for each task.
 
-function toggleSkillEditor(agentId, profileName) {
-    const ed = document.getElementById(`skill-editor-${agentId}-${profileName}`);
-    const nameInput = document.getElementById(`skill-name-${agentId}-${profileName}`);
-    const textArea = document.getElementById(`skill-text-${agentId}-${profileName}`);
-    if (ed.classList.contains('hidden')) {
-        // Opening fresh — clear and let user type a new name
-        ed.classList.remove('hidden');
-        if (!ed.dataset.editingName) {
-            nameInput.value = '';
-            nameInput.disabled = false;
-            textArea.value = '';
-        }
-    } else {
-        ed.classList.add('hidden');
-        ed.dataset.editingName = '';
-        nameInput.disabled = false;
-    }
-}
-
-async function editSkill(agentId, profileName, skillName) {
-    // Open editor and prefill with the skill's current content
-    const ed = document.getElementById(`skill-editor-${agentId}-${profileName}`);
-    const nameInput = document.getElementById(`skill-name-${agentId}-${profileName}`);
-    const textArea = document.getElementById(`skill-text-${agentId}-${profileName}`);
-    const status = document.getElementById(`skill-status-${agentId}-${profileName}`);
-    ed.classList.remove('hidden');
-    nameInput.value = skillName;
-    nameInput.disabled = true;  // can't rename via the editor
-    status.textContent = 'loading...';
-    status.className = 'text-xs text-gray-500';
-    textArea.value = '';
-    ed.dataset.editingName = skillName;
-    try {
-        const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}/skills/${encodeURIComponent(skillName)}`);
-        if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            status.textContent = 'load failed: ' + (err.detail || r.status);
-            status.className = 'text-xs text-red-600';
-            return;
-        }
-        const sk = await r.json();
-        textArea.value = sk.content || '';
-        status.textContent = '';
-        status.className = 'text-xs text-gray-500';
-    } catch (err) {
-        status.textContent = 'load error: ' + err.message;
-        status.className = 'text-xs text-red-600';
-    }
-}
-
-async function submitSkill(agentId, profileName) {
-    const ed = document.getElementById(`skill-editor-${agentId}-${profileName}`);
-    const nameInput = document.getElementById(`skill-name-${agentId}-${profileName}`);
-    const formatSelect = document.getElementById(`skill-format-${agentId}-${profileName}`);
-    const textArea = document.getElementById(`skill-text-${agentId}-${profileName}`);
-    const status = document.getElementById(`skill-status-${agentId}-${profileName}`);
-    const name = (nameInput.value || '').trim();
-    const content = textArea.value || '';
-    const format = formatSelect ? formatSelect.value : 'file';
-    if (!name) {
-        status.textContent = 'name is required';
-        status.className = 'text-xs text-red-600';
-        return;
-    }
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(name) || name === '.' || name === '..') {
-        status.textContent = 'invalid name (use letters, digits, ., _, -)';
-        status.className = 'text-xs text-red-600';
-        return;
-    }
-    status.textContent = 'submitting...';
-    status.className = 'text-xs text-gray-500';
-    try {
-        const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}/skills`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({name: name, content: content, format: format}),
-        });
-        if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            status.textContent = 'Error: ' + (err.detail || r.status);
-            status.className = 'text-xs text-red-600';
-            return;
-        }
-        status.textContent = 'pending; reload to see status...';
-        status.className = 'text-xs text-yellow-700';
-        // Reload after a short delay so the wrapper has time to apply.
-        // Skip the reload if the user is mid-typing in a form (smart polling).
-        if (!document.activeElement || document.activeElement === document.body) {
-            setTimeout(() => location.reload(), 1500);
-        }
-    } catch (err) {
-        status.textContent = 'Network error: ' + err.message;
-        status.className = 'text-xs text-red-600';
-    }
-}
-
-// Collapse/expand the skills list for a profile when there are more than
-// 5 skills. Initial render shows the first 5; the rest are hidden via a
-// per-profile CSS class. The toggle flips that class on each extra row
-// and updates the button label.
 function toggleSkillsList(key, total) {
     const extras = document.querySelectorAll('.skills-extra-' + key);
     if (extras.length === 0) return;
@@ -603,7 +473,7 @@ function toggleSkillsList(key, total) {
 }
 
 async function deleteSkill(agentId, profileName, skillName) {
-    if (!confirm(`Delete skill "${skillName}.md"? The file will be removed from the agent host.`)) return;
+    if (!confirm(`Delete skill "${skillName}"? The folder skills/${skillName}/ will be removed from the agent host.`)) return;
     try {
         const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}/skills/${encodeURIComponent(skillName)}`, {
             method: 'DELETE',

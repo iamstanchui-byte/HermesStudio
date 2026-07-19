@@ -123,15 +123,14 @@ class SkillCreate(BaseModel):
     """Body for creating/updating a skill.
 
     `name` is filename-safe (no path separators, no leading dot).
-    `format` controls the on-disk layout:
-      - "file"   (default, backward compatible): skills/<name>.md
-      - "folder" (hermes convention): skills/<name>/SKILL.md
-        with optional references/ and scripts/ siblings (not tracked by
-        the orchestrator; the agent host owns them).
+    The skill is always written as `skills/<name>/SKILL.md` (hermes
+    0.17+ folder layout). Skill creation is normally done by
+    agents (via the wrapper's auto-sync of self-taught SKILL.md
+    files); the dashboard POST endpoint exists for the wrapper
+    flow and is not exposed in the operator UI.
     """
     name: str
     content: str = ""
-    format: str = "file"  # "file" | "folder"
 
 
 class SkillInfo(BaseModel):
@@ -876,41 +875,30 @@ def _validate_skill_name(name: str) -> str:
     return name
 
 
-def _skill_file_path(skill_name: str, fmt: str = "folder") -> str:
+def _skill_file_path(skill_name: str) -> str:
     """Map a skill name to its canonical file_path in profile_configs.
 
-    fmt="folder" → skills/<name>/SKILL.md (hermes 0.17+ convention; this is
-                    what hermes actually reads on the agent host. We made
-                    this the default on 2026-07-19 after discovering that
-                    hermes 0.17+ does NOT read flat .md files -- every
-                    wrapper-uploaded skill was silently a no-op).
-    fmt="file"   → skills/<name>.md       (flat, legacy / pre-0.17)
+    Hermes 0.17+ (and later) only reads the folder layout
+    `skills/<name>/SKILL.md`. We dropped flat-file support entirely
+    on 2026-07-19 (commit d5b7c9a follow-up to a7516ba) because
+    every wrapper-uploaded flat-path skill was a no-op anyway --
+    the file never got read by hermes. See also the
+    SKILL LAYOUT BUG entry in agent memory for the full history.
     """
-    if fmt == "file":
-        return f"skills/{skill_name}.md"
     return f"skills/{skill_name}/SKILL.md"
 
 
 async def _latest_skill_config(db: Any, profile_id: str, skill_name: str) -> dict[str, Any] | None:
     """Return the newest profile_configs row for a skill, or None.
 
-    Searches both the canonical folder path (skills/<name>/SKILL.md)
-    and the legacy flat path (skills/<name>.md) so that:
-    1. Pre-migration records (flat) are still addressable by name
-       (e.g. delete_skill still finds the user-uploaded mt5-bridge
-        even though the canonical record is now folder-path).
-    2. Latest is by created_at -- newest version wins regardless of layout.
-
-    After the migration, the canonical record will be folder-path
-    (the new default), so most calls return the folder row.
+    Searches only the canonical folder path
+    (skills/<name>/SKILL.md) since flat-path support was dropped
+    on 2026-07-19 (commit d5b7c9a).
     """
-    folder_path = _skill_file_path(skill_name)        # skills/<name>/SKILL.md
-    flat_path = _skill_file_path(skill_name, "file")  # skills/<name>.md
     return await db.fetchone(
-        "SELECT * FROM profile_configs WHERE profile_id = ? "
-        "AND file_path IN (?, ?) "
+        "SELECT * FROM profile_configs WHERE profile_id = ? AND file_path = ? "
         "ORDER BY created_at DESC LIMIT 1",
-        (profile_id, folder_path, flat_path),
+        (profile_id, _skill_file_path(skill_name)),
     )
 
 
@@ -931,8 +919,16 @@ def _row_to_skill(row: dict[str, Any], include_content: bool = False) -> SkillIn
     else:
         status = raw_status
     content_bytes = content.encode("utf-8") if content else b""
+    # Path is skills/<name>/SKILL.md -- extract <name>
+    fp = row["file_path"]
+    if fp.endswith("/SKILL.md"):
+        name = fp[len("skills/"):-len("/SKILL.md")]
+    else:
+        # Defensive: should not happen post-d5b7c9a, but if a flat
+        # record sneaks in via direct DB write, fall back gracefully.
+        name = fp.removeprefix("skills/").removesuffix(".md")
     return SkillInfo(
-        name=row["file_path"].removeprefix("skills/").removesuffix(".md"),
+        name=name,
         file_path=row["file_path"],
         status=status,
         size=len(content_bytes),
@@ -967,39 +963,28 @@ async def list_skills(
     profile = await _find_profile(db, agent_id, profile_name)
     rows = await db.fetchall(
         "SELECT * FROM profile_configs WHERE profile_id = ? "
-        "AND file_path LIKE 'skills/%' "
+        "AND file_path LIKE 'skills/%/SKILL.md' "
         "ORDER BY created_at DESC",
         (profile["id"],),
     )
     include_deleted = request.query_params.get("include_deleted") == "1"
-    # Group by skill name (not file_path) -- after the 2026-07-19 layout
-    # migration we have both flat (skills/<name>.md, legacy) and folder
-    # (skills/<name>/SKILL.md, current) records for many skills. We want
-    # to show ONE entry per skill, preferring the folder-path record
-    # because that's what hermes 0.17+ actually reads.
-    by_name: dict[str, dict] = {}
-    for r in rows:
-        name = r["file_path"]
-        if r["file_path"].endswith("/SKILL.md"):
-            name = r["file_path"][len("skills/"):-len("/SKILL.md")]
-        elif r["file_path"].startswith("skills/") and r["file_path"].endswith(".md"):
-            name = r["file_path"][len("skills/"):-len(".md")]
-        else:
-            continue
-        existing = by_name.get(name)
-        if existing is None:
-            by_name[name] = r
-        else:
-            # Prefer folder-path record (current canonical) over flat
-            if r["file_path"].endswith("/SKILL.md") and not existing["file_path"].endswith("/SKILL.md"):
-                by_name[name] = r
+    # Flat-path support dropped 2026-07-19 (commit d5b7c9a), so we
+    # only ever have one record per (profile, skill_name). The
+    # newest one wins by created_at DESC + LIMIT 1 dedup.
+    seen: set[str] = set()
     out: list[SkillInfo] = []
-    for name in sorted(by_name.keys()):
-        r = by_name[name]
+    for r in rows:
+        # Path is skills/<name>/SKILL.md
+        name = r["file_path"][len("skills/"):-len("/SKILL.md")]
+        if name in seen:
+            continue
+        seen.add(name)
         info = _row_to_skill(r, include_content=False)
         if info.status == "deleted" and not include_deleted:
             continue
         out.append(info)
+    # Sort by name for stable display
+    out.sort(key=lambda s: s.name)
     return out
 
 
@@ -1044,14 +1029,9 @@ async def create_or_update_skill(
     profile = await _find_profile(db, agent_id, profile_name)
     name = _validate_skill_name(body.name)
     content = body.content or ""
-    # Default to "folder" because hermes 0.17+ actually reads SKILL.md
-    # inside skills/<name>/ — flat .md files are silently ignored.
-    fmt = (body.format or "folder").strip().lower()
-    if fmt not in ("file", "folder"):
-        raise HTTPException(400, f"invalid format {fmt!r}: must be 'file' or 'folder'")
     cfg_id = str(uuid.uuid4())
     sha = hashlib.sha256(content.encode()).hexdigest()
-    file_path = _skill_file_path(name, fmt)
+    file_path = _skill_file_path(name)
     await db.insert(
         "profile_configs",
         {

@@ -1298,14 +1298,11 @@ def start(
     # Reverse-sync: scan filesystem for skills/ files and push missing ones
     # to the orchestrator. Used both for the "Sync from disk" button on the
     # dashboard (immediate trigger via __sync_skills__ marker config) and for
-    # agent self-taught skills (any *.md the agent drops into skills/ shows
-    # up in orchestrator after the next periodic scan).
-    _SKILL_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.md$")
-    # Hermes skills can be either a flat file (skills/<name>.md) or a
-    # folder (skills/<name>/SKILL.md, optionally with references/ + scripts/
-    # siblings). We register the SKILL.md entry to the orchestrator so
-    # the planner sees the skill; the auxiliary files in the folder are
-    # synced as well, but the SKILL.md is what the agent reads at runtime.
+    # agent self-taught skills (the agent writes a SKILL.md into
+    # skills/<name>/SKILL.md and the next periodic scan picks it up).
+    # Hermes 0.17+ only reads the folder layout
+    # `skills/<name>/SKILL.md`; flat-file skills/<name>.md is no longer
+    # supported (dropped 2026-07-19, commit d5b7c9a).
     _SKILL_FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
     # Per-profile throttle for the periodic auto-sync (don't scan every 5s).
     _SKILL_AUTO_SYNC_INTERVAL = 30  # seconds
@@ -1360,23 +1357,20 @@ def start(
             #      only sync the SKILL.md content; references/ and scripts/
             #      siblings are NOT registered, they're treated as opaque
             #      files in the agent host's filesystem).
+            # Flat-file skill support dropped 2026-07-19 (commit d5b7c9a).
+            # Hermes 0.17+ only reads skills/<name>/SKILL.md, so we no
+            # longer scan for skills/<name>.md at the top level.
             for entry in sorted(skills_dir.iterdir()):
-                if entry.is_file():
-                    if not _SKILL_FILE_RE.match(entry.name):
-                        continue
-                    name = entry.stem
-                    file_path = entry
-                elif entry.is_dir():
-                    if not _SKILL_FOLDER_RE.match(entry.name):
-                        continue
-                    file_path = entry / "SKILL.md"
-                    if not file_path.exists() or not file_path.is_file():
-                        # Folder exists but no SKILL.md — skip silently
-                        # (could be a partial install or a non-skill dir)
-                        continue
-                    name = entry.name
-                else:
+                if not entry.is_dir():
+                    continue  # skip files (no more flat skills)
+                if not _SKILL_FOLDER_RE.match(entry.name):
                     continue
+                file_path = entry / "SKILL.md"
+                if not file_path.exists() or not file_path.is_file():
+                    # Folder exists but no SKILL.md — skip silently
+                    # (could be a partial install or a non-skill dir)
+                    continue
+                name = entry.name
                 try:
                     file_bytes = file_path.read_bytes()
                 except Exception as e:
@@ -1415,10 +1409,7 @@ def start(
                         **_auth_headers(),
                         "X-Skill-Source": "self-taught",
                     },
-                    # format="folder" → hermes 0.17+ will actually read
-                    # this. Without it, the file gets written flat and
-                    # hermes ignores it (see 2026-07-19 layout migration).
-                    json={"name": name, "content": content_text, "format": "folder"},
+                    json={"name": name, "content": content_text},
                     timeout=15,
                 )
                 if r.status_code == 201:
@@ -1528,40 +1519,23 @@ def start(
                                 # the file on the agent host (used by the
                                 # dashboard's "delete skill" flow).
                                 #
-                                # Two layouts:
-                                #   1. Flat file: skills/<name>.md → unlink
-                                #   2. Folder:   skills/<name>/SKILL.md →
-                                #      rmtree the whole <name> folder
-                                #      (we only register SKILL.md; aux files
-                                #      in the folder are owned by the user)
-                                if cfg_row["file_path"].endswith("/SKILL.md"):
-                                    # Folder layout: nuke the whole folder
-                                    skill_folder = target_resolved.parent
-                                    if skill_folder.exists() and skill_folder.is_dir():
-                                        import shutil as _shutil
-                                        _shutil.rmtree(skill_folder)
-                                        click.echo(
-                                            f"[daemon] deleted folder {skill_folder} "
-                                            f"on {pname}"
-                                        )
-                                    else:
-                                        click.echo(
-                                            f"[daemon] delete folder {skill_folder} "
-                                            f"(already absent) on {pname}"
-                                        )
+                                # Folder layout: skills/<name>/SKILL.md →
+                                # rmtree the whole <name> folder
+                                # (we only register SKILL.md; aux files
+                                # in the folder are owned by the user)
+                                skill_folder = target_resolved.parent
+                                if skill_folder.exists() and skill_folder.is_dir():
+                                    import shutil as _shutil
+                                    _shutil.rmtree(skill_folder)
+                                    click.echo(
+                                        f"[daemon] deleted folder {skill_folder} "
+                                        f"on {pname}"
+                                    )
                                 else:
-                                    # Flat file layout
-                                    if target_resolved.exists():
-                                        target_resolved.unlink()
-                                        click.echo(
-                                            f"[daemon] deleted {cfg_row['file_path']} "
-                                            f"from {pname}"
-                                        )
-                                    else:
-                                        click.echo(
-                                            f"[daemon] delete {cfg_row['file_path']} "
-                                            f"(already absent) on {pname}"
-                                        )
+                                    click.echo(
+                                        f"[daemon] delete folder {skill_folder} "
+                                        f"(already absent) on {pname}"
+                                    )
                                 actual_sha = hashlib.sha256(b"").hexdigest()
                             else:
                                 _atomic_write(target, content)
@@ -1903,22 +1877,14 @@ def apply_configs(config_path: str, profile_filter: str | None) -> None:
                         # Empty content for a skills/ path = delete on host.
                         # Folder layout (skills/<name>/SKILL.md) → rmtree the
                         # whole folder. Flat layout (skills/<name>.md) →
-                        # unlink the single file.
-                        if cfg_row["file_path"].endswith("/SKILL.md"):
-                            skill_folder = target_resolved.parent
-                            if skill_folder.exists() and skill_folder.is_dir():
-                                import shutil as _shutil
-                                _shutil.rmtree(skill_folder)
-                                click.echo(f"  deleted folder {skill_folder}")
-                            else:
-                                click.echo(f"  delete folder {skill_folder} (already absent)")
+                        # rmtree the whole skill folder
+                        skill_folder = target_resolved.parent
+                        if skill_folder.exists() and skill_folder.is_dir():
+                            import shutil as _shutil
+                            _shutil.rmtree(skill_folder)
+                            click.echo(f"  deleted folder {skill_folder}")
                         else:
-                            # Flat file layout
-                            if target_resolved.exists():
-                                target_resolved.unlink()
-                                click.echo(f"  deleted {target}")
-                            else:
-                                click.echo(f"  delete {target} (already absent)")
+                            click.echo(f"  delete folder {skill_folder} (already absent)")
                         actual_sha = hashlib.sha256(b"").hexdigest()
                     else:
                         _atomic_write(target, content)
