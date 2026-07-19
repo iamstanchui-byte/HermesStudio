@@ -179,7 +179,7 @@ def _fetch_user_recent_http(
     """
     try:
         r = httpx.get(
-            f"{orchestrator_url}/api/memory/recent",
+            f"{orchestrator_url}/api/projects/memory/recent",
             headers=_hmac_headers(agent_id, secret),
             timeout=10,
         )
