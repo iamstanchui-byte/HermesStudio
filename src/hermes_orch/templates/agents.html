@@ -189,6 +189,20 @@
                                 LLM: not reported
                             </span>
                             {% endif %}
+                            {# MCP servers — small chip stack on the header row #}
+                            {% set mcps = p.mcp_servers or [] %}
+                            {% set enabled_count = mcps|selectattr('enabled')|list|length %}
+                            {% if mcps %}
+                            <span class="px-1.5 py-0.5 text-[10px] rounded bg-emerald-50 text-emerald-700"
+                                title="{{ enabled_count }}/{{ mcps|length }} MCP server(s) enabled">
+                                MCP ({{ enabled_count }}/{{ mcps|length }})
+                            </span>
+                            {% else %}
+                            <span class="px-1.5 py-0.5 text-[10px] rounded bg-gray-100 text-gray-400 italic"
+                                title="No MCP servers configured (wrapper would push on next heartbeat if config.yaml has mcp_servers)">
+                                MCP: none
+                            </span>
+                            {% endif %}
                         </div>
                         <div class="flex items-center gap-1 flex-shrink-0">
                             {% for k, v in p.capabilities.items() %}{% if v %}<span class="px-1 bg-indigo-50 text-indigo-700 rounded text-[10px]" title="capability">{{ k }}</span>{% endif %}{% endfor %}
@@ -199,6 +213,24 @@
                     </div>
                     {% if p.description %}
                     <div class="text-xs text-gray-600 mt-1">{{ p.description }}</div>
+                    {% endif %}
+                    {# MCP servers list (detailed) — only render if there are any #}
+                    {% if p.mcp_servers %}
+                    <div class="mt-2 pt-2 border-t border-gray-200">
+                        <div class="text-[10px] font-medium text-gray-500 uppercase tracking-wide">
+                            MCP servers ({{ (p.mcp_servers|selectattr('enabled')|list|length) }}/{{ p.mcp_servers|length }})
+                        </div>
+                        <div class="mt-1 space-y-0.5">
+                            {% for m in p.mcp_servers %}
+                            <div class="text-xs flex items-center gap-1.5">
+                                <span class="inline-block w-2 h-2 rounded-full {% if m.enabled %}bg-emerald-500{% else %}bg-gray-400{% endif %}"
+                                    title="{% if m.enabled %}enabled{% else %}disabled{% endif %}"></span>
+                                <span class="font-mono">{{ m.name }}</span>
+                                {% if not m.enabled %}<span class="text-gray-400 italic">(disabled)</span>{% endif %}
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
                     {% endif %}
                     <form id="edit-profile-{{ agent.id }}-{{ p.name }}" class="hidden mt-2 p-2 bg-white border rounded" onsubmit="saveProfileEdit(event, '{{ agent.id }}', '{{ p.name }}')">
                         <textarea name="description" class="w-full text-xs border rounded p-1" rows="2" placeholder="description (optional)">{{ p.description or '' }}</textarea>

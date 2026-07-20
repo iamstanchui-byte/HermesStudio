@@ -83,6 +83,10 @@ class HeartbeatBody(BaseModel):
     model_default: str | None = None
     model_base_url: str | None = None
     model_provider: str | None = None
+    # MCP server list (reported by wrapper, read from <profile>/config.yaml
+    # mcp_servers section). Each entry must have a 'name' (str); optional
+    # 'enabled' (bool, default True). Sent as a list of dicts.
+    mcp_servers: list[dict] | None = None
 
 
 class AgentProfile(BaseModel):
@@ -97,6 +101,8 @@ class AgentProfile(BaseModel):
     llm_model_default: str | None = None
     llm_model_base_url: str | None = None
     llm_model_provider: str | None = None
+    # MCP server list (parsed from JSON column, default [])
+    mcp_servers: list[dict] = Field(default_factory=list)
     created_at: str | None = None
 
 
@@ -190,6 +196,26 @@ def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
                 caps = {str(k): bool(v) for k, v in parsed.items()}
         except (json.JSONDecodeError, TypeError):
             pass
+    # MCP server list — JSON array of {name, enabled}. Defensive: handle
+    # missing/malformed. Schema guarantees default '[]' on new rows.
+    mcp_raw = row.get("mcp_servers")
+    mcps: list[dict] = []
+    if mcp_raw:
+        try:
+            parsed = json.loads(mcp_raw) if isinstance(mcp_raw, str) else mcp_raw
+            if isinstance(parsed, list):
+                # Normalize each entry to {name: str, enabled: bool}; skip
+                # entries missing 'name' (the dashboard needs it as the
+                # primary key for the dot color).
+                for m in parsed:
+                    if isinstance(m, dict) and "name" in m:
+                        mcps.append({
+                            "name": str(m["name"]),
+                            "enabled": bool(m.get("enabled", True)),
+                        })
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     return AgentProfile(
         id=row["id"],
         agent_id=row["agent_id"],
@@ -202,6 +228,7 @@ def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
         llm_model_default=row.get("llm_model_default"),
         llm_model_base_url=row.get("llm_model_base_url"),
         llm_model_provider=row.get("llm_model_provider"),
+        mcp_servers=mcps,
         created_at=row.get("created_at"),
     )
 
@@ -417,7 +444,7 @@ async def heartbeat(
     # only UPDATE the columns that were provided. The `profile` field
     # scopes the update to a single profile; if missing, fan out to
     # all profiles of this agent.
-    if any(body_data.get(k) is not None for k in ("model_default", "model_base_url", "model_provider")):
+    if any(body_data.get(k) is not None for k in ("model_default", "model_base_url", "model_provider", "mcp_servers")):
         body = HeartbeatBody(**body_data)
         sets: list[str] = []
         params: list[Any] = []
@@ -430,6 +457,20 @@ async def heartbeat(
             if val is not None:
                 sets.append(f"{col} = ?")
                 params.append(val)
+        # MCP server list — store as JSON string. Validated server-side:
+        # each entry must have a 'name' (str). Malformed entries are
+        # dropped silently (the dashboard defensive parse will then show
+        # the empty list).
+        if body.mcp_servers is not None:
+            cleaned: list[dict] = []
+            for m in body.mcp_servers:
+                if isinstance(m, dict) and "name" in m and isinstance(m["name"], str):
+                    cleaned.append({
+                        "name": m["name"],
+                        "enabled": bool(m.get("enabled", True)),
+                    })
+            sets.append("mcp_servers = ?")
+            params.append(json.dumps(cleaned))
         if sets:
             sql = (
                 f"UPDATE agent_profiles SET {', '.join(sets)}, updated_at = ? "

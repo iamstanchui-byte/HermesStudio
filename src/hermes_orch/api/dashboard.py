@@ -182,6 +182,23 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
             p["llm_model_default"] = p.get("llm_model_default")
             p["llm_model_base_url"] = p.get("llm_model_base_url")
             p["llm_model_provider"] = p.get("llm_model_provider")
+            # MCP server list — JSON array of {name, enabled}. Same defensive
+            # parse as _row_to_profile (pattern #9 — both paths).
+            mcp_raw = p.get("mcp_servers")
+            mcps: list[dict] = []
+            if mcp_raw:
+                try:
+                    parsed = json.loads(mcp_raw) if isinstance(mcp_raw, str) else mcp_raw
+                    if isinstance(parsed, list):
+                        for m in parsed:
+                            if isinstance(m, dict) and "name" in m:
+                                mcps.append({
+                                    "name": str(m["name"]),
+                                    "enabled": bool(m.get("enabled", True)),
+                                })
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            p["mcp_servers"] = mcps
             caps_raw = p.get("capabilities")
             caps: dict[str, bool] = {}
             if caps_raw:

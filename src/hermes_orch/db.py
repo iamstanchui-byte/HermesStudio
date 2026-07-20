@@ -224,6 +224,13 @@ MIGRATIONS = [
     "ALTER TABLE agent_profiles ADD COLUMN llm_model_default TEXT",
     "ALTER TABLE agent_profiles ADD COLUMN llm_model_base_url TEXT",
     "ALTER TABLE agent_profiles ADD COLUMN llm_model_provider TEXT",
+    # Per-profile MCP server list (wrapper-reported via heartbeat). Stored
+    # as a JSON array of {name, enabled} objects. Default '[]' = no MCP
+    # servers configured. The wrapper reads <profile>/config.yaml
+    # (mcp_servers section) and pushes the list on heartbeat. Each entry
+    # must have a 'name' (str); the dashboard renders a green/grey dot
+    # per server based on 'enabled'.
+    "ALTER TABLE agent_profiles ADD COLUMN mcp_servers TEXT NOT NULL DEFAULT '[]'",
     # project_soul_presets is a new table; created in CREATE TABLE block above.
     # No ALTER needed for it on existing DBs — IF NOT EXISTS handles it.
     # project_sessions is a new table; created in CREATE TABLE block above.
