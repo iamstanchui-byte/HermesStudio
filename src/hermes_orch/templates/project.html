@@ -7,8 +7,8 @@
 </div>
 
 <div class="bg-white border rounded-lg p-6 shadow-sm mb-4">
-    <div class="flex items-center justify-between">
-        <div>
+    <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0 flex-1">
             <div class="font-mono text-xs text-gray-500">{{ project.id }}</div>
             <h1 class="text-2xl font-bold text-gray-800">{{ project.name or '(unnamed)' }}</h1>
             <p class="text-sm text-gray-600 mt-1">{{ project.goal or '-' }}</p>
@@ -35,70 +35,130 @@
             {% endif %}
             {% endif %}
         </div>
-        <div class="text-right">
-            <span class="px-3 py-1 text-sm rounded
-                {% if project.state == 'running' %}bg-blue-100 text-blue-800
-                {% elif project.state == 'completed' %}bg-green-100 text-green-800
-                {% elif project.state == 'cancelled' %}bg-gray-200 text-gray-700
-                {% elif project.state == 'archived' %}bg-yellow-100 text-yellow-800
-                {% else %}bg-yellow-100 text-yellow-800{% endif %}">
-                {{ project.state }}
-            </span>
-            {% if token_total %}
-            <div class="mt-1 inline-block" title="Total LLM tokens consumed by this project. Breakdown: {% for b in token_breakdown %}{{ b['call_kind'] }}={{ b['total'] }}{% if not loop.last %}, {% endif %}{% endfor %}">
-                <span class="px-2 py-0.5 text-xs rounded bg-purple-50 text-purple-700">
+        {#
+          Right column: redesigned for visual consistency.
+          - All pills (state, tokens, template, schedule) are the same small size
+            and use outline (transparent-bg) styling that works in dark mode.
+          - Action buttons are all the same size, organized into 2 rows:
+            Row 1 = quick utility actions, Row 2 = state changes / destructive.
+          - No two actions share a color family, so dark-mode contrast is safe.
+        #}
+        <div class="shrink-0 flex flex-col items-end gap-3 max-w-md">
+            {# Row 1: state + tokens (pills, all text-xs) #}
+            <div class="flex items-center gap-1.5">
+                <span class="px-2 py-0.5 text-xs font-medium rounded-full border
+                    {% if project.state == 'running' %}bg-blue-50 text-blue-700 border-blue-200
+                    {% elif project.state == 'completed' %}bg-green-50 text-green-700 border-green-200
+                    {% elif project.state == 'cancelled' %}bg-gray-100 text-gray-600 border-gray-200
+                    {% elif project.state == 'archived' %}bg-gray-100 text-gray-600 border-gray-200
+                    {% elif project.state == 'deleted' %}bg-red-50 text-red-700 border-red-200
+                    {% else %}bg-gray-100 text-gray-700 border-gray-200{% endif %}">
+                    {{ project.state }}
+                </span>
+                {% if token_total %}
+                <span class="px-2 py-0.5 text-xs font-medium rounded-full border bg-purple-50 text-purple-700 border-purple-200"
+                    title="Total LLM tokens consumed by this project. Breakdown: {% for b in token_breakdown %}{{ b['call_kind'] }}={{ b['total'] }}{% if not loop.last %}, {% endif %}{% endfor %}">
                     {{ '%.1f' % (token_total / 1000) }}K tokens
                 </span>
-            </div>
-            {% endif %}
-            {% if project.is_template %}
-            <div class="mt-1 inline-block">
-                <span class="px-2 py-0.5 text-xs rounded bg-amber-100 text-amber-800" title="This project is marked as a reusable template. Schedules can fire it on a cron.">📋 template</span>
-                {% if template_schedule %}
-                <a href="/schedules" class="px-2 py-0.5 text-xs rounded bg-purple-100 text-purple-800 ml-1 hover:bg-purple-200" title="Schedule: {{ template_schedule.name }} · {{ template_schedule.cron_expr }} ({{ template_schedule.timezone }}) · {{ template_schedule.mode }}">🔁 {{ template_schedule.name }}</a>
                 {% endif %}
             </div>
-            {% endif %}
-            {% if source_schedule %}
-            <div class="mt-1">
-                <a href="/schedules" class="px-2 py-0.5 text-xs rounded bg-purple-100 text-purple-800 hover:bg-purple-200" title="This run was triggered by: {{ source_schedule.name }} · {{ source_schedule.cron_expr }} ({{ source_schedule.timezone }}) · {{ source_schedule.mode }}">🔁 from {{ source_schedule.name }}</a>
-            </div>
-            {% endif %}
-            <div class="text-xs text-gray-500 mt-1">created {{ project.created_at }}</div>
-            <div class="mt-2 flex gap-1 justify-end flex-wrap">
-                <button onclick="openProjectFolder('{{ project.id }}')" class="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded hover:bg-gray-200" title="Open the project folder in File Explorer (only works if your browser is on the orchestrator host)">
-                    Open in Explorer
-                </button>
-                <button onclick="openReplanModal('{{ project.id }}')" class="px-2 py-1 text-xs bg-purple-100 text-purple-800 rounded hover:bg-purple-200" title="Re-trigger the LLM planner: set/update the project goal and configure iter-loop settings. Existing pending tasks are kept unless you also tick 'clear tasks'.">
-                    &#x2728; Generate plan
-                </button>
-                {# Hidden fields that openReplanModal pre-populates the modal with #}
-                <input type="hidden" id="replan-goal" value="{{ project.goal or '' }}">
-                <input type="hidden" id="replan-coord" value="{{ project.coordinator_role or '' }}">
-                <input type="hidden" id="replan-max-iter" value="{{ project.max_iterations or 0 }}">
-                <input type="hidden" id="replan-criteria" value="{{ project.accept_criteria or '' }}">
-                <input type="hidden" id="replan-deliverable" value="{{ project.deliverable_path or '' }}">
-                {% if project.state == 'archived' %}
-                <button onclick="unarchiveProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-blue-100 text-blue-800 rounded hover:bg-blue-200">Unarchive</button>
-                {% elif project.state == 'deleted' %}
-                <button onclick="undeleteProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-green-100 text-green-800 rounded hover:bg-green-200" title="Restore this soft-deleted project. Goes back to its prior state (e.g. 'completed'). Does NOT re-run any tasks.">Undelete</button>
-                {% else %}
-                <button onclick="archiveProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-yellow-100 text-yellow-800 rounded hover:bg-yellow-200">Archive</button>
-                {% endif %}
-                {% if project.state != 'deleted' %}
-                <button onclick="deleteProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-red-100 text-red-800 rounded hover:bg-red-200">Delete</button>
-                {% endif %}
-                {# Template + Schedule controls (#22). Mark-as-template is a
-                   one-click toggle: the schedule button is only useful after
-                   the project IS a template. We use the same modal as
-                   create-schedule but pre-fill template_project_id. #}
+
+            {# Row 2: template / schedule info (pills, only when applicable) #}
+            {% if project.is_template or source_schedule %}
+            <div class="flex items-center gap-1.5 flex-wrap justify-end">
                 {% if project.is_template %}
-                <button onclick="unmarkTemplate('{{ project.id }}', '{{ project.name|e }}')" class="px-2 py-1 text-xs bg-amber-50 text-amber-800 rounded hover:bg-amber-100" title="Remove the template flag. Existing schedules that reference this project will warn on their next fire.">Unmark template</button>
-                <a href="/schedules?template={{ project.id }}" class="px-2 py-1 text-xs bg-purple-100 text-purple-800 rounded hover:bg-purple-200" title="Go to the Schedules page to attach a cron expression to this template.">+ Schedule this</a>
-                {% else %}
-                <button onclick="markTemplate('{{ project.id }}', '{{ project.name|e }}')" class="px-2 py-1 text-xs bg-amber-100 text-amber-800 rounded hover:bg-amber-200" title="Mark this project as a reusable template. Schedules can then fire it on a cron.">+ Mark as template</button>
+                <span class="px-2 py-0.5 text-xs rounded-full border bg-amber-50 text-amber-700 border-amber-200"
+                    title="This project is marked as a reusable template. Schedules can fire it on a cron.">
+                    📋 template
+                </span>
+                {% endif %}
+                {% if template_schedule %}
+                <a href="/schedules" class="px-2 py-0.5 text-xs rounded-full border bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100"
+                    title="Schedule: {{ template_schedule.name }} · {{ template_schedule.cron_expr }} ({{ template_schedule.timezone }}) · {{ template_schedule.mode }}">
+                    🔁 {{ template_schedule.name }}
+                </a>
+                {% endif %}
+                {% if source_schedule %}
+                <a href="/schedules" class="px-2 py-0.5 text-xs rounded-full border bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100"
+                    title="This run was triggered by: {{ source_schedule.name }} · {{ source_schedule.cron_expr }} ({{ source_schedule.timezone }}) · {{ source_schedule.mode }}">
+                    🔁 from {{ source_schedule.name }}
+                </a>
                 {% endif %}
             </div>
+            {% endif %}
+
+            {# Row 3: created date (small text) #}
+            <div class="text-xs text-gray-500">created {{ project.created_at[:16] }}</div>
+
+            {# Row 4: action buttons. All uniform: px-3 py-1.5 text-xs rounded border.
+               Color families don't overlap (gray / blue / purple / amber / red),
+               so dark mode never has two adjacent buttons of similar warm hues. #}
+            <div class="flex flex-col gap-1.5 items-end">
+                <div class="flex gap-1.5 flex-wrap justify-end">
+                    <button onclick="openProjectFolder('{{ project.id }}')"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+                        title="Open the project folder in File Explorer (only works if your browser is on the orchestrator host)">
+                        Open folder
+                    </button>
+                    <button onclick="openReplanModal('{{ project.id }}')"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
+                        title="Re-trigger the LLM planner: set/update the project goal and configure iter-loop settings. Existing pending tasks are kept unless you also tick 'clear tasks'.">
+                        ✨ Generate plan
+                    </button>
+                </div>
+                <div class="flex gap-1.5 flex-wrap justify-end">
+                    {% if project.state == 'archived' %}
+                    <button onclick="unarchiveProject('{{ project.id }}')"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-blue-300 text-blue-700 hover:bg-blue-50">
+                        Unarchive
+                    </button>
+                    {% elif project.state == 'deleted' %}
+                    <button onclick="undeleteProject('{{ project.id }}')"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-green-300 text-green-700 hover:bg-green-50"
+                        title="Restore this soft-deleted project. Goes back to its prior state (e.g. 'completed'). Does NOT re-run any tasks.">
+                        Undelete
+                    </button>
+                    {% else %}
+                    <button onclick="archiveProject('{{ project.id }}')"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+                        title="Archive (soft-hide from default list)">
+                        Archive
+                    </button>
+                    {% endif %}
+                    {% if project.state != 'deleted' %}
+                    <button onclick="deleteProject('{{ project.id }}')"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-red-300 text-red-700 hover:bg-red-50">
+                        Delete
+                    </button>
+                    {% endif %}
+                    {# Template + Schedule controls (#22) #}
+                    {% if project.is_template %}
+                    <button onclick="unmarkTemplate('{{ project.id }}', '{{ project.name|e }}')"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-amber-300 text-amber-700 hover:bg-amber-50"
+                        title="Remove the template flag. Existing schedules that reference this project will warn on their next fire.">
+                        Unmark template
+                    </button>
+                    <a href="/schedules?template={{ project.id }}"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
+                        title="Go to the Schedules page to attach a cron expression to this template.">
+                        + Schedule this
+                    </a>
+                    {% else %}
+                    <button onclick="markTemplate('{{ project.id }}', '{{ project.name|e }}')"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-amber-300 text-amber-700 hover:bg-amber-50"
+                        title="Mark this project as a reusable template. Schedules can then fire it on a cron.">
+                        + Mark as template
+                    </button>
+                    {% endif %}
+                </div>
+            </div>
+
+            {# Hidden fields that openReplanModal pre-populates the modal with #}
+            <input type="hidden" id="replan-goal" value="{{ project.goal or '' }}">
+            <input type="hidden" id="replan-coord" value="{{ project.coordinator_role or '' }}">
+            <input type="hidden" id="replan-max-iter" value="{{ project.max_iterations or 0 }}">
+            <input type="hidden" id="replan-criteria" value="{{ project.accept_criteria or '' }}">
+            <input type="hidden" id="replan-deliverable" value="{{ project.deliverable_path or '' }}">
         </div>
     </div>
 </div>

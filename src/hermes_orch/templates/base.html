@@ -136,6 +136,34 @@
             background-color: #374151;
             border-color: #6b7280;
         }
+        /* Outline button colors (project page header + other places using
+           `border-{color}-300 text-{color}-700` pattern). Light borders need
+           to darken in dark mode; light text needs to brighten. Hover
+           backgrounds need to darken. The 300→600 / 700→300 / 50→700/800
+           mapping is the standard Tailwind "darken in dark mode" pattern. */
+        body.dark .border-gray-300,
+        body.dark .border-blue-300,
+        body.dark .border-purple-300,
+        body.dark .border-amber-300,
+        body.dark .border-red-300,
+        body.dark .border-green-300 { border-color: #4b5563; }
+        body.dark .border-blue-200,
+        body.dark .border-purple-200,
+        body.dark .border-amber-200,
+        body.dark .border-red-200,
+        body.dark .border-green-200 { border-color: #4b5563; }
+        body.dark .text-gray-700 { color: #d1d5db; }
+        body.dark .text-blue-700 { color: #93c5fd; }
+        body.dark .text-purple-700 { color: #c4b5fd; }
+        body.dark .text-amber-700 { color: #fcd34d; }
+        body.dark .text-red-700 { color: #fca5a5; }
+        body.dark .text-green-700 { color: #86efac; }
+        body.dark .hover\:bg-gray-50:hover { background-color: #374151; }
+        body.dark .hover\:bg-blue-50:hover { background-color: #1e3a8a; }
+        body.dark .hover\:bg-purple-50:hover { background-color: #4c1d95; }
+        body.dark .hover\:bg-amber-50:hover { background-color: #78350f; }
+        body.dark .hover\:bg-red-50:hover { background-color: #7f1d1d; }
+        body.dark .hover\:bg-green-50:hover { background-color: #14532d; }
         /* <pre> blocks (project memory L2 dump, agent output, etc.) */
         body.dark pre {
             background-color: #0f172a !important;
