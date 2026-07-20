@@ -164,6 +164,31 @@
         body.dark .hover\:bg-amber-50:hover { background-color: #78350f; }
         body.dark .hover\:bg-red-50:hover { background-color: #7f1d1d; }
         body.dark .hover\:bg-green-50:hover { background-color: #14532d; }
+        /* Status pill backgrounds. Without these, the outline pills (used by
+           tasks page + project page status badges) lose their fill in dark
+           mode and the text appears on the bare page background. Keep the
+           fill desaturated (not pure red/blue) so the border (a shade
+           lighter) still reads as the colored outline. */
+        body.dark .bg-gray-50 { background-color: #1f2937; }
+        body.dark .bg-blue-50 { background-color: #172554; }
+        body.dark .bg-purple-50 { background-color: #2e1065; }
+        body.dark .bg-amber-50 { background-color: #451a03; }
+        body.dark .bg-red-50 { background-color: #450a0a; }
+        body.dark .bg-green-50 { background-color: #052e16; }
+        body.dark .bg-orange-50 { background-color: #431407; }
+        body.dark .bg-yellow-50 { background-color: #422006; }
+        body.dark .text-orange-700 { color: #fdba74; }
+        body.dark .text-yellow-700 { color: #fde68a; }
+        /* Dropdown menu (used by schedules page ⋮ menu). In light mode the
+           menu is bg-white with gray border; in dark mode it should be a
+           dark elevated surface so it stands out from the table. */
+        body.dark .menu-elevated, body.dark [id^="menu-"] {
+            background-color: #1f2937 !important;
+            border-color: #4b5563 !important;
+        }
+        body.dark [id^="menu-"] button {
+            color: #e5e7eb;
+        }
         /* <pre> blocks (project memory L2 dump, agent output, etc.) */
         body.dark pre {
             background-color: #0f172a !important;

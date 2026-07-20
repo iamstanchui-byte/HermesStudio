@@ -74,13 +74,35 @@
                     <span class="text-gray-500">—</span>
                     {% endif %}
                 </td>
-                <td class="px-4 py-2 text-right">
-                    <button onclick="runNow('{{ s.id }}')" class="text-xs px-2 py-1 bg-blue-50 text-blue-700 rounded hover:bg-blue-100 mr-1" title="Trigger immediately (bypasses skip rule)">Run now</button>
-                    <button onclick="openEditModal('{{ s.id }}')" class="text-xs px-2 py-1 bg-amber-50 text-amber-800 rounded hover:bg-amber-100 mr-1" title="Edit name, cron, timezone, mode, or template">Edit</button>
-                    <button onclick="toggleEnabled('{{ s.id }}', {{ 0 if s.enabled else 1 }})" class="text-xs px-2 py-1 bg-gray-50 text-gray-700 rounded hover:bg-gray-100 mr-1">
-                        {% if s.enabled %}Pause{% else %}Resume{% endif %}
+                <td class="px-4 py-2 text-right whitespace-nowrap">
+                    {# Primary state toggle (always visible — most common action). #}
+                    <button onclick="toggleEnabled('{{ s.id }}', {{ 0 if s.enabled else 1 }})"
+                        class="text-xs px-2.5 py-1 font-medium rounded border
+                            {% if s.enabled %}border-gray-300 text-gray-700 hover:bg-gray-50
+                            {% else %}border-green-300 text-green-700 hover:bg-green-50{% endif %}"
+                        title="{% if s.enabled %}Pause this schedule (no more fires until you resume){% else %}Resume — arm the schedule again{% endif %}">
+                        {% if s.enabled %}⏸ Pause{% else %}▶ Resume{% endif %}
                     </button>
-                    <button onclick="deleteSchedule('{{ s.id }}', '{{ s.name|e }}')" class="text-xs px-2 py-1 bg-red-50 text-red-700 rounded hover:bg-red-100">Delete</button>
+                    {#
+                      ⋮ menu for less-frequent actions (Run now, Edit, Delete).
+                      Using a single dropdown keeps the actions column compact
+                      and avoids the 4-button wrap that breaks layout at 100%
+                      zoom. Click-outside-to-close via window onclick handler.
+                    #}
+                    <div class="relative inline-block ml-1" data-menu-row="{{ s.id }}">
+                        <button onclick="toggleMenu(event, 'menu-{{ s.id }}')"
+                            class="text-xs px-2 py-1 font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+                            title="More actions"
+                            aria-haspopup="true" aria-expanded="false">
+                            ⋮
+                        </button>
+                        <div id="menu-{{ s.id }}" class="hidden absolute right-0 mt-1 w-44 bg-white border border-gray-200 rounded shadow-lg z-20 text-left">
+                            <button onclick="runNow('{{ s.id }}')" class="block w-full px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-50" title="Trigger immediately (bypasses skip rule)">▶ Run now</button>
+                            <button onclick="openEditModal('{{ s.id }}')" class="block w-full px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-50" title="Edit name, cron, timezone, mode, or template">✎ Edit</button>
+                            <div class="border-t border-gray-200 my-1"></div>
+                            <button onclick="deleteSchedule('{{ s.id }}', '{{ s.name|e }}')" class="block w-full px-3 py-1.5 text-xs text-red-700 hover:bg-red-50">🗑 Delete</button>
+                        </div>
+                    </div>
                 </td>
             </tr>
             {% else %}
@@ -304,6 +326,41 @@ async function deleteSchedule(id, name) {
         alert("Delete failed: " + e.message);
     }
 }
+
+// ===== ⋮ menu (per-row dropdown) =====
+// Click the ⋮ button to toggle, click anywhere else to close. Closes other
+// open menus first (so only one is visible at a time). Stores the currently
+// open menu id on the window so the global click handler can find it.
+let _openMenuId = null;
+function toggleMenu(ev, menuId) {
+    ev.stopPropagation();
+    // Close any other open menu first
+    if (_openMenuId && _openMenuId !== menuId) {
+        const prev = document.getElementById(_openMenuId);
+        if (prev) prev.classList.add('hidden');
+    }
+    const menu = document.getElementById(menuId);
+    if (!menu) return;
+    if (menu.classList.contains('hidden')) {
+        menu.classList.remove('hidden');
+        _openMenuId = menuId;
+    } else {
+        menu.classList.add('hidden');
+        _openMenuId = null;
+    }
+}
+window.addEventListener('click', (e) => {
+    if (!_openMenuId) return;
+    // If the click was inside a [data-menu-row] for the currently open
+    // menu, leave it alone (the toggleMenu handler stopped propagation).
+    // Otherwise close it.
+    const menu = document.getElementById(_openMenuId);
+    if (!menu) { _openMenuId = null; return; }
+    const row = menu.closest('[data-menu-row]');
+    if (row && row.contains(e.target)) return;
+    menu.classList.add('hidden');
+    _openMenuId = null;
+});
 
 // Load per-schedule upcoming fires for the debug section. We fire all
 // queries in parallel; the dashboard will re-render on next 10s poll.
