@@ -176,6 +176,12 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
         # capabilities set. Phase 4 (smart dispatch).
         for p in profile_list:
             p["skills"] = await _load_profile_skills(db, p["id"])
+            # LLM model fields (plain TEXT, no JSON parsing — just pass through).
+            # If all three are NULL, the wrapper hasn't reported yet; the
+            # template renders a grey fallback badge with a tooltip.
+            p["llm_model_default"] = p.get("llm_model_default")
+            p["llm_model_base_url"] = p.get("llm_model_base_url")
+            p["llm_model_provider"] = p.get("llm_model_provider")
             caps_raw = p.get("capabilities")
             caps: dict[str, bool] = {}
             if caps_raw:

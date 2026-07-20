@@ -215,6 +215,15 @@ MIGRATIONS = [
     # existing flows — operators opt in by editing the JSON.
     "ALTER TABLE agent_profiles ADD COLUMN capabilities TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE tasks ADD COLUMN required_capability TEXT",
+    # Per-profile LLM model (wrapper-reported via heartbeat). Plain TEXT
+    # columns — no JSON parsing needed. The wrapper reads
+    # <profile>/config.yaml (the profile's hermes config) and reports
+    # the model.default, model.base_url, model.provider triple. NULL
+    # means "wrapper hasn't reported yet" — dashboard shows a grey
+    # fallback badge with a tooltip.
+    "ALTER TABLE agent_profiles ADD COLUMN llm_model_default TEXT",
+    "ALTER TABLE agent_profiles ADD COLUMN llm_model_base_url TEXT",
+    "ALTER TABLE agent_profiles ADD COLUMN llm_model_provider TEXT",
     # project_soul_presets is a new table; created in CREATE TABLE block above.
     # No ALTER needed for it on existing DBs — IF NOT EXISTS handles it.
     # project_sessions is a new table; created in CREATE TABLE block above.

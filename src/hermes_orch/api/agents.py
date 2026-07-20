@@ -76,6 +76,13 @@ class AgentProfileUpdate(BaseModel):
 
 class HeartbeatBody(BaseModel):
     status: str | None = None  # agent's reported state (e.g. 'busy', 'idle')
+    profile: str | None = None  # which profile this heartbeat is for (optional)
+    # LLM model (reported by wrapper, read from <profile>/config.yaml).
+    # All three are independent; any subset can be sent and the rest
+    # stays unchanged. To clear a value, send the empty string "".
+    model_default: str | None = None
+    model_base_url: str | None = None
+    model_provider: str | None = None
 
 
 class AgentProfile(BaseModel):
@@ -86,6 +93,10 @@ class AgentProfile(BaseModel):
     status: str = "idle"
     current_task_id: str | None = None
     capabilities: dict[str, bool] = Field(default_factory=dict)
+    # LLM model (NULL = wrapper hasn't reported yet)
+    llm_model_default: str | None = None
+    llm_model_base_url: str | None = None
+    llm_model_provider: str | None = None
     created_at: str | None = None
 
 
@@ -187,6 +198,10 @@ def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
         status=row["status"],
         current_task_id=row.get("current_task_id"),
         capabilities=caps,
+        # LLM model (plain text columns; safe to pass None)
+        llm_model_default=row.get("llm_model_default"),
+        llm_model_base_url=row.get("llm_model_base_url"),
+        llm_model_provider=row.get("llm_model_provider"),
         created_at=row.get("created_at"),
     )
 
@@ -395,6 +410,37 @@ async def heartbeat(
         ")",
         (now, agent_id),
     )
+
+    # Optional LLM model fields from the wrapper. The wrapper reads
+    # <profile>/config.yaml (model.default / model.base_url / model.provider)
+    # and pushes them on every heartbeat. Any subset can be sent; we
+    # only UPDATE the columns that were provided. The `profile` field
+    # scopes the update to a single profile; if missing, fan out to
+    # all profiles of this agent.
+    if any(body_data.get(k) is not None for k in ("model_default", "model_base_url", "model_provider")):
+        body = HeartbeatBody(**body_data)
+        sets: list[str] = []
+        params: list[Any] = []
+        for field, col in (
+            ("model_default", "llm_model_default"),
+            ("model_base_url", "llm_model_base_url"),
+            ("model_provider", "llm_model_provider"),
+        ):
+            val = getattr(body, field, None)
+            if val is not None:
+                sets.append(f"{col} = ?")
+                params.append(val)
+        if sets:
+            sql = (
+                f"UPDATE agent_profiles SET {', '.join(sets)}, updated_at = ? "
+                f"WHERE agent_id = ?"
+            )
+            params.extend([now, agent_id])
+            if body.profile:
+                # Scoped to a single profile
+                sql += " AND name = ?"
+                params.append(body.profile)
+            await db.execute(sql, tuple(params))
 
     # Return assigned + running tasks for this agent
     task_rows = await db.fetchall(

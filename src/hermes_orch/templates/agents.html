@@ -162,9 +162,9 @@
             <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;">
                 {% for p in agent.profiles %}
                 <div class="border rounded p-3 bg-gray-50" style="flex:1 1 320px; max-width:32rem; min-width:0;" id="profile-card-{{ agent.id }}-{{ p.name }}">
-                    {# Header row: name + status (left) | caps + edit + SOUL + × (right) #}
+                    {# Header row: name + status + LLM model (left) | caps + edit + SOUL + × (right) #}
                     <div class="flex items-center justify-between gap-2 flex-wrap">
-                        <div class="flex items-center gap-2 min-w-0">
+                        <div class="flex items-center gap-2 min-w-0 flex-wrap">
                             <span class="font-mono text-sm font-semibold">{{ p.name }}</span>
                             <span class="px-1.5 py-0.5 text-[10px] rounded
                                 {% if p.status == 'busy' %}bg-red-100 text-red-800
@@ -172,6 +172,23 @@
                                 {% else %}bg-yellow-100 text-yellow-800{% endif %}">
                                 {{ p.status }}
                             </span>
+                            {# LLM model badge — wrapper-reported via heartbeat #}
+                            {% if p.llm_model_default %}
+                            <span class="px-1.5 py-0.5 text-[10px] rounded bg-indigo-50 text-indigo-700 font-mono"
+                                title="LLM model: {{ p.llm_model_provider|default('?') }} &#10;Endpoint: {{ p.llm_model_base_url|default('?') }}">
+                                model: {{ p.llm_model_default }}{% if p.llm_model_provider %} ({{ p.llm_model_provider }}){% endif %}
+                            </span>
+                            {% if p.llm_model_base_url %}
+                            <span class="text-[10px] text-gray-500 font-mono truncate max-w-[28ch]" title="{{ p.llm_model_base_url }}">
+                                {{ p.llm_model_base_url }}
+                            </span>
+                            {% endif %}
+                            {% else %}
+                            <span class="px-1.5 py-0.5 text-[10px] rounded bg-gray-100 text-gray-500 italic"
+                                title="LLM not yet reported by wrapper. The wrapper reads <profile>/config.yaml (model.default) and pushes it on the next heartbeat.">
+                                LLM: not reported
+                            </span>
+                            {% endif %}
                         </div>
                         <div class="flex items-center gap-1 flex-shrink-0">
                             {% for k, v in p.capabilities.items() %}{% if v %}<span class="px-1 bg-indigo-50 text-indigo-700 rounded text-[10px]" title="capability">{{ k }}</span>{% endif %}{% endfor %}
