@@ -301,6 +301,12 @@ MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN source_schedule_id TEXT DEFAULT ''",
     # project_schedules is a new table; created in CREATE TABLE block above.
     # No ALTER needed for it on existing DBs — IF NOT EXISTS handles it.
+    # Procedure.md (#22 Path A): per-project procedure/policy markdown that
+    # the agent reads before doing each task. Stored in the project folder
+    # (visible to the user when they open the folder in Explorer) AND
+    # denormalized into the task row at dispatch time so the wrapper
+    # can inject it as prompt context without a separate file fetch.
+    "ALTER TABLE tasks ADD COLUMN procedure_md TEXT DEFAULT ''",
 ]
 
 

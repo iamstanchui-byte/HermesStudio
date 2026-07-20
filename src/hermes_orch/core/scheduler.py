@@ -531,10 +531,14 @@ class Scheduler:
         """Copy the template's project folder to the new project.
 
         We copy plan.md (source of truth for the task list), status.md,
-        decisions.md, and the memory/ folder (L1 trace, L2 facts, L3
-        state). We do NOT copy `current_session_id` / `current_sessions_json`
-        because hermes session IDs are namespaced per profile and a new
-        project naturally wants fresh sessions.
+        decisions.md, procedure.md, and the memory/ folder (L1 trace,
+        L2 facts, L3 state). We do NOT copy `current_session_id` /
+        `current_sessions_json` because hermes session IDs are namespaced
+        per profile and a new project naturally wants fresh sessions.
+
+        procedure.md is the n8n-style "how to do this workflow" markdown
+        the user defines on the project page. We copy it so the new
+        cycle has the same procedure (no need to redefine on every fire).
 
         Falls back to writing a fresh plan.md if the template folder
         is missing (defensive — could happen if a user deletes the
@@ -545,7 +549,7 @@ class Scheduler:
         src_dir = self._project_dir(src_id)
         dst_dir = self._project_dir(dst_id, create=True)
         if src_dir.exists():
-            for f in ("plan.md", "status.md", "decisions.md", "facts.md", "state.md"):
+            for f in ("plan.md", "status.md", "decisions.md", "facts.md", "state.md", "procedure.md"):
                 sp = src_dir / f
                 if sp.exists():
                     (dst_dir / f).write_bytes(sp.read_bytes())

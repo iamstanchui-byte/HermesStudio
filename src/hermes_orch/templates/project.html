@@ -150,6 +150,16 @@
                         + Mark as template
                     </button>
                     {% endif %}
+                    {# Path B (#22): promote this project to a SKILL.md on a
+                       target profile. Useful for "I just did X, now
+                       agents should know how to do X." Available on
+                       all projects (any state) — a half-finished
+                       project can still teach a useful lesson. #}
+                    <button onclick="promoteToSkill()"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-indigo-300 text-indigo-700 hover:bg-indigo-50"
+                        title="Render this project as a SKILL.md and register it to a target profile. The agent on that profile will see the skill in its available skills list within ~30s.">
+                        ✨ Promote to skill
+                    </button>
                 </div>
             </div>
 
@@ -161,6 +171,34 @@
             <input type="hidden" id="replan-deliverable" value="{{ project.deliverable_path or '' }}">
         </div>
     </div>
+</div>
+
+<!-- Workflow procedure (Path A, #22) — n8n-style "how to do this workflow"
+     markdown. The agent reads this before executing each task. For
+     recurring templates, this file is copied to the clone so the new
+     cycle has the same procedure without redefining it. -->
+<div class="bg-white border rounded-lg p-4 mb-4 shadow-sm">
+    <div class="flex items-center justify-between mb-2">
+        <h2 class="text-base font-semibold text-gray-800">
+            Workflow procedure
+            <span class="text-xs text-gray-500 font-normal">(read by the agent before each task)</span>
+        </h2>
+        <button id="proc-edit-btn" onclick="toggleProcEdit()" class="text-xs px-2 py-1 bg-gray-50 text-gray-700 rounded border border-gray-300 hover:bg-gray-100">
+            Edit
+        </button>
+    </div>
+    <div id="proc-view" class="text-sm text-gray-700 prose-sm max-w-none">
+        <div id="proc-content" class="text-xs text-gray-500 italic">Loading...</div>
+    </div>
+    <form id="proc-edit-form" class="hidden mt-2" onsubmit="saveProcedure(event)">
+        <textarea id="proc-textarea" class="block w-full border rounded px-3 py-2 text-sm font-mono" rows="10"
+            placeholder="# Procedure (markdown)&#10;&#10;## Step 1: fetch data&#10;...&#10;&#10;## Step 2: compose report&#10;..."></textarea>
+        <div class="mt-2 flex items-center gap-2">
+            <button type="submit" class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Save procedure</button>
+            <button type="button" onclick="toggleProcEdit()" class="px-3 py-1.5 bg-gray-200 text-gray-700 rounded text-sm hover:bg-gray-300">Cancel</button>
+            <span id="proc-msg" class="text-xs"></span>
+        </div>
+    </form>
 </div>
 
 <!-- Create task (collapsed) -->
@@ -402,6 +440,10 @@ they target different agent profiles. -->
 </div>
 
 <script>
+// Load the procedure.md preview on page load. Other procedure functions
+// (toggleProcEdit, saveProcedure) are defined further down with the
+// other template/schedule handlers.
+loadProcedure();
 function toggleForm(id) {
     document.getElementById(id).classList.toggle('hidden');
 }
@@ -608,6 +650,127 @@ async function unmarkTemplate(projectId, name) {
         location.reload();
     } catch (e) {
         alert("Unmark template failed: " + e.message);
+    }
+}
+
+// ===== Workflow procedure (Path A, #22) =====
+// procedure.md lives at <project_folder>/procedure.md. The supervisor
+// denormalizes it into each task's procedure_md column at assignment
+// time; the wrapper reads that and prepends it to the agent's prompt.
+// Here we just GET/PUT the raw file via the existing file API.
+const PROJECT_ID = "{{ project.id }}";
+async function loadProcedure() {
+    const el = document.getElementById('proc-content');
+    try {
+        const r = await fetch(`/api/projects/${PROJECT_ID}/files/procedure.md`);
+        if (r.status === 404) {
+            el.textContent = '(no procedure yet — click Edit to add one)';
+            el.classList.remove('italic', 'text-gray-500');
+            el.classList.add('text-gray-400');
+            return;
+        }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const text = await r.text();
+        if (!text.trim()) {
+            el.textContent = '(empty — click Edit to add one)';
+            el.classList.remove('italic', 'text-gray-500');
+            el.classList.add('text-gray-400');
+        } else {
+            // Render as plain text in a pre (so we don't need a markdown lib).
+            el.textContent = text;
+            el.classList.remove('italic', 'text-gray-500', 'text-gray-400');
+            el.classList.add('text-gray-800', 'whitespace-pre-wrap', 'font-mono', 'text-xs');
+        }
+    } catch (e) {
+        el.textContent = 'Failed to load: ' + e.message;
+    }
+}
+let _procInEditMode = false;
+function toggleProcEdit() {
+    _procInEditMode = !_procInEditMode;
+    document.getElementById('proc-view').classList.toggle('hidden', _procInEditMode);
+    document.getElementById('proc-edit-form').classList.toggle('hidden', !_procInEditMode);
+    if (_procInEditMode) {
+        // Pre-fill the textarea with current content (fetch fresh)
+        fetch(`/api/projects/${PROJECT_ID}/files/procedure.md`)
+            .then(r => r.ok ? r.text() : '')
+            .then(text => { document.getElementById('proc-textarea').value = text; });
+    }
+}
+async function saveProcedure(ev) {
+    ev.preventDefault();
+    const text = document.getElementById('proc-textarea').value;
+    const msg = document.getElementById('proc-msg');
+    msg.textContent = "saving...";
+    msg.className = "text-xs text-gray-500";
+    try {
+        const r = await fetch(`/api/projects/${PROJECT_ID}/files/procedure.md`, {
+            method: 'PUT',
+            body: text,
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        msg.textContent = "saved";
+        msg.className = "text-xs text-green-600";
+        // Reload the view, exit edit mode
+        _procInEditMode = false;
+        document.getElementById('proc-edit-form').classList.add('hidden');
+        document.getElementById('proc-view').classList.remove('hidden');
+        await loadProcedure();
+    } catch (e) {
+        msg.textContent = "error: " + e.message;
+        msg.className = "text-xs text-red-600";
+    }
+}
+
+// ===== Promote to skill (Path B, #22) =====
+// Render this project's plan + facts as a SKILL.md and push it to a
+// selected profile. After this, the target profile's hermes agent will
+// see the skill in its available-skills list and can use it for matching
+// tasks. Useful for "I just did X once, now let agents in any project
+// know how to do X".
+async function promoteToSkill() {
+    // Pick the target profile. We hardcode the 4 known profiles for
+    // demo simplicity; a real install would let the user pick from a
+    // dynamic list via GET /api/agents/ but for now this is enough.
+    const profiles = {{ all_profiles | tojson }};
+    if (profiles.length === 0) {
+        alert("No profiles registered yet. Add an agent first.");
+        return;
+    }
+    const opts = profiles.map((p, i) => `${i+1}. ${p.agent_id} / ${p.name}`).join('\n');
+    const choice = prompt(
+        `Promote this project to a SKILL.md.\n\n` +
+        `Pick a target profile (number):\n${opts}\n\n` +
+        `The skill will be named after the project (lowercased, dashes).`,
+        "1"
+    );
+    if (!choice) return;
+    const idx = parseInt(choice, 10) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= profiles.length) {
+        alert("Invalid choice");
+        return;
+    }
+    const target = profiles[idx];
+    const skillName = (prompt("Skill name (filename-safe, e.g. 'weather-report'):") || "").trim();
+    if (!skillName) return;
+    if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(skillName)) {
+        alert("Invalid name. Use lowercase letters, digits, dashes. e.g. 'weather-report'");
+        return;
+    }
+    try {
+        const r = await fetch(`/api/projects/${PROJECT_ID}/promote-to-skill`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({agent_id: target.agent_id, profile_name: target.name, skill_name: skillName}),
+        });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.detail || `HTTP ${r.status}`);
+        }
+        const data = await r.json();
+        alert(`Skill registered. ${data.skill_id || skillName} will land on the agent host within ~30s.`);
+    } catch (e) {
+        alert("Promote-to-skill failed: " + e.message);
     }
 }
 

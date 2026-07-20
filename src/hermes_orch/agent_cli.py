@@ -1123,6 +1123,19 @@ def start(
                 f"  (when done, write your result to this file. "
                 f"Other tasks will read it from the orchestrator.)"
             )
+        # Path A (#22): if the supervisor denormalized the project's
+        # procedure.md into this task's `procedure_md` column at assignment
+        # time, include it in the prompt as the first thing the agent sees.
+        # This is the n8n-style "how to do this workflow" doc — the agent
+        # reads it BEFORE the LLM-driven action call so it follows the
+        # project-specific procedure rather than improvising. The denormalized
+        # copy lives in the tasks table (set by Supervisor._assign_task),
+        # so the wrapper doesn't need a separate file fetch.
+        procedure_text = task.get("procedure_md") or ""
+        if procedure_text and procedure_text.strip():
+            context_lines.append("--- WORKFLOW PROCEDURE (read this first) ---")
+            context_lines.append(procedure_text)
+            context_lines.append("--- END WORKFLOW PROCEDURE ---")
         # Optional self-teach hint. The agent can drop a markdown file at
         # `../skills/<name>.md` (relative to the cache dir, which is
         # `<profile>/.orch-cache/<project_id>/`, so `../skills/` lands

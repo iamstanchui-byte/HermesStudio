@@ -1131,9 +1131,33 @@ class Supervisor:
         tid = task["id"]
         role = task["agent_role"]
         # Re-read to avoid races
-        cur = await self.db.fetchone("SELECT status FROM tasks WHERE id = ?", (tid,))
+        cur = await self.db.fetchone(
+            "SELECT id, status, project_id, agent_role, required_capability "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        )
         if not cur or cur["status"] != "pending":
             return False
+        # Path A (#22): inject the project's procedure.md into the task row
+        # at assignment time. The wrapper reads task.procedure_md and
+        # prepends it to the agent's prompt as project context (so the
+        # agent sees the workflow steps before doing its work). Reading
+        # the file at dispatch time (vs every time the wrapper fetches
+        # the project) keeps the wrapper's API surface unchanged and
+        # makes the task row self-contained for audit.
+        if not cur.get("procedure_md"):
+            try:
+                proj_root = Path(self.cfg["projects"]["storage_root"]).resolve()
+                proc_file = proj_root / cur["project_id"] / "procedure.md"
+                if proc_file.exists():
+                    proc_text = proc_file.read_text(encoding="utf-8")
+                    await self.db.execute(
+                        "UPDATE tasks SET procedure_md = ? WHERE id = ?",
+                        (proc_text, tid),
+                    )
+                    cur["procedure_md"] = proc_text
+            except Exception as e:
+                log.warning("failed to load procedure.md for task %s: %s", tid, e)
         # Find an idle profile for this role (prefer verified agents)
         prof = await self.db.fetchone(
             "SELECT ap.id, ap.agent_id, ap.capabilities FROM agent_profiles ap "

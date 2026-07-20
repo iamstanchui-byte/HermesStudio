@@ -486,6 +486,154 @@ async def unmark_project_as_template(project_id: str, request: Request):
     return None
 
 
+# ===== Promote to skill (Path B, #22) =====
+#
+# Render the project's plan + tasks + facts as a SKILL.md and push it to
+# the target profile's `skills/<name>/SKILL.md` file (via the same
+# profile_configs flow the dashboard's skill upload uses). The wrapper
+# picks it up on the next 30s config-sync tick and writes the file to
+# the agent host.
+#
+# Use case: "I just did this thing once, now let agents in any project
+# know how to do it." Best done on completed projects, but allowed on
+# any state — a half-finished project can still extract a useful lesson.
+
+class PromoteToSkillIn(BaseModel):
+    agent_id: str
+    profile_name: str
+    skill_name: str = Field(..., min_length=2, max_length=40, pattern=r"^[a-z0-9][a-z0-9-]{1,40}$")
+
+
+@router.post("/project/{project_id}/promote-to-skill")
+async def promote_project_to_skill(
+    project_id: str, body: PromoteToSkillIn, request: Request
+) -> dict:
+    """Render this project as a SKILL.md and push it to the target profile.
+
+    The skill lands on the agent host within ~30s (the wrapper's
+    config-sync tick). The agent's available-skills list will then
+    include it.
+    """
+    import secrets as _secrets
+    db = request.app.state.db
+    proj = await db.fetchone(
+        "SELECT id, name, goal, state FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    # Look up target profile. Must exist, must be verified (otherwise
+    # the wrapper won't accept our config push — no auth secret means
+    # the agent hasn't completed bootstrap).
+    target = await db.fetchone(
+        "SELECT ap.id, ap.name, a.id AS agent_id, a.status AS agent_status, a.secret_hash "
+        "FROM agent_profiles ap JOIN agents a ON a.id = ap.agent_id "
+        "WHERE ap.name = ? AND a.id = ?",
+        (body.profile_name, body.agent_id),
+    )
+    if not target:
+        raise HTTPException(
+            404, f"Profile not found: {body.agent_id}/{body.profile_name}"
+        )
+    if not target.get("secret_hash"):
+        raise HTTPException(
+            400,
+            f"Target agent '{body.agent_id}' has no auth secret — "
+            "register it first (or complete the bootstrap flow).",
+        )
+    # Render the SKILL.md body. Human-readable, no JSON frontmatter —
+    # the agent just reads it as a knowledge asset. Sections:
+    #   - Goal (1-2 lines from project.goal)
+    #   - Workflow steps (task list, action+role per step, status, result snippet)
+    #   - Key facts learned (from facts.md, trimmed)
+    #   - Outcome (from decision.md, trimmed)
+    #   - When to use (pointer)
+    parts: list[str] = []
+    parts.append(f"# {proj.get('name') or proj['id']}\n")
+    if proj.get("goal"):
+        parts.append("## Goal\n\n" + proj["goal"] + "\n")
+    # Pull task list from DB (cleaner than parsing plan.md, and handles
+    # manual-mode projects that never got an LLM-generated plan).
+    tasks = await db.fetchall(
+        "SELECT name, agent_role, action, status, result "
+        "FROM tasks WHERE project_id = ? "
+        "ORDER BY created_at ASC",
+        (project_id,),
+    )
+    if tasks:
+        parts.append("## Workflow steps\n")
+        for i, t in enumerate(tasks, 1):
+            tname = t.get("name") or t.get("action") or "task"
+            parts.append(
+                f"{i}. **{tname}** (`{t.get('action') or '?'}`, "
+                f"role=`{t.get('agent_role') or '?'}`) — {t.get('status') or ''}"
+            )
+            if t.get("result"):
+                r = (t.get("result") or "")[:400]
+                if len(t.get("result") or "") > 400:
+                    r += "..."
+                parts.append(f"   - Result: {r}")
+        parts.append("")
+    # facts.md (curated L2 memory) — what the user cared about
+    from hermes_orch.api.projects import _project_dir
+    pdir = _project_dir(request, project_id)
+    facts_path = pdir / "facts.md"
+    if facts_path.exists():
+        facts_text = facts_path.read_text(encoding="utf-8", errors="replace")
+        if facts_text.strip():
+            parts.append("## Key facts learned\n")
+            for line in facts_text.splitlines()[:80]:
+                parts.append(line)
+            parts.append("")
+    decision_path = pdir / "decision.md"
+    if decision_path.exists():
+        decision_text = decision_path.read_text(encoding="utf-8", errors="replace")
+        if decision_text.strip():
+            parts.append("## Outcome\n")
+            parts.append(decision_text[:1500])
+            parts.append("")
+    parts.append("## When to use this skill\n")
+    parts.append(
+        f"This skill captures the workflow from project `{proj['id']}`. "
+        "Use it when the user asks for a similar task and the same workflow steps apply.\n"
+    )
+    skill_body = "\n".join(parts).strip() + "\n"
+    # Push via profile_configs — same flow as the agents router uses
+    # for skills. The wrapper's apply-config loop writes it to
+    # <profile>/skills/<name>/SKILL.md.
+    skill_id = "skill-" + _secrets.token_hex(6)
+    await db.insert(
+        "profile_configs",
+        {
+            "id": skill_id,
+            "profile_id": target["id"],
+            "file_path": f"skills/{body.skill_name}/SKILL.md",
+            "desired_sha256": "",  # wrapper computes on apply
+            "desired_content": skill_body,
+            "status": "pending",
+        },
+    )
+    await audit_log(
+        db, "project.promoted_to_skill",
+        actor="operator",
+        project_id=project_id,
+        payload={
+            "skill_id": skill_id,
+            "skill_name": body.skill_name,
+            "agent_id": body.agent_id,
+            "profile_name": body.profile_name,
+            "size": len(skill_body),
+        },
+    )
+    return {
+        "skill_id": skill_id,
+        "skill_name": body.skill_name,
+        "size": len(skill_body),
+        "agent_id": body.agent_id,
+        "profile_name": body.profile_name,
+    }
+
+
 # ===== Internal helpers =====
 
 
