@@ -7,6 +7,65 @@
     <div class="text-sm text-gray-500">{{ agents|length }} registered</div>
 </div>
 
+<!-- ===== Overview (4 stat cards + donut + subagent count) ===== -->
+<div class="mb-4 bg-white border rounded-lg p-4 shadow-sm">
+    <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">Overview</h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
+        <!-- Left: 4 stat cards in a 2x2 grid -->
+        <div class="grid grid-cols-2 gap-3">
+            <div class="bg-gray-50 border rounded p-3">
+                <div class="text-xs text-gray-500 uppercase">Total</div>
+                <div class="text-2xl font-bold text-gray-800">{{ overview.total_agents }}</div>
+                <div class="text-xs text-gray-400">agents</div>
+            </div>
+            <div class="bg-green-50 border border-green-200 rounded p-3">
+                <div class="text-xs text-green-700 uppercase">Online</div>
+                <div class="text-2xl font-bold text-green-800">{{ overview.online }}</div>
+                <div class="text-xs text-green-600">heartbeat &lt; 90s</div>
+            </div>
+            <div class="bg-blue-50 border border-blue-200 rounded p-3">
+                <div class="text-xs text-blue-700 uppercase">Idle</div>
+                <div class="text-2xl font-bold text-blue-800">{{ overview.idle }}</div>
+                <div class="text-xs text-blue-600">profiles ready</div>
+            </div>
+            <div class="bg-red-50 border border-red-200 rounded p-3">
+                <div class="text-xs text-red-700 uppercase">Busy</div>
+                <div class="text-2xl font-bold text-red-800">{{ overview.busy }}</div>
+                <div class="text-xs text-red-600">profiles working</div>
+            </div>
+        </div>
+        <!-- Middle: donut SVG (idle / busy / offline) -->
+        <div class="flex justify-center">
+            <svg id="overview-donut" width="160" height="160" viewBox="0 0 160 160" aria-label="Profile status donut">
+                <circle cx="80" cy="80" r="60" fill="none" stroke="#e5e7eb" stroke-width="24" />
+            </svg>
+        </div>
+        <!-- Right: by-os / subagent stat block -->
+        <div class="grid grid-cols-2 gap-3">
+            <div class="bg-gray-50 border rounded p-3">
+                <div class="text-xs text-gray-500 uppercase">Windows</div>
+                <div class="text-2xl font-bold text-gray-800">{{ overview.windows_online }}</div>
+                <div class="text-xs text-gray-400">online</div>
+            </div>
+            <div class="bg-gray-50 border rounded p-3">
+                <div class="text-xs text-gray-500 uppercase">Linux</div>
+                <div class="text-2xl font-bold text-gray-800">{{ overview.linux_online }}</div>
+                <div class="text-xs text-gray-400">online</div>
+            </div>
+            <div class="bg-gray-50 border rounded p-3">
+                <div class="text-xs text-gray-500 uppercase">Profiles</div>
+                <div class="text-2xl font-bold text-gray-800">{{ overview.profiles_total }}</div>
+                <div class="text-xs text-gray-400">total</div>
+            </div>
+            <div class="bg-indigo-50 border border-indigo-200 rounded p-3">
+                <div class="text-xs text-indigo-700 uppercase">Subagents</div>
+                <div class="text-2xl font-bold text-indigo-800">{{ overview.subagents_online }}</div>
+                <div class="text-xs text-indigo-600">online</div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Register Agent (collapsed by default) -->
 {% if not agents %}
 <div class="bg-blue-50 border border-blue-200 rounded p-4 mb-3 text-sm text-blue-800">
@@ -545,6 +604,82 @@ async function syncSkillsFromDisk(agentId, profileName, btn) {
         btn.disabled = false;
     }
 }
+
+// ===== Overview donut =====
+// Renders a 3-slice donut (idle / busy / offline) on the overview
+// card. Slices come from the page context (window.OVERVIEW_SUMMARY
+// is set in the inline <script> at the top of the page). Pure
+// inline SVG, no chart library.
+
+(function renderOverviewDonut() {
+    const overview = {
+        idle: {{ overview.idle }},
+        busy: {{ overview.busy }},
+        // offline = total profiles - online. If no profiles at all,
+        // the donut shows 100% grey "no data".
+        total_profiles: {{ overview.profiles_total }},
+        online_profiles: {{ overview.subagents_online }},
+    };
+    const offline = Math.max(0, overview.total_profiles - overview.online_profiles);
+    const total = overview.idle + overview.busy + offline;
+    const slices = total > 0
+        ? [
+            {label: 'idle',  count: overview.idle,  color: '#1d4ed8'},  // blue-700
+            {label: 'busy',  count: overview.busy,  color: '#b91c1c'},  // red-700
+            {label: 'offline', count: offline,      color: '#9ca3af'},  // gray-400
+        ].filter(s => s.count > 0)
+        : [{label: 'no data', count: 1, color: '#e5e7eb'}];  // gray-200 fallback
+    const svg = document.getElementById('overview-donut');
+    if (!svg) return;
+    const cx = 80, cy = 80, r = 60;
+    const total2 = slices.reduce((a, s) => a + s.count, 0);
+    // The grey background ring is already in the SVG; only draw
+    // slices on top, with a 24px stroke and a small gap effect via
+    // round line caps.
+    let angle = -Math.PI / 2;  // start at 12 o'clock
+    for (const s of slices) {
+        const frac = s.count / total2;
+        const sweep = frac * 2 * Math.PI;
+        const end = angle + sweep;
+        const x1 = cx + r * Math.cos(angle);
+        const y1 = cy + r * Math.sin(angle);
+        const x2 = cx + r * Math.cos(end);
+        const y2 = cy + r * Math.sin(end);
+        const large = sweep > Math.PI ? 1 : 0;
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        // Use a stroke arc instead of a filled wedge — simpler and
+        // matches the existing grey ring (same r/stroke-width).
+        const d = `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;
+        path.setAttribute('d', d);
+        path.setAttribute('stroke', s.color);
+        path.setAttribute('stroke-width', '24');
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke-linecap', 'butt');
+        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+        title.textContent = `${s.label}: ${s.count} (${(frac * 100).toFixed(0)}%)`;
+        path.appendChild(title);
+        svg.appendChild(path);
+        angle = end;
+    }
+    // Center label: total profiles
+    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    text.setAttribute('x', cx);
+    text.setAttribute('y', cy + 6);
+    text.setAttribute('text-anchor', 'middle');
+    text.setAttribute('font-size', '20');
+    text.setAttribute('font-weight', '700');
+    text.setAttribute('fill', '#1f2937');
+    text.textContent = total;
+    svg.appendChild(text);
+    const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    sub.setAttribute('x', cx);
+    sub.setAttribute('y', cy + 22);
+    sub.setAttribute('text-anchor', 'middle');
+    sub.setAttribute('font-size', '10');
+    sub.setAttribute('fill', '#6b7280');
+    sub.textContent = 'profiles';
+    svg.appendChild(sub);
+})();
 
 </script>
 

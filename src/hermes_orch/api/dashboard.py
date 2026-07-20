@@ -253,15 +253,77 @@ async def root() -> RedirectResponse:
     return RedirectResponse(url="/agents")
 
 
+async def _load_agents_overview(db: Any) -> dict[str, Any]:
+    """Aggregate stats for the /agents overview dashboard.
+
+    Computes (in one DB roundtrip + a few follow-ups):
+      - total_agents, online (heartbeat within 90s)
+      - idle / busy profile counts (only for online agents)
+      - windows_online / linux_online
+      - profiles_total
+      - subagents_online (= online profile count)
+
+    The 90s "online" cutoff matches the dashboard's dot-color logic
+    (status=verified + last_heartbeat >= 90s ago -> green).
+
+    Donut proportions (idle / busy / offline) are derived client-side
+    in agents.html's renderDonut() — we send the raw counts only.
+    """
+    from datetime import timedelta
+    now = now_aware()
+    online_cutoff = (now - timedelta(seconds=90)).isoformat()
+    # Single aggregate row for everything we can do in one join
+    row = await db.fetchone(
+        """
+        SELECT
+            COUNT(DISTINCT a.id) AS total_agents,
+            SUM(CASE WHEN a.status='verified' AND a.last_heartbeat_at >= ? THEN 1 ELSE 0 END) AS online,
+            SUM(CASE WHEN a.status='verified' AND a.last_heartbeat_at >= ? AND p.status='idle' THEN 1 ELSE 0 END) AS idle,
+            SUM(CASE WHEN a.status='verified' AND a.last_heartbeat_at >= ? AND p.status='busy' THEN 1 ELSE 0 END) AS busy,
+            SUM(CASE WHEN a.os_type='windows' AND a.status='verified' AND a.last_heartbeat_at >= ? THEN 1 ELSE 0 END) AS windows_online,
+            SUM(CASE WHEN a.os_type='linux' AND a.status='verified' AND a.last_heartbeat_at >= ? THEN 1 ELSE 0 END) AS linux_online
+        FROM agents a
+        LEFT JOIN agent_profiles p ON p.agent_id = a.id
+        """,
+        (online_cutoff,) * 5,
+    )
+    profiles_total_row = await db.fetchone(
+        "SELECT COUNT(*) as n FROM agent_profiles"
+    )
+    subagents_online_row = await db.fetchone(
+        """
+        SELECT COUNT(*) as n FROM agent_profiles p
+        JOIN agents a ON a.id = p.agent_id
+        WHERE a.status='verified' AND a.last_heartbeat_at >= ?
+        """,
+        (online_cutoff,),
+    )
+    return {
+        "total_agents": int(row["total_agents"] or 0) if row else 0,
+        "online": int(row["online"] or 0) if row else 0,
+        "idle": int(row["idle"] or 0) if row else 0,
+        "busy": int(row["busy"] or 0) if row else 0,
+        "windows_online": int(row["windows_online"] or 0) if row else 0,
+        "linux_online": int(row["linux_online"] or 0) if row else 0,
+        "profiles_total": int(profiles_total_row["n"]) if profiles_total_row else 0,
+        "subagents_online": int(subagents_online_row["n"]) if subagents_online_row else 0,
+    }
+
+
 @router.get("/agents", response_class=HTMLResponse)
 async def agents_page(request: Request) -> HTMLResponse:
     """Agents page with expandable profile sub-cards."""
     db = request.app.state.db
     agents = await _load_agents(db)
+    overview = await _load_agents_overview(db)
     return templates.TemplateResponse(
         request=request,
         name="agents.html",
-        context={**_base_context(request, "agents"), "agents": agents},
+        context={
+            **_base_context(request, "agents"),
+            "agents": agents,
+            "overview": overview,
+        },
     )
 
 
