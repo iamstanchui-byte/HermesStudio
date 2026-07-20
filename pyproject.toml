@@ -23,6 +23,11 @@ dependencies = [
     # Recurring project schedules (cron parsing for /api/schedules).
     # croniter gives us parse + get_next() in one library; ~150KB pure-Python.
     "croniter>=2.0.5",
+    # IANA timezone database — Windows Python doesn't ship it, so
+    # zoneinfo.ZoneInfo('Asia/Hong_Kong') would fail with
+    # ZoneInfoNotFoundError. tzdata is a small pure-Python fallback
+    # (~300KB) that ships the tzdata2024a+ database.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
