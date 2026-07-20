@@ -80,6 +80,10 @@ class Task(BaseModel):
     required_capability: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    # Path A (#22): per-task denormalized procedure.md. The supervisor
+    # copies the project's procedure.md into this column at assignment
+    # time; the wrapper reads it and prepends to the agent's prompt.
+    procedure_md: str | None = None
 
 
 class TaskResult(BaseModel):

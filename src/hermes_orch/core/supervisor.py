@@ -34,6 +34,7 @@ from hermes_orch.core.audit import audit_log
 from hermes_orch.core.notifier import Notifier
 from hermes_orch.core.planner import Planner
 from hermes_orch.utils import now_iso as _now_iso, now_aware
+from pathlib import Path  # Path A (#22): read procedure.md at task assign
 
 log = logging.getLogger("hermes_orch.supervisor")
 
