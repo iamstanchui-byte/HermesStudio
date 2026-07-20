@@ -237,6 +237,61 @@ class Supervisor:
         except Exception as e:
             log.debug(f"stale-agent scan failed: {e}")
 
+        # Stuck-task check: if a 'running' task's assigned agent is
+        # stale (>3 min no heartbeat), the wrapper probably died
+        # mid-task. Mark the task as failed so the project can move
+        # on (otherwise it sits in 'running' forever and the iter
+        # loop's `nonterm` check blocks further progress).
+        try:
+            from datetime import timedelta
+            stuck_cutoff = (now_aware() - timedelta(seconds=180)).isoformat()
+            # Find stuck tasks: assigned to a verified agent whose
+            # last_heartbeat is older than 3 min. (Note: 'stale' status
+            # is the more recent flip; we also catch agents that never
+            # got flipped yet because the stale-agent check above runs
+            # every tick but the agent's heartbeat has been stale for
+            # >90s. The 180s threshold gives the stale-flip a chance
+            # to land first.)
+            stuck_tasks = await self.db.fetchall(
+                "SELECT t.id, t.project_id, t.name, t.assigned_agent_id, "
+                "a.last_heartbeat_at "
+                "FROM tasks t JOIN agents a ON a.id = t.assigned_agent_id "
+                "WHERE t.status = 'running' "
+                "AND a.last_heartbeat_at < ?",
+                (stuck_cutoff,),
+            )
+            for st in stuck_tasks:
+                await self.db.execute(
+                    "UPDATE tasks SET status = 'failed', updated_at = ? "
+                    "WHERE id = ? AND status = 'running'",
+                    (_now_iso(), st["id"]),
+                )
+                # Free the profile (it might be stuck claiming this task)
+                await self.db.execute(
+                    "UPDATE agent_profiles SET status = 'idle', "
+                    "current_task_id = NULL, updated_at = ? "
+                    "WHERE current_task_id = ?",
+                    (_now_iso(), st["id"]),
+                )
+                await audit_log(
+                    self.db, "task.stuck_wrapper",
+                    actor="supervisor",
+                    project_id=st["project_id"],
+                    task_id=st["id"],
+                    payload={
+                        "name": st["name"],
+                        "assigned_agent_id": st["assigned_agent_id"],
+                        "last_heartbeat_at": st["last_heartbeat_at"],
+                        "reason": "wrapper heartbeat stale > 3min; marking failed",
+                    },
+                )
+                log.warning(
+                    f"task {st['id']} ({st['name']}) marked failed: "
+                    f"wrapper heartbeat stale"
+                )
+        except Exception as e:
+            log.exception(f"stuck-task scan failed: {e}")
+
         projects = await self.db.fetchall(
             "SELECT * FROM projects WHERE state IN ('planning','ready','running')"
         )
@@ -1009,7 +1064,13 @@ class Supervisor:
         await self._complete_iterative_project(proj, decision_pass=decision_pass)
 
     async def _find_ready_tasks(self, project_id: str) -> list[dict[str, Any]]:
-        """Pending tasks where all depends_on are completed/skipped."""
+        """Pending tasks where all depends_on are completed/skipped.
+
+        Also auto-cancels pending tasks whose deps are no longer
+        satisfiable (any dep is failed/cancelled/interrupted) — those
+        tasks would never become ready, so leaving them pending just
+        blocks the project from being marked complete.
+        """
         rows = await self.db.fetchall(
             "SELECT * FROM tasks WHERE project_id = ? AND status = 'pending' "
             "ORDER BY created_at ASC",
@@ -1028,6 +1089,35 @@ class Supervisor:
                 tuple(deps),
             )
             statuses = {d["status"] for d in dep_rows}
+            unsatisfiable = statuses & {"failed", "cancelled", "interrupted"}
+            if unsatisfiable:
+                # Mark the dependent task cancelled too, with a note
+                # explaining which dep caused it. Operator can re-plan
+                # or manually re-enable if needed.
+                failed_dep = next(
+                    d["id"] for d in dep_rows if d["status"] in unsatisfiable
+                )
+                await self.db.execute(
+                    "UPDATE tasks SET status = 'cancelled', updated_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (_now_iso(), r["id"]),
+                )
+                await audit_log(
+                    self.db, "task.auto_cancelled",
+                    actor="supervisor",
+                    project_id=project_id,
+                    task_id=r["id"],
+                    payload={
+                        "name": r.get("name"),
+                        "reason": f"dependency {failed_dep} unsatisfiable",
+                        "dep_statuses": {d["id"]: d["status"] for d in dep_rows},
+                    },
+                )
+                log.info(
+                    f"task {r['id']} ({r.get('name')}) auto-cancelled: "
+                    f"dep {failed_dep} unsatisfiable"
+                )
+                continue
             if statuses <= {"completed", "skipped"}:
                 out.append(r)
         return out
