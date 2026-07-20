@@ -662,10 +662,22 @@ async function unmarkTemplate(projectId, name) {
 // Here we just GET/PUT the raw file via the existing file API.
 // (PROJECT_ID is declared earlier in the same script block — don't
 // redeclare or the page errors out silently.)
+// Wraps fetch with a hard 5s timeout so the UI never sits on "Loading..."
+// forever if the server is slow / network is wedged. 8s was too long for
+// a local LAN call; 5s is generous without being annoying.
+async function _fetchWithTimeout(url, opts = {}, ms = 5000) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), ms);
+    try {
+        return await fetch(url, { ...opts, signal: ctl.signal });
+    } finally {
+        clearTimeout(t);
+    }
+}
 async function loadProcedure() {
     const el = document.getElementById('proc-content');
     try {
-        const r = await fetch(`/api/projects/${PROJECT_ID}/files/procedure.md`);
+        const r = await _fetchWithTimeout(`/api/projects/${PROJECT_ID}/files/procedure.md`);
         if (r.status === 404) {
             el.textContent = '(no procedure yet — click Edit to add one)';
             el.classList.remove('italic', 'text-gray-500');
@@ -685,7 +697,11 @@ async function loadProcedure() {
             el.classList.add('text-gray-800', 'whitespace-pre-wrap', 'font-mono', 'text-xs');
         }
     } catch (e) {
-        el.textContent = 'Failed to load: ' + e.message;
+        // AbortError = our timeout fired; anything else = real failure.
+        const reason = e.name === 'AbortError' ? 'request timed out (>5s)' : e.message;
+        el.textContent = 'Failed to load: ' + reason;
+        el.classList.remove('italic', 'text-gray-500', 'text-gray-400', 'text-gray-800', 'whitespace-pre-wrap', 'font-mono', 'text-xs');
+        el.classList.add('text-red-500');
     }
 }
 let _procInEditMode = false;
@@ -761,7 +777,7 @@ async function promoteToSkill() {
         return;
     }
     try {
-        const r = await fetch(`/api/projects/${PROJECT_ID}/promote-to-skill`, {
+        const r = await fetch(`/api/schedules/project/${PROJECT_ID}/promote-to-skill`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({agent_id: target.agent_id, profile_name: target.name, skill_name: skillName}),
