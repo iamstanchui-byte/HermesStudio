@@ -88,6 +88,12 @@ class TaskResult(BaseModel):
     summary: str | None = None
     error: str | None = None
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    # Wrapper-reported per-task token usage. Read from the profile's
+    # hermes state.db (sessions table) by the wrapper after each hermes
+    # subprocess completes. Mapped into the orchestrator's token_usage
+    # table with call_kind='agent_task'. Optional for backward
+    # compatibility — old wrappers that don't report tokens still work.
+    token_usage: dict[str, Any] | None = None
 
 
 class TaskAssign(BaseModel):
@@ -514,6 +520,41 @@ async def submit_result(task_id: str, body: TaskResult, request: Request) -> Tas
             agent_id=task["assigned_agent_id"],
             payload={"error": body.error},
         )
+
+    # Record per-task token usage reported by the wrapper. Best-effort:
+    # if the wrapper didn't report (older versions) or the state.db
+    # schema is older than hermes v0.17, body.token_usage will be None
+    # and we skip silently. Cost of writing a row is ~1ms.
+    if body.token_usage:
+        try:
+            from hermes_orch.core.token_usage import record_token_usage
+            tu = body.token_usage
+            task_name = task.get("name") or task.get("agent_role") or "?"
+            call_label = f"task:{task_name[:40]}"
+            provider = tu.get("billing_provider")
+            if provider:
+                call_label = f"{call_label} ({provider})"
+            await record_token_usage(
+                db,
+                agent_id=task.get("assigned_agent_id"),
+                profile_id=task.get("assigned_profile_id"),
+                project_id=task["project_id"],
+                task_id=task_id,
+                role=task.get("agent_role"),
+                model=tu.get("model") or "unknown",
+                base_url=tu.get("billing_base_url"),
+                prompt_tokens=int(tu.get("prompt_tokens") or 0),
+                completion_tokens=int(tu.get("completion_tokens") or 0),
+                total_tokens=int(tu.get("total_tokens") or 0),
+                call_kind="agent_task",
+                call_label=call_label,
+            )
+        except Exception as e:  # noqa: BLE001
+            # Token tracking must never break a real task completion.
+            import logging
+            logging.getLogger(__name__).warning(
+                "token_usage record failed for task %s: %s", task_id, e
+            )
 
     return updated
 

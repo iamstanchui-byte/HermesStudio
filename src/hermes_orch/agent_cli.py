@@ -327,6 +327,120 @@ def _strip_prompt_echo(s: str) -> str:
     return s
 
 
+# Hermes state.db schema versions:
+#   v0.17+ (current): sessions table has input_tokens, output_tokens,
+#                     cache_read_tokens, cache_write_tokens, reasoning_tokens,
+#                     model, billing_provider, billing_base_url,
+#                     estimated_cost_usd, started_at, ended_at, cwd
+# Earlier versions: schema may differ (no per-session token columns).
+# If a column is missing, _capture_session_tokens falls back gracefully
+# and returns the partial dict.
+_HERMES_TOKEN_COLUMNS_V0_17 = [
+    "id",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "model",
+    "billing_provider",
+    "billing_base_url",
+    "estimated_cost_usd",
+    "started_at",
+    "ended_at",
+    "message_count",
+    "tool_call_count",
+]
+
+
+def _capture_session_tokens(profile_root: Path) -> dict | None:
+    """Read the most recent hermes session from ``<profile_root>/state.db``.
+
+    Returns a dict with token usage fields (mapped to the orchestrator's
+    token_usage schema) or ``None`` if the session can't be read.
+
+    Mapping (hermes state.db -> orchestrator token_usage):
+        input_tokens  -> prompt_tokens
+        output_tokens -> completion_tokens
+        sum of all token columns -> total_tokens
+        model         -> model
+        billing_provider -> (stored in call_label suffix, not a column)
+        billing_base_url -> base_url
+
+    Defensive: if the schema is older than v0.17, the column query may
+    fail; we log a warning and return None. Sub-second tasks (sessions
+    that end before being committed) also return None.
+    """
+    if not profile_root:
+        return None
+    state_db = profile_root / "state.db"
+    if not state_db.exists() or not state_db.is_file():
+        return None
+    try:
+        import sqlite3
+        # Read-only URI so we never block on a hermes write lock.
+        uri = f"file:{state_db}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2)
+        try:
+            c = conn.cursor()
+            # Probe columns first: if the schema is older than v0.17, the
+            # token columns won't exist. List the actual columns and skip
+            # the ones we expect.
+            c.execute("PRAGMA table_info(sessions)")
+            available = {row[1] for row in c.fetchall()}
+            if not available:
+                return None
+            cols = [col for col in _HERMES_TOKEN_COLUMNS_V0_17 if col in available]
+            if "input_tokens" not in cols or "started_at" not in cols:
+                # Either pre-v0.17 (no token columns) or some other schema
+                # we don't recognize. Skip silently.
+                return None
+            col_list = ", ".join(cols)
+            c.execute(
+                f"SELECT {col_list} FROM sessions "
+                "WHERE ended_at IS NOT NULL "
+                "ORDER BY started_at DESC LIMIT 1"
+            )
+            row = c.fetchone()
+            if not row:
+                return None
+            session = dict(zip(cols, row))
+        finally:
+            conn.close()
+    except Exception as e:
+        click.echo(f"  WARN: state.db read failed: {e}")
+        return None
+
+    in_t = session.get("input_tokens") or 0
+    out_t = session.get("output_tokens") or 0
+    cache_r = session.get("cache_read_tokens") or 0
+    cache_w = session.get("cache_write_tokens") or 0
+    reasoning = session.get("reasoning_tokens") or 0
+    return {
+        "session_id": session.get("id"),
+        "model": session.get("model") or "unknown",
+        "billing_provider": session.get("billing_provider"),
+        "billing_base_url": session.get("billing_base_url"),
+        "estimated_cost_usd": session.get("estimated_cost_usd"),
+        "started_at": session.get("started_at"),
+        "ended_at": session.get("ended_at"),
+        "message_count": session.get("message_count"),
+        "tool_call_count": session.get("tool_call_count"),
+        # The orchestrator's token_usage schema only has 3 token columns
+        # (prompt / completion / total). We map input -> prompt,
+        # output -> completion, and report total = input + output
+        # (cache tokens are reported in the breakdown but not added to
+        # the headline total, to keep "BY MODEL" / "BY AGENT" sums
+        # comparable across providers that may or may not bill cache).
+        "prompt_tokens": in_t,
+        "completion_tokens": out_t,
+        "total_tokens": in_t + out_t,
+        "cache_read_tokens": cache_r,
+        "cache_write_tokens": cache_w,
+        "reasoning_tokens": reasoning,
+    }
+
+
 def _load_wrapper_config(config_path: Path) -> dict:
     """Load wrapper config JSON. Fields:
     {
@@ -1288,11 +1402,31 @@ def start(
                     # Merge extra artifacts into the result
                     if artifacts_extra:
                         result.setdefault("artifacts", []).extend(artifacts_extra)
+                # Capture hermes session tokens (input/output/cache/etc) from
+                # the profile's state.db so the orchestrator can record real
+                # per-task token usage. Best-effort: returns None if the
+                # schema is older or the session isn't committed yet.
+                token_usage = _capture_session_tokens(profile_root)
+                if token_usage:
+                    result["token_usage"] = token_usage
+                    click.echo(
+                        f"  tokens: in={token_usage.get('prompt_tokens', 0)} "
+                        f"out={token_usage.get('completion_tokens', 0)} "
+                        f"cache_r={token_usage.get('cache_read_tokens', 0)} "
+                        f"cache_w={token_usage.get('cache_write_tokens', 0)}"
+                    )
                 return result
-            return {
+            failed_result = {
                 "status": "failed",
                 "error": (stderr or stdout or f"hermes exited {rc}")[:8000],
             }
+            # Even on failure the hermes subprocess may have completed
+            # enough to commit a session row (with partial token usage).
+            # Capture it so we still get a token record for cost analysis.
+            token_usage = _capture_session_tokens(profile_root)
+            if token_usage:
+                failed_result["token_usage"] = token_usage
+            return failed_result
         except Exception as e:
             # Catch-all: Popen.communicate can throw on Windows if the child
             # process closes pipes abruptly. Treat as a task failure.
