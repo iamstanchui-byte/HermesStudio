@@ -49,7 +49,13 @@ class AgentRegister(BaseModel):
     agent_id: str
     ip: str | None = None
     os_type: str | None = None  # 'windows' | 'linux'
-    roles: list[str] = Field(default_factory=list)  # profile names
+    # roles is DEPRECATED: profiles are now created separately (via
+    # /api/agents/{id}/profiles POST after register, or auto-detected
+    # by the wrapper on first heartbeat). Kept for backward compat —
+    # if present, it's silently ignored and recorded in the audit log
+    # as `roles_ignored` so operators can tell old clients are still
+    # sending it. Remove in a future major version.
+    roles: list[str] = Field(default_factory=list)
 
 
 class AgentUpdate(BaseModel):
@@ -243,16 +249,11 @@ async def register_agent(body: AgentRegister, request: Request) -> AgentRegistra
         },
     )
 
-    for role in body.roles:
-        await db.insert(
-            "agent_profiles",
-            {
-                "id": str(uuid.uuid4()),
-                "agent_id": body.agent_id,
-                "name": role,
-                "status": "idle",
-            },
-        )
+    # Backward-compat: old clients still send `roles` but profiles are
+    # now managed separately (see POST /api/agents/{id}/profiles). If
+    # roles is non-empty, audit it as `roles_ignored` so operators can
+    # tell stale clients are still around. Don't create any profile rows.
+    roles_ignored = list(body.roles) if body.roles else []
 
     agent = await _agent_with_profiles(db, body.agent_id)
     setup_instructions = (
@@ -265,7 +266,11 @@ async def register_agent(body: AgentRegister, request: Request) -> AgentRegistra
         db, "agent.registered",
         actor="operator",
         agent_id=body.agent_id,
-        payload={"ip": body.ip, "os_type": body.os_type, "roles": body.roles},
+        payload={
+            "ip": body.ip,
+            "os_type": body.os_type,
+            "roles_ignored": roles_ignored,
+        },
     )
     return AgentRegistrationResponse(
         agent=agent,

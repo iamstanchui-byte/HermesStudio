@@ -36,11 +36,13 @@
                 <option value="windows">windows</option>
             </select>
         </div>
-        <div>
-            <label class="block text-xs font-medium text-gray-700">Roles (comma-separated)</label>
-            <input name="roles" type="text" required class="mt-1 block w-full border rounded px-2 py-1 text-sm" placeholder="e.g. data-analyst,backtest-runner">
-        </div>
     </div>
+    <p class="mt-2 text-xs text-gray-500">
+        Tip: profiles (agent roles) are added separately after register —
+        either via the dashboard's "Add profile" button on each agent card,
+        or auto-detected by the wrapper on first heartbeat from
+        <code>~/.hermes/profiles/&lt;name&gt;/</code>.
+    </p>
     <div class="mt-3 flex items-center gap-2">
         <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Register</button>
         <span id="form-status" class="text-sm text-gray-500"></span>
@@ -207,10 +209,8 @@ document.getElementById('register-form').addEventListener('submit', async (e) =>
     status.className = 'text-sm text-gray-500';
     output.classList.add('hidden');
 
-    const roles = form.roles.value.split(',').map(r => r.trim()).filter(r => r);
     const body = {
         agent_id: form.agent_id.value,
-        roles: roles,
     };
     if (form.ip.value) body.ip = form.ip.value;
     if (form.os_type.value) body.os_type = form.os_type.value;
