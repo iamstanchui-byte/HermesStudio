@@ -76,6 +76,7 @@
                 </td>
                 <td class="px-4 py-2 text-right">
                     <button onclick="runNow('{{ s.id }}')" class="text-xs px-2 py-1 bg-blue-50 text-blue-700 rounded hover:bg-blue-100 mr-1" title="Trigger immediately (bypasses skip rule)">Run now</button>
+                    <button onclick="openEditModal('{{ s.id }}')" class="text-xs px-2 py-1 bg-amber-50 text-amber-800 rounded hover:bg-amber-100 mr-1" title="Edit name, cron, timezone, mode, or template">Edit</button>
                     <button onclick="toggleEnabled('{{ s.id }}', {{ 0 if s.enabled else 1 }})" class="text-xs px-2 py-1 bg-gray-50 text-gray-700 rounded hover:bg-gray-100 mr-1">
                         {% if s.enabled %}Pause{% else %}Resume{% endif %}
                     </button>
@@ -230,6 +231,69 @@ async function toggleEnabled(id, newVal) {
     }
 }
 
+// ===== Edit modal =====
+const _editModal = {
+    el: null,
+    sched: null,
+};
+async function openEditModal(id) {
+    // Fetch the schedule (full row, not the dashboard summary)
+    let r;
+    try {
+        r = await fetch(`/api/schedules/${id}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    } catch (e) {
+        alert("Failed to load schedule: " + e.message);
+        return;
+    }
+    const s = await r.json();
+    _editModal.sched = s;
+    const m = document.getElementById('edit-modal-overlay');
+    m.classList.remove('hidden');
+    document.getElementById('edit-name').value = s.name || '';
+    document.getElementById('edit-cron').value = s.cron_expr || '';
+    document.getElementById('edit-tz').value = s.timezone || 'Asia/Hong_Kong';
+    document.getElementById('edit-mode').value = s.mode || 'clone';
+    document.getElementById('edit-template').value = s.template_project_id || '';
+    document.getElementById('edit-msg').textContent = '';
+}
+function closeEditModal() {
+    document.getElementById('edit-modal-overlay').classList.add('hidden');
+    _editModal.sched = null;
+}
+async function saveEdit(ev) {
+    ev.preventDefault();
+    if (!_editModal.sched) return;
+    const id = _editModal.sched.id;
+    const body = {
+        name: document.getElementById('edit-name').value,
+        cron_expr: document.getElementById('edit-cron').value,
+        timezone: document.getElementById('edit-tz').value,
+        mode: document.getElementById('edit-mode').value,
+        template_project_id: document.getElementById('edit-template').value,
+    };
+    const msg = document.getElementById('edit-msg');
+    msg.textContent = "saving...";
+    msg.className = "text-xs text-gray-500";
+    try {
+        const r = await fetch(`/api/schedules/${id}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.detail || `HTTP ${r.status}`);
+        }
+        msg.textContent = "saved — reloading...";
+        msg.className = "text-xs text-green-600";
+        setTimeout(() => location.reload(), 500);
+    } catch (e) {
+        msg.textContent = "error: " + e.message;
+        msg.className = "text-xs text-red-600";
+    }
+}
+
 async function deleteSchedule(id, name) {
     if (!confirm(`Delete schedule "${name}"?\n\nExisting runs are kept (they just stop getting new fires).`)) return;
     try {
@@ -261,5 +325,67 @@ async function deleteSchedule(id, name) {
     }
 })();
 </script>
+
+<!-- ===== Edit modal (#22) ===== -->
+<!-- Pre-filled with the schedule's current values. Saves via PATCH
+     /api/schedules/{id}. The "next_fires" preview under the cron
+     field lets the user sanity-check their edit before saving. -->
+<div id="edit-modal-overlay" class="modal-overlay hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center" onclick="if (event.target === this) closeEditModal()">
+    <div class="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-[90vh] overflow-y-auto">
+        <form id="edit-form" onsubmit="saveEdit(event)">
+            <div class="px-6 py-4 border-b">
+                <h2 class="text-lg font-semibold text-gray-800">Edit schedule</h2>
+                <p class="text-xs text-gray-500">Edit name, cron, timezone, mode, or template. PATCH endpoint, all fields required.</p>
+            </div>
+            <div class="px-6 py-4 space-y-3">
+                <label class="block">
+                    <span class="text-sm font-medium text-gray-700">Name</span>
+                    <input id="edit-name" required minlength="1" maxlength="120"
+                        class="mt-1 block w-full border rounded px-3 py-2 text-sm">
+                </label>
+                <label class="block">
+                    <span class="text-sm font-medium text-gray-700">Cron expression</span>
+                    <input id="edit-cron" required pattern=".+"
+                        class="mt-1 block w-full border rounded px-3 py-2 text-sm font-mono">
+                    <span class="text-xs text-gray-500 mt-1 block">
+                        Common:
+                        <button type="button" onclick="document.getElementById('edit-cron').value='0 9 * * 1-5'" class="underline hover:text-blue-600">weekdays 9am</button> ·
+                        <button type="button" onclick="document.getElementById('edit-cron').value='0 0 * * *'" class="underline hover:text-blue-600">daily midnight</button> ·
+                        <button type="button" onclick="document.getElementById('edit-cron').value='*/15 * * * *'" class="underline hover:text-blue-600">every 15min</button>
+                    </span>
+                </label>
+                <label class="block">
+                    <span class="text-sm font-medium text-gray-700">Timezone</span>
+                    <input id="edit-tz" class="mt-1 block w-full border rounded px-3 py-2 text-sm">
+                </label>
+                <label class="block">
+                    <span class="text-sm font-medium text-gray-700">Mode</span>
+                    <select id="edit-mode" class="mt-1 block w-full border rounded px-3 py-2 text-sm bg-white">
+                        <option value="clone">Clone — new project per fire</option>
+                        <option value="append">Append — reuse one project</option>
+                    </select>
+                </label>
+                <label class="block">
+                    <span class="text-sm font-medium text-gray-700">Template project</span>
+                    <select id="edit-template" required
+                        class="mt-1 block w-full border rounded px-3 py-2 text-sm bg-white">
+                        {% for t in templates %}
+                        <option value="{{ t.id }}">
+                            {{ t.name or t.id }}
+                            {% if t.template_description %}— {{ t.template_description[:50] }}{% endif %}
+                        </option>
+                        {% endfor %}
+                    </select>
+                    <span class="text-xs text-gray-500 mt-1 block">Mark a project as template from the project page. Existing runs continue with the old template; new fires use the new one.</span>
+                </label>
+            </div>
+            <div class="px-6 py-3 bg-gray-50 border-t flex items-center gap-3">
+                <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Save changes</button>
+                <button type="button" onclick="closeEditModal()" class="px-4 py-2 bg-gray-200 text-gray-700 rounded text-sm hover:bg-gray-300">Cancel</button>
+                <span id="edit-msg" class="text-xs"></span>
+            </div>
+        </form>
+    </div>
+</div>
 
 {% endblock %}
