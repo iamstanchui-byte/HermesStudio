@@ -20,6 +20,8 @@ form to populate the template dropdown) lives here too:
 """
 from __future__ import annotations
 
+import json
+import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -544,10 +546,19 @@ async def promote_project_to_skill(
     # Render the SKILL.md body. Human-readable, no JSON frontmatter —
     # the agent just reads it as a knowledge asset. Sections:
     #   - Goal (1-2 lines from project.goal)
-    #   - Workflow steps (task list, action+role per step, status, result snippet)
-    #   - Key facts learned (from facts.md, trimmed)
+    #   - Workflow steps (task list, action+role per step, status, cleaned result snippet)
+    #   - Key facts learned (from facts.md, empty sections stripped)
     #   - Outcome (from decision.md, trimmed)
-    #   - When to use (pointer)
+    #   - When to use (concrete match from project goal + workflow pattern)
+    #
+    # "Cleaned" = the result snippet we put in SKILL.md is:
+    #   1. JSON-parsed if it looks like {"summary": "..."} — this also
+    #      auto-decodes the \uXXXX escape sequences (the wrapper writes
+    #      with json.dumps(ensure_ascii=True)).
+    #   2. Stripped of the trailing "--- PROJECT CONTEXT ---" block —
+    #      that's the wrapper's internal context log, not user-facing
+    #      skill content. Future agents loading this skill would be
+    #      confused by the inline L3-recent dump.
     parts: list[str] = []
     parts.append(f"# {proj.get('name') or proj['id']}\n")
     if proj.get("goal"):
@@ -568,11 +579,12 @@ async def promote_project_to_skill(
                 f"{i}. **{tname}** (`{t.get('action') or '?'}`, "
                 f"role=`{t.get('agent_role') or '?'}`) — {t.get('status') or ''}"
             )
-            if t.get("result"):
-                r = (t.get("result") or "")[:400]
-                if len(t.get("result") or "") > 400:
-                    r += "..."
-                parts.append(f"   - Result: {r}")
+            cleaned = _clean_task_result(t.get("result") or "")
+            if cleaned:
+                snippet = cleaned[:300]
+                if len(cleaned) > 300:
+                    snippet += "..."
+                parts.append(f"   - Result: {snippet}")
         parts.append("")
     # facts.md (curated L2 memory) — what the user cared about
     from hermes_orch.api.projects import _project_dir
@@ -580,9 +592,11 @@ async def promote_project_to_skill(
     facts_path = pdir / "facts.md"
     if facts_path.exists():
         facts_text = facts_path.read_text(encoding="utf-8", errors="replace")
-        if facts_text.strip():
+        facts_filtered = _filter_facts_sections(facts_text)
+        if facts_filtered.strip():
             parts.append("## Key facts learned\n")
-            for line in facts_text.splitlines()[:80]:
+            # Cap at 80 lines after filtering empty sections.
+            for line in facts_filtered.splitlines()[:80]:
                 parts.append(line)
             parts.append("")
     decision_path = pdir / "decision.md"
@@ -592,11 +606,12 @@ async def promote_project_to_skill(
             parts.append("## Outcome\n")
             parts.append(decision_text[:1500])
             parts.append("")
+    # When to use: auto-generated from the project goal + workflow shape,
+    # NOT a generic "use it when the user asks for a similar task" —
+    # that's useless for an LLM trying to decide if it should match.
+    when_to_use = _render_when_to_use(proj, tasks)
     parts.append("## When to use this skill\n")
-    parts.append(
-        f"This skill captures the workflow from project `{proj['id']}`. "
-        "Use it when the user asks for a similar task and the same workflow steps apply.\n"
-    )
+    parts.append(when_to_use)
     skill_body = "\n".join(parts).strip() + "\n"
     # Push via profile_configs — same flow as the agents router uses
     # for skills. The wrapper's apply-config loop writes it to
@@ -662,3 +677,133 @@ async def _fetch_one(sched_id: str, db) -> Schedule:
         row["last_run_state"] = last["state"]
         row["last_run_at"] = last.get("created_at")
     return Schedule(**row)
+
+
+# ===== SKILL.md rendering helpers (used by promote-to-skill) =====
+#
+# These existed inline before but the noise (hermes wrapper context
+# blocks, \uXXXX escapes from json.dumps(ensure_ascii=True), empty
+# facts.md sections, generic "when to use" pointer) made the resulting
+# SKILL.md barely useful for future agents. Lifted out so they're
+# independently testable.
+
+
+_PROJECT_CONTEXT_RE = re.compile(
+    # Hermes wrapper prepends a block that starts with the literal
+    # "--- PROJECT CONTEXT ---" (sometimes after a leading newline) and
+    # runs to end-of-result. The "--- USER RECENT (L3: ...)" sentinel
+    # and the "--- WORKFLOW PROCEDURE" sentinel are also possible
+    # cut-points we want to drop.
+    r"\n+---\s*(?:PROJECT CONTEXT|USER RECENT|WORKFLOW PROCEDURE).*$",
+    re.DOTALL,
+)
+
+
+def _clean_task_result(raw: str) -> str:
+    """Turn a hermes task-result string into a human-readable snippet.
+
+    The wrapper writes results as `{"summary": "..."}` JSON, with
+    json.dumps(ensure_ascii=True), so all non-ASCII characters are
+    \\uXXXX-escaped. Then it appends a multi-line "--- PROJECT CONTEXT ---"
+    block that's purely internal to the wrapper's prompt.
+
+    This function:
+      1. json.loads() — auto-decodes \\uXXXX escapes, extracts summary.
+      2. Strips the trailing context block.
+      3. Returns the cleaned text (may be empty).
+    """
+    if not raw:
+        return ""
+    s = raw
+    # json.loads handles "string with escapes" -> decoded unicode chars
+    # in one shot. If the value is a dict, grab the summary. If it's a
+    # bare string, use it. If parsing fails, fall back to the raw text
+    # (and let the context-strip step do its best).
+    try:
+        d = json.loads(s)
+    except (ValueError, TypeError):
+        d = None
+    if isinstance(d, dict):
+        s = d.get("summary") or d.get("result") or ""
+        if not isinstance(s, str):
+            s = str(s)
+    elif isinstance(d, str):
+        s = d
+    # Strip the wrapper context block — everything from the first
+    # "--- PROJECT CONTEXT ---" (or similar sentinel) to end-of-string.
+    s = _PROJECT_CONTEXT_RE.sub("", s)
+    return s.strip()
+
+
+def _filter_facts_sections(text: str) -> str:
+    """Drop empty `## Foo` sections from facts.md.
+
+    facts.md is auto-curated from L1 trace.jsonl and contains many
+    sections (Key Findings, Coord Verdicts, Human Notes, etc.) that
+    often have just a header and no body. They add noise to SKILL.md
+    without telling future agents anything.
+
+    A section is considered "empty" if its body (until the next `## `
+    header or EOF) is whitespace-only.
+    """
+    if not text:
+        return ""
+    lines = text.splitlines()
+    out: list[str] = []
+    # State machine: keep track of whether the current section has any
+    # non-header content. When we hit the next `## ` header (or EOF),
+    # decide whether to keep the buffered section.
+    section_buf: list[str] = []  # lines for the current section
+    section_has_content = False
+
+    def flush():
+        nonlocal section_buf, section_has_content
+        if section_has_content:
+            out.extend(section_buf)
+        section_buf = []
+        section_has_content = False
+
+    for line in lines:
+        if line.startswith("## "):
+            # New section: flush the previous one
+            flush()
+            section_buf.append(line)
+            section_has_content = False
+        else:
+            section_buf.append(line)
+            # Body content = not blank, not a cite-only or bullet-empty
+            # line. Conservative: any non-blank line counts.
+            if line.strip():
+                section_has_content = True
+    flush()
+    return "\n".join(out)
+
+
+def _render_when_to_use(proj: dict, tasks: list) -> str:
+    """Generate a concrete 'When to use this skill' paragraph.
+
+    The old generic pointer ("Use it when the user asks for a similar
+    task") told future agents nothing. This produces a concrete match
+    line based on the project's goal + workflow pattern:
+
+        Use when the user asks: <goal>
+        Workflow: <N> steps (<step1> -> <step2> -> ...)
+
+    """
+    goal = (proj.get("goal") or "").strip()
+    parts: list[str] = []
+    if goal:
+        # Cap the quoted goal at 200 chars so the SKILL.md stays compact.
+        quoted = goal if len(goal) <= 200 else goal[:200] + "..."
+        parts.append(f"- Use when the user asks: **{quoted}**")
+    # Workflow shape: list the action names in order so a future agent
+    # can see at a glance what kind of pipeline this is.
+    actions = [t.get("action") for t in tasks if t.get("action")]
+    if actions:
+        arrow = " -> ".join(actions)
+        parts.append(f"- Workflow: {len(actions)} step(s) — `{arrow}`")
+    if not parts:
+        parts.append(
+            f"- This skill captures the workflow from project `{proj['id']}`."
+        )
+    return "\n".join(parts) + "\n"

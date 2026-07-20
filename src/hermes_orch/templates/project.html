@@ -183,9 +183,15 @@
             Workflow procedure
             <span class="text-xs text-gray-500 font-normal">(read by the agent before each task)</span>
         </h2>
-        <button id="proc-edit-btn" onclick="toggleProcEdit()" class="text-xs px-2 py-1 bg-gray-50 text-gray-700 rounded border border-gray-300 hover:bg-gray-100">
-            Edit
-        </button>
+        <div class="flex items-center gap-2">
+            <button id="proc-autogen-btn" onclick="autoGenerateProcedure()" class="text-xs px-2 py-1 bg-purple-50 text-purple-700 rounded border border-purple-300 hover:bg-purple-100"
+                title="Ask the LLM to write procedure.md from this project's tasks + facts">
+                ✨ Auto-generate
+            </button>
+            <button id="proc-edit-btn" onclick="toggleProcEdit()" class="text-xs px-2 py-1 bg-gray-50 text-gray-700 rounded border border-gray-300 hover:bg-gray-100">
+                Edit
+            </button>
+        </div>
     </div>
     <div id="proc-view" class="text-sm text-gray-700 prose-sm max-w-none">
         <div id="proc-content" class="text-xs text-gray-500 italic">Loading...</div>
@@ -738,6 +744,46 @@ async function saveProcedure(ev) {
     } catch (e) {
         msg.textContent = "error: " + e.message;
         msg.className = "text-xs text-red-600";
+    }
+}
+
+async function autoGenerateProcedure() {
+    // Confirm before overwriting. Most projects have at least a stub
+    // procedure.md, and we don't want to nuke a hand-edited one
+    // without an explicit click.
+    if (!confirm(
+        'Auto-generate procedure.md from this project\'s tasks + facts?\n\n'
+        + 'The LLM will read the project\'s tasks, facts.md, and decision.md, '
+        + 'then write a new procedure.md. Any existing procedure.md (including '
+        + 'your hand-edited version) will be overwritten.'
+    )) return;
+
+    const btn = document.getElementById('proc-autogen-btn');
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '... generating ...';
+    try {
+        const r = await _fetchWithTimeout(
+            `/api/projects/${PROJECT_ID}/procedure/auto-generate`,
+            { method: 'POST' },
+            30000,  // 30s — LLM call may take 5-15s for big projects
+        );
+        if (!r.ok) {
+            let err;
+            try { err = (await r.json()).detail; } catch { err = `HTTP ${r.status}`; }
+            throw new Error(err || `HTTP ${r.status}`);
+        }
+        const data = await r.json();
+        // Reload the view to show the new content
+        await loadProcedure();
+        // Briefly show success on the button
+        btn.textContent = `✓ ${data.size} bytes`;
+        setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
+    } catch (e) {
+        const reason = e.name === 'AbortError' ? 'request timed out (>30s)' : e.message;
+        alert('Auto-generate failed: ' + reason);
+        btn.textContent = orig;
+        btn.disabled = false;
     }
 }
 

@@ -11,6 +11,7 @@ Project folder structure (per §3.2):
 """
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import shutil
@@ -18,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 import yaml
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
@@ -353,6 +355,264 @@ async def delete_file(project_id: str, path: str, request: Request) -> dict:
         payload={"path": path},
     )
     return {"path": path, "deleted_at": _now_iso()}
+
+
+# ===== Auto-generate procedure.md (#22) =====
+#
+# Path A for recurring templates: the agent needs a "how to do this
+# workflow" markdown that's read before each task. Hand-writing it for
+# every project is friction, so this endpoint asks the LLM to look at
+# the project's tasks + facts + decision and render a n8n-style
+# procedure.md.
+#
+# The endpoint just calls LLM once with a structured prompt, writes
+# the result to <project>/procedure.md, and returns it. No DB mutation
+# beyond an audit log entry. If the user doesn't like the generated
+# procedure, they can click Edit and rewrite it by hand (the existing
+# Edit form posts back to the PUT file endpoint).
+
+
+_PROCEDURE_PROMPT = """You are a workflow-procedure author for a multi-agent orchestrator.
+
+Given a project's tasks (the steps that were actually run) plus its
+curated facts (what the user cared about) and final decision (the
+verdict), produce a clear, n8n-style procedure.md that the next agent
+can read BEFORE starting the workflow.
+
+# Output rules (strict)
+- Output ONLY the markdown. No preamble, no "Here is your procedure",
+  no code fence wrappers.
+- Plain markdown — no JSON frontmatter, no HTML.
+- Length: 30-80 lines, ~1-2 KB. Be concise; this is a reading primer,
+  not a tutorial.
+- Use second-person imperative ("Fetch the data", "Compose the report")
+  so an agent reading it knows exactly what to do at each step.
+- Each numbered step should reference the corresponding task (name +
+  action) so the agent can match it against the plan it's been given.
+
+# Required sections (in this order)
+1. # <project name> — Procedure
+2. ## Goal — one or two sentences, copy from project.goal
+3. ## Steps — numbered list, one step per task, in execution order
+4. ## Pitfalls — 1-3 things that went wrong or that the next agent
+   should be careful about (derive from facts.md and decision.md)
+5. ## Definition of done — what "good output" looks like for this
+   workflow (1-2 sentences)
+
+If facts.md or decision.md are empty, skip the Pitfalls section.
+
+# Project context (input)
+"""
+
+
+@router.post("/{project_id}/procedure/auto-generate")
+async def auto_generate_procedure(project_id: str, request: Request) -> dict:
+    """Use the LLM to render procedure.md from this project's tasks + facts.
+
+    Writes the generated markdown to <project>/procedure.md (overwriting
+    any existing hand-written version — the user can re-Edit it
+    afterwards). Returns the rendered text so the UI can show it.
+
+    Failure modes:
+      - LLM unreachable: 502 with the error
+      - LLM returns empty / unparseable: 502
+      - Project not found: 404
+      - No tasks yet: 400 (nothing to render)
+    """
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+
+    db = request.app.state.db
+    cfg = request.app.state.config
+
+    proj = await db.fetchone(
+        "SELECT id, name, goal, state FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+
+    tasks = await db.fetchall(
+        "SELECT name, agent_role, action, status, depends_on, params, "
+        "       output_path, priority, max_retries, timeout_seconds, "
+        "       on_parent_failure "
+        "FROM tasks WHERE project_id = ? "
+        "ORDER BY created_at ASC",
+        (project_id,),
+    )
+    if not tasks:
+        raise HTTPException(
+            400,
+            f"Project {project_id} has no tasks yet — add tasks first so "
+            "the LLM has something to render.",
+        )
+
+    # Pull facts.md and decision.md (optional, for pitfalls + done)
+    pdir = _project_dir(request, project_id)
+    facts_text = ""
+    facts_path = pdir / "facts.md"
+    if facts_path.exists():
+        facts_text = facts_path.read_text(encoding="utf-8", errors="replace")
+    decision_text = ""
+    decision_path = pdir / "decision.md"
+    if decision_path.exists():
+        decision_text = decision_path.read_text(encoding="utf-8", errors="replace")
+
+    # Compose the input the LLM sees. Strip wrapper context blocks from
+    # task rows so the LLM doesn't get confused by hermes internals
+    # (same regex as the SKILL.md renderer, kept in sync).
+    from hermes_orch.api.schedules import _PROJECT_CONTEXT_RE
+
+    def _clean(s: str) -> str:
+        if not s:
+            return ""
+        # Try JSON first — many task results are {"summary": "..."}
+        try:
+            d = json.loads(s)
+            if isinstance(d, dict):
+                s = d.get("summary") or d.get("result") or ""
+            elif isinstance(d, str):
+                s = d
+        except (ValueError, TypeError):
+            pass
+        s = _PROJECT_CONTEXT_RE.sub("", s)
+        return s.strip()
+
+    task_lines: list[str] = []
+    for i, t in enumerate(tasks, 1):
+        deps = t.get("depends_on") or []
+        deps_str = f" (depends on: {', '.join(deps)})" if deps else ""
+        role = t.get("agent_role") or "?"
+        action = t.get("action") or "?"
+        name = t.get("name") or action
+        status = t.get("status") or "?"
+        params = t.get("params") or {}
+        params_str = ""
+        if params:
+            params_str = f" params={json.dumps(params, ensure_ascii=False)}"
+        out_path = t.get("output_path")
+        out_str = f" -> writes to {out_path}" if out_path else ""
+        task_lines.append(
+            f"{i}. task name='{name}', action='{action}', role='{role}', "
+            f"status='{status}'{deps_str}{params_str}{out_str}"
+        )
+        # Snippet from result (cleaned) if any
+        result_raw = t.get("result") or ""
+        # NB: tasks table has `result` as JSON dict (not raw string),
+        # so the result-snippet side is already structured; we just
+        # stringify its summary if present.
+        cleaned = _clean(result_raw) if isinstance(result_raw, str) else ""
+        if cleaned:
+            task_lines.append(f"   result snippet: {cleaned[:200]}")
+
+    # Truncate facts.md so the prompt stays under control
+    facts_for_prompt = facts_text[:2500]
+    decision_for_prompt = decision_text[:1000]
+
+    prompt = (
+        _PROCEDURE_PROMPT
+        + "\n## Project name\n"
+        + (proj.get("name") or project_id)
+        + "\n\n## Project goal\n"
+        + (proj.get("goal") or "(no goal set)")
+        + "\n\n## Tasks executed (in order)\n"
+        + "\n".join(task_lines)
+        + "\n\n## facts.md (curated user-side memory)\n"
+        + (facts_for_prompt or "(empty)")
+        + "\n\n## decision.md (final verdict)\n"
+        + (decision_for_prompt or "(no decision yet)")
+    )
+
+    # LLM call. Reuse the same httpx pattern as core/synthesis.py
+    # to keep the credentials / endpoint format consistent.
+    llm_cfg = cfg.get("llm", {})
+    base_url = (llm_cfg.get("base_url") or "https://api.minimax.io/v1").rstrip("/")
+    api_key = llm_cfg.get("api_key") or ""
+    model = llm_cfg.get("model") or "MiniMax-M3"
+    timeout = float(llm_cfg.get("timeout_seconds") or 60)
+
+    if not api_key:
+        raise HTTPException(
+            503,
+            "LLM api_key not configured — set llm.api_key in config.yaml "
+            "before auto-generating procedures.",
+        )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You write clear, terse procedure markdown for AI agents "
+                    "to read before starting a workflow. Output ONLY the "
+                    "markdown. No preamble."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,  # low — we want deterministic structure
+        "max_tokens": 1500,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(
+                f"{base_url}/chat/completions", json=payload, headers=headers
+            )
+        if r.status_code != 200:
+            raise HTTPException(
+                502,
+                f"LLM returned HTTP {r.status_code}: {r.text[:300]}",
+            )
+        data = r.json()
+        try:
+            text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise HTTPException(502, f"LLM response shape unexpected: {e}")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(502, "LLM returned empty content")
+    except httpx.HTTPError as e:
+        log.warning(f"procedure auto-gen LLM call failed for {project_id}: {e}")
+        raise HTTPException(502, f"LLM unreachable: {e}")
+
+    # Strip any leading "Sure, here is..." / code-fence wrappers the
+    # LLM sometimes adds despite the prompt. Most modern models comply;
+    # this is defense for the ones that don't.
+    text = text.strip()
+    # Strip reasoning traces — MiniMax M3 emits <think>...</think>
+    # blocks before the actual answer. These are useful to the model
+    # but useless (and noisy) in the saved procedure.md. Match across
+    # newlines; non-greedy so we don't eat multiple blocks at once if
+    # the model emits more than one.
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    if text.startswith("```"):
+        # Strip outer code fence
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    # Write to procedure.md
+    proc_path = pdir / "procedure.md"
+    proc_path.write_text(text, encoding="utf-8")
+    await audit_log(
+        db, "procedure.auto_generated",
+        actor="operator",
+        project_id=project_id,
+        payload={"size": len(text), "task_count": len(tasks)},
+    )
+    return {
+        "path": "procedure.md",
+        "size": len(text),
+        "content": text,
+        "generated_at": _now_iso(),
+    }
 
 
 # ===== Plan API (§4.1 — plan.md frontmatter) =====
