@@ -43,7 +43,15 @@
 
         /* Dark mode overrides. When body has .dark class, override the
            most common Tailwind colors used across templates. */
-        body.dark { background: #111827; color: #f3f4f6; }
+        :root {
+            --text-primary: #1f2937;
+            --text-muted: #6b7280;
+        }
+        body.dark {
+            background: #111827; color: #f3f4f6;
+            --text-primary: #f3f4f6;
+            --text-muted: #9ca3af;
+        }
         body.dark .bg-white { background-color: #1f2937; }
         body.dark .bg-gray-50 { background-color: #374151; }
         body.dark .bg-gray-100 { background-color: #374151; }
@@ -58,6 +66,12 @@
         body.dark .bg-blue-100 { background-color: #1e3a8a; }
         body.dark .bg-blue-200 { border-color: #1d4ed8 !important; }
         body.dark .bg-indigo-50 { background-color: #312e81; }
+        body.dark .bg-indigo-100 { background-color: #312e81; }
+        body.dark .bg-purple-50 { background-color: #4c1d95; }
+        body.dark .bg-emerald-50 { background-color: #064e3b; }
+        body.dark .bg-red-50 { background-color: #450a0a; }
+        body.dark .text-red-800 { color: #fca5a5; }
+        body.dark .text-purple-800 { color: #d8b4fe; }
         body.dark .text-gray-800 { color: #f3f4f6; }
         body.dark .text-gray-700 { color: #e5e7eb; }
         body.dark .text-gray-600 { color: #d1d5db; }

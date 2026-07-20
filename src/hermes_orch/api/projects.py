@@ -1026,7 +1026,7 @@ async def regenerate_project_state(project_id: str, request: Request) -> dict:
     from hermes_orch.core.synthesis import get_state_generator
     memory = get_memory_writer()
     facts_text = memory.read_facts_full(project_id) or ""
-    state_gen = get_state_generator()
+    state_gen = get_state_generator(db=request.app.state.db)
     ok = await state_gen.regenerate_state_async(
         project_id=project_id,
         project_meta={

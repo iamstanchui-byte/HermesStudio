@@ -49,7 +49,7 @@ class StateGenerator:
     wraps the JSON-ish output in code fences).
     """
 
-    def __init__(self, llm_config: dict[str, Any]):
+    def __init__(self, llm_config: dict[str, Any], db: Any = None):
         self.base_url = (
             (llm_config.get("base_url") or "https://api.minimax.io/v1")
             .rstrip("/")
@@ -58,6 +58,9 @@ class StateGenerator:
         self.model = llm_config.get("model", "MiniMax-M3")
         self.timeout = float(llm_config.get("timeout_seconds", 60))
         self.mock = bool(llm_config.get("mock", False))
+        # Optional DB handle for token-usage recording (used by the
+        # LLM call site below). If None, recording is silently skipped.
+        self.db = db
 
     async def regenerate_state_async(
         self,
@@ -185,22 +188,28 @@ class StateGenerator:
 
         # Record token usage. Best-effort: if the insert fails, log
         # but don't break the synthesis flow.
-        try:
-            usage = data.get("usage", {}) or {}
-            from .token_usage import record_token_usage
-            await record_token_usage(
-                self.db,
-                project_id=getattr(self, "_current_project_id", None),
-                model=self.model,
-                base_url=self.base_url,
-                prompt_tokens=usage.get("prompt_tokens", 0),
-                completion_tokens=usage.get("completion_tokens", 0),
-                total_tokens=usage.get("total_tokens", 0),
-                call_kind="synthesis",
-                call_label=getattr(self, "_current_call_label", "synth"),
+        if self.db is None:
+            log.warning(
+                "StateGenerator: self.db is None, cannot record token usage. "
+                "Was get_state_generator() called without db=?"
             )
-        except Exception as ex:  # noqa: BLE001
-            log.debug("synthesis token usage recording skipped: %s", ex)
+        else:
+            try:
+                usage = data.get("usage", {}) or {}
+                from .token_usage import record_token_usage
+                await record_token_usage(
+                    self.db,
+                    project_id=getattr(self, "_current_project_id", None),
+                    model=self.model,
+                    base_url=self.base_url,
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0),
+                    total_tokens=usage.get("total_tokens", 0),
+                    call_kind="synthesis",
+                    call_label=getattr(self, "_current_call_label", "synth"),
+                )
+            except Exception as ex:  # noqa: BLE001
+                log.debug("synthesis token usage recording skipped: %s", ex)
         return clean_llm_markdown(text)
 
 
@@ -239,14 +248,19 @@ _gen: StateGenerator | None = None
 _recent_gen: RecentGenerator | None = None
 
 
-def get_state_generator() -> StateGenerator:
-    """Get the process-wide StateGenerator, lazily initialized from config."""
+def get_state_generator(db: Any = None) -> StateGenerator:
+    """Get the process-wide StateGenerator, lazily initialized from config.
+
+    The `db` argument is the orchestrator's aiosqlite Database instance
+    (used for token-usage recording after each LLM call). If not
+    provided, recording is silently skipped.
+    """
     global _gen
     if _gen is None:
         from hermes_orch.config import load_config
         cfg = load_config()
         llm_cfg = (cfg.get("llm") or {})
-        _gen = StateGenerator(llm_cfg)
+        _gen = StateGenerator(llm_cfg, db=db)
     return _gen
 
 

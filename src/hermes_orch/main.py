@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Start the brain: notifier + planner + supervisor (background task)
     notifier = Notifier(cfg)
-    planner = Planner(cfg)
+    planner = Planner(cfg, db=db)  # db needed for token-usage recording
     supervisor = Supervisor(db, cfg, notifier, planner)
     # CleanupJob shared by supervisor (daily sweep) + API (manual run).
     # Create BEFORE supervisor.start() so the supervisor can fire its

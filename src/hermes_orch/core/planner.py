@@ -104,13 +104,17 @@ Yahoo's free feed, or the analysis is built on stale/wrong prices).
 
 
 class Planner:
-    def __init__(self, cfg: dict[str, Any]):
+    def __init__(self, cfg: dict[str, Any], db: Any = None):
         self.cfg = cfg.get("llm", {}) or {}
         self.mock = bool(self.cfg.get("mock", True)) or not (self.cfg.get("api_key") or "").strip()
         self.base_url = (self.cfg.get("base_url") or "").rstrip("/")
         self.api_key = (self.cfg.get("api_key") or "").strip()
         self.model = self.cfg.get("model") or "MiniMax-Text-01"
         self.timeout = float(self.cfg.get("timeout_seconds", 60))
+        # Optional DB handle for token-usage recording. If None
+        # (legacy / tests), the recording is silently skipped. The
+        # main.py lifespan passes the real db.
+        self.db = db
         if self.mock:
             log.info("planner in MOCK mode (no api_key)")
         else:
@@ -197,6 +201,7 @@ class Planner:
             log.warning(f"planner: failed to load recent.md: {e}")
             return ""
 
+    @staticmethod
     def _format_role_skills(
         available_roles: list[str],
         role_skills: dict[str, list[str]] | None,
@@ -217,6 +222,7 @@ class Planner:
                 lines.append(f"- {r}: (no skills yet)")
         return "\n".join(lines) if lines else "(no roles)"
 
+    @staticmethod
     def _format_capabilities_block(
         available_roles: list[str],
         role_capabilities: dict[str, dict[str, bool]] | None,
@@ -464,22 +470,28 @@ class Planner:
         # project_id this plan is for (the supervisor wraps it; we
         # only have the goal here). call_label is the first 50 chars
         # of the goal so the dashboard shows which plan used what.
-        try:
-            usage = data.get("usage", {}) or {}
-            from .token_usage import record_token_usage
-            label = (goal[:50] + "...") if len(goal) > 50 else goal
-            await record_token_usage(
-                self.db,
-                model=self.model,
-                base_url=self.base_url,
-                prompt_tokens=usage.get("prompt_tokens", 0),
-                completion_tokens=usage.get("completion_tokens", 0),
-                total_tokens=usage.get("total_tokens", 0),
-                call_kind="planner",
-                call_label=label,
+        if self.db is None:
+            logger.warning(
+                "planner: self.db is None, cannot record token usage. "
+                "Was Planner() constructed without db=?"
             )
-        except Exception as ex:  # noqa: BLE001
-            logger.debug("token usage recording skipped: %s", ex)
+        else:
+            try:
+                usage = data.get("usage", {}) or {}
+                from .token_usage import record_token_usage
+                label = (goal[:50] + "...") if len(goal) > 50 else goal
+                await record_token_usage(
+                    self.db,
+                    model=self.model,
+                    base_url=self.base_url,
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0),
+                    total_tokens=usage.get("total_tokens", 0),
+                    call_kind="planner",
+                    call_label=label,
+                )
+            except Exception as ex:  # noqa: BLE001
+                logger.debug("token usage recording skipped: %s", ex)
         # Detect truncation BEFORE we try to parse the JSON. If the model
         # hit its output cap mid-stream, finish_reason will be "length"
         # and the JSON is almost certainly incomplete. Falling back to

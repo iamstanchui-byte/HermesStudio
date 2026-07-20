@@ -913,7 +913,7 @@ class Supervisor:
             from hermes_orch.core.synthesis import get_state_generator
             memory = get_memory_writer()
             facts_text = memory.read_facts_full(pid) or ""
-            state_gen = get_state_generator()
+            state_gen = get_state_generator(db=self.db)
             regen_ok = await state_gen.regenerate_state_async(
                 project_id=pid,
                 project_meta={

@@ -217,7 +217,7 @@
             tx.setAttribute('y', (H - 1).toFixed(1));
             tx.setAttribute('text-anchor', 'middle');
             tx.setAttribute('font-size', '8');
-            tx.setAttribute('fill', '#9ca3af');
+            tx.setAttribute('fill', 'var(--text-muted, #9ca3af)');
             tx.textContent = d.date;
             svg.appendChild(tx);
         });
@@ -337,29 +337,10 @@
                                 title="LLM model: {{ p.llm_model_provider|default('?') }} &#10;Endpoint: {{ p.llm_model_base_url|default('?') }}">
                                 model: {{ p.llm_model_default }}{% if p.llm_model_provider %} ({{ p.llm_model_provider }}){% endif %}
                             </span>
-                            {% if p.llm_model_base_url %}
-                            <span class="text-[10px] text-gray-500 font-mono truncate max-w-[28ch]" title="{{ p.llm_model_base_url }}">
-                                {{ p.llm_model_base_url }}
-                            </span>
-                            {% endif %}
                             {% else %}
                             <span class="px-1.5 py-0.5 text-[10px] rounded bg-gray-100 text-gray-500 italic"
                                 title="LLM not yet reported by wrapper. The wrapper reads <profile>/config.yaml (model.default) and pushes it on the next heartbeat.">
                                 LLM: not reported
-                            </span>
-                            {% endif %}
-                            {# MCP servers — small chip stack on the header row #}
-                            {% set mcps = p.mcp_servers or [] %}
-                            {% set enabled_count = mcps|selectattr('enabled')|list|length %}
-                            {% if mcps %}
-                            <span class="px-1.5 py-0.5 text-[10px] rounded bg-emerald-50 text-emerald-700"
-                                title="{{ enabled_count }}/{{ mcps|length }} MCP server(s) enabled">
-                                MCP ({{ enabled_count }}/{{ mcps|length }})
-                            </span>
-                            {% else %}
-                            <span class="px-1.5 py-0.5 text-[10px] rounded bg-gray-100 text-gray-400 italic"
-                                title="No MCP servers configured (wrapper would push on next heartbeat if config.yaml has mcp_servers)">
-                                MCP: none
                             </span>
                             {% endif %}
                         </div>
@@ -373,12 +354,12 @@
                     {% if p.description %}
                     <div class="text-xs text-gray-600 mt-1">{{ p.description }}</div>
                     {% endif %}
-                    {# MCP servers list (detailed) — only render if there are any #}
-                    {% if p.mcp_servers %}
-                    <div class="mt-2 pt-2 border-t border-gray-200">
-                        <div class="text-[10px] font-medium text-gray-500 uppercase tracking-wide">
-                            MCP servers ({{ (p.mcp_servers|selectattr('enabled')|list|length) }}/{{ p.mcp_servers|length }})
-                        </div>
+                    {# MCP servers list (default collapsed like skills) #}
+                    <details class="mt-2" {% if p.mcp_servers %}open{% endif %}>
+                        <summary class="text-[10px] font-medium text-gray-500 uppercase tracking-wide cursor-pointer select-none hover:text-gray-700">
+                            MCP servers ({{ (p.mcp_servers|selectattr('enabled')|list|length) if p.mcp_servers else 0 }}/{{ p.mcp_servers|length if p.mcp_servers else 0 }})
+                        </summary>
+                        {% if p.mcp_servers %}
                         <div class="mt-1 space-y-0.5">
                             {% for m in p.mcp_servers %}
                             <div class="text-xs flex items-center gap-1.5">
@@ -389,8 +370,10 @@
                             </div>
                             {% endfor %}
                         </div>
-                    </div>
-                    {% endif %}
+                        {% else %}
+                        <div class="mt-1 text-xs text-gray-400">No MCP servers configured</div>
+                        {% endif %}
+                    </details>
                     <form id="edit-profile-{{ agent.id }}-{{ p.name }}" class="hidden mt-2 p-2 bg-white border rounded" onsubmit="saveProfileEdit(event, '{{ agent.id }}', '{{ p.name }}')">
                         <textarea name="description" class="w-full text-xs border rounded p-1" rows="2" placeholder="description (optional)">{{ p.description or '' }}</textarea>
                         <label class="block text-[10px] text-gray-500 mt-1 mb-0.5">Capabilities (JSON, e.g. <code>{"mt5": true, "xauusd_feed": true}</code>):</label>
@@ -876,7 +859,8 @@ async function syncSkillsFromDisk(agentId, profileName, btn) {
     text.setAttribute('text-anchor', 'middle');
     text.setAttribute('font-size', '20');
     text.setAttribute('font-weight', '700');
-    text.setAttribute('fill', '#1f2937');
+    // Use CSS variables so dark mode override works (set in base.html)
+    text.setAttribute('fill', 'var(--text-primary, #1f2937)');
     text.textContent = total;
     svg.appendChild(text);
     const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
@@ -884,7 +868,7 @@ async function syncSkillsFromDisk(agentId, profileName, btn) {
     sub.setAttribute('y', cy + 22);
     sub.setAttribute('text-anchor', 'middle');
     sub.setAttribute('font-size', '10');
-    sub.setAttribute('fill', '#6b7280');
+    sub.setAttribute('fill', 'var(--text-muted, #6b7280)');
     sub.textContent = 'profiles';
     svg.appendChild(sub);
 })();

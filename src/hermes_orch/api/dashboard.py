@@ -280,7 +280,7 @@ async def root() -> RedirectResponse:
 async def _load_agents_overview(db: Any) -> dict[str, Any]:
     """Aggregate stats for the /agents overview dashboard.
 
-    Computes (in one DB roundtrip + a few follow-ups):
+    Computes:
       - total_agents, online (heartbeat within 90s)
       - idle / busy profile counts (only for online agents)
       - windows_online / linux_online
@@ -290,47 +290,55 @@ async def _load_agents_overview(db: Any) -> dict[str, Any]:
     The 90s "online" cutoff matches the dashboard's dot-color logic
     (status=verified + last_heartbeat >= 90s ago -> green).
 
+    We use TWO queries instead of one big LEFT JOIN aggregate, because
+    the JOIN would inflate agent-level counts by the profile count
+    (e.g. an agent with 2 profiles would be counted twice in
+    `SUM(CASE WHEN a.status='verified' ...)`). Profile-level counts
+    (idle/busy/subagents) DO want the join.
+
     Donut proportions (idle / busy / offline) are derived client-side
     in agents.html's renderDonut() — we send the raw counts only.
     """
     from datetime import timedelta
     now = now_aware()
     online_cutoff = (now - timedelta(seconds=90)).isoformat()
-    # Single aggregate row for everything we can do in one join
-    row = await db.fetchone(
+    # Agent-level: use the agents table directly (no join) to avoid
+    # the per-profile-row inflation bug.
+    agent_row = await db.fetchone(
         """
         SELECT
-            COUNT(DISTINCT a.id) AS total_agents,
-            SUM(CASE WHEN a.status='verified' AND a.last_heartbeat_at >= ? THEN 1 ELSE 0 END) AS online,
-            SUM(CASE WHEN a.status='verified' AND a.last_heartbeat_at >= ? AND p.status='idle' THEN 1 ELSE 0 END) AS idle,
-            SUM(CASE WHEN a.status='verified' AND a.last_heartbeat_at >= ? AND p.status='busy' THEN 1 ELSE 0 END) AS busy,
-            SUM(CASE WHEN a.os_type='windows' AND a.status='verified' AND a.last_heartbeat_at >= ? THEN 1 ELSE 0 END) AS windows_online,
-            SUM(CASE WHEN a.os_type='linux' AND a.status='verified' AND a.last_heartbeat_at >= ? THEN 1 ELSE 0 END) AS linux_online
-        FROM agents a
-        LEFT JOIN agent_profiles p ON p.agent_id = a.id
+            COUNT(*) AS total_agents,
+            SUM(CASE WHEN status='verified' AND last_heartbeat_at >= ? THEN 1 ELSE 0 END) AS online,
+            SUM(CASE WHEN os_type='windows' AND status='verified' AND last_heartbeat_at >= ? THEN 1 ELSE 0 END) AS windows_online,
+            SUM(CASE WHEN os_type='linux' AND status='verified' AND last_heartbeat_at >= ? THEN 1 ELSE 0 END) AS linux_online
+        FROM agents
         """,
-        (online_cutoff,) * 5,
+        (online_cutoff, online_cutoff, online_cutoff),
     )
-    profiles_total_row = await db.fetchone(
-        "SELECT COUNT(*) as n FROM agent_profiles"
-    )
-    subagents_online_row = await db.fetchone(
+    # Profile-level: only count profiles whose agent is currently
+    # online. The join is correct here because we want per-profile
+    # counts (an agent with 2 idle profiles should show idle=2).
+    profile_row = await db.fetchone(
         """
-        SELECT COUNT(*) as n FROM agent_profiles p
+        SELECT
+            COUNT(*) AS profiles_total,
+            SUM(CASE WHEN a.last_heartbeat_at >= ? AND p.status='idle' THEN 1 ELSE 0 END) AS idle,
+            SUM(CASE WHEN a.last_heartbeat_at >= ? AND p.status='busy' THEN 1 ELSE 0 END) AS busy,
+            SUM(CASE WHEN a.last_heartbeat_at >= ? THEN 1 ELSE 0 END) AS subagents_online
+        FROM agent_profiles p
         JOIN agents a ON a.id = p.agent_id
-        WHERE a.status='verified' AND a.last_heartbeat_at >= ?
         """,
-        (online_cutoff,),
+        (online_cutoff, online_cutoff, online_cutoff),
     )
     return {
-        "total_agents": int(row["total_agents"] or 0) if row else 0,
-        "online": int(row["online"] or 0) if row else 0,
-        "idle": int(row["idle"] or 0) if row else 0,
-        "busy": int(row["busy"] or 0) if row else 0,
-        "windows_online": int(row["windows_online"] or 0) if row else 0,
-        "linux_online": int(row["linux_online"] or 0) if row else 0,
-        "profiles_total": int(profiles_total_row["n"]) if profiles_total_row else 0,
-        "subagents_online": int(subagents_online_row["n"]) if subagents_online_row else 0,
+        "total_agents": int(agent_row["total_agents"] or 0) if agent_row else 0,
+        "online": int(agent_row["online"] or 0) if agent_row else 0,
+        "idle": int(profile_row["idle"] or 0) if profile_row else 0,
+        "busy": int(profile_row["busy"] or 0) if profile_row else 0,
+        "windows_online": int(agent_row["windows_online"] or 0) if agent_row else 0,
+        "linux_online": int(agent_row["linux_online"] or 0) if agent_row else 0,
+        "profiles_total": int(profile_row["profiles_total"] or 0) if profile_row else 0,
+        "subagents_online": int(profile_row["subagents_online"] or 0) if profile_row else 0,
     }
 
 
