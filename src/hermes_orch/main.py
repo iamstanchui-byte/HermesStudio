@@ -15,6 +15,7 @@ from hermes_orch.config import load_config
 from hermes_orch.core.cleanup import CleanupJob
 from hermes_orch.core.notifier import Notifier
 from hermes_orch.core.planner import Planner
+from hermes_orch.core.scheduler import Scheduler
 from hermes_orch.core.supervisor import Supervisor
 from hermes_orch.db import Database
 
@@ -41,11 +42,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # first daily-sweep check on the next tick.
     cleanup_job = CleanupJob(db, cfg)
     supervisor.set_cleanup_job(cleanup_job)
+    # Scheduler (#22): turn any project into a template + attach a
+    # cron, and the orchestrator will fire it on schedule. Started
+    # AFTER the supervisor so its first tick can rely on the same
+    # DB state the supervisor sees.
+    scheduler = Scheduler(db, cfg)
     app.state.notifier = notifier
     app.state.planner = planner
     app.state.supervisor = supervisor
     app.state.cleanup = cleanup_job
+    app.state.scheduler = scheduler
     supervisor.start()
+    scheduler.start()
 
     # Fire-and-forget startup cleanup. Skip if retention is 0
     # (disabled). Errors are logged by the job itself; we don't
@@ -63,6 +71,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Stop in reverse order: scheduler first (it queries the DB
+        # the supervisor writes to), then supervisor, then close DB.
+        await scheduler.stop()
         await supervisor.stop()
         await db.close()
         logger.info("Hermes orchestrator stopped")

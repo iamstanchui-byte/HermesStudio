@@ -20,6 +20,9 @@ dependencies = [
     "click>=8.1.7",
     "httpx>=0.27.0",
     "aiosqlite>=0.20.0",
+    # Recurring project schedules (cron parsing for /api/schedules).
+    # croniter gives us parse + get_next() in one library; ~150KB pure-Python.
+    "croniter>=2.0.5",
 ]
 
 [project.optional-dependencies]

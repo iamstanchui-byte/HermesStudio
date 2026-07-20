@@ -203,6 +203,34 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_project ON token_usage(project_id);
 CREATE INDEX IF NOT EXISTS idx_token_usage_task    ON token_usage(task_id);
 CREATE INDEX IF NOT EXISTS idx_token_usage_created ON token_usage(created_at);
 CREATE INDEX IF NOT EXISTS idx_token_usage_model   ON token_usage(model);
+
+-- Recurring project schedules (#22): turn any project into a template, attach
+-- a cron expression, and the orchestrator's background scheduler will
+-- create new project runs (clone) or append task batches (append) on every
+-- fire. Skip-if-previous-running rule keeps the schedule from stacking up
+-- when a run is slow. See core/scheduler.py for the fire loop.
+--
+--   is_template flag on projects marks a project as "reusable for schedules"
+--   source_schedule_id on projects links a run back to the schedule that
+--   created it, so the skip rule and the projects-list badge can find it.
+CREATE TABLE IF NOT EXISTS project_schedules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    template_project_id TEXT NOT NULL,    -- FK to projects.id (must be is_template=1)
+    cron_expr TEXT NOT NULL,              -- e.g. "0 9 * * 1-5" (in `timezone`)
+    timezone TEXT NOT NULL DEFAULT 'Asia/Hong_Kong',
+    mode TEXT NOT NULL DEFAULT 'clone',   -- 'clone' = new project each fire; 'append' = add to existing
+    enabled INTEGER NOT NULL DEFAULT 1,   -- 0 = paused
+    last_fired_at TIMESTAMP,
+    next_fire_at TIMESTAMP,               -- updated by scheduler on each tick
+    last_skip_reason TEXT,                -- if last fire was skipped, why (debug aid)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (template_project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON project_schedules(enabled);
+CREATE INDEX IF NOT EXISTS idx_schedules_template ON project_schedules(template_project_id);
+CREATE INDEX IF NOT EXISTS idx_schedules_next_fire ON project_schedules(next_fire_at);
 """
 
 # Idempotent migrations for older DBs that may be missing columns added later.
@@ -264,6 +292,14 @@ MIGRATIONS = [
     # project_soul_presets is a new table; created in CREATE TABLE block above.
     # No ALTER needed for it on existing DBs — IF NOT EXISTS handles it.
     # project_sessions is a new table; created in CREATE TABLE block above.
+    # No ALTER needed for it on existing DBs — IF NOT EXISTS handles it.
+    # Recurring schedules (#22): mark a project as a reusable template
+    # (is_template=1), and link a project back to the schedule that
+    # created it (source_schedule_id, NULL for ad-hoc projects).
+    "ALTER TABLE projects ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE projects ADD COLUMN template_description TEXT DEFAULT ''",
+    "ALTER TABLE projects ADD COLUMN source_schedule_id TEXT DEFAULT ''",
+    # project_schedules is a new table; created in CREATE TABLE block above.
     # No ALTER needed for it on existing DBs — IF NOT EXISTS handles it.
 ]
 
