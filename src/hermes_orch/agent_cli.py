@@ -1871,6 +1871,33 @@ def start(
         return applied
 
     try:
+        # Agent-level heartbeat in a daemon thread (independent of the
+        # main loop). Without this, a long-running hermes subprocess
+        # (3+ min) blocks the main loop's heartbeat call, so the
+        # orchestrator's `stale` threshold (90s) trips and the agent
+        # shows as offline even though the wrapper is actively working.
+        # Mirrors the per-task liveness poll inside _run_task: we
+        # already learned from #22 + the stuck-wrapper diagnosis that
+        # long subprocesses need a side-channel for liveness, and the
+        # agent-level heartbeat is exactly that side channel.
+        # Idempotent: if the thread is already running, skip.
+        import threading as _threading
+        if "_hb_thread" not in globals() or not _hb_thread.is_alive():
+            def _heartbeat_loop():
+                while not stop_flag["stop"]:
+                    try:
+                        _heartbeat()
+                    except Exception as e:
+                        click.echo(f"[daemon] bg heartbeat error: {e}")
+                    # interval/2 so heartbeats overlap with main loop's
+                    # slower calls (apply-configs takes a few seconds)
+                    time_mod.sleep(max(1, interval // 2))
+            _hb_thread = _threading.Thread(
+                target=_heartbeat_loop, daemon=True, name="agent-hb-bg"
+            )
+            _hb_thread.start()
+            click.echo(f"[daemon] background heartbeat thread started (every {max(1, interval // 2)}s)")
+
         while not stop_flag["stop"]:
             tasks, cleanup_ids = _heartbeat()
             # Process any session-cleanup requests the supervisor queued
