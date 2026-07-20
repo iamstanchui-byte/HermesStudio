@@ -195,6 +195,12 @@ document.getElementById('filter-form').addEventListener('submit', (e) => {
                         {% else %}bg-yellow-100 text-yellow-800{% endif %}">
                         {{ p.state }}
                     </span>
+                    {% set tk = token_map.get(p.id, 0) %}
+                    {% if tk %}
+                    <div class="mt-1">
+                        <span class="px-2 py-0.5 text-xs rounded bg-purple-50 text-purple-700" title="Total LLM tokens consumed by this project across all tasks">{% if tk >= 1000000 %}{{ '%.1f' % (tk / 1000000) }}M{% else %}{{ '%.1f' % (tk / 1000) }}K{% endif %} tokens</span>
+                    </div>
+                    {% endif %}
                     <div class="text-xs text-gray-500 mt-1">{{ p.created_at }}</div>
                 </div>
             </div>

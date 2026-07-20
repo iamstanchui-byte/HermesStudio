@@ -44,6 +44,13 @@
                 {% else %}bg-yellow-100 text-yellow-800{% endif %}">
                 {{ project.state }}
             </span>
+            {% if token_total %}
+            <div class="mt-1 inline-block" title="Total LLM tokens consumed by this project. Breakdown: {% for b in token_breakdown %}{{ b['call_kind'] }}={{ b['total'] }}{% if not loop.last %}, {% endif %}{% endfor %}">
+                <span class="px-2 py-0.5 text-xs rounded bg-purple-50 text-purple-700">
+                    {{ '%.1f' % (token_total / 1000) }}K tokens
+                </span>
+            </div>
+            {% endif %}
             <div class="text-xs text-gray-500 mt-1">created {{ project.created_at }}</div>
             <div class="mt-2 flex gap-1 justify-end flex-wrap">
                 <button onclick="openProjectFolder('{{ project.id }}')" class="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded hover:bg-gray-200" title="Open the project folder in File Explorer (only works if your browser is on the orchestrator host)">

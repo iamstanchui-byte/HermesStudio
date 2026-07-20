@@ -636,6 +636,21 @@ async def projects_list_page(
         f"SELECT * FROM projects{where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
         page_params,
     )
+    # Per-project token totals — single grouped query (subquery) so we
+    # don't issue N+1. Used to show "X tokens" badge on each row in the
+    # list. Empty dict means no rows (e.g. brand-new project).
+    if projects:
+        proj_ids = [p["id"] for p in projects]
+        placeholders = ",".join("?" for _ in proj_ids)
+        token_rows = await db.fetchall(
+            f"SELECT project_id, COALESCE(SUM(total_tokens), 0) AS total "
+            f"FROM token_usage WHERE project_id IN ({placeholders}) "
+            f"GROUP BY project_id",
+            tuple(proj_ids),
+        )
+        token_map = {r["project_id"]: int(r["total"] or 0) for r in token_rows}
+    else:
+        token_map = {}
     # Profiles for the "Coordinator role" dropdown in the create form
     profile_rows = await db.fetchall(
         "SELECT agent_id, name FROM agent_profiles ORDER BY agent_id, name"
@@ -649,6 +664,7 @@ async def projects_list_page(
         context={
             **_base_context(request, "projects"),
             "projects": projects,
+            "token_map": token_map,
             "show_archived": show_archived,
             "show_deleted": show_deleted,
             "filter_state": state,
@@ -721,6 +737,21 @@ async def project_page(
         (project_id,),
     )
     soul_presets = [dict(r) for r in preset_rows]
+    # Per-project token totals (so the user can see "this project used X
+    # tokens" without going to the agents page). Broken down by call_kind
+    # so the breakdown is visible (planner + synthesis + agent_task).
+    token_rows = await db.fetchall(
+        "SELECT call_kind, "
+        "COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+        "COALESCE(SUM(completion_tokens), 0) AS completion, "
+        "COALESCE(SUM(total_tokens), 0) AS total, "
+        "COUNT(*) AS calls "
+        "FROM token_usage WHERE project_id = ? "
+        "GROUP BY call_kind ORDER BY call_kind",
+        (project_id,),
+    )
+    token_breakdown = [dict(r) for r in token_rows]
+    token_total = sum(r["total"] for r in token_breakdown)
     return templates.TemplateResponse(
         request=request,
         name="project.html",
@@ -733,6 +764,8 @@ async def project_page(
             "filter_offset": offset,
             "all_profiles": all_profiles,
             "soul_presets": soul_presets,
+            "token_breakdown": token_breakdown,
+            "token_total": token_total,
         },
     )
 
