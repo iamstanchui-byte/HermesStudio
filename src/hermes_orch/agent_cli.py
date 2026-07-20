@@ -396,9 +396,16 @@ def _capture_session_tokens(profile_root: Path) -> dict | None:
                 # we don't recognize. Skip silently.
                 return None
             col_list = ", ".join(cols)
+            # Don't filter by ended_at — most hermes sessions don't commit
+            # an end timestamp even when they're functionally done (the
+            # process exits but the session row stays NULL on ended_at /
+            # end_reason). The most recent session by started_at is what
+            # we want, regardless of whether ended_at is set. The wrapper
+            # is the only writer for sessions started within the task's
+            # hermes subprocess lifetime, so picking the most recent is
+            # the right session for our task.
             c.execute(
                 f"SELECT {col_list} FROM sessions "
-                "WHERE ended_at IS NOT NULL "
                 "ORDER BY started_at DESC LIMIT 1"
             )
             row = c.fetchone()
@@ -1231,6 +1238,54 @@ def start(
         except Exception as e:
             return {"status": "failed", "error": f"{type(e).__name__}: {e}"}
 
+        # Keep task liveness alive while hermes runs. Without this, the
+        # orchestrator's stuck-task detector (180s threshold) marks the
+        # task failed even though the wrapper is still actively working.
+        # The detector only looks at the task's `last_liveness_at`, not
+        # the agent's `last_heartbeat_at`, so a long hermes subprocess
+        # (e.g. fetch_weather with multiple sources, or a long tool
+        # sequence) trips the detector. Poll /api/tasks/{id}/poll every
+        # 30s in a background thread; the orchestrator updates
+        # last_liveness_at on each call. If poll ever returns
+        # status != "running" (e.g. the user cancelled), kill hermes
+        # so the wrapper stops wasting tokens on a dead task.
+        import threading
+        stop_poll = threading.Event()
+        def _poll_liveness() -> None:
+            while not stop_poll.is_set():
+                try:
+                    r = httpx.post(
+                        f"{orchestrator_url}/api/tasks/{tid}/poll",
+                        headers={
+                            "X-Agent-Id": agent_id,
+                            "X-Timestamp": str(int(time_mod.time())),
+                            "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
+                        },
+                        timeout=5,
+                    )
+                    if r.status_code == 200:
+                        body = r.json() or {}
+                        if body.get("status") != "running":
+                            click.echo(
+                                f"  task {tid} no longer running "
+                                f"(status={body.get('status')}); killing hermes"
+                            )
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            return
+                except Exception as e:
+                    click.echo(f"  WARN: task poll failed: {e}")
+                # 30s sleep, but check stop flag every second so we exit
+                # quickly when the subprocess finishes
+                for _ in range(30):
+                    if stop_poll.is_set():
+                        return
+                    time_mod.sleep(1)
+        poll_thread = threading.Thread(target=_poll_liveness, daemon=True)
+        poll_thread.start()
+
         try:
             try:
                 raw_stdout, raw_stderr = proc.communicate(timeout=timeout)
@@ -1240,6 +1295,8 @@ def start(
                     proc.communicate(timeout=5)
                 except Exception:
                     pass
+                # stop the liveness poller before any other handling
+                stop_poll.set()
                 return {"status": "failed", "error": f"hermes timeout after {timeout}s"}
             # Decode bytes as UTF-8, replacing bad chars (Windows consoles can
             # produce mixed encodings in edge cases)
@@ -1415,6 +1472,8 @@ def start(
                         f"cache_r={token_usage.get('cache_read_tokens', 0)} "
                         f"cache_w={token_usage.get('cache_write_tokens', 0)}"
                     )
+                # Stop the liveness poller before returning
+                stop_poll.set()
                 return result
             failed_result = {
                 "status": "failed",
@@ -1426,6 +1485,8 @@ def start(
             token_usage = _capture_session_tokens(profile_root)
             if token_usage:
                 failed_result["token_usage"] = token_usage
+            # Stop the liveness poller before returning
+            stop_poll.set()
             return failed_result
         except Exception as e:
             # Catch-all: Popen.communicate can throw on Windows if the child
