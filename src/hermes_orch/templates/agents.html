@@ -823,30 +823,55 @@ async function syncSkillsFromDisk(agentId, profileName, btn) {
     // The grey background ring is already in the SVG; only draw
     // slices on top, with a 24px stroke and a small gap effect via
     // round line caps.
-    let angle = -Math.PI / 2;  // start at 12 o'clock
-    for (const s of slices) {
-        const frac = s.count / total2;
-        const sweep = frac * 2 * Math.PI;
-        const end = angle + sweep;
-        const x1 = cx + r * Math.cos(angle);
-        const y1 = cy + r * Math.sin(angle);
-        const x2 = cx + r * Math.cos(end);
-        const y2 = cy + r * Math.sin(end);
-        const large = sweep > Math.PI ? 1 : 0;
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        // Use a stroke arc instead of a filled wedge — simpler and
-        // matches the existing grey ring (same r/stroke-width).
-        const d = `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;
-        path.setAttribute('d', d);
-        path.setAttribute('stroke', s.color);
-        path.setAttribute('stroke-width', '24');
-        path.setAttribute('fill', 'none');
-        path.setAttribute('stroke-linecap', 'butt');
+    // Edge case: if there's only ONE slice and it's 100%, the SVG
+    // arc would be degenerate (start == end point) and most
+    // renderers (Chrome/Safari/Firefox) draw a 0-length invisible
+    // path. So we special-case: draw a full circle for the
+    // single-slice-100% case, otherwise the usual arc. The 'no
+    // data' fallback is the same color as the background ring, so
+    // we skip drawing it (just shows the ring).
+    const is_no_data_fallback = slices.length === 1 && slices[0].label === 'no data';
+    if (is_no_data_fallback) {
+        // Nothing to draw — the background ring is the visual
+    } else if (slices.length === 1 && total2 > 0) {
+        const s = slices[0];
+        const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        circle.setAttribute('cx', cx);
+        circle.setAttribute('cy', cy);
+        circle.setAttribute('r', r);
+        circle.setAttribute('fill', 'none');
+        circle.setAttribute('stroke', s.color);
+        circle.setAttribute('stroke-width', '24');
         const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-        title.textContent = `${s.label}: ${s.count} (${(frac * 100).toFixed(0)}%)`;
-        path.appendChild(title);
-        svg.appendChild(path);
-        angle = end;
+        title.textContent = `${s.label}: ${s.count} (100%)`;
+        circle.appendChild(title);
+        svg.appendChild(circle);
+    } else {
+        let angle = -Math.PI / 2;  // start at 12 o'clock
+        for (const s of slices) {
+            const frac = s.count / total2;
+            const sweep = frac * 2 * Math.PI;
+            const end = angle + sweep;
+            const x1 = cx + r * Math.cos(angle);
+            const y1 = cy + r * Math.sin(angle);
+            const x2 = cx + r * Math.cos(end);
+            const y2 = cy + r * Math.sin(end);
+            const large = sweep > Math.PI ? 1 : 0;
+            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+            // Use a stroke arc instead of a filled wedge — simpler and
+            // matches the existing grey ring (same r/stroke-width).
+            const d = `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;
+            path.setAttribute('d', d);
+            path.setAttribute('stroke', s.color);
+            path.setAttribute('stroke-width', '24');
+            path.setAttribute('fill', 'none');
+            path.setAttribute('stroke-linecap', 'butt');
+            const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+            title.textContent = `${s.label}: ${s.count} (${(frac * 100).toFixed(0)}%)`;
+            path.appendChild(title);
+            svg.appendChild(path);
+            angle = end;
+        }
     }
     // Center label: total profiles
     const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
