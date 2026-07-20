@@ -215,6 +215,14 @@
             if (document.querySelector('[id^="result-"]:not(.hidden), [id^="presult-"]:not(.hidden)')) {
                 return;
             }
+            // Pause if any modal overlay is visible. The focus-based
+            // check below misses the case where the user has clicked
+            // outside an open modal (focus -> body) or is hovering a
+            // button inside the modal, in which case location.reload()
+            // would clobber the form state.
+            if (document.querySelector('.modal-overlay:not(.hidden), [id$="-modal-overlay"]:not(.hidden)')) {
+                return;
+            }
             const a = document.activeElement;
             if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT')) {
                 return;  // user is editing a form
