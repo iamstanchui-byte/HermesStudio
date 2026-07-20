@@ -317,8 +317,8 @@
             <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;">
                 {% for p in agent.profiles %}
                 <div class="border rounded p-3 bg-gray-50" style="flex:1 1 320px; max-width:32rem; min-width:0;" id="profile-card-{{ agent.id }}-{{ p.name }}">
-                    {# Header row: name + status + LLM model (left) | caps + edit + SOUL + × (right) #}
-                    <div class="flex items-center justify-between gap-2 flex-wrap">
+                    {# Row 1: name + status + LLM model (left) | × close (right) #}
+                    <div class="flex items-center justify-between gap-2">
                         <div class="flex items-center gap-2 min-w-0 flex-wrap">
                             <span class="font-mono text-sm font-semibold">{{ p.name }}</span>
                             <span class="px-1.5 py-0.5 text-[10px] rounded
@@ -340,11 +340,19 @@
                             </span>
                             {% endif %}
                         </div>
-                        <div class="flex items-center gap-1 flex-shrink-0">
+                        <button onclick="removeProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-red-600 hover:underline flex-shrink-0" title="Remove profile">&times;</button>
+                    </div>
+                    {# Row 2: capability badges (left) | edit + SOUL.md (right). Always a
+                       separate row so the layout is identical regardless of how
+                       many capability badges the profile has (avoids flex-wrap
+                       pushing SOUL.md to a 2nd line on cards with more caps). #}
+                    <div class="mt-1.5 flex items-center justify-between gap-2">
+                        <div class="flex items-center gap-1 flex-wrap min-w-0">
                             {% for k, v in p.capabilities.items() %}{% if v %}<span class="px-1 bg-indigo-50 text-indigo-700 rounded text-[10px]" title="capability">{{ k }}</span>{% endif %}{% endfor %}
+                        </div>
+                        <div class="flex items-center gap-2 flex-shrink-0">
                             <button onclick="editProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-blue-600 hover:underline" title="Edit description">&#9998;</button>
                             <button onclick="toggleSoulEditor('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-purple-600 hover:underline" title="Edit SOUL.md (wrapper-mediated). On Linux, the file is SOUL.md (uppercase) — match the case for the agent to pick it up.">SOUL.md</button>
-                            <button onclick="removeProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-red-600 hover:underline" title="Remove profile">&times;</button>
                         </div>
                     </div>
                     {% if p.description %}
