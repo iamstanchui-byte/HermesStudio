@@ -173,6 +173,36 @@ CREATE TABLE IF NOT EXISTS project_sessions (
 CREATE INDEX IF NOT EXISTS idx_proj_sessions_project ON project_sessions(project_id);
 CREATE INDEX IF NOT EXISTS idx_proj_sessions_status ON project_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_proj_sessions_last_used ON project_sessions(last_used_at);
+
+-- Per-call LLM token usage log. Every planner / synthesis / wrapper
+-- LLM call should write one row, with the prompt/completion/total
+-- token counts from the OpenAI-compatible `usage` field. The dashboard
+-- aggregates this for the 4h / 24h / 7d overview and the by-model /
+-- by-agent / by-project / top-tasks breakdowns.
+-- Columns kept as raw integers (no JSON); the call_kind enum makes
+-- the dashboards easy to filter on without string parsing.
+CREATE TABLE IF NOT EXISTS token_usage (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT,            -- NULL for planner/synthesis (orchestrator-side)
+    profile_id TEXT,          -- NULL when not tied to a specific profile
+    project_id TEXT,
+    task_id TEXT,
+    role TEXT,                -- profile name (matches agent_profiles.name) when wrapper-side
+    model TEXT NOT NULL,
+    base_url TEXT,
+    prompt_tokens INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    total_tokens INTEGER NOT NULL,
+    call_kind TEXT NOT NULL,   -- 'planner' | 'synthesis' | 'agent_task' | 'wrapper_other'
+    call_label TEXT,          -- free text: e.g. 'plan_world_cup', 'regen_state'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_token_usage_agent   ON token_usage(agent_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_profile ON token_usage(profile_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_project ON token_usage(project_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_task    ON token_usage(task_id);
+CREATE INDEX IF NOT EXISTS idx_token_usage_created ON token_usage(created_at);
+CREATE INDEX IF NOT EXISTS idx_token_usage_model   ON token_usage(model);
 """
 
 # Idempotent migrations for older DBs that may be missing columns added later.

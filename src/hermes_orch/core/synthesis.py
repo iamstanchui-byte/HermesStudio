@@ -182,6 +182,25 @@ class StateGenerator:
         if not isinstance(text, str):
             log.warning(f"L3 LLM response content not str: {type(text)}")
             return None
+
+        # Record token usage. Best-effort: if the insert fails, log
+        # but don't break the synthesis flow.
+        try:
+            usage = data.get("usage", {}) or {}
+            from .token_usage import record_token_usage
+            await record_token_usage(
+                self.db,
+                project_id=getattr(self, "_current_project_id", None),
+                model=self.model,
+                base_url=self.base_url,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+                call_kind="synthesis",
+                call_label=getattr(self, "_current_call_label", "synth"),
+            )
+        except Exception as ex:  # noqa: BLE001
+            log.debug("synthesis token usage recording skipped: %s", ex)
         return clean_llm_markdown(text)
 
 

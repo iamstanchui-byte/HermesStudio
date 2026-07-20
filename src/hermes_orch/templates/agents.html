@@ -66,6 +66,165 @@
     </div>
 </div>
 
+<!-- ===== Token usage (4h / 24h / 7d + breakdowns + sparkline) ===== -->
+<div class="mb-4 bg-white border rounded-lg p-4 shadow-sm">
+    <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">
+        Token usage
+        <span class="text-xs text-gray-400 font-normal normal-case ml-1">(LLM calls across all profiles + orchestrator-side)</span>
+    </h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+        <div class="bg-gray-50 border rounded p-3">
+            <div class="text-xs text-gray-500 uppercase">4h</div>
+            <div class="text-xl font-bold text-gray-800" id="tu-total-4h">0</div>
+            <div class="text-xs text-gray-400" id="tu-detail-4h">0 calls</div>
+        </div>
+        <div class="bg-indigo-50 border border-indigo-200 rounded p-3">
+            <div class="text-xs text-indigo-700 uppercase">24h</div>
+            <div class="text-xl font-bold text-indigo-800" id="tu-total-24h">0</div>
+            <div class="text-xs text-indigo-600" id="tu-detail-24h">0 calls</div>
+        </div>
+        <div class="bg-purple-50 border border-purple-200 rounded p-3">
+            <div class="text-xs text-purple-700 uppercase">7d</div>
+            <div class="text-xl font-bold text-purple-800" id="tu-total-7d">0</div>
+            <div class="text-xs text-purple-600" id="tu-detail-7d">0 calls</div>
+        </div>
+    </div>
+    {# By-model + by-agent + sparkline (3-col grid) #}
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div>
+            <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">By model (7d)</div>
+            <table class="w-full text-xs">
+                <tbody id="tu-by-model">
+                    <tr><td class="text-gray-400 italic py-1" colspan="2">No data yet</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div>
+            <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">By agent (7d)</div>
+            <table class="w-full text-xs">
+                <tbody id="tu-by-agent">
+                    <tr><td class="text-gray-400 italic py-1" colspan="2">No data yet</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div>
+            <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Daily totals (7d)</div>
+            <svg id="tu-sparkline" width="100%" height="80" viewBox="0 0 280 80" preserveAspectRatio="none" aria-label="Daily token usage 7-day sparkline">
+                <line x1="0" y1="40" x2="280" y2="40" stroke="#e5e7eb" stroke-width="1" stroke-dasharray="2 2" />
+            </svg>
+        </div>
+    </div>
+    {# By-project (collapsible) + top-5 tasks #}
+    <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
+        <details class="border rounded p-2">
+            <summary class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide cursor-pointer">
+                By project (7d, top 5)
+            </summary>
+            <table class="w-full text-xs mt-2">
+                <tbody id="tu-by-project">
+                    <tr><td class="text-gray-400 italic py-1" colspan="2">No data yet</td></tr>
+                </tbody>
+            </table>
+        </details>
+        <details class="border rounded p-2">
+            <summary class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide cursor-pointer">
+                Top-5 tasks (7d)
+            </summary>
+            <table class="w-full text-xs mt-2">
+                <tbody id="tu-top-tasks">
+                    <tr><td class="text-gray-400 italic py-1" colspan="2">No data yet</td></tr>
+                </tbody>
+            </table>
+        </details>
+    </div>
+</div>
+<script>
+// Populate token usage panel from the page context (set by template).
+(function renderTokenUsage() {
+    const t = {{ token_usage | tojson }};
+    function fmt(n) {
+        if (n == null) return '0';
+        if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+        if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+        return String(n);
+    }
+    // Total cards
+    for (const w of ['4h', '24h', '7d']) {
+        const tot = (t.totals && t.totals[w]) || { total: 0, calls: 0 };
+        const totEl = document.getElementById('tu-total-' + w);
+        const detEl = document.getElementById('tu-detail-' + w);
+        if (totEl) totEl.textContent = fmt(tot.total);
+        if (detEl) detEl.textContent = tot.calls + ' call' + (tot.calls === 1 ? '' : 's');
+    }
+    // By-model
+    const bm = document.getElementById('tu-by-model');
+    if (bm && t.by_model && t.by_model.length) {
+        bm.innerHTML = t.by_model.map(m =>
+            '<tr><td class="font-mono py-0.5 pr-2">' + m.model + '</td>' +
+            '<td class="text-right py-0.5">' + fmt(m.total) + ' <span class="text-gray-400">(' + m.calls + ')</span></td></tr>'
+        ).join('');
+    }
+    // By-agent
+    const ba = document.getElementById('tu-by-agent');
+    if (ba && t.by_agent && t.by_agent.length) {
+        ba.innerHTML = t.by_agent.map(a =>
+            '<tr><td class="font-mono py-0.5 pr-2">' + a.agent_id + '</td>' +
+            '<td class="text-right py-0.5">' + fmt(a.total) + ' <span class="text-gray-400">(' + a.calls + ')</span></td></tr>'
+        ).join('');
+    }
+    // By-project
+    const bp = document.getElementById('tu-by-project');
+    if (bp && t.by_project && t.by_project.length) {
+        bp.innerHTML = t.by_project.map(p =>
+            '<tr><td class="py-0.5 pr-2"><a href="/projects/' + p.project_id + '" class="text-blue-600 hover:underline">' +
+            p.name + '</a></td>' +
+            '<td class="text-right py-0.5">' + fmt(p.total) + ' <span class="text-gray-400">(' + p.calls + ')</span></td></tr>'
+        ).join('');
+    }
+    // Top tasks
+    const tt = document.getElementById('tu-top-tasks');
+    if (tt && t.top_tasks && t.top_tasks.length) {
+        tt.innerHTML = t.top_tasks.map(x =>
+            '<tr><td class="py-0.5 pr-2"><a href="/tasks?status=completed" class="font-mono text-blue-600 hover:underline">' +
+            x.task_id.slice(0, 16) + '</a> ' +
+            '<span class="text-gray-500">' + (x.role || '-') + ' / ' + (x.model || '-') + '</span></td>' +
+            '<td class="text-right py-0.5">' + fmt(x.total) + ' <span class="text-gray-400">(' + x.calls + ')</span></td></tr>'
+        ).join('');
+    }
+    // Sparkline: 7 daily bars
+    const svg = document.getElementById('tu-sparkline');
+    if (svg && t.sparkline && t.sparkline.length) {
+        const W = 280, H = 80, P = 8;
+        const max = Math.max(1, ...t.sparkline.map(d => d.total));
+        const bw = (W - P * 2) / t.sparkline.length;
+        t.sparkline.forEach((d, i) => {
+            const h = d.total > 0 ? Math.max(2, (d.total / max) * (H - P * 2)) : 1;
+            const x = P + i * bw;
+            const y = H - P - h;
+            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+            rect.setAttribute('x', x.toFixed(1));
+            rect.setAttribute('y', y.toFixed(1));
+            rect.setAttribute('width', (bw - 2).toFixed(1));
+            rect.setAttribute('height', h.toFixed(1));
+            rect.setAttribute('fill', d.total > 0 ? '#6366f1' : '#e5e7eb');  // indigo-500 / gray-200
+            const t1 = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+            t1.textContent = d.date + ': ' + d.total + ' tokens';
+            rect.appendChild(t1);
+            svg.appendChild(rect);
+            // Date label below bar
+            const tx = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            tx.setAttribute('x', (x + (bw - 2) / 2).toFixed(1));
+            tx.setAttribute('y', (H - 1).toFixed(1));
+            tx.setAttribute('text-anchor', 'middle');
+            tx.setAttribute('font-size', '8');
+            tx.setAttribute('fill', '#9ca3af');
+            tx.textContent = d.date;
+            svg.appendChild(tx);
+        });
+    }
+})();
+</script>
+
 <!-- Register Agent (collapsed by default) -->
 {% if not agents %}
 <div class="bg-blue-50 border border-blue-200 rounded p-4 mb-3 text-sm text-blue-800">

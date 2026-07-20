@@ -457,6 +457,29 @@ class Planner:
             finish_reason = choice.get("finish_reason", "")
         except (KeyError, IndexError) as e:
             raise RuntimeError(f"LLM response missing content: {data}") from e
+
+        # Record token usage. The OpenAI-compatible `usage` field is
+        # present for all major providers (OpenAI, Anthropic via
+        # proxy, MiniMax). The _plan_llm helper doesn't know which
+        # project_id this plan is for (the supervisor wraps it; we
+        # only have the goal here). call_label is the first 50 chars
+        # of the goal so the dashboard shows which plan used what.
+        try:
+            usage = data.get("usage", {}) or {}
+            from .token_usage import record_token_usage
+            label = (goal[:50] + "...") if len(goal) > 50 else goal
+            await record_token_usage(
+                self.db,
+                model=self.model,
+                base_url=self.base_url,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+                call_kind="planner",
+                call_label=label,
+            )
+        except Exception as ex:  # noqa: BLE001
+            logger.debug("token usage recording skipped: %s", ex)
         # Detect truncation BEFORE we try to parse the JSON. If the model
         # hit its output cap mid-stream, finish_reason will be "length"
         # and the JSON is almost certainly incomplete. Falling back to

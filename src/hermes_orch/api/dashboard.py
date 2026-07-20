@@ -13,6 +13,7 @@ Live updates via 5s polling (vanilla JS setInterval + fetch).
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -333,12 +334,132 @@ async def _load_agents_overview(db: Any) -> dict[str, Any]:
     }
 
 
+async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
+    """Aggregate LLM token usage for the agents page token section.
+
+    Returns:
+      - totals: {4h, 24h, 7d} -> {total, prompt, completion, calls}
+      - by_model: [{model, total_7d, calls_7d}, ...]  (top 10)
+      - by_agent: [{agent_id, profile, total_7d, calls_7d}, ...]  (top 10)
+      - by_project: [{project_id, name, total_7d, calls_7d}, ...]  (top 5)
+      - top_tasks: [{task_id, project_id, role, model, total_7d, calls_7d}, ...]
+        (top 5, sorted by 7d total)
+      - sparkline: [{date, total}, ...]  (7 daily buckets, oldest first)
+
+    All numbers are integers; missing data is represented as 0 or [].
+    The template handles the empty case with "no data yet" copy.
+    """
+    now = now_aware()
+    cutoffs = {
+        "4h": (now - timedelta(hours=4)).isoformat(),
+        "24h": (now - timedelta(hours=24)).isoformat(),
+        "7d": (now - timedelta(days=7)).isoformat(),
+    }
+    out: dict[str, Any] = {
+        "totals": {},
+        "by_model": [],
+        "by_agent": [],
+        "by_project": [],
+        "top_tasks": [],
+        "sparkline": [],
+    }
+    # Totals for each window
+    for window, cutoff in cutoffs.items():
+        row = await db.fetchone(
+            "SELECT COALESCE(SUM(total_tokens),0) as total, "
+            "COALESCE(SUM(prompt_tokens),0) as prompt, "
+            "COALESCE(SUM(completion_tokens),0) as completion, "
+            "COUNT(*) as calls FROM token_usage WHERE created_at >= ?",
+            (cutoff,),
+        )
+        out["totals"][window] = {
+            "total": int(row["total"]) if row else 0,
+            "prompt": int(row["prompt"]) if row else 0,
+            "completion": int(row["completion"]) if row else 0,
+            "calls": int(row["calls"]) if row else 0,
+        }
+    cutoff_7d = cutoffs["7d"]
+    # by_model (7d)
+    out["by_model"] = [
+        {"model": r["model"], "total": int(r["total"] or 0), "calls": int(r["calls"] or 0)}
+        for r in await db.fetchall(
+            "SELECT model, SUM(total_tokens) as total, COUNT(*) as calls "
+            "FROM token_usage WHERE created_at >= ? GROUP BY model "
+            "ORDER BY total DESC LIMIT 10",
+            (cutoff_7d,),
+        )
+    ]
+    # by_agent (7d) — group by agent_id, take top 10
+    out["by_agent"] = [
+        {
+            "agent_id": r["agent_id"] or "(orchestrator)",
+            "total": int(r["total"] or 0),
+            "calls": int(r["calls"] or 0),
+        }
+        for r in await db.fetchall(
+            "SELECT agent_id, SUM(total_tokens) as total, COUNT(*) as calls "
+            "FROM token_usage WHERE created_at >= ? "
+            "GROUP BY agent_id ORDER BY total DESC LIMIT 10",
+            (cutoff_7d,),
+        )
+    ]
+    # by_project (7d) — top 5
+    by_proj_rows = await db.fetchall(
+        "SELECT tu.project_id, COALESCE(p.name, '?') as name, "
+        "SUM(tu.total_tokens) as total, COUNT(*) as calls "
+        "FROM token_usage tu LEFT JOIN projects p ON p.id = tu.project_id "
+        "WHERE tu.created_at >= ? AND tu.project_id IS NOT NULL "
+        "GROUP BY tu.project_id ORDER BY total DESC LIMIT 5",
+        (cutoff_7d,),
+    )
+    out["by_project"] = [
+        {"project_id": r["project_id"], "name": r["name"],
+         "total": int(r["total"] or 0), "calls": int(r["calls"] or 0)}
+        for r in by_proj_rows
+    ]
+    # top_tasks (7d) — top 5
+    out["top_tasks"] = [
+        {
+            "task_id": r["task_id"],
+            "project_id": r["project_id"],
+            "role": r["role"],
+            "model": r["model"],
+            "total": int(r["total"] or 0),
+            "calls": int(r["calls"] or 0),
+        }
+        for r in await db.fetchall(
+            "SELECT task_id, project_id, role, model, "
+            "SUM(total_tokens) as total, COUNT(*) as calls "
+            "FROM token_usage WHERE created_at >= ? AND task_id IS NOT NULL "
+            "GROUP BY task_id ORDER BY total DESC LIMIT 5",
+            (cutoff_7d,),
+        )
+    ]
+    # 7-day sparkline (oldest first)
+    for i in range(7):
+        day_start = (now - timedelta(days=6 - i)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        day_end = day_start + timedelta(days=1)
+        r = await db.fetchone(
+            "SELECT COALESCE(SUM(total_tokens),0) as total FROM token_usage "
+            "WHERE created_at >= ? AND created_at < ?",
+            (day_start.isoformat(), day_end.isoformat()),
+        )
+        out["sparkline"].append({
+            "date": day_start.strftime("%m-%d"),
+            "total": int(r["total"]) if r else 0,
+        })
+    return out
+
+
 @router.get("/agents", response_class=HTMLResponse)
 async def agents_page(request: Request) -> HTMLResponse:
     """Agents page with expandable profile sub-cards."""
     db = request.app.state.db
     agents = await _load_agents(db)
     overview = await _load_agents_overview(db)
+    token_usage = await _load_token_usage_overview(db)
     return templates.TemplateResponse(
         request=request,
         name="agents.html",
@@ -346,6 +467,7 @@ async def agents_page(request: Request) -> HTMLResponse:
             **_base_context(request, "agents"),
             "agents": agents,
             "overview": overview,
+            "token_usage": token_usage,
         },
     )
 
