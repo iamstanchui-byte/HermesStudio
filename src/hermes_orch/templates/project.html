@@ -440,10 +440,9 @@ they target different agent profiles. -->
 </div>
 
 <script>
-// Load the procedure.md preview on page load. Other procedure functions
-// (toggleProcEdit, saveProcedure) are defined further down with the
-// other template/schedule handlers.
-loadProcedure();
+// loadProcedure() is invoked AFTER PROJECT_ID is declared (further
+// down) to avoid a temporal-dead-zone ReferenceError on the const.
+// We don't call it here.
 function toggleForm(id) {
     document.getElementById(id).classList.toggle('hidden');
 }
@@ -543,6 +542,9 @@ function fallbackCopy(text, btn) {
 }
 
 const PROJECT_ID = "{{ project.id }}";
+
+// PROJECT_ID is in scope from here down. Safe to call loadProcedure.
+loadProcedure();
 
 document.getElementById('new-task-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -658,7 +660,8 @@ async function unmarkTemplate(projectId, name) {
 // denormalizes it into each task's procedure_md column at assignment
 // time; the wrapper reads that and prepends it to the agent's prompt.
 // Here we just GET/PUT the raw file via the existing file API.
-const PROJECT_ID = "{{ project.id }}";
+// (PROJECT_ID is declared earlier in the same script block — don't
+// redeclare or the page errors out silently.)
 async function loadProcedure() {
     const el = document.getElementById('proc-content');
     try {
