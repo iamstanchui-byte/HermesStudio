@@ -614,7 +614,14 @@ async def set_project_session(project_id: str, request: Request) -> dict:
         raise HTTPException(400, "invalid JSON body")
     session_id = data.get("session_id")
     role = data.get("role")
-    agent_id = data.get("agent_id")
+    # Wrapper previously sent only {session_id, role} in the body, which
+    # left agent_id / profile_id NULL in the project_sessions row. The
+    # cleanup-ack endpoint JOINS agent_profiles on profile_id, so NULL
+    # rows can never be acked — they sit in pending_cleanup forever.
+    # Fall back to deriving both from the request's X-Agent-Id header
+    # (HMAC-authenticated) + (agent_id, role) lookup. The wrapper
+    # doesn't even need to send them in the body anymore.
+    agent_id = data.get("agent_id") or request.headers.get("X-Agent-Id")
     profile_id = data.get("profile_id")
     if not session_id:
         raise HTTPException(400, "session_id is required")
@@ -623,7 +630,23 @@ async def set_project_session(project_id: str, request: Request) -> dict:
         # Without it, we'd write to current_session_id only (and a future
         # task on a different profile would try to resume it).
         raise HTTPException(400, "role is required (sessions are per-role)")
+    if not agent_id:
+        raise HTTPException(
+            400,
+            "agent_id required (X-Agent-Id header or body.agent_id)"
+        )
     db = request.app.state.db
+    # Resolve profile_id from (agent_id, role) if the wrapper didn't
+    # send it. This is the standard case — the wrapper knows the role
+    # but doesn't know the UUID of its own profile row.
+    if not profile_id:
+        prof_row = await db.fetchone(
+            "SELECT id FROM agent_profiles "
+            "WHERE agent_id = ? AND name = ?",
+            (agent_id, role),
+        )
+        if prof_row:
+            profile_id = prof_row["id"]
     # Read existing per-role map and update under this role's key.
     row = await db.fetchone(
         "SELECT current_sessions_json FROM projects WHERE id = ?", (project_id,)

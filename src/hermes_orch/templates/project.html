@@ -298,8 +298,14 @@ they target different agent profiles. -->
                     <ul class="list-disc ml-6 mt-1">
                     {% for a in t.result.artifacts %}
                         <li>
-                            <a href="/projects/{{ t.project_id }}/files/{{ a.name or a.path }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name or a.path }}</a>
+                            {% if a.exists %}
+                            <a href="/api/projects/{{ t.project_id }}/files/{{ a.name or a.path }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name or a.path }}</a>
                             <span class="text-gray-500">({{ a.storage_kind|default('?') }}{% if a.size_bytes %}, {{ a.size_bytes }} bytes{% endif %})</span>
+                            {% else %}
+                            <span class="font-mono text-gray-500" title="{% if a.is_ephemeral %}Ephemeral control file: read + unlinked by supervisor (decision / status / plan signal){% else %}File no longer on disk (may have been cleaned up){% endif %}{% if a.size_bytes %}&#10;original size: {{ a.size_bytes }} bytes{% endif %}">{{ a.name or a.path }}</span>
+                            <span class="px-1.5 py-0.5 text-xs rounded bg-gray-200 text-gray-600">deleted</span>
+                            {% if a.size_bytes %}<span class="text-gray-400 text-xs">({{ a.size_bytes }} bytes)</span>{% endif %}
+                            {% endif %}
                         </li>
                     {% endfor %}
                     </ul>

@@ -141,6 +141,52 @@ def _compute_task_timing(task: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# Files the supervisor treats as ephemeral control signals (read +
+# unlink). These get registered as artifacts in the DB by the wrapper's
+# auto-upload path, but the file itself is gone from disk by the time
+# the user looks at the page. The template uses this set to render
+# a "(deleted)" badge instead of a broken link. Keep in sync with
+# agent_cli.py:1420 (where the wrapper SKIPS auto-uploading these).
+EPHEMERAL_CONTROL_FILES = frozenset({
+    "decision.md",
+    "decisions.md",
+    "status.md",
+    "plan.md",
+})
+
+
+def _annotate_artifact_exists(
+    task: dict[str, Any], projects_root: "Path | None"
+) -> None:
+    """For each artifact in `task.result.artifacts`, set `exists: bool`
+    and `is_ephemeral: bool` flags so the template can render links /
+    "deleted" badges without re-doing the disk check. Mutates `task`
+    in place. Safe to call with projects_root=None (skips disk check
+    and falls back to False).
+    """
+    result = task.get("result") or {}
+    arts = result.get("artifacts") or []
+    if not arts:
+        return
+    for a in arts:
+        name = a.get("name") or a.get("path") or ""
+        is_ephemeral = name in EPHEMERAL_CONTROL_FILES
+        a["is_ephemeral"] = is_ephemeral
+        if projects_root is None:
+            a["exists"] = False
+            continue
+        # Resolve the on-disk path. Server-side convention: project
+        # files live at <projects_root>/<project_id>/<name>. The
+        # wrapper uploads via PUT /api/projects/{pid}/files/<rel>
+        # which writes to exactly that location.
+        try:
+            pdir = projects_root / task["project_id"]
+            fpath = pdir / name
+            a["exists"] = fpath.is_file()
+        except (OSError, ValueError):
+            a["exists"] = False
+
+
 def _format_duration(seconds: float | None) -> str:
     """Format a duration in seconds as a human-readable string."""
     if seconds is None:
@@ -552,6 +598,15 @@ async def tasks_page(
     for t in tasks:
         t["project_name"] = project_map.get(t["project_id"], t["project_id"])
         t["timing"] = _compute_task_timing(t)
+    # Annotate each artifact with on-disk existence so the template
+    # can show "deleted" badges for ephemeral control files
+    # (decision.md, status.md, plan.md, etc.) that the supervisor
+    # read + unlinked. Cheap stat() per artifact; not a hot path.
+    from pathlib import Path
+    cfg = request.app.state.config
+    projects_root_t = Path(cfg["projects"]["storage_root"]).resolve()
+    for t in tasks:
+        _annotate_artifact_exists(t, projects_root_t)
     profile_rows = await db.fetchall(
         "SELECT agent_id, name FROM agent_profiles ORDER BY agent_id, name"
     )
@@ -717,6 +772,15 @@ async def project_page(
     # Compute execution timing for each task (started_at, completed_at, duration)
     for t in project_tasks:
         t["timing"] = _compute_task_timing(t)
+    # Annotate artifacts with on-disk existence (see _annotate_artifact_exists
+    # for why this matters — without it, links to ephemeral control files
+    # like decision.md / status.md / plan.md 404 because the supervisor
+    # read + unlinked them after each iter loop)
+    from pathlib import Path
+    cfg = request.app.state.config
+    projects_root_p = Path(cfg["projects"]["storage_root"]).resolve()
+    for t in project_tasks:
+        _annotate_artifact_exists(t, projects_root_p)
 
     # All profiles for role dropdown
     profile_rows = await db.fetchall(
