@@ -84,25 +84,19 @@
                         {% if s.enabled %}⏸ Pause{% else %}▶ Resume{% endif %}
                     </button>
                     {#
-                      ⋮ menu for less-frequent actions (Run now, Edit, Delete).
-                      Using a single dropdown keeps the actions column compact
-                      and avoids the 4-button wrap that breaks layout at 100%
-                      zoom. Click-outside-to-close via window onclick handler.
+                      ⋮ menu trigger. The menu itself is dynamically created in
+                      JS (see toggleMenu below) and appended to document.body
+                      with `position: fixed`, so it escapes any overflow
+                      clipping on the table cell. We pass the schedule's name
+                      to the handler so the delete confirmation can show it.
                     #}
-                    <div class="relative inline-block ml-1" data-menu-row="{{ s.id }}">
-                        <button onclick="toggleMenu(event, 'menu-{{ s.id }}')"
-                            class="text-xs px-2 py-1 font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
-                            title="More actions"
-                            aria-haspopup="true" aria-expanded="false">
-                            ⋮
-                        </button>
-                        <div id="menu-{{ s.id }}" class="hidden absolute right-0 mt-1 w-44 bg-white border border-gray-200 rounded shadow-lg z-20 text-left">
-                            <button onclick="runNow('{{ s.id }}')" class="block w-full px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-50" title="Trigger immediately (bypasses skip rule)">▶ Run now</button>
-                            <button onclick="openEditModal('{{ s.id }}')" class="block w-full px-3 py-1.5 text-xs text-gray-700 hover:bg-gray-50" title="Edit name, cron, timezone, mode, or template">✎ Edit</button>
-                            <div class="border-t border-gray-200 my-1"></div>
-                            <button onclick="deleteSchedule('{{ s.id }}', '{{ s.name|e }}')" class="block w-full px-3 py-1.5 text-xs text-red-700 hover:bg-red-50">🗑 Delete</button>
-                        </div>
-                    </div>
+                    <button data-menu-button="{{ s.id }}" data-sched-name="{{ s.name|e }}"
+                        onclick="toggleMenu(event, this)"
+                        class="ml-1 text-xs px-2 py-1 font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+                        title="More actions"
+                        aria-haspopup="true" aria-expanded="false">
+                        ⋮
+                    </button>
                 </td>
             </tr>
             {% else %}
@@ -327,40 +321,89 @@ async function deleteSchedule(id, name) {
     }
 }
 
-// ===== ⋮ menu (per-row dropdown) =====
-// Click the ⋮ button to toggle, click anywhere else to close. Closes other
-// open menus first (so only one is visible at a time). Stores the currently
-// open menu id on the window so the global click handler can find it.
-let _openMenuId = null;
-function toggleMenu(ev, menuId) {
-    ev.stopPropagation();
-    // Close any other open menu first
-    if (_openMenuId && _openMenuId !== menuId) {
-        const prev = document.getElementById(_openMenuId);
-        if (prev) prev.classList.add('hidden');
-    }
-    const menu = document.getElementById(menuId);
-    if (!menu) return;
-    if (menu.classList.contains('hidden')) {
-        menu.classList.remove('hidden');
-        _openMenuId = menuId;
-    } else {
-        menu.classList.add('hidden');
-        _openMenuId = null;
-    }
+// ===== ⋮ menu (dynamic, fixed-position) =====
+// The menu is created on demand and appended to <body> with position: fixed.
+// This is the only way to escape overflow clipping on the table cell —
+// position: absolute gets clipped by the parent's overflow:hidden. Position
+// fixed coordinates come from the trigger button's getBoundingClientRect().
+//
+// Lifecycle:
+//   - Click ⋮ → close any existing menu, then open one anchored to that button
+//   - Click outside → close
+//   - Scroll / resize → close (positioned to the old viewport coords, would float)
+//   - Action click → close, then run action
+//
+// We only ever have one menu element in the DOM at a time (re-created on each
+// open) so there's no stale-state concern. Stored on a module-level var.
+let _openMenuEl = null;
+let _openMenuSchedId = null;
+
+function _closeMenu() {
+    if (_openMenuEl) { _openMenuEl.remove(); _openMenuEl = null; _openMenuSchedId = null; }
 }
+
+function toggleMenu(ev, button) {
+    ev.stopPropagation();
+    const schedId = button.dataset.menuButton;
+    const schedName = button.dataset.schedName || schedId;
+    // If same button clicked twice → close (toggle behavior)
+    if (_openMenuSchedId === schedId) { _closeMenu(); return; }
+    // Otherwise close any prior menu and open new one
+    _closeMenu();
+    const rect = button.getBoundingClientRect();
+    const menu = document.createElement('div');
+    menu.className = 'fixed z-50 w-44 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded shadow-lg text-left';
+    // Anchor the menu to the right edge of the button (same visual position
+    // as the previous absolute menu). Clamp the top so a menu near the
+    // bottom of the viewport still has room — flip above the button if
+    // there isn't enough space below.
+    const MENU_ESTIMATED_HEIGHT = 110;
+    const would_overflow = (rect.bottom + 4 + MENU_ESTIMATED_HEIGHT) > window.innerHeight;
+    menu.style.top = would_overflow
+        ? `${Math.max(4, rect.top - MENU_ESTIMATED_HEIGHT - 4)}px`
+        : `${rect.bottom + 4}px`;
+    menu.style.left = `${Math.max(4, rect.right - 176)}px`;  // 176 ≈ w-44 (11rem)
+    // Build menu HTML. Inline so each action's onclick can call its handler
+    // and then _closeMenu() (the existing handlers alert/confirm/redirect
+    // which is enough UX feedback on its own).
+    const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    menu.innerHTML = `
+        <button data-menu-action="run" class="block w-full px-3 py-1.5 text-xs text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700 text-left" title="Trigger immediately (bypasses skip rule)">▶ Run now</button>
+        <button data-menu-action="edit" class="block w-full px-3 py-1.5 text-xs text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700 text-left" title="Edit name, cron, timezone, mode, or template">✎ Edit</button>
+        <div class="border-t border-gray-200 dark:border-gray-600 my-1"></div>
+        <button data-menu-action="delete" class="block w-full px-3 py-1.5 text-xs text-red-700 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 text-left">🗑 Delete</button>
+    `;
+    // Single delegated click handler — easier than wiring 3 inline onclicks
+    menu.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-menu-action]');
+        if (!btn) return;
+        e.stopPropagation();
+        const action = btn.dataset.menuAction;
+        _closeMenu();
+        if (action === 'run')   runNow(schedId);
+        if (action === 'edit')  openEditModal(schedId);
+        if (action === 'delete') deleteSchedule(schedId, schedName);
+    });
+    document.body.appendChild(menu);
+    _openMenuEl = menu;
+    _openMenuSchedId = schedId;
+}
+
+// Close on any click outside the menu. We can't rely on the menu's onclick
+// stopping propagation because the action buttons inside the menu use the
+// delegated handler above (which calls _closeMenu first), but a click on
+// whitespace inside the menu should NOT close it — so we use closest() check.
 window.addEventListener('click', (e) => {
-    if (!_openMenuId) return;
-    // If the click was inside a [data-menu-row] for the currently open
-    // menu, leave it alone (the toggleMenu handler stopped propagation).
-    // Otherwise close it.
-    const menu = document.getElementById(_openMenuId);
-    if (!menu) { _openMenuId = null; return; }
-    const row = menu.closest('[data-menu-row]');
-    if (row && row.contains(e.target)) return;
-    menu.classList.add('hidden');
-    _openMenuId = null;
+    if (!_openMenuEl) return;
+    if (_openMenuEl.contains(e.target)) return;  // click inside the menu
+    if (e.target.closest('[data-menu-button]')) return;  // click on a trigger
+    _closeMenu();
 });
+// Close on scroll/resize (the menu is positioned to the old viewport coords
+// and would float away from its trigger). Use capture so we catch scroll on
+// any ancestor, not just window scroll.
+window.addEventListener('scroll', _closeMenu, true);
+window.addEventListener('resize', _closeMenu);
 
 // Load per-schedule upcoming fires for the debug section. We fire all
 // queries in parallel; the dashboard will re-render on next 10s poll.
