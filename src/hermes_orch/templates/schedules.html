@@ -46,9 +46,11 @@
                     <span class="text-gray-400 text-xs">({{ s.timezone }})</span>
                 </td>
                 <td class="px-4 py-2">
-                    <span class="px-2 py-0.5 rounded text-xs
-                        {% if s.mode == 'clone' %}bg-blue-100 text-blue-800
-                        {% else %}bg-purple-100 text-purple-800{% endif %}">
+                    <span class="px-2 py-0.5 rounded-full border text-xs
+                        {% if s.mode == 'clone' %}bg-blue-50 text-blue-700 border-blue-200
+                        {% elif s.mode == 'deterministic' %}bg-green-50 text-green-700 border-green-200
+                        {% else %}bg-purple-50 text-purple-700 border-purple-200{% endif %}"
+                        title="{% if s.mode == 'deterministic' %}Same task list every cycle (no LLM){% elif s.mode == 'clone' %}LLM re-derives plan each fire{% else %}Reuse one project, add new task batch{% endif %}">
                         {{ s.mode }}
                     </span>
                 </td>
@@ -158,9 +160,15 @@
             <label class="block">
                 <span class="text-sm font-medium text-gray-700">Mode</span>
                 <select name="mode" class="mt-1 block w-full border rounded px-3 py-2 text-sm bg-white">
-                    <option value="clone">Clone — new project per fire (independent runs)</option>
+                    <option value="clone">Clone — new project per fire, LLM re-derives plan each time</option>
+                    <option value="deterministic">Deterministic — new project per fire, exact same task list (no LLM)</option>
                     <option value="append">Append — reuse one project, add new task batch</option>
                 </select>
+                <span class="text-xs text-gray-500 mt-1 block">
+                    <strong>Clone:</strong> re-derive plan with LLM. Tasks similar but not identical.<br>
+                    <strong>Deterministic:</strong> copy template's tasks 1:1. Same workflow every cycle.<br>
+                    <strong>Append:</strong> reuse one project, supervisor adds a fresh task batch.
+                </span>
             </label>
             <label class="flex items-center gap-2 mt-6">
                 <input type="checkbox" name="enabled" checked>
@@ -461,7 +469,8 @@ window.addEventListener('resize', _closeMenu);
                 <label class="block">
                     <span class="text-sm font-medium text-gray-700">Mode</span>
                     <select id="edit-mode" class="mt-1 block w-full border rounded px-3 py-2 text-sm bg-white">
-                        <option value="clone">Clone — new project per fire</option>
+                        <option value="clone">Clone — LLM re-derives plan</option>
+                        <option value="deterministic">Deterministic — exact same task list</option>
                         <option value="append">Append — reuse one project</option>
                     </select>
                 </label>

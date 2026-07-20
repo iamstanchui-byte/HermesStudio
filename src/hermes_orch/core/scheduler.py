@@ -5,11 +5,18 @@ On lifespan startup we start a daemon asyncio task that ticks every
 TICK_SECONDS, queries all enabled `project_schedules`, and fires any
 whose `next_fire_at` has passed.
 
-Two execution modes (per-schedule, set at create time):
+Three execution modes (per-schedule, set at create time):
 - `clone`  — every fire creates a new project (clone of the template's
   plan, fresh ID, new audit trail). The standard "GitHub Actions
-  workflow_run" pattern. Use for daily reports, periodic checks, anything
-  where each run is independent.
+  workflow_run" pattern. The supervisor's next tick re-derives the
+  task list by calling the LLM planner with the template's goal.
+  Each fire may produce a slightly different plan (LLM non-determinism).
+- `deterministic` — every fire creates a new project AND copies the
+  template's tasks table 1:1 (same name / role / action / params /
+  depends_on, only IDs change). No LLM call. Use when the user has
+  dialed in a workflow and wants the EXACT same task list every
+  cycle (e.g. fetch_X, compose_Y, send_Z). State goes straight to
+  `ready`, skipping planning.
 - `append` — the first fire creates a new project; subsequent fires
   add a fresh task batch to the most recent non-terminal project for
   this schedule. Use when the user wants a single long-lived project
@@ -31,7 +38,9 @@ delegates to the existing supervisor, which already handles `planning`
 → `ready` → `running` → `completed` for regular projects. The
 scheduled clone is just a normal `create_project` call followed by a
 state transition to `planning` (so the supervisor picks it up on its
-next tick, like a user-created project).
+next tick, like a user-created project). The exception is
+`deterministic`, which inserts tasks directly and goes straight to
+`ready`.
 """
 from __future__ import annotations
 
@@ -213,6 +222,8 @@ class Scheduler:
         mode = (sched.get("mode") or "clone").lower()
         if mode == "clone":
             return await self._fire_clone(sched, template)
+        elif mode == "deterministic":
+            return await self._fire_clone_deterministic(sched, template)
         elif mode == "append":
             return await self._fire_append(sched, template)
         else:
@@ -256,6 +267,207 @@ class Scheduler:
         # template's curated structure. We don't copy `current_session_id`
         # — sessions are per-profile-namespaced, and a new project
         # naturally wants fresh sessions.
+        await self._clone_project_files(template["id"], new_id)
+        await audit_log(
+            self.db, "schedule.fired_clone",
+            actor="scheduler",
+            project_id=new_id,
+            payload={
+                "schedule_id": sched["id"],
+                "template_project_id": template["id"],
+                "mode": "clone",
+            },
+        )
+        return new_id
+
+    async def _fire_clone_deterministic(
+        self, sched: dict[str, Any], template: dict[str, Any]
+    ) -> str:
+        """Deterministic clone: same as `_fire_clone` for project creation,
+        but ALSO copies the template's `tasks` table rows 1:1 into the new
+        project and goes straight to `ready` (skipping planning).
+
+        The supervisor never sees a `planning` state, so the LLM planner
+        is NEVER called. The task list for every fire is the same as
+        the template's, only with fresh task IDs and `project_id`.
+
+        Use case: a workflow the user has dialed in and wants repeated
+        exactly (fetch_X, compose_Y, send_Z). The `clone` mode's LLM
+        re-derive produces similar but not identical plans each cycle —
+        this avoids that.
+
+        Fields copied per task:
+        - name, agent_role, action, params
+        - depends_on (mapped via name → new id)
+        - on_parent_failure, priority, max_retries, timeout_seconds
+        - required_capability (so smart dispatch still routes correctly)
+        - output_path
+
+        Fields NOT copied (always fresh on the new project):
+        - id (new t-xxxxxxxx)
+        - project_id (the new project's id)
+        - assigned_agent_id, assigned_profile_id (dispatch hasn't run yet)
+        - status (always 'pending' on the new project)
+        - retry_count, last_liveness_at, error, result
+        - created_at, updated_at (now)
+
+        If the template has no tasks, fall back to `_fire_clone` (LLM
+        regen) so the user isn't stuck with a non-functional schedule.
+        We log a warning so the dashboard can show "deterministic
+        template is empty — falling back to LLM regen" if it wants.
+        """
+        new_id = _project_id()
+        now = _now_iso()
+        # Carry the template's iter-loop fields + goal. Same as
+        # _fire_clone: tasks are denormalized separately, but the
+        # iter-loop config (coordinator_role, accept_criteria, etc.)
+        # still applies at the project level.
+        await self.db.insert(
+            "projects",
+            {
+                "id": new_id,
+                "name": _next_clone_name(template.get("name") or template["id"], now_utc_str:=_now_iso()),
+                "goal": template.get("goal") or "",
+                "state": "ready",  # skip planning — tasks already inserted below
+                "coordinator_role": template.get("coordinator_role") or "",
+                "accept_criteria": template.get("accept_criteria") or "",
+                "deliverable_path": template.get("deliverable_path") or "",
+                "max_iterations": int(template.get("max_iterations") or 0),
+                "current_iteration": 0,
+                "last_iteration_summary": "",
+                "source_schedule_id": sched["id"],
+            },
+        )
+        # Copy on-disk artifacts (plan.md, status.md, decisions.md,
+        # memory/) for historical context. Same as _fire_clone.
+        await self._clone_project_files(template["id"], new_id)
+        # Read the template's tasks 1:1. Each task gets a new t-xxx id,
+        # a fresh project_id, status='pending', retry_count=0. We
+        # remap depends_on via task NAME (template's depends_on stores
+        # task ids; we replace each with the new id of the same name).
+        template_tasks = await self.db.fetchall(
+            "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC",
+            (template["id"],),
+        )
+        if not template_tasks:
+            logger.warning(
+                "scheduler: deterministic mode but template %s has no tasks; "
+                "falling back to _fire_clone (LLM regen) for schedule %s",
+                template["id"], sched["id"],
+            )
+            await self.db.execute(
+                "DELETE FROM projects WHERE id = ?", (new_id,)
+            )
+            # Remove the folder we just created
+            try:
+                import shutil
+                shutil.rmtree(self._project_dir(new_id), ignore_errors=True)
+            except Exception:
+                pass
+            # Fall through to regular clone. We need to set state back
+            # to planning so the supervisor will call the planner.
+            return await self._fire_clone_with_state(sched, template, state="planning")
+        # Two-pass insert: first collect name→new_id mapping, then wire
+        # depends_on using that mapping.
+        import json as _json
+        import uuid as _uuid
+        name_to_new_id: dict[str, str] = {}
+        for t in template_tasks:
+            new_tid = "t-" + _uuid.uuid4().hex[:8]
+            name_to_new_id[t["name"]] = new_tid
+            await self.db.insert(
+                "tasks",
+                {
+                    "id": new_tid,
+                    "project_id": new_id,
+                    "name": t.get("name") or "",
+                    "agent_role": t.get("agent_role") or "",
+                    "assigned_agent_id": None,
+                    "assigned_profile_id": None,
+                    "depends_on": _json.dumps([]),  # wired in 2nd pass
+                    "on_parent_failure": t.get("on_parent_failure") or "skip",
+                    "status": "pending",
+                    "priority": t.get("priority") or "normal",
+                    "action": t.get("action") or "",
+                    "params": t.get("params") or "{}",
+                    "retry_count": 0,
+                    "max_retries": int(t.get("max_retries") or 2),
+                    "timeout_seconds": int(t.get("timeout_seconds") or 1800),
+                    "output_path": t.get("output_path") or "",
+                    "last_liveness_at": None,
+                    "error": None,
+                    "result": None,
+                    "required_capability": t.get("required_capability"),
+                },
+            )
+        # Second pass: depends_on. Template depends_on stores task IDs,
+        # but if those IDs are stale (template was created before
+        # denormalization) or just for robustness, we try ID first
+        # then fall back to name match.
+        template_id_to_name = {t["id"]: t["name"] for t in template_tasks}
+        for t in template_tasks:
+            raw_deps = t.get("depends_on") or "[]"
+            try:
+                old_dep_ids = _json.loads(raw_deps) if isinstance(raw_deps, str) else list(raw_deps)
+            except (ValueError, TypeError):
+                old_dep_ids = []
+            new_dep_ids = []
+            for old_id in old_dep_ids:
+                # Prefer id-lookup; fall back to name-lookup if the
+                # template's task id doesn't exist anymore (e.g. task
+                # was deleted after the template was marked).
+                if old_id in name_to_new_id:
+                    new_dep_ids.append(name_to_new_id[old_id])
+                else:
+                    old_name = template_id_to_name.get(old_id)
+                    if old_name and old_name in name_to_new_id:
+                        new_dep_ids.append(name_to_new_id[old_name])
+            if new_dep_ids:
+                await self.db.execute(
+                    "UPDATE tasks SET depends_on = ? WHERE id = ?",
+                    (_json.dumps(new_dep_ids), name_to_new_id[t["name"]]),
+                )
+        await audit_log(
+            self.db, "schedule.fired_deterministic",
+            actor="scheduler",
+            project_id=new_id,
+            payload={
+                "schedule_id": sched["id"],
+                "template_project_id": template["id"],
+                "mode": "deterministic",
+                "task_count": len(template_tasks),
+            },
+        )
+        return new_id
+
+    async def _fire_clone_with_state(
+        self, sched: dict[str, Any], template: dict[str, Any], state: str
+    ) -> str:
+        """Like `_fire_clone` but allows caller to specify the initial
+        state. Used by the deterministic fallback path when the
+        template has no tasks to copy — we want the supervisor to call
+        the LLM planner, so state='planning'. The other project
+        creation fields (goal, iter-loop, files) are identical to
+        _fire_clone.
+        """
+        new_id = _project_id()
+        now = _now_iso()
+        await self.db.insert(
+            "projects",
+            {
+                "id": new_id,
+                "name": _next_clone_name(template.get("name") or template["id"], now_utc_str:=_now_iso()),
+                "goal": template.get("goal") or "",
+                "state": state,
+                "coordinator_role": template.get("coordinator_role") or "",
+                "accept_criteria": template.get("accept_criteria") or "",
+                "deliverable_path": template.get("deliverable_path") or "",
+                "max_iterations": int(template.get("max_iterations") or 0),
+                "current_iteration": 0,
+                "last_iteration_summary": "",
+                "source_schedule_id": sched["id"],
+            },
+        )
         await self._clone_project_files(template["id"], new_id)
         await audit_log(
             self.db, "schedule.fired_clone",

@@ -48,7 +48,7 @@ class ScheduleCreate(BaseModel):
     template_project_id: str = Field(..., min_length=1)
     cron_expr: str = Field(..., min_length=1, max_length=200)
     timezone: str = "Asia/Hong_Kong"
-    mode: str = "clone"  # 'clone' | 'append'
+    mode: str = "clone"  # 'clone' | 'deterministic' | 'append'
     enabled: bool = True
 
 
@@ -103,10 +103,22 @@ def _validate_cron(expr: str) -> None:
 
 
 def _validate_mode(mode: str) -> str:
-    """Normalize + validate mode. Returns the canonical lowercase form."""
+    """Normalize + validate mode. Returns the canonical lowercase form.
+
+    Accepted values:
+    - 'clone'         — fresh project per fire, LLM re-derives tasks
+                        (similar but not identical plan each cycle)
+    - 'deterministic' — fresh project per fire, template's task list
+                        copied 1:1 (exact same tasks, fresh IDs)
+    - 'append'        — reuse most recent non-terminal project,
+                        supervisor re-derives tasks
+    """
     m = (mode or "clone").lower()
-    if m not in ("clone", "append"):
-        raise HTTPException(400, f"mode must be 'clone' or 'append', got: {mode}")
+    if m not in ("clone", "deterministic", "append"):
+        raise HTTPException(
+            400,
+            f"mode must be 'clone' | 'deterministic' | 'append', got: {mode}",
+        )
     return m
 
 
@@ -346,8 +358,15 @@ async def run_schedule_now(sched_id: str, request: Request) -> dict:
     if not template:
         raise HTTPException(404, f"Template project not found: {sched['template_project_id']}")
     sched_obj = _Scheduler(db, cfg)
-    if (sched.get("mode") or "clone").lower() == "clone":
+    # Dispatch by mode. The scheduler's `_fire` does the same dispatch
+    # for the background tick; we replicate it here so manual "run now"
+    # honors the schedule's mode (otherwise deterministic schedules would
+    # silently fall back to LLM regen when triggered manually).
+    mode = (sched.get("mode") or "clone").lower()
+    if mode == "clone":
         new_id = await sched_obj._fire_clone(sched, template)
+    elif mode == "deterministic":
+        new_id = await sched_obj._fire_clone_deterministic(sched, template)
     else:
         new_id = await sched_obj._fire_append(sched, template)
     # Bump last_fired_at + next_fire_at (manual fire still advances the schedule)
