@@ -350,8 +350,9 @@
                     {% if p.description %}
                     <div class="text-xs text-gray-600 mt-1">{{ p.description }}</div>
                     {% endif %}
-                    {# MCP servers list (default collapsed like skills) #}
-                    <details class="mt-2" {% if p.mcp_servers %}open{% endif %}>
+                    {# MCP servers list (always collapsed — user preference;
+                       open it explicitly to see which servers are configured) #}
+                    <details class="mt-2">
                         <summary class="text-[10px] font-medium text-gray-500 uppercase tracking-wide cursor-pointer select-none hover:text-gray-700">
                             MCP servers ({{ (p.mcp_servers|selectattr('enabled')|list|length) if p.mcp_servers else 0 }}/{{ p.mcp_servers|length if p.mcp_servers else 0 }})
                         </summary>

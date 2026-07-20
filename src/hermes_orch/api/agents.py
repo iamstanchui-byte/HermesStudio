@@ -76,10 +76,13 @@ class AgentProfileUpdate(BaseModel):
 
 class HeartbeatBody(BaseModel):
     status: str | None = None  # agent's reported state (e.g. 'busy', 'idle')
-    profile: str | None = None  # which profile this heartbeat is for (optional)
+    profile: str | None = None  # which profile this heartbeat is for (optional, legacy single-profile path)
     # LLM model (reported by wrapper, read from <profile>/config.yaml).
     # All three are independent; any subset can be sent and the rest
     # stays unchanged. To clear a value, send the empty string "".
+    # Used by the legacy single-profile path (top-level fields). The
+    # bulk `profiles` field below supersedes this for the new
+    # per-agent heartbeat that reports all profiles at once.
     model_default: str | None = None
     model_base_url: str | None = None
     model_provider: str | None = None
@@ -87,6 +90,12 @@ class HeartbeatBody(BaseModel):
     # mcp_servers section). Each entry must have a 'name' (str); optional
     # 'enabled' (bool, default True). Sent as a list of dicts.
     mcp_servers: list[dict] | None = None
+    # Bulk per-profile metadata. The wrapper now reads each profile's
+    # config.yaml and reports them all in one heartbeat. If `profiles`
+    # is set, the endpoint updates each profile's llm_* and mcp_servers
+    # columns. If a single `profile` is also set, the bulk update is
+    # skipped for that profile (legacy path takes precedence).
+    profiles: list[dict] | None = None  # [{name, model_default, model_base_url, model_provider, mcp_servers}]
 
 
 class AgentProfile(BaseModel):
@@ -482,6 +491,52 @@ async def heartbeat(
                 sql += " AND name = ?"
                 params.append(body.profile)
             await db.execute(sql, tuple(params))
+
+    # Bulk per-profile metadata (preferred path). The wrapper reads
+    # each profile's config.yaml and reports them all in one heartbeat.
+    # Iterates each entry and updates llm_model_* + mcp_servers for
+    # the named profile. Validation: 'name' must be a non-empty str;
+    # mcp_servers entries must have a 'name' (str); other fields are
+    # optional (None = don't change). Malformed entries are dropped
+    # silently so a bad config doesn't break the whole heartbeat.
+    body = body_data.get("profiles")
+    if isinstance(body, list):
+        for p in body:
+            if not isinstance(p, dict):
+                continue
+            name = p.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            sets: list[str] = []
+            params2: list[Any] = []
+            for field, col in (
+                ("model_default", "llm_model_default"),
+                ("model_base_url", "llm_model_base_url"),
+                ("model_provider", "llm_model_provider"),
+            ):
+                val = p.get(field)
+                if val is not None:
+                    sets.append(f"{col} = ?")
+                    params2.append(val)
+            mcp = p.get("mcp_servers")
+            if mcp is not None:
+                cleaned: list[dict] = []
+                if isinstance(mcp, list):
+                    for m in mcp:
+                        if isinstance(m, dict) and "name" in m and isinstance(m["name"], str):
+                            cleaned.append({
+                                "name": m["name"],
+                                "enabled": bool(m.get("enabled", True)),
+                            })
+                sets.append("mcp_servers = ?")
+                params2.append(json.dumps(cleaned))
+            if sets:
+                sql = (
+                    f"UPDATE agent_profiles SET {', '.join(sets)}, updated_at = ? "
+                    f"WHERE agent_id = ? AND name = ?"
+                )
+                params2.extend([now, agent_id, name])
+                await db.execute(sql, tuple(params2))
 
     # Return assigned + running tasks for this agent
     task_rows = await db.fetchall(

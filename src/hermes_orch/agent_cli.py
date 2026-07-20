@@ -353,6 +353,69 @@ _HERMES_TOKEN_COLUMNS_V0_17 = [
 ]
 
 
+def _read_profile_config(profile_root: Path) -> dict:
+    """Read <profile_root>/config.yaml and extract the fields the
+    orchestrator's agent page needs to show per-profile metadata:
+    LLM model (default / base_url / provider) and MCP server list.
+
+    Returns a dict with keys:
+        model_default:   str | None
+        model_base_url:  str | None
+        model_provider:  str | None
+        mcp_servers:     list[dict]  (each: {"name": str, "enabled": bool})
+
+    All fields are optional. On missing file, parse error, or empty
+    config, returns a dict with all-None / empty-list defaults. Never
+    raises — heartbeat must not break on a single bad config.yaml.
+
+    YAML schema (v0.17+):
+        model:
+          default: MiniMax-M3
+          base_url: https://...
+          provider: minimax-oauth
+        mcp_servers:
+          <name>:
+            command: ...
+            args: [...]
+            enabled: true   # optional, default true
+    """
+    out: dict = {
+        "model_default": None,
+        "model_base_url": None,
+        "model_provider": None,
+        "mcp_servers": [],
+    }
+    if not profile_root:
+        return out
+    cfg_path = profile_root / "config.yaml"
+    if not cfg_path.exists() or not cfg_path.is_file():
+        return out
+    try:
+        import yaml
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception as e:
+        click.echo(f"  WARN: failed to read {cfg_path}: {e}")
+        return out
+    if not isinstance(cfg, dict):
+        return out
+    model = cfg.get("model") or {}
+    if isinstance(model, dict):
+        out["model_default"] = model.get("default") if isinstance(model.get("default"), str) else None
+        out["model_base_url"] = model.get("base_url") if isinstance(model.get("base_url"), str) else None
+        out["model_provider"] = model.get("provider") if isinstance(model.get("provider"), str) else None
+    mcp_servers = cfg.get("mcp_servers") or {}
+    if isinstance(mcp_servers, dict):
+        for name, conf in mcp_servers.items():
+            if not isinstance(name, str) or not name:
+                continue
+            enabled = True
+            if isinstance(conf, dict) and "enabled" in conf:
+                enabled = bool(conf.get("enabled"))
+            out["mcp_servers"].append({"name": name, "enabled": enabled})
+    return out
+
+
 def _capture_session_tokens(profile_root: Path) -> dict | None:
     """Read the most recent hermes session from ``<profile_root>/state.db``.
 
@@ -809,12 +872,42 @@ def start(
         has aged out (status='pending_cleanup' in project_sessions). The
         wrapper runs `hermes sessions delete <id> --yes` for each and
         POSTs to /sessions/{id}/cleanup-ack to mark the row deleted.
+
+        Per-profile metadata (LLM model + MCP servers) is read from each
+        profile's config.yaml and sent in a `profiles: [...]` list. The
+        orchestrator stores these in the agent_profiles table so the
+        agent page can show "model: MiniMax-M3 (minimax-oauth)" badges
+        and the collapsible MCP server list. Reading every cycle (5s)
+        is cheap (~few KB YAML files) and ensures the dashboard stays
+        in sync with the live config (e.g. user adds a new MCP server,
+        it shows up within 5s without a wrapper restart).
         """
+        profile_meta: list[dict] = []
+        for role, pcfg in (profiles_cfg or {}).items():
+            try:
+                root = resolve_profile_root(
+                    pcfg.get("root", ""),
+                    role,
+                    profiles_dir=hermes_profiles_dir,
+                )
+            except Exception:
+                continue
+            meta = _read_profile_config(root)
+            profile_meta.append({
+                "name": role,
+                "model_default": meta["model_default"],
+                "model_base_url": meta["model_base_url"],
+                "model_provider": meta["model_provider"],
+                "mcp_servers": meta["mcp_servers"],
+            })
         try:
             r = httpx.post(
                 f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
                 headers=_auth_headers(),
-                json={"status": "idle"},
+                json={
+                    "status": "idle",
+                    "profiles": profile_meta,
+                },
                 timeout=10,
             )
             if r.status_code != 200:
