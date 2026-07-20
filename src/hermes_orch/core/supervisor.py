@@ -220,6 +220,23 @@ class Supervisor:
     # ===== tick (one pass) =====
 
     async def tick(self) -> None:
+        # Stale-agent check: if a 'verified' agent hasn't heartbeated
+        # in 90s, mark it 'stale' so the dot color matches the
+        # "online" definition (90s heartbeat cutoff). Without this,
+        # an agent that died stays 'verified' forever (sticky
+        # status) and the dashboard shows contradictory info
+        # (green dot + WINDOWS=0).
+        try:
+            from datetime import timedelta
+            cutoff = (now_aware() - timedelta(seconds=90)).isoformat()
+            await self.db.execute(
+                "UPDATE agents SET status = 'stale' "
+                "WHERE status = 'verified' AND last_heartbeat_at < ?",
+                (cutoff,),
+            )
+        except Exception as e:
+            log.debug(f"stale-agent scan failed: {e}")
+
         projects = await self.db.fetchall(
             "SELECT * FROM projects WHERE state IN ('planning','ready','running')"
         )

@@ -7,11 +7,11 @@
     <div class="text-sm text-gray-500">{{ agents|length }} registered</div>
 </div>
 
-<!-- ===== Overview (4 stat cards + donut + subagent count) ===== -->
+<!-- ===== Overview (left=agent-level, middle=donut, right=profile-level) ===== -->
 <div class="mb-4 bg-white border rounded-lg p-4 shadow-sm">
     <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">Overview</h2>
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
-        <!-- Left: 4 stat cards in a 2x2 grid -->
+        <!-- LEFT: Agent-level (4 cards: TOTAL / ONLINE / WINDOWS / LINUX) -->
         <div class="grid grid-cols-2 gap-3">
             <div class="bg-gray-50 border rounded p-3">
                 <div class="text-xs text-gray-500 uppercase">Total</div>
@@ -23,25 +23,6 @@
                 <div class="text-2xl font-bold text-green-800">{{ overview.online }}</div>
                 <div class="text-xs text-green-600">heartbeat &lt; 90s</div>
             </div>
-            <div class="bg-blue-50 border border-blue-200 rounded p-3">
-                <div class="text-xs text-blue-700 uppercase">Idle</div>
-                <div class="text-2xl font-bold text-blue-800">{{ overview.idle }}</div>
-                <div class="text-xs text-blue-600">profiles ready</div>
-            </div>
-            <div class="bg-amber-50 border border-amber-200 rounded p-3">
-                <div class="text-xs text-amber-700 uppercase">Busy</div>
-                <div class="text-2xl font-bold text-amber-800">{{ overview.busy }}</div>
-                <div class="text-xs text-amber-600">profiles working</div>
-            </div>
-        </div>
-        <!-- Middle: donut SVG (idle / busy / offline) -->
-        <div class="flex justify-center">
-            <svg id="overview-donut" width="160" height="160" viewBox="0 0 160 160" aria-label="Profile status donut">
-                <circle cx="80" cy="80" r="60" fill="none" stroke="#e5e7eb" stroke-width="24" />
-            </svg>
-        </div>
-        <!-- Right: by-os / subagent stat block -->
-        <div class="grid grid-cols-2 gap-3">
             <div class="bg-gray-50 border rounded p-3">
                 <div class="text-xs text-gray-500 uppercase">Windows</div>
                 <div class="text-2xl font-bold text-gray-800">{{ overview.windows_online }}</div>
@@ -52,15 +33,29 @@
                 <div class="text-2xl font-bold text-gray-800">{{ overview.linux_online }}</div>
                 <div class="text-xs text-gray-400">online</div>
             </div>
-            <div class="bg-gray-50 border rounded p-3">
-                <div class="text-xs text-gray-500 uppercase">Profiles</div>
-                <div class="text-2xl font-bold text-gray-800">{{ overview.profiles_total }}</div>
-                <div class="text-xs text-gray-400">total</div>
+        </div>
+        <!-- Middle: donut SVG (idle / busy / offline) -->
+        <div class="flex justify-center">
+            <svg id="overview-donut" width="160" height="160" viewBox="0 0 160 160" aria-label="Profile status donut">
+                <circle cx="80" cy="80" r="60" fill="none" stroke="#e5e7eb" stroke-width="24" />
+            </svg>
+        </div>
+        <!-- RIGHT: Profile-level (3 cards: IDLE / BUSY / PROFILES with online subtext) -->
+        <div class="grid grid-cols-2 gap-3">
+            <div class="bg-blue-50 border border-blue-200 rounded p-3">
+                <div class="text-xs text-blue-700 uppercase">Idle</div>
+                <div class="text-2xl font-bold text-blue-800">{{ overview.idle }}</div>
+                <div class="text-xs text-blue-600">profiles ready</div>
             </div>
-            <div class="bg-indigo-50 border border-indigo-200 rounded p-3">
-                <div class="text-xs text-indigo-700 uppercase">Subagents</div>
-                <div class="text-2xl font-bold text-indigo-800">{{ overview.subagents_online }}</div>
-                <div class="text-xs text-indigo-600">online</div>
+            <div class="bg-amber-50 border border-amber-200 rounded p-3">
+                <div class="text-xs text-amber-700 uppercase">Busy</div>
+                <div class="text-2xl font-bold text-amber-800">{{ overview.busy }}</div>
+                <div class="text-xs text-amber-600">profiles working</div>
+            </div>
+            <div class="bg-indigo-50 border border-indigo-200 rounded p-3 col-span-2">
+                <div class="text-xs text-indigo-700 uppercase">Profiles</div>
+                <div class="text-2xl font-bold text-indigo-800">{{ overview.profiles_total }}</div>
+                <div class="text-xs text-indigo-600">{{ overview.subagents_online }} online · {{ overview.profiles_total - overview.subagents_online }} offline</div>
             </div>
         </div>
     </div>
@@ -282,6 +277,7 @@
                 <span class="px-2 py-0.5 text-xs rounded-full
                     {% if agent.status == 'verified' %}bg-green-100 text-green-800
                     {% elif agent.status == 'verifying' %}bg-yellow-100 text-yellow-800
+                    {% elif agent.status == 'stale' %}bg-amber-100 text-amber-800
                     {% else %}bg-gray-100 text-gray-800{% endif %}">
                     {{ agent.status }}
                 </span>
