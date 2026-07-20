@@ -28,10 +28,10 @@
                 <div class="text-2xl font-bold text-blue-800">{{ overview.idle }}</div>
                 <div class="text-xs text-blue-600">profiles ready</div>
             </div>
-            <div class="bg-red-50 border border-red-200 rounded p-3">
-                <div class="text-xs text-red-700 uppercase">Busy</div>
-                <div class="text-2xl font-bold text-red-800">{{ overview.busy }}</div>
-                <div class="text-xs text-red-600">profiles working</div>
+            <div class="bg-amber-50 border border-amber-200 rounded p-3">
+                <div class="text-xs text-amber-700 uppercase">Busy</div>
+                <div class="text-2xl font-bold text-amber-800">{{ overview.busy }}</div>
+                <div class="text-xs text-amber-600">profiles working</div>
             </div>
         </div>
         <!-- Middle: donut SVG (idle / busy / offline) -->
@@ -326,7 +326,7 @@
                         <div class="flex items-center gap-2 min-w-0 flex-wrap">
                             <span class="font-mono text-sm font-semibold">{{ p.name }}</span>
                             <span class="px-1.5 py-0.5 text-[10px] rounded
-                                {% if p.status == 'busy' %}bg-red-100 text-red-800
+                                {% if p.status == 'busy' %}bg-amber-100 text-amber-800
                                 {% elif p.status == 'idle' %}bg-gray-200 text-gray-700
                                 {% else %}bg-yellow-100 text-yellow-800{% endif %}">
                                 {{ p.status }}
@@ -816,7 +816,7 @@ async function syncSkillsFromDisk(agentId, profileName, btn) {
     const slices = total > 0
         ? [
             {label: 'idle',  count: overview.idle,  color: '#1d4ed8'},  // blue-700
-            {label: 'busy',  count: overview.busy,  color: '#b91c1c'},  // red-700
+            {label: 'busy',  count: overview.busy,  color: '#b45309'},  // amber-700 (less alarming than red)
             {label: 'offline', count: offline,      color: '#9ca3af'},  // gray-400
         ].filter(s => s.count > 0)
         : [{label: 'no data', count: 1, color: '#e5e7eb'}];  // gray-200 fallback
