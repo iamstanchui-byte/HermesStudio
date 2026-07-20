@@ -181,7 +181,15 @@ document.getElementById('filter-form').addEventListener('submit', (e) => {
         <a href="/projects/{{ p.id }}" class="flex-1 min-w-0">
             <div class="flex items-center justify-between">
                 <div>
-                    <div class="font-mono text-sm text-gray-500">{{ p.id }}</div>
+                    <div class="flex items-center gap-2">
+                        <div class="font-mono text-sm text-gray-500">{{ p.id }}</div>
+                        {% if schedule_map.get(p.id) %}
+                        <span class="px-2 py-0.5 bg-purple-100 text-purple-800 rounded text-xs" title="This project was created by a recurring schedule">🔁 {{ schedule_map[p.id] }}</span>
+                        {% endif %}
+                        {% if p.id in template_ids %}
+                        <span class="px-2 py-0.5 bg-amber-100 text-amber-800 rounded text-xs" title="Marked as a reusable template. Schedules can fire this.">📋 template</span>
+                        {% endif %}
+                    </div>
                     <div class="font-semibold text-gray-800">{{ p.name or '(unnamed)' }}</div>
                     <div class="text-sm text-gray-600 mt-1">{{ p.goal or '-' }}</div>
                 </div>

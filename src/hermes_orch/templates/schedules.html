@@ -1,0 +1,265 @@
+{% extends "base.html" %}
+{% block title %}Schedules — Hermes Orchestrator{% endblock %}
+{% block content %}
+
+<h1 class="text-2xl font-bold mb-1">Recurring schedules</h1>
+<p class="text-gray-600 text-sm mb-6">
+    Turn any project into a reusable template and attach a cron expression.
+    The orchestrator's background scheduler fires each schedule on time
+    (clone mode = new project per fire, append mode = re-uses one project).
+    Skips if a previous run is still active.
+</p>
+
+<!-- ====== Existing schedules table ====== -->
+<div class="bg-white border rounded-lg overflow-hidden mb-8">
+    <table class="w-full text-sm">
+        <thead class="bg-gray-100 text-gray-600 text-xs uppercase">
+            <tr>
+                <th class="text-left px-4 py-2">Name</th>
+                <th class="text-left px-4 py-2">Template</th>
+                <th class="text-left px-4 py-2">Schedule</th>
+                <th class="text-left px-4 py-2">Mode</th>
+                <th class="text-left px-4 py-2">Last run</th>
+                <th class="text-left px-4 py-2">Next fire</th>
+                <th class="text-left px-4 py-2">State</th>
+                <th class="text-right px-4 py-2">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in schedules %}
+            <tr class="border-t hover:bg-gray-50" data-sched-id="{{ s.id }}">
+                <td class="px-4 py-2 font-medium text-gray-800">
+                    <div class="flex items-center gap-2">
+                        <span class="status-dot {% if s.enabled %}dot-running{% else %}dot-idle{% endif %}"></span>
+                        {{ s.name }}
+                    </div>
+                </td>
+                <td class="px-4 py-2 text-gray-600">
+                    {% if s.template_name %}
+                    <a href="/projects/{{ s.template_project_id }}" class="text-blue-600 hover:underline">{{ s.template_name }}</a>
+                    {% else %}
+                    <span class="text-gray-400">{{ s.template_project_id }}</span>
+                    {% endif %}
+                </td>
+                <td class="px-4 py-2 font-mono text-xs text-gray-700" title="{{ s.timezone }}">
+                    {{ s.cron_expr }}
+                    <span class="text-gray-400 text-xs">({{ s.timezone }})</span>
+                </td>
+                <td class="px-4 py-2">
+                    <span class="px-2 py-0.5 rounded text-xs
+                        {% if s.mode == 'clone' %}bg-blue-100 text-blue-800
+                        {% else %}bg-purple-100 text-purple-800{% endif %}">
+                        {{ s.mode }}
+                    </span>
+                </td>
+                <td class="px-4 py-2 text-xs text-gray-600">
+                    {% if s.last_run_state %}
+                    <a href="/projects/{{ s.last_run_project_id }}" class="text-blue-600 hover:underline">{{ s.last_run_state }}</a>
+                    <span class="text-gray-400">{{ s.last_run_at[:16] if s.last_run_at else '' }}</span>
+                    {% else %}
+                    <span class="text-gray-400">—</span>
+                    {% endif %}
+                </td>
+                <td class="px-4 py-2 text-xs text-gray-600">
+                    {{ s.next_fire_at[:16] if s.next_fire_at else '—' }}
+                </td>
+                <td class="px-4 py-2 text-xs">
+                    {% if s.last_skip_reason %}
+                    <span class="text-amber-700" title="{{ s.last_skip_reason }}">skipped</span>
+                    {% elif not s.enabled %}
+                    <span class="text-gray-500">paused</span>
+                    {% elif s.next_fire_at %}
+                    <span class="text-green-700">armed</span>
+                    {% else %}
+                    <span class="text-gray-500">—</span>
+                    {% endif %}
+                </td>
+                <td class="px-4 py-2 text-right">
+                    <button onclick="runNow('{{ s.id }}')" class="text-xs px-2 py-1 bg-blue-50 text-blue-700 rounded hover:bg-blue-100 mr-1" title="Trigger immediately (bypasses skip rule)">Run now</button>
+                    <button onclick="toggleEnabled('{{ s.id }}', {{ 0 if s.enabled else 1 }})" class="text-xs px-2 py-1 bg-gray-50 text-gray-700 rounded hover:bg-gray-100 mr-1">
+                        {% if s.enabled %}Pause{% else %}Resume{% endif %}
+                    </button>
+                    <button onclick="deleteSchedule('{{ s.id }}', '{{ s.name|e }}')" class="text-xs px-2 py-1 bg-red-50 text-red-700 rounded hover:bg-red-100">Delete</button>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="8" class="px-4 py-8 text-center text-gray-400">
+                    No schedules yet. Mark a project as a template below, then create your first schedule.
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<!-- ====== New schedule form ====== -->
+<div class="bg-white border rounded-lg p-6">
+    <h2 class="text-lg font-semibold mb-4">New schedule</h2>
+    <form id="new-sched-form" onsubmit="createSchedule(event)">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label class="block">
+                <span class="text-sm font-medium text-gray-700">Name</span>
+                <input name="name" required minlength="1" maxlength="120"
+                    class="mt-1 block w-full border rounded px-3 py-2 text-sm"
+                    placeholder="Daily 9am report">
+            </label>
+            <label class="block">
+                <span class="text-sm font-medium text-gray-700">Template project</span>
+                <select name="template_project_id" required
+                    class="mt-1 block w-full border rounded px-3 py-2 text-sm bg-white">
+                    <option value="" disabled {% if not preselect_template_id %}selected{% endif %}>— pick a template —</option>
+                    {% for t in templates %}
+                    <option value="{{ t.id }}" {% if preselect_template_id == t.id %}selected{% endif %}>
+                        {{ t.name or t.id }}
+                        {% if t.template_description %}— {{ t.template_description[:50] }}{% endif %}
+                    </option>
+                    {% else %}
+                    <option value="" disabled>(no templates yet — mark a project as template on the project page)</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label class="block">
+                <span class="text-sm font-medium text-gray-700">Cron expression</span>
+                <input name="cron_expr" required pattern=".+"
+                    class="mt-1 block w-full border rounded px-3 py-2 text-sm font-mono"
+                    placeholder="0 9 * * 1-5">
+                <span class="text-xs text-gray-500 mt-1 block">
+                    Common:
+                    <button type="button" onclick="fillCron('0 9 * * 1-5', this)" class="underline hover:text-blue-600">weekdays 9am</button> ·
+                    <button type="button" onclick="fillCron('0 0 * * *', this)" class="underline hover:text-blue-600">daily midnight</button> ·
+                    <button type="button" onclick="fillCron('*/15 * * * *', this)" class="underline hover:text-blue-600">every 15min</button> ·
+                    <button type="button" onclick="fillCron('0 0 1 * *', this)" class="underline hover:text-blue-600">monthly 1st</button>
+                </span>
+            </label>
+            <label class="block">
+                <span class="text-sm font-medium text-gray-700">Timezone</span>
+                <input name="timezone" value="Asia/Hong_Kong"
+                    class="mt-1 block w-full border rounded px-3 py-2 text-sm">
+                <span class="text-xs text-gray-500 mt-1 block">IANA name. e.g. <code>Asia/Hong_Kong</code>, <code>UTC</code>, <code>America/New_York</code></span>
+            </label>
+            <label class="block">
+                <span class="text-sm font-medium text-gray-700">Mode</span>
+                <select name="mode" class="mt-1 block w-full border rounded px-3 py-2 text-sm bg-white">
+                    <option value="clone">Clone — new project per fire (independent runs)</option>
+                    <option value="append">Append — reuse one project, add new task batch</option>
+                </select>
+            </label>
+            <label class="flex items-center gap-2 mt-6">
+                <input type="checkbox" name="enabled" checked>
+                <span class="text-sm text-gray-700">Enabled</span>
+            </label>
+        </div>
+        <div class="mt-4 flex items-center gap-3">
+            <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Create schedule</button>
+            <span id="form-msg" class="text-xs"></span>
+        </div>
+    </form>
+</div>
+
+<!-- ====== Upcoming fires preview (lives below the fold; useful for debugging) ====== -->
+<details class="mt-8 text-sm text-gray-500">
+    <summary class="cursor-pointer hover:text-gray-800">Debug: per-schedule upcoming fires</summary>
+    <div class="mt-3 space-y-2" id="debug-fires"></div>
+</details>
+
+<script>
+function fillCron(expr, btn) {
+    const input = document.querySelector('input[name="cron_expr"]');
+    input.value = expr;
+    input.focus();
+}
+
+async function createSchedule(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const body = {
+        name: form.name.value,
+        template_project_id: form.template_project_id.value,
+        cron_expr: form.cron_expr.value,
+        timezone: form.timezone.value || "Asia/Hong_Kong",
+        mode: form.mode.value,
+        enabled: form.enabled.checked,
+    };
+    const msg = document.getElementById('form-msg');
+    msg.textContent = "creating...";
+    msg.className = "text-xs text-gray-500";
+    try {
+        const r = await fetch('/api/schedules/', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.detail || `HTTP ${r.status}`);
+        }
+        msg.textContent = "created — reloading...";
+        msg.className = "text-xs text-green-600";
+        setTimeout(() => location.reload(), 600);
+    } catch (e) {
+        msg.textContent = "error: " + e.message;
+        msg.className = "text-xs text-red-600";
+    }
+}
+
+async function runNow(id) {
+    if (!confirm("Run this schedule now? (bypasses the skip rule)")) return;
+    try {
+        const r = await fetch(`/api/schedules/${id}/run-now`, {method: 'POST'});
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        const data = await r.json();
+        alert(`Fired. New project: ${data.project_id}`);
+        setTimeout(() => location.reload(), 300);
+    } catch (e) {
+        alert("Run-now failed: " + e.message);
+    }
+}
+
+async function toggleEnabled(id, newVal) {
+    try {
+        const r = await fetch(`/api/schedules/${id}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled: !!newVal}),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        location.reload();
+    } catch (e) {
+        alert("Toggle failed: " + e.message);
+    }
+}
+
+async function deleteSchedule(id, name) {
+    if (!confirm(`Delete schedule "${name}"?\n\nExisting runs are kept (they just stop getting new fires).`)) return;
+    try {
+        const r = await fetch(`/api/schedules/${id}`, {method: 'DELETE'});
+        if (!r.ok && r.status !== 204) throw new Error(`HTTP ${r.status}`);
+        location.reload();
+    } catch (e) {
+        alert("Delete failed: " + e.message);
+    }
+}
+
+// Load per-schedule upcoming fires for the debug section. We fire all
+// queries in parallel; the dashboard will re-render on next 10s poll.
+(async function loadDebugFires() {
+    const container = document.getElementById('debug-fires');
+    const rows = document.querySelectorAll('[data-sched-id]');
+    for (const r of rows) {
+        const id = r.dataset.schedId;
+        try {
+            const resp = await fetch(`/api/schedules/${id}/next-fires?count=3`);
+            if (!resp.ok) continue;
+            const data = await resp.json();
+            const div = document.createElement('div');
+            div.className = 'text-xs';
+            const label = r.querySelector('.font-medium')?.textContent?.trim() || id;
+            div.innerHTML = `<span class="font-mono text-gray-700">${id}</span> <span class="text-gray-600">${label}</span> → ${data.next_fires.map(f => f.slice(0, 16)).join(', ')}`;
+            container.appendChild(div);
+        } catch (e) { /* ignore */ }
+    }
+})();
+</script>
+
+{% endblock %}

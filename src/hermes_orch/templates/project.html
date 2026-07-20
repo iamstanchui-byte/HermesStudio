@@ -51,6 +51,19 @@
                 </span>
             </div>
             {% endif %}
+            {% if project.is_template %}
+            <div class="mt-1 inline-block">
+                <span class="px-2 py-0.5 text-xs rounded bg-amber-100 text-amber-800" title="This project is marked as a reusable template. Schedules can fire it on a cron.">📋 template</span>
+                {% if template_schedule %}
+                <a href="/schedules" class="px-2 py-0.5 text-xs rounded bg-purple-100 text-purple-800 ml-1 hover:bg-purple-200" title="Schedule: {{ template_schedule.name }} · {{ template_schedule.cron_expr }} ({{ template_schedule.timezone }}) · {{ template_schedule.mode }}">🔁 {{ template_schedule.name }}</a>
+                {% endif %}
+            </div>
+            {% endif %}
+            {% if source_schedule %}
+            <div class="mt-1">
+                <a href="/schedules" class="px-2 py-0.5 text-xs rounded bg-purple-100 text-purple-800 hover:bg-purple-200" title="This run was triggered by: {{ source_schedule.name }} · {{ source_schedule.cron_expr }} ({{ source_schedule.timezone }}) · {{ source_schedule.mode }}">🔁 from {{ source_schedule.name }}</a>
+            </div>
+            {% endif %}
             <div class="text-xs text-gray-500 mt-1">created {{ project.created_at }}</div>
             <div class="mt-2 flex gap-1 justify-end flex-wrap">
                 <button onclick="openProjectFolder('{{ project.id }}')" class="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded hover:bg-gray-200" title="Open the project folder in File Explorer (only works if your browser is on the orchestrator host)">
@@ -74,6 +87,16 @@
                 {% endif %}
                 {% if project.state != 'deleted' %}
                 <button onclick="deleteProject('{{ project.id }}')" class="px-2 py-1 text-xs bg-red-100 text-red-800 rounded hover:bg-red-200">Delete</button>
+                {% endif %}
+                {# Template + Schedule controls (#22). Mark-as-template is a
+                   one-click toggle: the schedule button is only useful after
+                   the project IS a template. We use the same modal as
+                   create-schedule but pre-fill template_project_id. #}
+                {% if project.is_template %}
+                <button onclick="unmarkTemplate('{{ project.id }}', '{{ project.name|e }}')" class="px-2 py-1 text-xs bg-amber-50 text-amber-800 rounded hover:bg-amber-100" title="Remove the template flag. Existing schedules that reference this project will warn on their next fire.">Unmark template</button>
+                <a href="/schedules?template={{ project.id }}" class="px-2 py-1 text-xs bg-purple-100 text-purple-800 rounded hover:bg-purple-200" title="Go to the Schedules page to attach a cron expression to this template.">+ Schedule this</a>
+                {% else %}
+                <button onclick="markTemplate('{{ project.id }}', '{{ project.name|e }}')" class="px-2 py-1 text-xs bg-amber-100 text-amber-800 rounded hover:bg-amber-200" title="Mark this project as a reusable template. Schedules can then fire it on a cron.">+ Mark as template</button>
                 {% endif %}
             </div>
         </div>
@@ -498,6 +521,33 @@ async function openProjectFolder(projectId) {
         }
     } catch (err) {
         alert('Network error: ' + err.message);
+    }
+}
+
+async function markTemplate(projectId, name) {
+    const desc = prompt(`Mark "${name}" as a reusable template?\n\nOptionally enter a short description:`, "");
+    if (desc === null) return;  // user cancelled
+    try {
+        const r = await fetch(`/api/schedules/project/${projectId}/mark-template`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({description: desc}),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+        location.reload();
+    } catch (e) {
+        alert("Mark template failed: " + e.message);
+    }
+}
+
+async function unmarkTemplate(projectId, name) {
+    if (!confirm(`Unmark "${name}" as a template?\n\nSchedules that reference this project will warn on their next fire.`)) return;
+    try {
+        const r = await fetch(`/api/schedules/project/${projectId}/mark-template`, {method: 'DELETE'});
+        if (!r.ok && r.status !== 204) throw new Error(`HTTP ${r.status}`);
+        location.reload();
+    } catch (e) {
+        alert("Unmark template failed: " + e.message);
     }
 }
 

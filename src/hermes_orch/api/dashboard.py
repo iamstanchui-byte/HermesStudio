@@ -6,6 +6,7 @@ Pages:
 - GET /tasks             -> Tasks page (filterable)
 - GET /projects          -> Projects list
 - GET /projects/{id}     -> Project detail (plan + tasks)
+- GET /schedules         -> Recurring schedules (CRUD + template dropdown)
 - GET /history           -> History (audit log)
 
 Live updates via 5s polling (vanilla JS setInterval + fetch).
@@ -713,6 +714,25 @@ async def projects_list_page(
     all_profiles = [
         {"agent_id": r["agent_id"], "name": r["name"]} for r in profile_rows
     ]
+    # Schedule info for projects that came from a recurring schedule
+    # (#22). One query, returns {project_id: schedule_name} for projects
+    # with a non-empty source_schedule_id. The dashboard shows a small
+    # "🔁 <schedule_name>" badge next to those rows. Missing projects
+    # (e.g. schedule deleted) just don't show the badge.
+    schedule_rows = await db.fetchall(
+        "SELECT p.id AS project_id, s.name AS schedule_name "
+        "FROM projects p "
+        "JOIN project_schedules s ON s.id = p.source_schedule_id "
+        "WHERE p.source_schedule_id IS NOT NULL AND p.source_schedule_id != ''"
+    )
+    schedule_map = {r["project_id"]: r["schedule_name"] for r in schedule_rows}
+    # Also fetch template markers — show "📋 template" badge for projects
+    # that are marked as reusable templates.
+    template_ids = {
+        r["id"] for r in await db.fetchall(
+            "SELECT id FROM projects WHERE is_template = 1"
+        )
+    }
     return templates.TemplateResponse(
         request=request,
         name="projects_list.html",
@@ -720,6 +740,8 @@ async def projects_list_page(
             **_base_context(request, "projects"),
             "projects": projects,
             "token_map": token_map,
+            "schedule_map": schedule_map,
+            "template_ids": template_ids,
             "show_archived": show_archived,
             "show_deleted": show_deleted,
             "filter_state": state,
@@ -816,6 +838,24 @@ async def project_page(
     )
     token_breakdown = [dict(r) for r in token_rows]
     token_total = sum(r["total"] for r in token_breakdown)
+    # Schedule info (#22): if this project is marked as a template or
+    # was created by a recurring schedule, pull the schedule row so the
+    # page can show "this project is a template for <schedule>" or
+    # "this run was triggered by <schedule>". The badge is on the
+    # projects list; the detail page shows the schedule details inline
+    # so the user can see cron + next fire + jump to the schedule page.
+    template_schedule = None
+    if project.get("is_template"):
+        template_schedule = await db.fetchone(
+            "SELECT * FROM project_schedules WHERE template_project_id = ?",
+            (project_id,),
+        )
+    source_schedule = None
+    if project.get("source_schedule_id"):
+        source_schedule = await db.fetchone(
+            "SELECT * FROM project_schedules WHERE id = ?",
+            (project["source_schedule_id"],),
+        )
     return templates.TemplateResponse(
         request=request,
         name="project.html",
@@ -830,6 +870,8 @@ async def project_page(
             "soul_presets": soul_presets,
             "token_breakdown": token_breakdown,
             "token_total": token_total,
+            "template_schedule": dict(template_schedule) if template_schedule else None,
+            "source_schedule": dict(source_schedule) if source_schedule else None,
         },
     )
 
@@ -874,6 +916,62 @@ async def settings_page(request: Request) -> HTMLResponse:
             "cleanup_daily_sweep": bool(cleanup.get("daily_sweep", True)),
             "cleanup_last_run_at": cleanup_last_run_at,
             "cleanup_last_result": cleanup_last_result,
+        },
+    )
+
+
+@router.get("/schedules", response_class=HTMLResponse)
+async def schedules_page(
+    request: Request,
+    template: str | None = None,  # ?template=<id> pre-selects the template
+) -> HTMLResponse:
+    """Recurring project schedules (#22).
+
+    Two sections:
+    1. Active schedules table — one row per schedule, with
+       last-fire / next-fire / last-run state / mode. Click row
+       to expand inline edit form (toggle enabled, change cron,
+       delete).
+    2. "New schedule" form — pick a template from the dropdown,
+       choose mode (clone vs append), enter cron expression
+       (with a friendly "common patterns" helper that translates
+       "every weekday 9am" → "0 9 * * 1-5").
+
+    The page polls the same /api/schedules/ endpoint the form
+    uses, so a 10s reload shows schedule state changes without
+    needing explicit refresh. `?template=<id>` pre-selects the
+    template dropdown (used by the "+ Schedule this" button on
+    a project page).
+    """
+    db = request.app.state.db
+    # List schedules (full join with last-run state) — same SQL
+    # the API uses, so the table stays in sync.
+    schedule_rows = await db.fetchall(
+        "SELECT s.*, p.name AS template_name, "
+        "(SELECT id FROM projects WHERE source_schedule_id = s.id "
+        " ORDER BY created_at DESC LIMIT 1) AS last_run_project_id, "
+        "(SELECT state FROM projects WHERE source_schedule_id = s.id "
+        " ORDER BY created_at DESC LIMIT 1) AS last_run_state, "
+        "(SELECT created_at FROM projects WHERE source_schedule_id = s.id "
+        " ORDER BY created_at DESC LIMIT 1) AS last_run_at "
+        "FROM project_schedules s "
+        "LEFT JOIN projects p ON p.id = s.template_project_id "
+        "ORDER BY s.enabled DESC, s.next_fire_at ASC, s.created_at DESC"
+    )
+    # Templates dropdown (is_template=1)
+    template_rows = await db.fetchall(
+        "SELECT id, name, goal, state, template_description, updated_at, created_at "
+        "FROM projects WHERE is_template = 1 "
+        "ORDER BY updated_at DESC, created_at DESC"
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="schedules.html",
+        context={
+            **_base_context(request, "schedules"),
+            "schedules": [dict(r) for r in schedule_rows],
+            "templates": [dict(r) for r in template_rows],
+            "preselect_template_id": template or "",
         },
     )
 
