@@ -160,9 +160,17 @@ if ($existing) {
 # Key: inject env vars so the LocalSystem daemon sees the user's HOME/LOCALAPPDATA.
 # Without these, hermes looks for profiles at LocalSystem's HOME and can't
 # find them. With them, hermes finds the user's profile registry.
-& nssm set $ServiceName AppEnvironmentExtra "LOCALAPPDATA=$UserLocalAppData"
-& nssm set $ServiceName AppEnvironmentExtra "USERPROFILE=$UserProfile"
-& nssm set $ServiceName AppEnvironmentExtra "HOME=$UserHome"
+#
+# IMPORTANT: AppEnvironmentExtra is a REG_MULTI_SZ value. Calling `nssm set
+# X AppEnvironmentExtra "k=v"` three times REPLACES the whole value each
+# time (last call wins). To get all three rows, pass all three as
+# positional args to a SINGLE nssm set call. The v2 script previously
+# used three separate calls and the user hit "hermes CLI not found"
+# on every task because only HOME survived.
+& nssm set $ServiceName AppEnvironmentExtra `
+    "LOCALAPPDATA=$UserLocalAppData" `
+    "USERPROFILE=$UserProfile" `
+    "HOME=$UserHome"
 
 # Log rotation (10 MB per file, keep history)
 & nssm set $ServiceName AppStdout $LogOut
