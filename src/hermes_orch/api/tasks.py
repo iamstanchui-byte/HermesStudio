@@ -11,6 +11,7 @@ State transitions handled by:
 - POST /api/tasks/{id}/assign  — dispatcher assigns to agent (pending → assigned)
 - POST /api/tasks/{id}/start   — agent acks (assigned → running)
 - GET  /api/tasks/{id}/poll    — agent liveness check (running → running)
+- POST /api/tasks/{id}/poll    — same; POST is the canonical path the wrapper uses
 - POST /api/tasks/{id}/result  — agent submits result (running → completed/failed)
 - POST /api/tasks/{id}/cancel  — operator (any → cancelled)
 - POST /api/tasks/{id}/interrupt — operator (running → interrupted)
@@ -333,7 +334,13 @@ async def start_task(task_id: str, request: Request) -> Task:
     return _row_to_task(row)
 
 
+# Accept both GET and POST: the wrapper's liveness poller uses POST
+# (semantically correct — this endpoint has a side effect, updating
+# last_liveness_at), but the route was originally registered as GET.
+# Keeping GET works for any future read-only inspectors; POST is the
+# primary path the wrapper uses.
 @router.get("/{task_id}/poll")
+@router.post("/{task_id}/poll")
 async def poll_task(task_id: str, request: Request) -> dict:
     """Agent polls for liveness. Updates last_liveness_at."""
     db = request.app.state.db
