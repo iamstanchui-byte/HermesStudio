@@ -353,6 +353,153 @@ _HERMES_TOKEN_COLUMNS_V0_17 = [
 ]
 
 
+# ===== Zombie-session sweep (Plan B for #22 follow-up) =====
+#
+# Hermes's own `state.db` accumulates rows in the `sessions` table for
+# every hermes CLI/TUI/Telegram invocation. Most close cleanly
+# (ended_at IS NOT NULL), but a non-trivial number end up with
+# ended_at IS NULL when the hermes subprocess is killed mid-flight
+# (Ctrl-C, parent wrapper crash, OOM). These zombies are harmless
+# individually but they grow the state.db (super profile was 33 MB
+# with 49 zombie sessions as of 2026-07-21) and they generate log
+# spam because the wrapper's normal cleanup path only touches
+# `source='orchestrator'` rows (which the supervisor manages).
+#
+# The fix: periodically scan each profile's state.db for sessions
+# that are (a) still active (ended_at IS NULL) AND (b) NOT
+# orchestrator-managed (source != 'orchestrator') AND (c) older than
+# the TTL. Call `hermes sessions delete <id> --yes` for each. Safe to
+# run because:
+#   - We exclude source='orchestrator' (the supervisor owns those)
+#   - We require 7+ days old (won't touch any session currently in use)
+#   - hermes sessions delete is idempotent (no-op if already gone)
+_ZOMBIE_SESSION_TTL_DAYS = 7
+_ZOMBIE_SESSION_SWEEP_INTERVAL_S = 24 * 3600  # once a day is plenty
+_last_zombie_sweep: dict[str, float] = {}  # profile_name -> ts
+
+
+def _sweep_zombie_sessions_inline(
+    pname: str,
+    pcfg: dict,
+    *,
+    ttl_days: int = _ZOMBIE_SESSION_TTL_DAYS,
+    dry_run: bool = False,
+    hermes_profiles_dir: "Path | None" = None,
+) -> int:
+    """Delete hermes-internal zombie sessions from <profile>/state.db.
+
+    Targets:
+      - ended_at IS NULL (process never set the close timestamp)
+      - source != 'orchestrator' (we don't touch orchestrator-managed
+        sessions; those go through the supervisor cleanup-ack flow)
+      - started_at < now - ttl_days (defensive: don't touch recent
+        sessions in case a long-lived hermes subprocess is still using
+        them — e.g. a dashboard or gateway)
+
+    Returns the number of sessions deleted (0 if none found / dry-run).
+
+    Best-effort: failures are logged, not raised. The orchestrator
+    can re-run safely on the next tick.
+    """
+    from hermes_orch.agent_paths import resolve_profile_root
+    import sqlite3 as _sqlite3
+    import subprocess as _subprocess
+    import time as _time_mod
+
+    try:
+        root = resolve_profile_root(
+            pcfg.get("root", ""),
+            pname,
+            profiles_dir=hermes_profiles_dir,
+        )
+    except Exception as e:
+        click.echo(f"[daemon] zombie-sweep {pname}: resolve_profile_root failed: {e}")
+        return 0
+    state_db = Path(root) / "state.db"
+    if not state_db.exists():
+        return 0
+
+    # Threshold = (now - ttl_days) in unix epoch seconds. Hermes
+    # state.db `started_at` is stored as unix seconds (float), based
+    # on observed schema.
+    threshold = _time_mod.time() - ttl_days * 86400
+    try:
+        db = _sqlite3.connect(str(state_db))
+        try:
+            rows = db.execute(
+                "SELECT id, source, started_at FROM sessions "
+                "WHERE ended_at IS NULL "
+                "  AND (source IS NULL OR source != 'orchestrator') "
+                "  AND started_at IS NOT NULL AND started_at < ? "
+                "ORDER BY started_at ASC LIMIT 200",
+                (threshold,),
+            ).fetchall()
+        finally:
+            db.close()
+    except Exception as e:
+        click.echo(f"[daemon] zombie-sweep {pname}: state.db query failed: {e}")
+        return 0
+
+    if not rows:
+        return 0
+
+    if dry_run:
+        click.echo(
+            f"[daemon] zombie-sweep {pname}: dry-run, would delete "
+            f"{len(rows)} session(s) older than {ttl_days}d"
+        )
+        return 0
+
+    # Find the hermes CLI on PATH. We try a couple of common locations;
+    # if neither works, we silently skip (the wrapper can't do much
+    # without hermes anyway — it'll have been failing earlier already).
+    hermes_bin = None
+    for cand in (Path(root).parent.parent / "hermes-agent" / "venv" / "bin" / "hermes",
+                 Path(root).parent / "hermes-agent" / "venv" / "bin" / "hermes"):
+        if cand.exists():
+            hermes_bin = str(cand)
+            break
+    if hermes_bin is None:
+        # Fall back to whatever's on PATH
+        hermes_bin = "hermes"
+
+    deleted = 0
+    for sid, source, started_at in rows:
+        # Skip if session is super-stale (> 90d): hermes may have
+        # already pruned it; the SQL DELETE is harmless but the
+        # subprocess call is wasted. (defensive: cheap skip)
+        age_d = (_time_mod.time() - float(started_at)) / 86400 if started_at else 0
+        if age_d > 90:
+            continue
+        try:
+            proc = _subprocess.run(
+                [hermes_bin, "sessions", "delete", sid, "--yes"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                deleted += 1
+            elif "not found" in (proc.stderr or "").lower() or "no such" in (proc.stderr or "").lower():
+                # Already gone — count as success (we wanted it gone)
+                deleted += 1
+            else:
+                click.echo(
+                    f"[daemon] zombie-sweep {pname}: delete {sid} (age {age_d:.1f}d) "
+                    f"failed: rc={proc.returncode} err={proc.stderr.strip()[:200]}"
+                )
+        except _subprocess.TimeoutExpired:
+            click.echo(f"[daemon] zombie-sweep {pname}: delete {sid} timed out (>15s)")
+        except Exception as e:
+            click.echo(f"[daemon] zombie-sweep {pname}: delete {sid} error: {e}")
+    if deleted:
+        click.echo(
+            f"[daemon] zombie-sweep {pname}: deleted {deleted} zombie session(s) "
+            f"(older than {ttl_days}d, source != orchestrator)"
+        )
+    return deleted
+
+
 def _read_profile_config(profile_root: Path) -> dict:
     """Read <profile_root>/config.yaml and extract the fields the
     orchestrator's agent page needs to show per-profile metadata:
@@ -1936,6 +2083,25 @@ def start(
             # Apply pending profile configs (e.g. soul.md) every tick.
             # Cheap when nothing pending; no separate loop needed.
             _apply_pending_configs_inline()
+            # Periodic zombie-session sweep (Plan B for the long-standing
+            # "49 active sessions in super/state.db" issue). Throttled to
+            # once per day per profile — the SQL scan is cheap but the
+            # hermes sessions delete subprocess calls aren't, and a fresh
+            # sweep every 5s would be wasteful. Each profile is swept
+            # independently so a slow hermes on one profile doesn't block
+            # the others.
+            now_ts = time_mod.time()
+            for pname, pcfg in profiles_cfg.items():
+                last = _last_zombie_sweep.get(pname, 0)
+                if (now_ts - last) < _ZOMBIE_SESSION_SWEEP_INTERVAL_S:
+                    continue
+                try:
+                    _sweep_zombie_sessions_inline(
+                        pname, pcfg, hermes_profiles_dir=hermes_profiles_dir,
+                    )
+                    _last_zombie_sweep[pname] = now_ts
+                except Exception as e:
+                    click.echo(f"[daemon] zombie-sweep {pname} tick error: {e}")
             # Periodic auto-sync of skills from disk (throttled per profile).
             # Catches self-taught skills the agent wrote into skills/ without
             # going through the dashboard. We use a single short-lived client
