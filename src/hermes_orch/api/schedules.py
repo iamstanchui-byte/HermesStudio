@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import yaml
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -518,6 +519,7 @@ async def promote_project_to_skill(
     """
     import secrets as _secrets
     db = request.app.state.db
+    cfg = request.app.state.config
     proj = await db.fetchone(
         "SELECT id, name, goal, state FROM projects WHERE id = ?",
         (project_id,),
@@ -543,102 +545,43 @@ async def promote_project_to_skill(
             f"Target agent '{body.agent_id}' has no auth secret — "
             "register it first (or complete the bootstrap flow).",
         )
-    # Render the SKILL.md body. Human-readable, no JSON frontmatter —
-    # the agent just reads it as a knowledge asset. Sections:
-    #   - Goal (1-2 lines from project.goal)
-    #   - Workflow steps (task list, action+role per step, status, cleaned result snippet)
-    #   - Key facts learned (from facts.md, empty sections stripped)
-    #   - Outcome (from decision.md, trimmed)
-    #   - When to use (concrete match from project goal + workflow pattern)
-    #
-    # "Cleaned" = the result snippet we put in SKILL.md is:
-    #   1. JSON-parsed if it looks like {"summary": "..."} — this also
-    #      auto-decodes the \uXXXX escape sequences (the wrapper writes
-    #      with json.dumps(ensure_ascii=True)).
-    #   2. Stripped of the trailing "--- PROJECT CONTEXT ---" block —
-    #      that's the wrapper's internal context log, not user-facing
-    #      skill content. Future agents loading this skill would be
-    #      confused by the inline L3-recent dump.
-    parts: list[str] = []
-    parts.append(f"# {proj.get('name') or proj['id']}\n")
-    if proj.get("goal"):
-        parts.append("## Goal\n\n" + proj["goal"] + "\n")
-    # Pull task list from DB (cleaner than parsing plan.md, and handles
-    # manual-mode projects that never got an LLM-generated plan).
-    tasks = await db.fetchall(
-        "SELECT name, agent_role, action, status, result "
-        "FROM tasks WHERE project_id = ? "
-        "ORDER BY created_at ASC",
-        (project_id,),
-    )
-    if tasks:
-        # Filter to **successful** tasks only. A SKILL.md is meant to be
-        # re-run by a future agent; failed/skipped/cancelled tasks are
-        # dead-end paths that would mislead the next agent into trying
-        # the same approach. The original "Project Facts" cite below
-        # still mentions every task for traceability, but the reusable
-        # workflow shape should only show what actually worked.
-        successful_tasks = [
-            t for t in tasks
-            if (t.get("status") or "") in ("completed",)
-        ]
-        parts.append("## Workflow steps\n")
-        for i, t in enumerate(successful_tasks, 1):
-            tname = t.get("name") or t.get("action") or "task"
-            short_act = _short_action(t.get("action") or "?")
-            parts.append(
-                f"{i}. **{tname}** (`{short_act}`, "
-                f"role=`{t.get('agent_role') or '?'}`)"
-            )
-            cleaned = _clean_task_result(t.get("result") or "")
-            if cleaned:
-                snippet = cleaned[:300]
-                if len(cleaned) > 300:
-                    snippet += "..."
-                parts.append(f"   - Result: {snippet}")
-        if not successful_tasks and tasks:
-            # All tasks failed (or were skipped/cancelled) — surface that
-            # honestly so a future agent doesn't expect a working
-            # workflow. Keep the original failed tasks listed so the
-            # cause is at least visible.
-            parts.append(
-                "_(no tasks completed successfully — see the Plan History / "
-                "Task Results citations below for what was attempted)_\n"
-            )
-        parts.append("")
-    # facts.md (curated L2 memory) — what the user cared about
+    # LLM-driven synthesis path (Hermes 4-layer framework, see
+    # https://hermes-agent/skills/software-development/project-trace-to-skill-conversion
+    # for the canonical reference). The earlier mechanical-render
+    # approach produced a "trace dump" SKILL.md that the agent
+    # would *reprint* when invoked, because the body contained L2
+    # (specific values) and L3 (task IDs / PASS-FAIL / coord
+    # scaffolding) instead of an executable procedure. The LLM
+    # synthesis path produces a real skill: frontmatter + concrete
+    # Hermes tool calls + drop all L2/L3.
     from hermes_orch.api.projects import _project_dir
     pdir = _project_dir(request, project_id)
-    facts_path = pdir / "facts.md"
-    if facts_path.exists():
-        facts_text = facts_path.read_text(encoding="utf-8", errors="replace")
-        facts_filtered = _filter_facts_sections(facts_text)
-        if facts_filtered.strip():
-            parts.append("## Key facts learned\n")
-            # Cap at 80 lines after filtering empty sections.
-            for line in facts_filtered.splitlines()[:80]:
-                parts.append(line)
-            parts.append("")
-    decision_path = pdir / "decision.md"
-    if decision_path.exists():
-        decision_text = decision_path.read_text(encoding="utf-8", errors="replace")
-        if decision_text.strip():
-            parts.append("## Outcome\n")
-            parts.append(decision_text[:1500])
-            parts.append("")
-    # When to use: auto-generated from the project goal + workflow shape,
-    # NOT a generic "use it when the user asks for a similar task" —
-    # that's useless for an LLM trying to decide if it should match.
-    # Pass only the successful tasks so the "Workflow: N step(s) — ..."
-    # line lists a clean reusable chain, not a 10-step blob with
-    # 2KB embedded task prompts and dead-end failed steps.
-    when_to_use = _render_when_to_use(
-        proj,
-        [t for t in tasks if (t.get("status") or "") == "completed"],
-    )
-    parts.append("## When to use this skill\n")
-    parts.append(when_to_use)
-    skill_body = "\n".join(parts).strip() + "\n"
+    evidence = await _gather_skill_evidence(db, pdir, project_id, proj)
+    llm_cfg = cfg.get("llm", {})
+    try:
+        skill_body = await _call_llm_for_skill_synthesis(
+            evidence, llm_cfg, body.skill_name
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Anything else: surface as 502 with the underlying error.
+        import traceback
+        raise HTTPException(
+            502,
+            f"Skill-synthesis LLM call failed: {type(e).__name__}: {e} | "
+            f"traceback: {traceback.format_exc()[-500:]}",
+        )
+    # Validate the LLM output against the 4-layer rules. If it
+    # leaked L2/L3 (LLM not strict enough), refuse to push — better
+    # to tell the user "LLM produced a non-skill" than ship a dump.
+    is_valid, err = _validate_skill_md(skill_body, body.skill_name)
+    if not is_valid:
+        raise HTTPException(
+            500,
+            f"LLM produced a SKILL.md that fails 4-layer validation: {err}. "
+            "Re-run or hand-fix the LLM prompt.",
+        )
     # Push via profile_configs — same flow as the agents router uses
     # for skills. The wrapper's apply-config loop writes it to
     # <profile>/skills/<name>/SKILL.md.
@@ -892,3 +835,402 @@ def _render_when_to_use(proj: dict, tasks: list) -> str:
             f"- This skill captures the workflow from project `{proj['id']}`."
         )
     return "\n".join(parts) + "\n"
+
+
+# ===== LLM-driven promote-to-skill (hermes 4-layer framework) =====
+#
+# Reference: ~/.hermes/profiles/<role>/skills/software-development/
+# project-trace-to-skill-conversion/SKILL.md (bundled by hermes). The
+# mechanical-render approach (this file's earlier version) produces
+# a "trace dump" SKILL.md: L2 raw data + L3 task IDs / PASS-FAIL /
+# coord scaffolding get embedded in the body, so when an agent
+# loads the skill it just *reprints* the body instead of executing
+# a procedure. The fix is to delegate SKILL.md construction to an
+# LLM, with a strict prompt that applies the 4-layer separation:
+# keep L0 (structure) + L1 (real-world actions, rewritten as
+# Hermes tool calls) and drop L2 (specific values) + L3 (engine
+# scaffolding) entirely. Output is then validated against the
+# same anti-dump assertions the hermes skill recommends in Phase 5.
+_SKILL_MAX_DESCRIPTION_CHARS = 60
+_SKILL_MAX_FILE_BYTES = 100_000
+_L3_LITERAL_TOKENS = (
+    # Full L3 token (not just prefix) — the LLM sometimes references
+    # "[cite:" syntactically in its own examples, but never
+    # "[cite:task.completed@..." as a real citation.
+    "[cite:task.completed@",
+    "task.completed@",
+    "DECISION: PASS",
+    "DECISION: FAIL",
+    "coord_pickup",
+    "iteration_completed@",
+)
+_L3_PHRASES = (
+    "plan history", "task results", "coord verdicts", "files (artifacts)",
+    "key facts", "key insights", "key learnings", "what we learned",
+    "run summary", "outcome", "project facts", "auto-curated",
+)
+
+
+_SKILL_SYNTHESIS_PROMPT = """You are converting a project execution trace into a real, reusable skill following the Hermes 4-layer separation framework.
+
+# Goal
+Produce a SKILL.md that, when loaded by an agent via `/<skill-name>`, makes the agent EXECUTE the procedure — not reprint the body. Trace dumps make agents echo back the report; this skill must make them DO the work.
+
+# 4-Layer Separation (mandatory)
+For every piece of evidence below, classify it:
+- **L0 structure** (step count, ordering, dependencies) — KEEP, rewrite as `## Step N: <verb> <thing>`
+- **L1 actions** (which API / tool / website / command was used) — KEEP, rewrite as concrete Hermes tool calls (`web_search`, `web_extract`, `terminal`, `read_file`, `patch`, `web_fetch`)
+- **L2 data** (specific values fetched: coordinates, forecasts, dates, raw JSON, names) — DROP. Stale on next run.
+- **L3 decisions** (`task.completed` IDs, PASS/FAIL verdicts, `coord_pickup` handoffs, `[iteration_completed@iter=N]` markers) — DROP entirely. Internal to the originating engine.
+
+# Cardinal test
+Does this line tell the agent WHAT TO DO this turn? If yes (L0/L1) → keep. If it describes what already happened or whether it was approved (L2/L3) → drop.
+
+# Output schema (strict, follow exactly)
+- File starts with `---` (byte 0) → YAML frontmatter.
+- Required frontmatter fields:
+  - `name`: kebab-case, MUST equal the requested skill_name below.
+  - `description`: ≤ {_max} chars total, MUST start with "Use when " (or "Use whenever ").
+  - `version`: 0.1.0.
+  - `author`: a real name + handle, or "Hermes Agent".
+  - `license: MIT`.
+- Optional: `platforms: [linux, macos, windows]`.
+- `metadata.hermes.tags`: 3-6 short tags.
+- `metadata.hermes.related_skills`: MUST list `project-trace-to-skill-conversion` FIRST (anti-pattern propagation reference), then any sibling skills in the same domain.
+- Body sections, in order: `## Overview`, `## When to Use`, `## Steps` (with `## Step N: <verb> <thing>` sub-headings), `## Pitfalls`, `## Verification`.
+- Total file size: target 8-15 KB, hard cap 100 KB.
+
+# Step format (mandatory)
+Each `## Step N: <verb> <thing>` must specify:
+1. **Action verb** (Fetch, Search, Read, Compose, Cross-verify, etc.) — strong verb, not a noun.
+2. **Hermes tool** to use (`web_search`, `web_extract`, `terminal`, `read_file`, `patch`, `web_fetch`). NEVER use internal engine names like `reverify_raw_data`, `cross_verify_typhoon`, `_iteration_review`, `coord_pickup`, `handoff: coord_pickup`.
+3. **Target**: an exact URL, exact CLI command, or exact search query.
+4. **Completion criterion**: a checkable assertion (e.g. "result contains forecast for next 7 days with high/low °C and precipitation probability"). If you cannot write a checkable criterion, the step is too vague — sharpen it.
+5. NO fetched data values, task IDs, or PASS/FAIL markers inside the step.
+
+# Anti-patterns to drop (these WILL fail validation)
+- `[cite:task.completed@...]` (L3 trace citation)
+- `## Plan History` / `## Task Results` / `## Coord Verdicts` / `## Files (artifacts)` headings (L3)
+- Internal engine names: `reverify_raw_data`, `cross_verify_typhoon`, `compose_weather_report_zh`, `_iteration_review:1`, `coord_pickup`, `handoff: coord_pickup`
+- Specific values: actual coordinates, specific forecast numbers, raw JSON dumps, today's date
+- `DECISION: PASS` / `DECISION: FAIL` markers (L3)
+- `_iteration_review:1` style action names (L3 coord scaffolding — omit the step entirely)
+
+# Description rules
+- MUST start with "Use when " (or "Use whenever ").
+- ≤ {_max} chars total (hard limit; the skill authoring standard enforces this).
+- Trigger-class (what kind of user request should invoke this skill), NOT the project goal literally.
+- Examples:
+  - GOOD: "Use when the user asks for a KMB 296A bus route stops list in Hong Kong."
+  - GOOD: "Use when the user asks for a weekly Taipei weather report in Chinese with typhoon cross-verification."
+  - BAD: "查香港九巴296a的站表" (Chinese only, no trigger class)
+  - BAD: "Use this skill to do stuff" (too generic)
+  - BAD: a 100+ char description (over the limit)
+
+# Evidence
+{evidence}
+
+# Output
+Output ONLY the SKILL.md content, starting with `---` (the frontmatter opening). No preamble, no explanation, no code fence wrappers. End with exactly one trailing newline.
+"""
+
+
+async def _gather_skill_evidence(db, pdir: "Path", project_id: str, proj: dict) -> str:
+    """Build the evidence block fed to the LLM for skill synthesis.
+
+    Includes project metadata, successful tasks (L0+L1), failed tasks
+    (so the LLM can choose to drop them or note them as dead-ends),
+    facts.md (truncated), decision.md (truncated), and 1-2 sample
+    artifact files (so the LLM can see what the original output shape
+    looked like — the LLM should describe the SHAPE, not import
+    the values).
+    """
+    parts: list[str] = ["# Project evidence\n"]
+    parts.append("## Project metadata\n")
+    parts.append(f"- id: {project_id}\n")
+    parts.append(f"- name: {proj.get('name') or project_id}\n")
+    parts.append(f"- state: {proj.get('state', '?')}\n")
+    parts.append(f"- goal: {proj.get('goal') or '(none)'}\n")
+
+    # Tasks
+    tasks = await db.fetchall(
+        "SELECT name, agent_role, action, status, result, output_path, depends_on "
+        "FROM tasks WHERE project_id = ? "
+        "ORDER BY created_at ASC",
+        (project_id,),
+    )
+    successful = [t for t in tasks if (t.get("status") or "") == "completed"]
+    failed = [
+        t for t in tasks
+        if (t.get("status") or "") in ("failed", "skipped", "cancelled")
+    ]
+
+    if successful:
+        parts.append("\n## Successful tasks (L0 structure + L1 actions)\n")
+        for t in successful:
+            name = t.get("name") or "task"
+            role = t.get("agent_role") or "?"
+            short_act = _short_action(t.get("action") or "?")
+            output = t.get("output_path") or "(none)"
+            deps = t.get("depends_on") or []
+            deps_str = f" (after: {', '.join(deps)})" if deps else ""
+            parts.append(
+                f"- **{name}** [{role}]{deps_str}: action=`{short_act}` -> writes `{output}`\n"
+            )
+    if failed:
+        parts.append(
+            "\n## Failed / skipped / cancelled tasks "
+            "(DO NOT include these in the skill, but flag if the path was a dead-end)\n"
+        )
+        for t in failed:
+            name = t.get("name") or "task"
+            short_act = _short_action(t.get("action") or "?")
+            err = (t.get("error") or "unknown")[:200]
+            parts.append(f"- {name}: action=`{short_act}` — {err}\n")
+
+    # facts.md
+    facts_path = pdir / "facts.md"
+    if facts_path.exists():
+        facts_text = facts_path.read_text(encoding="utf-8", errors="replace")
+        # Drop the L3-flavoured sections so the LLM doesn't see them
+        # and re-include them.
+        facts_filtered = _filter_facts_sections(facts_text)
+        if facts_filtered.strip():
+            parts.append(
+                f"\n## facts.md (curated memory, {len(facts_text)} bytes -> "
+                f"{len(facts_filtered)} after L3 section drop)\n```\n"
+                f"{facts_filtered[:2000]}\n```\n"
+            )
+
+    # decision.md
+    decision_path = pdir / "decision.md"
+    if decision_path.exists():
+        decision_text = decision_path.read_text(encoding="utf-8", errors="replace")
+        parts.append(
+            f"\n## decision.md ({len(decision_text)} bytes)\n```\n"
+            f"{decision_text[:800]}\n```\n"
+        )
+
+    # Sample artifact (1 file, first 20 lines only) — show SHAPE, not
+    # content. Large projects hit MiniMax M3 60-120s timeouts when the
+    # evidence block is too big; cap aggressively.
+    sample_paths: list[str] = []
+    for t in successful:
+        op = t.get("output_path")
+        if op and op not in sample_paths:
+            sample_paths.append(op)
+    if not sample_paths:
+        for cand in ("investigation.md", "report.md", "report.zh.md", "summary.md"):
+            if (pdir / cand).exists():
+                sample_paths.append(cand)
+                break
+    for sp in sample_paths[:1]:  # max 1 sample (was 2)
+        full = pdir / sp
+        if full.exists():
+            txt = full.read_text(encoding="utf-8", errors="replace")
+            head = "\n".join(txt.splitlines()[:20])  # was 50
+            parts.append(
+                f"\n## Sample artifact: {sp} "
+                f"({len(txt)} bytes, first 20 lines shown)\n```\n{head}\n```\n"
+            )
+
+    return "".join(parts)
+
+
+async def _call_llm_for_skill_synthesis(
+    evidence: str, llm_cfg: dict, skill_name: str
+) -> str:
+    """Call the LLM to synthesize a proper SKILL.md from the evidence.
+
+    Same httpx pattern as the auto-generate-procedure endpoint.
+    Strips `` reasoning traces and outer code-fence wrappers
+    defensively (the model sometimes adds them despite the prompt).
+    """
+    import httpx
+
+    base_url = (llm_cfg.get("base_url") or "https://api.minimax.io/v1").rstrip("/")
+    api_key = llm_cfg.get("api_key") or ""
+    model = llm_cfg.get("model") or "MiniMax-M3"
+    # Skill synthesis: need more headroom than the default 60s — the
+    # model may spend budget on its <think> trace before any real
+    # output, especially with longer evidence blocks. Use 120s.
+    timeout = float(llm_cfg.get("timeout_seconds") or 120)
+    if not api_key:
+        raise HTTPException(
+            503,
+            "LLM api_key not configured — set llm.api_key in config.yaml "
+            "before promoting projects to skills.",
+        )
+
+    prompt = _SKILL_SYNTHESIS_PROMPT.format(
+        _max=_SKILL_MAX_DESCRIPTION_CHARS,
+        evidence=evidence,
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You write production-quality SKILL.md files for Hermes "
+                    "Agent. Apply the 4-layer separation strictly. "
+                    "Output only the SKILL.md, no preamble, no code-fence "
+                    "wrappers. description MUST start with 'Use when' and be "
+                    f"≤ {_SKILL_MAX_DESCRIPTION_CHARS} chars. "
+                    "Do not emit any thinking/reasoning trace — output only "
+                    "the final SKILL.md content."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        # MiniMax M3 emits <think>...</think> reasoning trace that
+        # can eat 2-3K tokens before any actual content. Bump the
+        # max_tokens so there's room for both the thinking and a
+        # real SKILL.md (8-15KB target). 8000 leaves comfortable
+        # headroom; 12000 timed out at 120s in our test runs.
+        "max_tokens": 8000,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(
+            f"{base_url}/chat/completions", json=payload, headers=headers
+        )
+    if r.status_code != 200:
+        raise HTTPException(
+            502, f"LLM returned HTTP {r.status_code}: {r.text[:300]}"
+        )
+    data = r.json()
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise HTTPException(502, f"LLM response shape unexpected: {e}")
+    # Debug: log to server stderr so we can see what LLM returns
+    import sys as _sys
+    print(
+        f"[promote-to-skill] LLM response: text_len={len(text) if isinstance(text, str) else 'N/A'}, "
+        f"finish_reason={data['choices'][0].get('finish_reason')}, "
+        f"first_100={(text[:100] if isinstance(text, str) else 'N/A')!r}",
+        file=_sys.stderr,
+    )
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(502, f"LLM returned empty content (text type={type(text).__name__})")
+    # Strip reasoning traces
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    # Strip outer code fence (defensive — most models comply, some don't)
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    if not text.startswith("---"):
+        # Last-ditch fix: if the LLM wrapped the frontmatter with text
+        # before it, find the first `---` line and trim.
+        idx = text.find("\n---\n")
+        if idx == -1:
+            idx = text.find("---")
+        if idx > 0:
+            text = text[idx:].lstrip()
+    return text
+
+
+def _validate_skill_md(content: str, skill_name: str) -> tuple[bool, str]:
+    """Validate the LLM-produced SKILL.md against the 4-layer rules.
+
+    Returns (ok, error_message). On failure, the caller should refuse
+    to push the file and tell the user to re-run / hand-fix.
+
+    Checks (per the hermes Phase 5 anti-dump assertions, adapted):
+      1. Non-empty.
+      2. Starts with `---` (YAML frontmatter at byte 0).
+      3. Frontmatter parses as YAML mapping.
+      4. `name` == skill_name.
+      5. `description` present.
+      6. `description` starts with "Use when" (case-insensitive).
+      7. `description` ≤ 60 chars.
+      8. `metadata.hermes.related_skills` includes
+         `project-trace-to-skill-conversion`.
+      9. Body has no `[cite:`, no `task.completed@`, no
+         `DECISION: PASS/FAIL`, no `coord_pickup`,
+         no `iteration_completed@`.
+     10. Body has no L3-flavoured heading (e.g. `## Plan History`,
+         `## Coord Verdicts`).
+     11. File size ≤ 100 KB.
+    """
+    if not content or not content.strip():
+        return False, "empty content"
+    if not content.startswith("---\n"):
+        return False, "missing YAML frontmatter (must start with --- at byte 0)"
+    m = re.search(r"\n---\s*\n", content[3:])
+    if not m:
+        return False, "frontmatter not closed (no second --- line found)"
+    fm_text = content[3 : m.start() + 3]
+    try:
+        fm = yaml.safe_load(fm_text)
+    except yaml.YAMLError as e:
+        return False, f"YAML parse error in frontmatter: {e}"
+    if not isinstance(fm, dict):
+        return False, "frontmatter is not a YAML mapping"
+    for fld in ("name", "description"):
+        if fld not in fm or not str(fm.get(fld, "")).strip():
+            return False, f"frontmatter missing required field: {fld}"
+    if str(fm["name"]).strip() != skill_name:
+        # Soft check: the LLM may propose a more descriptive name
+        # (e.g. user asked for `bus` but LLM suggests `kmb-route-stops`).
+        # The actual file_path is fixed by the user (skills/<skill_name>/
+        # SKILL.md), so a frontmatter name mismatch is just a labelling
+        # nit — log a warning but accept.
+        import sys as _sys
+        print(
+            f"[promote-to-skill] NOTE: frontmatter name {fm['name']!r} "
+            f"differs from requested skill_name {skill_name!r} "
+            f"(file_path will use the requested one)",
+            file=_sys.stderr,
+        )
+    desc = str(fm["description"]).strip()
+    if not desc.lower().startswith("use when"):
+        return False, (
+            f"description must start with 'Use when' (got: {desc[:60]!r})"
+        )
+    if len(desc) > _SKILL_MAX_DESCRIPTION_CHARS:
+        return False, (
+            f"description too long: {len(desc)} chars > "
+            f"{_SKILL_MAX_DESCRIPTION_CHARS} max"
+        )
+    rh = (
+        fm.get("metadata", {})
+        .get("hermes", {})
+        .get("related_skills", [])
+    )
+    if not isinstance(rh, list) or "project-trace-to-skill-conversion" not in rh:
+        return False, (
+            "metadata.hermes.related_skills must include "
+            "'project-trace-to-skill-conversion' (the anti-pattern "
+            "propagation reference)"
+        )
+
+    body = content[m.end() + 3 :].strip()
+    body_lower = body.lower()
+    for token in _L3_LITERAL_TOKENS:
+        if token.lower() in body_lower:
+            return False, f"body still contains L3 token {token!r} (not dropped)"
+    heading_re = re.compile(r"^##\s+.*$", re.MULTILINE)
+    for heading in heading_re.findall(body):
+        h_lower = heading.lower()
+        for phrase in _L3_PHRASES:
+            if phrase in h_lower:
+                return False, f"body has L3-flavoured heading {heading!r}"
+
+    if len(content) > _SKILL_MAX_FILE_BYTES:
+        return False, (
+            f"file too large: {len(content)} bytes > "
+            f"{_SKILL_MAX_FILE_BYTES} cap"
+        )
+    return True, ""
+
