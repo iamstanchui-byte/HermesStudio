@@ -572,12 +572,23 @@ async def promote_project_to_skill(
         (project_id,),
     )
     if tasks:
+        # Filter to **successful** tasks only. A SKILL.md is meant to be
+        # re-run by a future agent; failed/skipped/cancelled tasks are
+        # dead-end paths that would mislead the next agent into trying
+        # the same approach. The original "Project Facts" cite below
+        # still mentions every task for traceability, but the reusable
+        # workflow shape should only show what actually worked.
+        successful_tasks = [
+            t for t in tasks
+            if (t.get("status") or "") in ("completed",)
+        ]
         parts.append("## Workflow steps\n")
-        for i, t in enumerate(tasks, 1):
+        for i, t in enumerate(successful_tasks, 1):
             tname = t.get("name") or t.get("action") or "task"
+            short_act = _short_action(t.get("action") or "?")
             parts.append(
-                f"{i}. **{tname}** (`{t.get('action') or '?'}`, "
-                f"role=`{t.get('agent_role') or '?'}`) — {t.get('status') or ''}"
+                f"{i}. **{tname}** (`{short_act}`, "
+                f"role=`{t.get('agent_role') or '?'}`)"
             )
             cleaned = _clean_task_result(t.get("result") or "")
             if cleaned:
@@ -585,6 +596,15 @@ async def promote_project_to_skill(
                 if len(cleaned) > 300:
                     snippet += "..."
                 parts.append(f"   - Result: {snippet}")
+        if not successful_tasks and tasks:
+            # All tasks failed (or were skipped/cancelled) — surface that
+            # honestly so a future agent doesn't expect a working
+            # workflow. Keep the original failed tasks listed so the
+            # cause is at least visible.
+            parts.append(
+                "_(no tasks completed successfully — see the Plan History / "
+                "Task Results citations below for what was attempted)_\n"
+            )
         parts.append("")
     # facts.md (curated L2 memory) — what the user cared about
     from hermes_orch.api.projects import _project_dir
@@ -609,7 +629,13 @@ async def promote_project_to_skill(
     # When to use: auto-generated from the project goal + workflow shape,
     # NOT a generic "use it when the user asks for a similar task" —
     # that's useless for an LLM trying to decide if it should match.
-    when_to_use = _render_when_to_use(proj, tasks)
+    # Pass only the successful tasks so the "Workflow: N step(s) — ..."
+    # line lists a clean reusable chain, not a 10-step blob with
+    # 2KB embedded task prompts and dead-end failed steps.
+    when_to_use = _render_when_to_use(
+        proj,
+        [t for t in tasks if (t.get("status") or "") == "completed"],
+    )
     parts.append("## When to use this skill\n")
     parts.append(when_to_use)
     skill_body = "\n".join(parts).strip() + "\n"
@@ -697,6 +723,58 @@ _PROJECT_CONTEXT_RE = re.compile(
     r"\n+---\s*(?:PROJECT CONTEXT|USER RECENT|WORKFLOW PROCEDURE).*$",
     re.DOTALL,
 )
+
+
+# Cap on the action string we print in the SKILL.md. Above this length
+# the LLM has clearly concatenated a full task prompt into
+# `tasks.action` (a planner-path bug we can't fix at the source yet).
+# The short form is what the Workflow list + When-to-use workflow line
+# actually want — the long form goes in the citation under "Key facts
+# learned" for traceability.
+_SHORT_ACTION_MAX = 30
+
+
+def _short_action(action: str) -> str:
+    """Return a SKILL.md-friendly short form of a `tasks.action` string.
+
+    The wrapper normally writes a short action like `fetch_weekly_weather`
+    or `investigate`, but on some LLM planner paths the whole task
+    prompt (2KB+) ends up in `tasks.action`. That blows up both the
+    Workflow list (1 entry eats 30+ lines) and the When-to-use
+    "Workflow: N step(s) — a -> b -> c" line (a single long action
+    makes the line unreadable).
+
+    Strategy:
+      1. Take the first line only (most prompts are multi-line; we
+         only want the headline).
+      2. If the head fits in _SHORT_ACTION_MAX, return as-is.
+         (Real action names like `cross_verify_and_compose_zh` are
+         27 chars — fine. Only the LLM-polluted ones blow past 30.)
+      3. If too long, try to cut on a separator (em-dash, double-dash,
+         single dash, colon, open paren) — these are the punctuation
+         marks the LLM uses to separate the action verb from its
+         description. The LLM-polluted strings almost always start
+         with the verb and then a separator (e.g.
+         `investigate — gather the data and context needed for X`).
+      4. If no separator found in the first _SHORT_ACTION_MAX chars,
+         hard-truncate to _SHORT_ACTION_MAX + "…".
+    """
+    if not action:
+        return ""
+    head = action.split("\n", 1)[0].strip()
+    if len(head) <= _SHORT_ACTION_MAX:
+        return head
+    # Try separator cut first — this catches the common
+    # "verb — description" pollution pattern
+    for sep in (" — ", " -- ", " - ", ": ", "(", " —", " --", " -"):
+        idx = head.find(sep)
+        if 0 < idx <= _SHORT_ACTION_MAX:
+            return head[:idx].rstrip() + "…"
+    # No separator: hard truncate
+    return head[:_SHORT_ACTION_MAX].rstrip() + "…"
+
+
+
 
 
 def _clean_task_result(raw: str) -> str:
@@ -797,8 +875,15 @@ def _render_when_to_use(proj: dict, tasks: list) -> str:
         quoted = goal if len(goal) <= 200 else goal[:200] + "..."
         parts.append(f"- Use when the user asks: **{quoted}**")
     # Workflow shape: list the action names in order so a future agent
-    # can see at a glance what kind of pipeline this is.
-    actions = [t.get("action") for t in tasks if t.get("action")]
+    # can see at a glance what kind of pipeline this is. Use
+    # _short_action() to truncate the LLM's verbose action strings
+    # (some planner paths concatenate the full task prompt into
+    # `tasks.action`, which would blow up the workflow line).
+    actions = [
+        _short_action(t.get("action") or "")
+        for t in tasks
+        if t.get("action")
+    ]
     if actions:
         arrow = " -> ".join(actions)
         parts.append(f"- Workflow: {len(actions)} step(s) — `{arrow}`")
