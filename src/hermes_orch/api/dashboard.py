@@ -806,11 +806,32 @@ async def project_page(
 
     # All profiles for role dropdown
     profile_rows = await db.fetchall(
-        "SELECT agent_id, name FROM agent_profiles ORDER BY agent_id, name"
+        "SELECT ap.id, ap.name, a.id AS agent_id, a.ip, a.os_type, a.secret_hash "
+        "FROM agent_profiles ap JOIN agents a ON a.id = ap.agent_id "
+        "ORDER BY a.id, ap.name"
     )
     all_profiles = [
-        {"agent_id": r["agent_id"], "name": r["name"]} for r in profile_rows
+        {"id": r["id"], "name": r["name"], "agent_id": r["agent_id"]}
+        for r in profile_rows
     ]
+    # Group by host for the promote-to-skill distribute modal. Each
+    # group is one agent with its profiles + a `verified` flag so the
+    # UI can badge unverified agents (no auth secret). `ip` is
+    # included as a secondary identifier when the agent_id is opaque
+    # (rare in practice but useful for remote hosts).
+    groups: dict[str, dict] = {}
+    for r in profile_rows:
+        aid = r["agent_id"]
+        if aid not in groups:
+            groups[aid] = {
+                "agent_id": aid,
+                "ip": r["ip"],
+                "os_type": r["os_type"],
+                "verified": bool(r["secret_hash"]),
+                "profiles": [],
+            }
+        groups[aid]["profiles"].append({"id": r["id"], "name": r["name"]})
+    all_profiles_grouped = list(groups.values())
     # SOUL presets for this project (so the page can show them inline + let
     # the user edit / apply each one)
     preset_rows = await db.fetchall(
@@ -867,6 +888,7 @@ async def project_page(
             "filter_limit": limit,
             "filter_offset": offset,
             "all_profiles": all_profiles,
+            "all_profiles_grouped": all_profiles_grouped,
             "soul_presets": soul_presets,
             "token_breakdown": token_breakdown,
             "token_total": token_total,

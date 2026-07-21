@@ -501,9 +501,21 @@ async def unmark_project_as_template(project_id: str, request: Request):
 # know how to do it." Best done on completed projects, but allowed on
 # any state — a half-finished project can still extract a useful lesson.
 
-class PromoteToSkillIn(BaseModel):
+class TargetAgent(BaseModel):
     agent_id: str
     profile_name: str
+
+
+class PromoteToSkillIn(BaseModel):
+    # Legacy single-target fields — kept for backward compat. If
+    # `target_agents` is omitted, the endpoint uses agent_id+profile_name
+    # as a single-target promote (the same as before).
+    agent_id: str | None = None
+    profile_name: str | None = None
+    # Optional multi-target distribute list. If `None` or empty,
+    # the endpoint promotes to ALL verified agents (default sync to all).
+    # Each entry must match an existing (agent_id, profile_name) pair.
+    target_agents: list[TargetAgent] | None = None
     skill_name: str = Field(..., min_length=2, max_length=40, pattern=r"^[a-z0-9][a-z0-9-]{1,40}$")
 
 
@@ -526,24 +538,19 @@ async def promote_project_to_skill(
     )
     if not proj:
         raise HTTPException(404, f"Project not found: {project_id}")
-    # Look up target profile. Must exist, must be verified (otherwise
-    # the wrapper won't accept our config push — no auth secret means
-    # the agent hasn't completed bootstrap).
-    target = await db.fetchone(
-        "SELECT ap.id, ap.name, a.id AS agent_id, a.status AS agent_status, a.secret_hash "
-        "FROM agent_profiles ap JOIN agents a ON a.id = ap.agent_id "
-        "WHERE ap.name = ? AND a.id = ?",
-        (body.profile_name, body.agent_id),
+    # Resolve the target list. If `target_agents` is provided, use
+    # it directly. Otherwise fall back to the legacy single-target
+    # `agent_id`+`profile_name` fields. If both are absent, default
+    # to "all verified agents and their profiles".
+    targets = await _resolve_target_agents(
+        db, body, request.app.state.config
     )
-    if not target:
-        raise HTTPException(
-            404, f"Profile not found: {body.agent_id}/{body.profile_name}"
-        )
-    if not target.get("secret_hash"):
+    if not targets:
         raise HTTPException(
             400,
-            f"Target agent '{body.agent_id}' has no auth secret — "
-            "register it first (or complete the bootstrap flow).",
+            "No target agents resolved — provide `target_agents` list, "
+            "or legacy `agent_id`+`profile_name`, or register at least "
+            "one verified agent.",
         )
     # LLM-driven synthesis path (Hermes 4-layer framework, see
     # https://hermes-agent/skills/software-development/project-trace-to-skill-conversion
@@ -584,37 +591,48 @@ async def promote_project_to_skill(
         )
     # Push via profile_configs — same flow as the agents router uses
     # for skills. The wrapper's apply-config loop writes it to
-    # <profile>/skills/<name>/SKILL.md.
-    skill_id = "skill-" + _secrets.token_hex(6)
-    await db.insert(
-        "profile_configs",
-        {
-            "id": skill_id,
-            "profile_id": target["id"],
-            "file_path": f"skills/{body.skill_name}/SKILL.md",
-            "desired_sha256": "",  # wrapper computes on apply
-            "desired_content": skill_body,
-            "status": "pending",
-        },
-    )
-    await audit_log(
-        db, "project.promoted_to_skill",
-        actor="operator",
-        project_id=project_id,
-        payload={
+    # <profile>/skills/<name>/SKILL.md. Multi-target distribute: insert
+    # one profile_configs row per target. The wrapper on each agent
+    # host picks up its own row on the next 30s config-sync tick.
+    distributed: list[dict] = []
+    for tgt in targets:
+        skill_id = "skill-" + _secrets.token_hex(6)
+        await db.insert(
+            "profile_configs",
+            {
+                "id": skill_id,
+                # Use `profile_id` (set by _resolve_target_agents' SQL
+                # alias); fall back to `id` for backward compat with
+                # the legacy single-target code path.
+                "profile_id": tgt.get("profile_id") or tgt.get("id"),
+                "file_path": f"skills/{body.skill_name}/SKILL.md",
+                "desired_sha256": "",  # wrapper computes on apply
+                "desired_content": skill_body,
+                "status": "pending",
+            },
+        )
+        await audit_log(
+            db, "project.promoted_to_skill",
+            actor="operator",
+            project_id=project_id,
+            payload={
+                "skill_id": skill_id,
+                "skill_name": body.skill_name,
+                "agent_id": tgt["agent_id"],
+                "profile_name": tgt["profile_name"],
+                "size": len(skill_body),
+            },
+        )
+        distributed.append({
             "skill_id": skill_id,
-            "skill_name": body.skill_name,
-            "agent_id": body.agent_id,
-            "profile_name": body.profile_name,
-            "size": len(skill_body),
-        },
-    )
+            "agent_id": tgt["agent_id"],
+            "profile_name": tgt["profile_name"],
+        })
     return {
-        "skill_id": skill_id,
         "skill_name": body.skill_name,
         "size": len(skill_body),
-        "agent_id": body.agent_id,
-        "profile_name": body.profile_name,
+        "target_count": len(distributed),
+        "distributed": distributed,
     }
 
 
@@ -835,6 +853,97 @@ def _render_when_to_use(proj: dict, tasks: list) -> str:
             f"- This skill captures the workflow from project `{proj['id']}`."
         )
     return "\n".join(parts) + "\n"
+
+
+async def _resolve_target_agents(
+    db, body: "PromoteToSkillIn", cfg: dict
+) -> list[dict]:
+    """Resolve the target agent list for promote-to-skill distribute.
+
+    Resolution order:
+      1. If `body.target_agents` is non-empty: validate each entry
+         (must exist + verified), return as-is.
+      2. Else if legacy `body.agent_id` + `body.profile_name` are
+         both provided: validate that single target, return as
+         a 1-element list.
+      3. Else: return ALL verified agents' profiles (default sync
+         to all). Each profile is included unless the agent is
+         in a 'not yet bootstrapped' state (no secret_hash).
+
+    Returns a list of dicts with shape:
+        {id, profile_id, agent_id, profile_name, agent_status, ip, secret_hash}
+    """
+    def _normalize(row: dict) -> dict:
+        """Re-key the SQL row to a stable shape used by the caller."""
+        if row is None:
+            return None
+        d = dict(row)
+        # SQL row uses `ap.name`; downstream code expects `profile_name`.
+        if "profile_name" not in d and "name" in d:
+            d["profile_name"] = d["name"]
+        return d
+
+    # Case 1: explicit list
+    if body.target_agents:
+        out: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for t in body.target_agents:
+            key = (t.agent_id, t.profile_name)
+            if key in seen:
+                continue  # de-dupe if user listed the same target twice
+            seen.add(key)
+            row = await db.fetchone(
+                "SELECT ap.id AS profile_id, ap.name, a.id AS agent_id, "
+                "a.status AS agent_status, a.ip, a.secret_hash "
+                "FROM agent_profiles ap JOIN agents a ON a.id = ap.agent_id "
+                "WHERE ap.name = ? AND a.id = ?",
+                (t.profile_name, t.agent_id),
+            )
+            row = _normalize(row)
+            if not row:
+                raise HTTPException(
+                    404,
+                    f"Profile not found: {t.agent_id}/{t.profile_name}",
+                )
+            if not row.get("secret_hash"):
+                raise HTTPException(
+                    400,
+                    f"Target agent '{t.agent_id}' has no auth secret — "
+                    "register it first (or complete the bootstrap flow).",
+                )
+            out.append(row)
+        return out
+    # Case 2: legacy single-target fields
+    if body.agent_id and body.profile_name:
+        row = await db.fetchone(
+            "SELECT ap.id AS profile_id, ap.name, a.id AS agent_id, "
+            "a.status AS agent_status, a.ip, a.secret_hash "
+            "FROM agent_profiles ap JOIN agents a ON a.id = ap.agent_id "
+            "WHERE ap.name = ? AND a.id = ?",
+            (body.profile_name, body.agent_id),
+        )
+        row = _normalize(row)
+        if not row:
+            raise HTTPException(
+                404,
+                f"Profile not found: {body.agent_id}/{body.profile_name}",
+            )
+        if not row.get("secret_hash"):
+            raise HTTPException(
+                400,
+                f"Target agent '{body.agent_id}' has no auth secret — "
+                "register it first (or complete the bootstrap flow).",
+            )
+        return [row]
+    # Case 3: default to ALL verified agents' profiles
+    rows = await db.fetchall(
+        "SELECT ap.id AS profile_id, ap.name, a.id AS agent_id, "
+        "a.status AS agent_status, a.ip, a.secret_hash "
+        "FROM agent_profiles ap JOIN agents a ON a.id = ap.agent_id "
+        "WHERE a.secret_hash IS NOT NULL AND a.secret_hash != '' "
+        "ORDER BY a.id, ap.name"
+    )
+    return [_normalize(r) for r in rows]
 
 
 # ===== LLM-driven promote-to-skill (hermes 4-layer framework) =====

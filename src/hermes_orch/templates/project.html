@@ -548,6 +548,7 @@ function fallbackCopy(text, btn) {
 }
 
 const PROJECT_ID = "{{ project.id }}";
+const PROJECT_NAME = {{ (project.name or project.id) | tojson }};
 
 // PROJECT_ID is in scope from here down. Safe to call loadProcedure.
 loadProcedure();
@@ -787,55 +788,86 @@ async function autoGenerateProcedure() {
     }
 }
 
-// ===== Promote to skill (Path B, #22) =====
-// Render this project's plan + facts as a SKILL.md and push it to a
-// selected profile. After this, the target profile's hermes agent will
-// see the skill in its available-skills list and can use it for matching
-// tasks. Useful for "I just did X once, now let agents in any project
-// know how to do X".
+// ===== Promote to skill (Path B, #22 + Stage 2a multi-target distribute) =====
+function openPromoteModal() {
+    // Pre-fill skill name from project name if it fits the pattern
+    const nameInput = document.getElementById('promote-skill-name');
+    if (!nameInput.value) {
+        const projectName = (window.PROJECT_NAME || '').toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 40);
+        if (projectName && /^[a-z0-9][a-z0-9-]{1,40}$/.test(projectName)) {
+            nameInput.value = projectName;
+        }
+    }
+    document.getElementById('promote-status').textContent = '';
+    document.getElementById('promote-modal-overlay').classList.remove('hidden');
+}
+function closePromoteModal() {
+    document.getElementById('promote-modal-overlay').classList.add('hidden');
+}
+function promoteCheckAll(checked) {
+    document.querySelectorAll('.promote-target-cb').forEach(cb => {
+        if (!cb.disabled) cb.checked = checked;
+    });
+}
 async function promoteToSkill() {
-    // Pick the target profile. We hardcode the 4 known profiles for
-    // demo simplicity; a real install would let the user pick from a
-    // dynamic list via GET /api/agents/ but for now this is enough.
-    const profiles = {{ all_profiles | tojson }};
-    if (profiles.length === 0) {
-        alert("No profiles registered yet. Add an agent first.");
-        return;
-    }
-    const opts = profiles.map((p, i) => `${i+1}. ${p.agent_id} / ${p.name}`).join('\n');
-    const choice = prompt(
-        `Promote this project to a SKILL.md.\n\n` +
-        `Pick a target profile (number):\n${opts}\n\n` +
-        `The skill will be named after the project (lowercased, dashes).`,
-        "1"
-    );
-    if (!choice) return;
-    const idx = parseInt(choice, 10) - 1;
-    if (isNaN(idx) || idx < 0 || idx >= profiles.length) {
-        alert("Invalid choice");
-        return;
-    }
-    const target = profiles[idx];
-    const skillName = (prompt("Skill name (filename-safe, e.g. 'weather-report'):") || "").trim();
-    if (!skillName) return;
+    // Legacy entry point — the old prompt()-based single-target flow
+    // is replaced by the multi-target modal. The button onclick
+    // still calls promoteToSkill() for backward compat; we just open
+    // the modal here.
+    openPromoteModal();
+}
+async function submitPromote() {
+    const skillName = (document.getElementById('promote-skill-name').value || '').trim();
     if (!/^[a-z0-9][a-z0-9-]{1,40}$/.test(skillName)) {
-        alert("Invalid name. Use lowercase letters, digits, dashes. e.g. 'weather-report'");
+        alert("Invalid skill name. Use lowercase letters, digits, dashes. e.g. 'kmb-route-stops'");
         return;
     }
+    const targets = Array.from(document.querySelectorAll('.promote-target-cb:checked'))
+        .map(cb => {
+            const [agent_id, profile_name] = cb.value.split('|');
+            return { agent_id, profile_name };
+        });
+    if (targets.length === 0) {
+        alert("Pick at least one target profile (or click 'Select all').");
+        return;
+    }
+    const btn = document.getElementById('promote-submit-btn');
+    const status = document.getElementById('promote-status');
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '... LLM synthesizing ...';
+    status.textContent = `Synthesizing SKILL.md from project ${PROJECT_ID} and pushing to ${targets.length} target(s). Typically 30-90s.`;
+    status.className = 'text-sm text-gray-500 ml-2';
     try {
         const r = await fetch(`/api/schedules/project/${PROJECT_ID}/promote-to-skill`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({agent_id: target.agent_id, profile_name: target.name, skill_name: skillName}),
+            body: JSON.stringify({skill_name: skillName, target_agents: targets}),
         });
         if (!r.ok) {
             const err = await r.json().catch(() => ({}));
             throw new Error(err.detail || `HTTP ${r.status}`);
         }
         const data = await r.json();
-        alert(`Skill registered. ${data.skill_id || skillName} will land on the agent host within ~30s.`);
+        const lines = (data.distributed || []).map(t => `  - ${t.agent_id} / ${t.profile_name}`).join('\n');
+        status.textContent = `Done. ${data.target_count} target(s) updated. SKILL.md will land on each agent host within ~30s.`;
+        status.className = 'text-sm text-green-600 ml-2';
+        alert(
+            `Skill "${data.skill_name}" (${data.size} bytes) registered for ${data.target_count} target(s):\n\n` +
+            lines +
+            `\n\nEach agent will see it in its available-skills list within ~30s.`
+        );
+        // Don't auto-close — user may want to verify the targets.
     } catch (e) {
+        status.textContent = 'Error: ' + e.message;
+        status.className = 'text-sm text-red-600 ml-2';
         alert("Promote-to-skill failed: " + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
     }
 }
 
@@ -1225,6 +1257,78 @@ async function deletePreset(agentId, profileName, btn) {
                     Cancel
                 </button>
                 <span id="replan-status" class="text-sm text-gray-500 ml-2"></span>
+            </div>
+        </form>
+    </div>
+</div>
+
+
+<!-- ===== Promote to skill modal (#22 Stage 2a — multi-target distribute) =====
+     Group by host. Default: every verified profile is checked. User can
+     uncheck individual profiles or whole hosts. Skill body is LLM-
+     synthesized once and pushed as a single profile_configs row per
+     checked target (one row per (profile_id, file_path)). -->
+<div id="promote-modal-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center" style="background-color: rgba(0,0,0,0.5);">
+    <div class="bg-white rounded-lg shadow-xl max-w-xl w-full mx-4 max-h-screen overflow-y-auto">
+        <form id="promote-form" onsubmit="event.preventDefault(); submitPromote();" class="p-5">
+            <h2 class="text-lg font-semibold text-gray-800 mb-1">&#x2728; Promote to skill</h2>
+            <p class="text-sm text-gray-500 mb-4">
+                Render this project as a SKILL.md (LLM-synthesized) and push to the checked profiles. The agent on each profile sees the skill within ~30s.
+            </p>
+
+            <label class="block text-sm font-medium text-gray-700 mb-1">
+                Skill name <span class="text-red-500">*</span>
+            </label>
+            <input id="promote-skill-name" name="skill_name" required
+                pattern="^[a-z0-9][a-z0-9-]{1,40}$"
+                class="mt-1 mb-3 block w-full border rounded px-2 py-1 text-sm font-mono"
+                placeholder="e.g. kmb-route-stops">
+            <p class="text-xs text-gray-500 -mt-2 mb-3">lowercase letters, digits, dashes; max 40 chars; matches the file path <code>skills/&lt;name&gt;/SKILL.md</code></p>
+
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-sm font-semibold text-gray-800">Target agents</h3>
+                <div class="flex items-center gap-2 text-xs">
+                    <button type="button" onclick="promoteCheckAll(true)" class="px-2 py-0.5 border border-gray-300 rounded text-gray-600 hover:bg-gray-50">Select all</button>
+                    <button type="button" onclick="promoteCheckAll(false)" class="px-2 py-0.5 border border-gray-300 rounded text-gray-600 hover:bg-gray-50">Clear</button>
+                </div>
+            </div>
+            <div class="border rounded p-2 max-h-72 overflow-y-auto bg-gray-50">
+                {% if all_profiles_grouped %}
+                    {% for g in all_profiles_grouped %}
+                    <fieldset class="mb-2 last:mb-0">
+                        <legend class="text-xs font-medium text-gray-700 flex items-center gap-2">
+                            <span>{{ g.agent_id }}{% if g.ip and g.ip != g.agent_id %} <span class="text-gray-400">({{ g.ip }})</span>{% endif %}{% if g.os_type %} <span class="text-gray-400">[{{ g.os_type }}]</span>{% endif %}</span>
+                            <span class="text-gray-400">({{ g.profiles|length }} profile{{ 's' if g.profiles|length > 1 }})</span>
+                            {% if not g.verified %}
+                            <span class="text-red-600 font-normal">[unverified &mdash; skip]</span>
+                            {% endif %}
+                        </legend>
+                        <div class="ml-3">
+                        {% for p in g.profiles %}
+                            <label class="flex items-center gap-2 text-xs text-gray-700 py-0.5">
+                                <input type="checkbox" name="promote-target"
+                                    value="{{ g.agent_id }}|{{ p.name }}"
+                                    class="promote-target-cb rounded"
+                                    {% if g.verified %}checked{% else %}disabled{% endif %}>
+                                <span class="font-mono">{{ p.name }}</span>
+                            </label>
+                        {% endfor %}
+                        </div>
+                    </fieldset>
+                    {% endfor %}
+                {% else %}
+                    <p class="text-xs text-gray-500 italic">No agents registered yet.</p>
+                {% endif %}
+            </div>
+
+            <div class="mt-4 flex items-center gap-2">
+                <button id="promote-submit-btn" type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded text-sm hover:bg-indigo-700">
+                    Promote
+                </button>
+                <button type="button" onclick="closePromoteModal()" class="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm hover:bg-gray-200">
+                    Cancel
+                </button>
+                <span id="promote-status" class="text-sm text-gray-500 ml-2"></span>
             </div>
         </form>
     </div>
