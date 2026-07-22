@@ -859,14 +859,28 @@ async def update_profile(
     if body.storage_refs is not None:
         # Validate each entry: kind non-empty, ref non-empty. Drop
         # malformed entries silently rather than 400 (operator can
-        # fix the bad entry from the UI).
+        # fix the bad entry from the UI). body.storage_refs is
+        # list[StorageRef] (Pydantic models) — access via attribute,
+        # not dict key. Defensive: also handle the dict case in case
+        # a non-Pydantic caller sends raw dicts.
         cleaned_refs: list[dict] = []
         for s in body.storage_refs:
-            if isinstance(s, dict) and s.get("kind") and s.get("ref"):
+            if isinstance(s, dict):
+                kind = s.get("kind")
+                ref = s.get("ref")
+                desc = s.get("description", "")
+            elif hasattr(s, "kind"):
+                # Pydantic v2 StorageRef
+                kind = getattr(s, "kind", None)
+                ref = getattr(s, "ref", None)
+                desc = getattr(s, "description", "")
+            else:
+                continue
+            if kind and ref:
                 cleaned_refs.append({
-                    "kind": str(s["kind"]),
-                    "ref": str(s["ref"]),
-                    "description": str(s.get("description", "")),
+                    "kind": str(kind),
+                    "ref": str(ref),
+                    "description": str(desc) if desc else "",
                 })
         await db.execute(
             "UPDATE agent_profiles SET storage_refs = ? WHERE id = ?",

@@ -1590,6 +1590,16 @@ def start(
                 proc = subprocess.Popen(
                     hermes_args,
                     cwd=hermes_cwd,
+                    # DEVNULL stdin prevents hermes's dep_ensure.py
+                    # `input("Install now? [Y/n] ")` from hanging on a
+                    # closed stdin (NSSM service context has no
+                    # controlling terminal). When isatty() returns
+                    # False, hermes skips the prompt and proceeds
+                    # to install attempt. The transcript log
+                    # (hermes.{tid}.stdout.log) still captures any
+                    # later output, so the user can review what
+                    # happened even if install fails.
+                    stdin=subprocess.DEVNULL,
                     stdout=stdout_fh,
                     stderr=stderr_fh,
                     # env=...: force UTF-8 output from hermes even on Windows
