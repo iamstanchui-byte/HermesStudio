@@ -238,27 +238,40 @@ class Supervisor:
         except Exception as e:
             log.debug(f"stale-agent scan failed: {e}")
 
-        # Stuck-task check: if a 'running' task's assigned agent is
-        # stale (>3 min no heartbeat), the wrapper probably died
-        # mid-task. Mark the task as failed so the project can move
-        # on (otherwise it sits in 'running' forever and the iter
-        # loop's `nonterm` check blocks further progress).
+        # Stuck-task check: if a 'running' task's last_liveness_at is
+        # stale (>3 min), the wrapper has either died, lost network,
+        # or its liveness poller is hung. Mark the task as failed so
+        # the project can move on (otherwise it sits in 'running'
+        # forever and the iter loop's `nonterm` check blocks further
+        # progress).
+        #
+        # Why task.last_liveness_at (not agents.last_heartbeat_at):
+        #   The wrapper runs a background heartbeat thread
+        #   (commit 983a364, 2s interval) so the agent's heartbeat
+        #   is ALWAYS fresh as long as the wrapper process is alive.
+        #   But a hung hermes subprocess (PIPE deadlock, infinite
+        #   loop in LLM, etc.) won't update task.last_liveness_at
+        #   because the liveness poller hangs in the same Python
+        #   process. So task.last_liveness_at is the more accurate
+        #   signal for "this specific task is making progress".
+        #   Old logic (agent heartbeat stale) would NEVER trigger
+        #   while the wrapper is alive — the bug that hid proj-7a85ab48
+        #   for hours.
         try:
             from datetime import timedelta
             stuck_cutoff = (now_aware() - timedelta(seconds=180)).isoformat()
-            # Find stuck tasks: assigned to a verified agent whose
-            # last_heartbeat is older than 3 min. (Note: 'stale' status
-            # is the more recent flip; we also catch agents that never
-            # got flipped yet because the stale-agent check above runs
-            # every tick but the agent's heartbeat has been stale for
-            # >90s. The 180s threshold gives the stale-flip a chance
-            # to land first.)
+            # Find stuck tasks: running tasks whose last_liveness_at
+            # is older than 3 min (or NULL — i.e. never polled).
+            # The wrapper's liveness poller hits /api/tasks/{id}/poll
+            # every 30s, so any task that's been silent for >3 min is
+            # genuinely stuck (the wrapper is either dead or its
+            # poller is blocked).
             stuck_tasks = await self.db.fetchall(
                 "SELECT t.id, t.project_id, t.name, t.assigned_agent_id, "
-                "a.last_heartbeat_at "
-                "FROM tasks t JOIN agents a ON a.id = t.assigned_agent_id "
+                "t.last_liveness_at, t.updated_at "
+                "FROM tasks t "
                 "WHERE t.status = 'running' "
-                "AND a.last_heartbeat_at < ?",
+                "AND (t.last_liveness_at IS NULL OR t.last_liveness_at < ?)",
                 (stuck_cutoff,),
             )
             for st in stuck_tasks:
@@ -282,13 +295,14 @@ class Supervisor:
                     payload={
                         "name": st["name"],
                         "assigned_agent_id": st["assigned_agent_id"],
-                        "last_heartbeat_at": st["last_heartbeat_at"],
-                        "reason": "wrapper heartbeat stale > 3min; marking failed",
+                        "last_liveness_at": st["last_liveness_at"],
+                        "updated_at": st["updated_at"],
+                        "reason": "task last_liveness_at stale > 3min; marking failed",
                     },
                 )
                 log.warning(
                     f"task {st['id']} ({st['name']}) marked failed: "
-                    f"wrapper heartbeat stale"
+                    f"last_liveness_at > 3min stale"
                 )
         except Exception as e:
             log.exception(f"stuck-task scan failed: {e}")

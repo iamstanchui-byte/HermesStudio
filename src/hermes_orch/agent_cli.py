@@ -1463,26 +1463,49 @@ def start(
             except Exception as e:
                 click.echo(f"  WARN: session lookup failed: {e}")
 
-        # Use Popen + communicate (NOT subprocess.run with capture_output=True).
-        # On Windows, subprocess.run's reader threads can throw OSError after
-        # the child exits, crashing the daemon. Popen + communicate is safer.
+        # Run hermes with stdout/stderr redirected to FILES, NOT PIPE.
         #
-        # Use bytes mode (text=False) + explicit UTF-8 decode. On Windows,
-        # `text=True` would use cp1252 and choke on hermes's UTF-8 / box-drawing
-        # / Chinese output. With bytes mode, we get raw bytes and can decode
-        # safely with errors='replace'.
+        # Why files (not PIPE):
+        #   subprocess.PIPE has a 64KB kernel buffer. When the LLM
+        #   streams ~9K+ output tokens (typical for a multi-tool
+        #   task like a Google Drive query), the buffer fills and
+        #   hermes's stdout write() BLOCKS. Meanwhile the wrapper
+        #   is in `proc.communicate()` waiting for hermes to exit
+        #   before reading — classic deadlock. The 1800s timeout
+        #   kills hermes and we get `error: hermes timeout after
+        #   1800s` even though the agent was making real progress.
+        #
+        # With file redirection, the OS handles the buffering (write
+        # goes to disk, hermes never blocks on output). We get the
+        # full transcript on disk for review. The liveness poller
+        # (separate thread) keeps the server informed of progress
+        # regardless of stdout size.
         try:
             # Run hermes in the local cache dir so file tools work there
             # (the agent sees a real filesystem; we sync via API).
             hermes_cwd = str(cache_dir) if cache_dir else str(profile_root)
-            proc = subprocess.Popen(
-                hermes_args,
-                cwd=hermes_cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                # env=...: force UTF-8 output from hermes even on Windows
-                env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
-            )
+            # Per-task transcript files. Persisted on disk so the user
+            # can review what the agent actually said/did after a
+            # timeout (the prior PIPE approach lost all output on
+            # deadlock). Rotation by tid keeps names short + unique.
+            stdout_log = Path(hermes_cwd) / f"hermes.{tid}.stdout.log"
+            stderr_log = Path(hermes_cwd) / f"hermes.{tid}.stderr.log"
+            stdout_fh = open(stdout_log, "wb")
+            stderr_fh = open(stderr_log, "wb")
+            try:
+                proc = subprocess.Popen(
+                    hermes_args,
+                    cwd=hermes_cwd,
+                    stdout=stdout_fh,
+                    stderr=stderr_fh,
+                    # env=...: force UTF-8 output from hermes even on Windows
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+                )
+            except BaseException:
+                # If Popen fails, close the file handles we opened
+                stdout_fh.close()
+                stderr_fh.close()
+                raise
         except FileNotFoundError:
             return {
                 "status": "failed",
@@ -1541,30 +1564,70 @@ def start(
 
         try:
             try:
-                raw_stdout, raw_stderr = proc.communicate(timeout=timeout)
+                # proc.wait() does NOT touch stdout/stderr (those go to
+                # files), so it never deadlocks on the PIPE-buffer issue.
+                # We just wait for hermes to exit, up to `timeout` seconds.
+                rc = proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 try:
-                    proc.communicate(timeout=5)
+                    proc.wait(timeout=5)
                 except Exception:
                     pass
                 # stop the liveness poller before any other handling
                 stop_poll.set()
-                return {"status": "failed", "error": f"hermes timeout after {timeout}s"}
+                # Close file handles so the buffered output is flushed
+                try:
+                    stdout_fh.close()
+                    stderr_fh.close()
+                except Exception:
+                    pass
+                return {"status": "failed", "error": f"hermes timeout after {timeout}s. See {stdout_log.name} for full transcript."}
+            # Close file handles — Python flushes its userspace buffer
+            # on close, so we get the complete transcript on disk.
+            stdout_fh.close()
+            stderr_fh.close()
+            # Read transcripts back from disk. Cap at 100KB in memory
+            # (the full file is on disk for review). _clean_hermes_output
+            # further truncates to MAX_SUMMARY_CHARS (32KB) before
+            # storing in the DB. The 100KB ceiling here protects us
+            # from OOM on absurd outputs (100MB log, recursive loop, etc.)
+            # while still preserving the LLM's actual conclusion at the end.
+            MAX_INPROC_READ_BYTES = 100 * 1024  # 100KB cap
+            try:
+                raw = stdout_log.read_bytes()
+                if len(raw) > MAX_INPROC_READ_BYTES:
+                    # Take TAIL — that's where the agent's actual conclusion
+                    # is. The start is typically the prompt echo (handled by
+                    # _strip_prompt_echo) and progress logs. Cleaner keeps
+                    # the agent's last messages.
+                    stdout_bytes = raw[-MAX_INPROC_READ_BYTES:]
+                else:
+                    stdout_bytes = raw
+            except Exception as e:
+                stdout_bytes = f"<read failed: {e}>".encode("utf-8", errors="replace")
+            try:
+                raw = stderr_log.read_bytes()
+                stderr_bytes = raw[-MAX_INPROC_READ_BYTES:] if len(raw) > MAX_INPROC_READ_BYTES else raw
+            except Exception as e:
+                stderr_bytes = f"<read failed: {e}>".encode("utf-8", errors="replace")
             # Decode bytes as UTF-8, replacing bad chars (Windows consoles can
             # produce mixed encodings in edge cases)
             try:
-                stdout = raw_stdout.decode("utf-8", errors="replace")
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
             except Exception:
-                stdout = raw_stdout.decode("cp1252", errors="replace")
+                stdout = stdout_bytes.decode("cp1252", errors="replace")
             try:
-                stderr = raw_stderr.decode("utf-8", errors="replace")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
             except Exception:
-                stderr = raw_stderr.decode("cp1252", errors="replace")
+                stderr = stderr_bytes.decode("cp1252", errors="replace")
             stdout = (stdout or "").strip()
             stderr = (stderr or "").strip()
-            rc = proc.returncode
-            click.echo(f"  exit={rc} stdout_len={len(stdout)} stderr_len={len(stderr)}")
+            click.echo(
+                f"  exit={rc} stdout_len={len(stdout_bytes)} (cap {MAX_STDOUT_READ_BYTES}) "
+                f"stderr_len={len(stderr_bytes)}"
+            )
+            click.echo(f"  full transcript: {stdout_log}")
 
             # Save session_id to the project for future resume.
             # Hermes prints "Session: <id>" near the end of its output.
@@ -1742,10 +1805,19 @@ def start(
             stop_poll.set()
             return failed_result
         except Exception as e:
-            # Catch-all: Popen.communicate can throw on Windows if the child
-            # process closes pipes abruptly. Treat as a task failure.
+            # Catch-all: proc.wait() can throw on Windows if the child
+            # process closes handles abruptly. Also try to close our
+            # file handles so the partial transcript gets flushed.
             try:
                 proc.kill()
+            except Exception:
+                pass
+            try:
+                stdout_fh.close()
+            except Exception:
+                pass
+            try:
+                stderr_fh.close()
             except Exception:
                 pass
             return {"status": "failed", "error": f"{type(e).__name__}: {e}"}
