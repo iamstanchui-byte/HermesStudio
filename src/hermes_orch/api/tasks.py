@@ -422,8 +422,23 @@ async def submit_result(task_id: str, body: TaskResult, request: Request) -> Tas
     # Auto-register artifact if the task declared an output_path and the
     # wrapper attached an artifact entry to the result. (The wrapper computes
     # sha256 + size before submitting.)
+    #
+    # Defense in depth: dedupe the artifacts list by (path, sha256) before
+    # iterating. If the wrapper accidentally sends the same file twice
+    # (e.g., a merge bug in the auto-upload loop, fixed 2026-07-22), we
+    # still produce one artifact row per (path, sha) pair. First occurrence
+    # wins (path/sha order in the list is preserved).
     if body.status == "completed" and body.artifacts:
+        seen_artifacts: set[tuple[str, str]] = set()
+        deduped_artifacts: list[dict[str, Any]] = []
         for art in body.artifacts:
+            key = (art.get("path", ""), art.get("sha256", "") or "")
+            if key in seen_artifacts:
+                continue
+            seen_artifacts.add(key)
+            deduped_artifacts.append(art)
+        artifacts_to_register = deduped_artifacts
+        for art in artifacts_to_register:
             try:
                 # Wrapper sends either {"path": "rel/path", "size_bytes": N, "sha256": "..."}
                 # or the legacy {"path": "rel", "absolute_path": "abs"}.

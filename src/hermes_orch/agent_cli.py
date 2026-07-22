@@ -2017,14 +2017,16 @@ def start(
                                 click.echo(f"  WARN: auto-upload {rel} error: {e}")
                     except Exception as e:
                         click.echo(f"  WARN: auto-upload scan error: {e}")
-                    # Merge extras into the result
+                    # Merge auto-uploaded artifacts into the result so the
+                    # server can register them in the artifacts table. Merge
+                    # each list EXACTLY ONCE — extending twice causes duplicate
+                    # artifact rows in the DB (caught 2026-07-22: 6 files
+                    # produced 12 artifact.registered audit events, server
+                    # registered 12 artifact rows for the 6 unique files).
                     if artifacts_extra:
                         result.setdefault("artifacts", []).extend(artifacts_extra)
                     if skipped_extra:
                         result.setdefault("skipped_artifacts", []).extend(skipped_extra)
-                    # Merge extra artifacts into the result
-                    if artifacts_extra:
-                        result.setdefault("artifacts", []).extend(artifacts_extra)
                 # Capture hermes session tokens (input/output/cache/etc) from
                 # the profile's state.db so the orchestrator can record real
                 # per-task token usage. Best-effort: returns None if the
