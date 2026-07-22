@@ -108,6 +108,49 @@ def _read_secret(secret_path: Path) -> str:
 MAX_SUMMARY_CHARS = 32_000
 
 
+# Module-level cache of per-profile storage_refs. Populated by
+# _heartbeat (the server returns it in the heartbeat response),
+# read by _run_task to build the [AVAILABLE STORAGE] block in
+# the task prompt. Cleared on every heartbeat tick (so operator
+# edits to storage_refs in the dashboard propagate within 5s).
+_storage_refs_cache: dict[str, list[dict]] = {}
+
+
+def _render_storage_block(role: str) -> str:
+    """Render the [AVAILABLE STORAGE] block for the task prompt.
+
+    Pulls from `_storage_refs_cache` (populated by heartbeat) for
+    the given profile role. If empty, returns "" (block omitted).
+    Each entry is rendered as `- [kind] ref (description)` so the
+    agent knows which storage target to use for what.
+
+    The 15MB orch cap means the agent must write large outputs
+    to one of these paths directly. Per orch-as-coordinator
+    principle (2026-07-22): orch stores metadata, agent stores
+    data.
+    """
+    refs = _storage_refs_cache.get(role) or []
+    if not refs:
+        return ""
+    lines = [
+        "--- AVAILABLE STORAGE (for outputs > 15MB; orch cap below) ---",
+        "Per orch policy, the orchestrator's project share folder is for",
+        "metadata + small files (cap 15MB per file). For LARGE outputs,",
+        "write directly to one of these paths and only store a reference",
+        "in your task result. Choose by kind:",
+    ]
+    for s in refs:
+        kind = s.get("kind", "?")
+        ref = s.get("ref", "?")
+        desc = s.get("description", "").strip()
+        line = f"  - [{kind}] {ref}"
+        if desc:
+            line += f"  ({desc})"
+        lines.append(line)
+    lines.append("--- END AVAILABLE STORAGE ---")
+    return "\n".join(lines)
+
+
 def _atomic_write(target: Path, content: str) -> None:
     """Atomic write: write to .tmp then rename. Survives partial writes.
 
@@ -304,7 +347,7 @@ def _strip_prompt_echo(s: str) -> str:
     """Strip the prompt template echo that hermes prepends to its output.
 
     The wrapper builds the prompt as:
-        {action}({params})\\n\\n--- PROJECT CONTEXT ---\\n{context_block}\\n--- END CONTEXT ---
+        {action}({params})\\n\\n[AVAILABLE STORAGE block]\\n\\n--- PROJECT CONTEXT ---\\n{context_block}\\n--- END CONTEXT ---
 
     Hermes echoes this prompt at the top of its stdout (because it was the
     system message it received), so without stripping, the orchestrator's
@@ -313,15 +356,34 @@ def _strip_prompt_echo(s: str) -> str:
     from the human reader's perspective and pollutes the L2 (facts.md)
     Task Results section that gets injected into future task prompts.
 
-    Strategy: only strip if the markers are near the start (first ~1500
-    chars) -- if the body of the analysis references these strings later
-    in the output, we leave them alone.
+    We strip the LAST prompt-echo closing marker found near the start
+    of the output (whichever comes last: END AVAILABLE STORAGE or
+    END CONTEXT). Order matters: the storage block is prepended BEFORE
+    the PROJECT CONTEXT block, so the END marker that's deeper in the
+    output is the right one to strip up to.
+
+    Strategy: only strip if the markers are near the start (first ~2500
+    chars -- bigger to accommodate the storage block) -- if the body of
+    the analysis references these strings later in the output, we
+    leave them alone.
     """
-    head = s[:1500]
-    # If we find the closing marker near the start, drop everything up to it
-    m = re.search(r"\s*--- END CONTEXT ---\s*\n", head)
-    if m:
-        return s[m.end():].lstrip()
+    head = s[:2500]
+    # Find the LAST closing marker in the first 2500 chars. Each marker
+    # is associated with a block that the agent shouldn't have echoed
+    # in the first place. Strip everything up to and including the
+    # deepest closing marker.
+    end_markers = [
+        r"\s*--- END AVAILABLE STORAGE ---\s*\n",
+        r"\s*--- END CONTEXT ---\s*\n",
+    ]
+    last_end = -1
+    last_end_pos = 0
+    for marker in end_markers:
+        m = re.search(marker, head)
+        if m and m.end() > last_end_pos:
+            last_end_pos = m.end()
+    if last_end_pos > 0:
+        return s[last_end_pos:].lstrip()
     # If only "Query: ..." is at the start, drop that single line
     s = re.sub(r"^Query:[^\n]*\n\n?", "", s, count=1)
     return s
@@ -1028,6 +1090,14 @@ def start(
         is cheap (~few KB YAML files) and ensures the dashboard stays
         in sync with the live config (e.g. user adds a new MCP server,
         it shows up within 5s without a wrapper restart).
+
+        Also pulls per-profile `storage_refs` from the response
+        (user-stated 2026-07-22): the orchestrator returns
+        `storage_refs_by_profile: {profile_name: [{kind, ref, description}, ...]}`.
+        The wrapper caches this in a module-level dict and the
+        `_run_task` function injects an [AVAILABLE STORAGE] block into
+        the task prompt so the agent knows where to write large
+        outputs (bypassing the 15MB per-file orch cap).
         """
         profile_meta: list[dict] = []
         for role, pcfg in (profiles_cfg or {}).items():
@@ -1061,6 +1131,14 @@ def start(
                 click.echo(f"[daemon] heartbeat {r.status_code}: {r.text[:200]}")
                 return [], []
             body = r.json() or {}
+            # Cache storage_refs keyed by profile name. _run_task
+            # reads from this dict when building the prompt.
+            srefs = body.get("storage_refs_by_profile") or {}
+            if isinstance(srefs, dict):
+                _storage_refs_cache.clear()
+                for pname, refs in srefs.items():
+                    if isinstance(refs, list):
+                        _storage_refs_cache[str(pname)] = refs
             return body.get("tasks", []), body.get("cleanup_session_ids", []) or []
         except httpx.RequestError as e:
             click.echo(f"[daemon] heartbeat failed: {e}")
@@ -1386,10 +1464,26 @@ def start(
         except Exception as e:
             click.echo(f"[daemon] failed to load project memory: {e}")
 
-        # Build prompt for hermes
+        # Build prompt for hermes. Prepend the [AVAILABLE STORAGE] block
+        # (if any) so the agent knows where to put large outputs BEFORE
+        # it starts thinking about how to structure the work. Without
+        # this, the LLM might default to "write to cache_dir" and hit
+        # the 15MB upload cap, then try to chunk or base64 the data
+        # through the orch — neither is what we want.
         params_str = json.dumps(params, ensure_ascii=False) if params else "{}"
+        storage_block = _render_storage_block(role)
+        prefix_parts = []
+        if storage_block:
+            prefix_parts.append(storage_block)
         if context_block:
-            prompt = f"{action}({params_str})\n\n--- PROJECT CONTEXT ---\n{context_block}\n--- END CONTEXT ---"
+            prefix_parts.append(
+                f"--- PROJECT CONTEXT ---\n{context_block}\n--- END CONTEXT ---"
+            )
+        if prefix_parts:
+            prompt = (
+                f"{action}({params_str})\n\n"
+                + "\n\n".join(prefix_parts)
+            )
         else:
             prompt = f"{action}({params_str})"
         click.echo(f"[daemon] task {tid}: running")

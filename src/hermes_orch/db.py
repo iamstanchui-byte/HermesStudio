@@ -307,6 +307,21 @@ MIGRATIONS = [
     # denormalized into the task row at dispatch time so the wrapper
     # can inject it as prompt context without a separate file fetch.
     "ALTER TABLE tasks ADD COLUMN procedure_md TEXT DEFAULT ''",
+    # Per-profile storage references (user-stated 2026-07-22). Operator-
+    # curated list of paths/URLs the agent can use to write large outputs
+    # directly (bypassing the 15MB per-file orch cap). Stored as a JSON
+    # array of {kind, ref, description} objects. Common kinds:
+    #   - "smb" : Windows file share, e.g. "\\\\nas01\\reports"
+    #   - "local": Local folder the agent host has mounted, e.g. "S:\\reports"
+    #   - "gdrive": Google Drive folder ID or URL
+    #   - "s3": S3 bucket/prefix
+    #   - "url": Generic URL the agent has credentials for
+    # Default '[]' = no storage configured. Wrapper reads this column
+    # and injects an [AVAILABLE STORAGE] block into the task prompt
+    # so the agent knows where to put large outputs. This is the
+    # primary mechanism (alongside OS-level mount) for keeping large
+    # data out of the orch's project share folder.
+    "ALTER TABLE agent_profiles ADD COLUMN storage_refs TEXT NOT NULL DEFAULT '[]'",
 ]
 
 

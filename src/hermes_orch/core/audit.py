@@ -46,7 +46,19 @@ async def audit_log(
             UTC-naive and rendered in the dashboard as if it were local).
     """
     if isinstance(payload, (dict, list)):
-        payload = json.dumps(payload)
+        # Defensive: if any element is a Pydantic v2 model, convert
+        # to a plain dict via .model_dump() before json.dumps.
+        # This catches callers that pass list[BaseModel] directly
+        # (e.g. list[StorageRef]) without manual conversion.
+        def _normalize(obj):
+            if hasattr(obj, "model_dump") and callable(obj.model_dump):
+                return obj.model_dump()
+            if isinstance(obj, dict):
+                return {k: _normalize(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_normalize(v) for v in obj]
+            return obj
+        payload = json.dumps(_normalize(payload))
     data: dict[str, Any] = {"event_type": event_type}
     if actor is not None:
         data["actor"] = actor

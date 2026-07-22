@@ -63,15 +63,37 @@ class AgentUpdate(BaseModel):
     os_type: str | None = None
 
 
+class StorageRef(BaseModel):
+    """One storage reference for an agent profile. Operator-curated.
+
+    The agent can write large outputs directly to any of these paths
+    (bypassing the orch's 15MB per-file cap). The wrapper injects
+    the configured list into the task prompt as an [AVAILABLE STORAGE]
+    block so the agent knows where to put data.
+
+    Common kinds:
+      - "smb"   : Windows file share, e.g. "\\\\nas01\\reports"
+      - "local" : Local folder the agent host has mounted, e.g. "S:\\reports"
+      - "gdrive": Google Drive folder ID or URL
+      - "s3"    : S3 bucket/prefix
+      - "url"   : Generic URL the agent has credentials for
+    """
+    kind: str
+    ref: str
+    description: str = ""
+
+
 class AgentProfileCreate(BaseModel):
     name: str
     description: str | None = None
     capabilities: dict[str, bool] = Field(default_factory=dict)
+    storage_refs: list[StorageRef] = Field(default_factory=list)
 
 
 class AgentProfileUpdate(BaseModel):
     description: str | None = None
     capabilities: dict[str, bool] | None = None
+    storage_refs: list[StorageRef] | None = None
 
 
 class HeartbeatBody(BaseModel):
@@ -112,6 +134,10 @@ class AgentProfile(BaseModel):
     llm_model_provider: str | None = None
     # MCP server list (parsed from JSON column, default [])
     mcp_servers: list[dict] = Field(default_factory=list)
+    # Storage references for large outputs (parsed from JSON column).
+    # Per orch-as-coordinator principle: agent writes large data
+    # directly to these paths; orch only stores metadata + reference.
+    storage_refs: list[StorageRef] = Field(default_factory=list)
     created_at: str | None = None
 
 
@@ -224,6 +250,24 @@ def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
                         })
         except (json.JSONDecodeError, TypeError):
             pass
+    # Storage references (user-stated 2026-07-22). Operator-curated
+    # list of paths/URLs the agent can use to write large outputs
+    # directly. Same defensive parsing pattern as MCP servers.
+    sref_raw = row.get("storage_refs")
+    srefs: list[dict] = []
+    if sref_raw:
+        try:
+            parsed = json.loads(sref_raw) if isinstance(sref_raw, str) else sref_raw
+            if isinstance(parsed, list):
+                for s in parsed:
+                    if isinstance(s, dict) and "kind" in s and "ref" in s:
+                        srefs.append({
+                            "kind": str(s["kind"]),
+                            "ref": str(s["ref"]),
+                            "description": str(s.get("description", "")),
+                        })
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     return AgentProfile(
         id=row["id"],
@@ -238,6 +282,7 @@ def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
         llm_model_base_url=row.get("llm_model_base_url"),
         llm_model_provider=row.get("llm_model_provider"),
         mcp_servers=mcps,
+        storage_refs=srefs,
         created_at=row.get("created_at"),
     )
 
@@ -586,12 +631,45 @@ async def heartbeat(
         (agent_id,),
     )
 
+    # Per-profile storage_refs (user-stated 2026-07-22): operator-curated
+    # list of paths/URLs the agent can use to write large outputs directly
+    # (bypassing the 15MB per-file cap). Wrapper reads this on heartbeat
+    # and caches it, injecting as an [AVAILABLE STORAGE] block into the
+    # task prompt. Keyed by profile name so the wrapper can look up
+    # the right entry for the role it's running as.
+    profile_rows = await db.fetchall(
+        "SELECT name, storage_refs FROM agent_profiles WHERE agent_id = ?",
+        (agent_id,),
+    )
+    storage_refs_by_profile: dict[str, list[dict]] = {}
+    for pr in profile_rows:
+        sref_raw = pr["storage_refs"]
+        srefs: list[dict] = []
+        if sref_raw:
+            try:
+                parsed = json.loads(sref_raw) if isinstance(sref_raw, str) else sref_raw
+                if isinstance(parsed, list):
+                    for s in parsed:
+                        if isinstance(s, dict) and "kind" in s and "ref" in s:
+                            srefs.append({
+                                "kind": str(s["kind"]),
+                                "ref": str(s["ref"]),
+                                "description": str(s.get("description", "")),
+                            })
+            except (json.JSONDecodeError, TypeError):
+                pass
+        storage_refs_by_profile[pr["name"]] = srefs
+
     return {
         "status": "ok",
         "timestamp": now,
         "agent_status": body_data.get("status", "idle"),
         "tasks": tasks,
         "cleanup_session_ids": [r["session_id"] for r in cleanup_rows],
+        # Profile name -> list of {kind, ref, description}. Empty list
+        # if operator hasn't configured any storage for that profile.
+        # Wrapper caches this and injects as [AVAILABLE STORAGE] block.
+        "storage_refs_by_profile": storage_refs_by_profile,
     }
 
 
@@ -690,6 +768,14 @@ async def add_profile(
         raise HTTPException(409, f"Profile already exists: {body.name}")
 
     profile_id = str(uuid.uuid4())
+    cleaned_refs: list[dict] = []
+    for s in (body.storage_refs or []):
+        if isinstance(s, dict) and s.get("kind") and s.get("ref"):
+            cleaned_refs.append({
+                "kind": str(s["kind"]),
+                "ref": str(s["ref"]),
+                "description": str(s.get("description", "")),
+            })
     await db.insert(
         "agent_profiles",
         {
@@ -699,6 +785,7 @@ async def add_profile(
             "description": body.description,
             "status": "idle",
             "capabilities": json.dumps(body.capabilities or {}),
+            "storage_refs": json.dumps(cleaned_refs),
         },
     )
     row = await db.fetchone("SELECT * FROM agent_profiles WHERE id = ?", (profile_id,))
@@ -769,7 +856,40 @@ async def update_profile(
             "UPDATE agent_profiles SET capabilities = ? WHERE id = ?",
             (json.dumps(body.capabilities), profile["id"]),
         )
+    if body.storage_refs is not None:
+        # Validate each entry: kind non-empty, ref non-empty. Drop
+        # malformed entries silently rather than 400 (operator can
+        # fix the bad entry from the UI).
+        cleaned_refs: list[dict] = []
+        for s in body.storage_refs:
+            if isinstance(s, dict) and s.get("kind") and s.get("ref"):
+                cleaned_refs.append({
+                    "kind": str(s["kind"]),
+                    "ref": str(s["ref"]),
+                    "description": str(s.get("description", "")),
+                })
+        await db.execute(
+            "UPDATE agent_profiles SET storage_refs = ? WHERE id = ?",
+            (json.dumps(cleaned_refs), profile["id"]),
+        )
     row = await db.fetchone("SELECT * FROM agent_profiles WHERE id = ?", (profile["id"],))
+    # Audit log payload — convert Pydantic StorageRef list to plain
+    # dicts so json.dumps (in core/audit.py) can serialize. Audit
+    # is informational ("operator set these refs") — full fidelity
+    # not needed; just preserve kind + ref + description. Note:
+    # body.storage_refs is list[StorageRef] (Pydantic models), so
+    # we access via attribute (s.kind) not dict key (s["kind"]).
+    srefs_audit: list[dict] = []
+    if body.storage_refs is not None:
+        for s in body.storage_refs:
+            kind = getattr(s, "kind", None)
+            ref = getattr(s, "ref", None)
+            if kind and ref:
+                srefs_audit.append({
+                    "kind": str(kind),
+                    "ref": str(ref),
+                    "description": str(getattr(s, "description", "")),
+                })
     await audit_log(
         db, "agent.profile_updated",
         actor="operator",
@@ -778,6 +898,7 @@ async def update_profile(
             "profile_name": profile_name,
             "description": body.description,
             "capabilities": body.capabilities,
+            "storage_refs": srefs_audit,
         },
     )
     return _row_to_profile(row)

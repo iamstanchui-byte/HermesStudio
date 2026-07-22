@@ -247,6 +247,25 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
                 except (json.JSONDecodeError, TypeError):
                     pass
             p["mcp_servers"] = mcps
+            # Storage references (user-stated 2026-07-22). Same defensive
+            # parse as _row_to_profile. Pattern #9 reminder: both API
+            # and HTML page paths must parse the same JSON column.
+            sref_raw = p.get("storage_refs")
+            srefs: list[dict] = []
+            if sref_raw:
+                try:
+                    parsed = json.loads(sref_raw) if isinstance(sref_raw, str) else sref_raw
+                    if isinstance(parsed, list):
+                        for s in parsed:
+                            if isinstance(s, dict) and "kind" in s and "ref" in s:
+                                srefs.append({
+                                    "kind": str(s["kind"]),
+                                    "ref": str(s["ref"]),
+                                    "description": str(s.get("description", "")),
+                                })
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            p["storage_refs"] = srefs
             caps_raw = p.get("capabilities")
             caps: dict[str, bool] = {}
             if caps_raw:
