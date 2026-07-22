@@ -46,19 +46,33 @@ async def audit_log(
             UTC-naive and rendered in the dashboard as if it were local).
     """
     if isinstance(payload, (dict, list)):
-        # Defensive: if any element is a Pydantic v2 model, convert
-        # to a plain dict via .model_dump() before json.dumps.
-        # This catches callers that pass list[BaseModel] directly
-        # (e.g. list[StorageRef]) without manual conversion.
+        # Defensive: convert Pydantic v2 models to plain dicts
+        # before json.dumps. Recursive helper handles nested cases
+        # (e.g. list[StorageRef] inside a dict). Pydantic models
+        # expose .model_dump(); Pydantic v1 used .dict() — we use
+        # model_dump with a try/except for v1 compat (defensive).
         def _normalize(obj):
+            # Pydantic v2
             if hasattr(obj, "model_dump") and callable(obj.model_dump):
-                return obj.model_dump()
+                try:
+                    return obj.model_dump()
+                except Exception:
+                    pass
+            # Pydantic v1 (older hermes-orch versions)
+            if hasattr(obj, "dict") and callable(obj.dict):
+                try:
+                    return obj.dict()
+                except Exception:
+                    pass
+            # Standard types
             if isinstance(obj, dict):
                 return {k: _normalize(v) for k, v in obj.items()}
             if isinstance(obj, (list, tuple)):
                 return [_normalize(v) for v in obj]
+            if isinstance(obj, set):
+                return [_normalize(v) for v in sorted(obj, key=str)]
             return obj
-        payload = json.dumps(_normalize(payload))
+        payload = json.dumps(_normalize(payload), default=str)
     data: dict[str, Any] = {"event_type": event_type}
     if actor is not None:
         data["actor"] = actor
