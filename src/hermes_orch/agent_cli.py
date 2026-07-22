@@ -1254,6 +1254,15 @@ def start(
         role = task.get("agent_role", "")
         action = task.get("action", "")
         params = task.get("params") or {}
+        # Mark the start time of THIS task. The auto-upload loop at the
+        # end of this function uses it to skip files that pre-date the
+        # current task (cached files from previous tasks in the same
+        # project). Without this filter, every task re-uploads every
+        # file in the project cache, causing duplicate artifact rows
+        # and audit_log events. (Bug fixed 2026-07-22: user reported
+        # N×duplicate artifact.registered events for the same file.)
+        import time as _time_mod_for_start
+        _task_start_ts = _time_mod_for_start.time()
         profile_cfg = profiles_cfg.get(role)
         if not profile_cfg:
             return {
@@ -1851,12 +1860,30 @@ def start(
                         # Find files modified during this task run. We use a
                         # generous cutoff: 5 min before the task started (so
                         # parent tasks' cached files are also captured) and
-                        # now as the upper bound.
+                        # now as the upper bound. Compute the cutoff from
+                        # _task_start_ts (captured at function entry) so
+                        # the filter is deterministic per-task. Without
+                        # this filter, every task re-uploads every file
+                        # in the cache and the audit_log fills with
+                        # duplicate artifact.registered events.
                         from datetime import datetime, timezone, timedelta
-                        # Best-effort time filter (skip if mtime is unreliable)
+                        # Per-task cutoff: any file with mtime before
+                        # (_task_start_ts - 300s) is treated as "from
+                        # a previous task" and skipped. 5 min cushion
+                        # catches any clock skew between cache file
+                        # writes and the timestamp the wrapper records.
+                        task_cutoff_ts = _task_start_ts - 300
                         for f in cache_root.rglob("*"):
                             if not f.is_file():
                                 continue
+                            # Skip files not modified during this task.
+                            # Use mtime directly (cheaper than stat twice).
+                            try:
+                                f_mtime = f.stat().st_mtime
+                            except OSError:
+                                continue
+                            if f_mtime < task_cutoff_ts:
+                                continue  # leftover from earlier task
                             # Skip our own internal test files and the cache
                             # structure (we use relative paths for the upload)
                             rel = f.relative_to(cache_root).as_posix()
