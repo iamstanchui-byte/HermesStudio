@@ -382,10 +382,11 @@
                     {# Storage refs (per-profile list of large-output destinations).
                        Operator-curated, injected into task prompts as
                        [AVAILABLE STORAGE] block by the wrapper. Each entry is
-                       {kind, ref, description} where kind ∈ {smb, local,
-                       gdrive, s3, url}. Color-coded by kind so the operator
-                       can scan the kinds at a glance. Always collapsed —
-                       same UX as MCP servers. #}
+                       {name?, kind, ref, description} where kind ∈ {smb, local,
+                       gdrive, s3, url} and `name` (optional) is a short alias
+                       tasks reference via params.output_to. Name shown first
+                       (bold), then kind chip, then ref, then description.
+                       Always collapsed — same UX as MCP servers. #}
                     <details class="mt-2">
                         <summary class="text-[10px] font-medium text-gray-500 uppercase tracking-wide cursor-pointer select-none hover:text-gray-700">
                             Storage refs ({{ p.storage_refs|length if p.storage_refs else 0 }})
@@ -394,6 +395,10 @@
                         <div class="mt-1 space-y-0.5">
                             {% for s in p.storage_refs %}
                             <div class="text-xs flex items-center gap-1.5 min-w-0">
+                                {% if s.name %}
+                                <span class="font-semibold text-gray-800 flex-shrink-0" title="alias (use as params.output_to)">{{ s.name }}</span>
+                                <span class="text-gray-400 flex-shrink-0">·</span>
+                                {% endif %}
                                 <span class="px-1 rounded text-[10px] font-mono flex-shrink-0
                                     {%- if s.kind == 'smb' %} bg-blue-50 text-blue-700
                                     {%- elif s.kind == 'local' %} bg-gray-100 text-gray-700
@@ -415,8 +420,8 @@
                         <textarea name="description" class="w-full text-xs border rounded p-1" rows="2" placeholder="description (optional)">{{ p.description or '' }}</textarea>
                         <label class="block text-[10px] text-gray-500 mt-1 mb-0.5">Capabilities (JSON, e.g. <code>{"mt5": true, "xauusd_feed": true}</code>):</label>
                         <textarea name="capabilities" class="w-full text-xs border rounded p-1 font-mono" rows="2" placeholder='{"mt5": true, "xauusd_feed": false}'>{{ p.capabilities | tojson(indent=2) if p.capabilities else '{}' }}</textarea>
-                        <label class="block text-[10px] text-gray-500 mt-1 mb-0.5">Storage refs (JSON, e.g. <code>[{"kind":"gdrive","ref":"https://drive.google.com/...","description":"stanley/ folder"}]</code>):</label>
-                        <textarea name="storage_refs" class="w-full text-xs border rounded p-1 font-mono" rows="3" placeholder='[{"kind": "gdrive", "ref": "https://drive.google.com/drive/folders/<id>", "description": "stanley/ folder"}]'>{{ p.storage_refs | tojson(indent=2) if p.storage_refs else '[]' }}</textarea>
+                        <label class="block text-[10px] text-gray-500 mt-1 mb-0.5">Storage refs (JSON, e.g. <code>[{"name":"stanley","kind":"gdrive","ref":"https://...","description":"..."}]</code>):</label>
+                        <textarea name="storage_refs" class="w-full text-xs border rounded p-1 font-mono" rows="3" placeholder='[{"name": "stanley", "kind": "gdrive", "ref": "https://drive.google.com/drive/folders/<id>", "description": "user main GDrive"}]'>{{ p.storage_refs | tojson(indent=2) if p.storage_refs else '[]' }}</textarea>
                         <div class="mt-1 text-[10px] text-gray-500">
                             <span class="font-medium">kinds:</span>
                             <code class="bg-blue-50 text-blue-700 px-1 rounded">smb</code>
@@ -424,7 +429,7 @@
                             <code class="bg-emerald-50 text-emerald-700 px-1 rounded">gdrive</code>
                             <code class="bg-orange-50 text-orange-700 px-1 rounded">s3</code>
                             <code class="bg-purple-50 text-purple-700 px-1 rounded">url</code>
-                            &nbsp;·&nbsp;changes propagate to wrapper within ~5s (next heartbeat).
+                            &nbsp;·&nbsp;<span class="font-medium">name</span> is an optional short alias (e.g. <code>"stanley"</code>) that tasks reference via <code>params.output_to: "stanley"</code>. Without a name, pass the full <code>ref</code> string in <code>params.output_to</code>. &nbsp;·&nbsp;changes propagate to wrapper within ~5s (next heartbeat).
                         </div>
                         <div class="mt-1 flex gap-1">
                             <button type="submit" class="text-xs px-2 py-0.5 bg-blue-600 text-white rounded">Save</button>

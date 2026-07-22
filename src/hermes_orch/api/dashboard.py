@@ -260,6 +260,9 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
             # Storage references (user-stated 2026-07-22). Same defensive
             # parse as _row_to_profile. Pattern #9 reminder: both API
             # and HTML page paths must parse the same JSON column.
+            # Includes `name` (optional alias, 2026-07-22) so the
+            # agents.html template can show it as a short tag in front
+            # of the kind chip.
             sref_raw = p.get("storage_refs")
             srefs: list[dict] = []
             if sref_raw:
@@ -269,6 +272,7 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
                         for s in parsed:
                             if isinstance(s, dict) and "kind" in s and "ref" in s:
                                 srefs.append({
+                                    "name": str(s.get("name", "")).strip() or None,
                                     "kind": str(s["kind"]),
                                     "ref": str(s["ref"]),
                                     "description": str(s.get("description", "")),

@@ -77,7 +77,15 @@ class StorageRef(BaseModel):
       - "gdrive": Google Drive folder ID or URL
       - "s3"    : S3 bucket/prefix
       - "url"   : Generic URL the agent has credentials for
+
+    `name` (optional, 2026-07-22): short alias tasks can reference via
+    `params.output_to = "stanley"`. The wrapper resolves the alias to
+    the matching ref at task dispatch and injects a [STORAGE HINT] block
+    so the agent doesn't have to guess. Without a name, the task must
+    pass the full ref string in params.output_to. Names are
+    per-profile (operator can rename without touching task params).
     """
+    name: str | None = None
     kind: str
     ref: str
     description: str = ""
@@ -261,7 +269,9 @@ def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
             if isinstance(parsed, list):
                 for s in parsed:
                     if isinstance(s, dict) and "kind" in s and "ref" in s:
+                        # `name` is optional (alias for params.output_to)
                         srefs.append({
+                            "name": str(s.get("name", "")).strip() or None,
                             "kind": str(s["kind"]),
                             "ref": str(s["ref"]),
                             "description": str(s.get("description", "")),
@@ -652,6 +662,7 @@ async def heartbeat(
                     for s in parsed:
                         if isinstance(s, dict) and "kind" in s and "ref" in s:
                             srefs.append({
+                                "name": str(s.get("name", "")).strip() or None,
                                 "kind": str(s["kind"]),
                                 "ref": str(s["ref"]),
                                 "description": str(s.get("description", "")),
@@ -771,7 +782,9 @@ async def add_profile(
     cleaned_refs: list[dict] = []
     for s in (body.storage_refs or []):
         if isinstance(s, dict) and s.get("kind") and s.get("ref"):
+            name = s.get("name")
             cleaned_refs.append({
+                "name": str(name).strip() if name else None,
                 "kind": str(s["kind"]),
                 "ref": str(s["ref"]),
                 "description": str(s.get("description", "")),
@@ -869,15 +882,18 @@ async def update_profile(
                 kind = s.get("kind")
                 ref = s.get("ref")
                 desc = s.get("description", "")
+                name = s.get("name")
             elif hasattr(s, "kind"):
                 # Pydantic v2 StorageRef
                 kind = getattr(s, "kind", None)
                 ref = getattr(s, "ref", None)
                 desc = getattr(s, "description", "")
+                name = getattr(s, "name", None)
             else:
                 continue
             if kind and ref:
                 cleaned_refs.append({
+                    "name": str(name).strip() if name else None,
                     "kind": str(kind),
                     "ref": str(ref),
                     "description": str(desc) if desc else "",
@@ -899,7 +915,9 @@ async def update_profile(
             kind = getattr(s, "kind", None)
             ref = getattr(s, "ref", None)
             if kind and ref:
+                name = getattr(s, "name", None)
                 srefs_audit.append({
+                    "name": str(name).strip() if name else None,
                     "kind": str(kind),
                     "ref": str(ref),
                     "description": str(getattr(s, "description", "")),

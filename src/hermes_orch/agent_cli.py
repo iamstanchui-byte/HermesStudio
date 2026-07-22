@@ -121,13 +121,18 @@ def _render_storage_block(role: str) -> str:
 
     Pulls from `_storage_refs_cache` (populated by heartbeat) for
     the given profile role. If empty, returns "" (block omitted).
-    Each entry is rendered as `- [kind] ref (description)` so the
-    agent knows which storage target to use for what.
+    Each entry is rendered with its `name` alias first (so the agent
+    can see `stanley` instead of the long URL), then the kind, then
+    the full ref, then the description.
 
     The 15MB orch cap means the agent must write large outputs
     to one of these paths directly. Per orch-as-coordinator
     principle (2026-07-22): orch stores metadata, agent stores
     data.
+
+    Output format (per entry):
+      - [name] kind  ref  -- description
+    If `name` is missing, falls back to `[kind] ref  -- description`.
     """
     refs = _storage_refs_cache.get(role) or []
     if not refs:
@@ -137,17 +142,87 @@ def _render_storage_block(role: str) -> str:
         "Per orch policy, the orchestrator's project share folder is for",
         "metadata + small files (cap 15MB per file). For LARGE outputs,",
         "write directly to one of these paths and only store a reference",
-        "in your task result. Choose by kind:",
+        "in your task result. Choose by name (preferred) or kind:",
     ]
     for s in refs:
         kind = s.get("kind", "?")
         ref = s.get("ref", "?")
-        desc = s.get("description", "").strip()
-        line = f"  - [{kind}] {ref}"
+        desc = (s.get("description") or "").strip()
+        name = (s.get("name") or "").strip()
+        # Format: - [name] kind  ref  -- description
+        # If no name: - [kind] ref  -- description
+        if name:
+            line = f"  - [{name}] {kind}  {ref}"
+        else:
+            line = f"  - [{kind}] {ref}"
         if desc:
-            line += f"  ({desc})"
+            line += f"  -- {desc}"
         lines.append(line)
     lines.append("--- END AVAILABLE STORAGE ---")
+    return "\n".join(lines)
+
+
+def _resolve_storage_hint(role: str, output_to: str) -> str:
+    """Resolve `params.output_to` (an alias name OR a full ref) to a
+    [STORAGE HINT] block for the task prompt.
+
+    The supervisor (LLM planner) sets `params.output_to` on tasks that
+    need a specific storage destination. The value can be either:
+      - an alias `name` (preferred; e.g. "stanley")
+      - the full `ref` (fallback if no alias matches; e.g. the long URL)
+
+    Returns the hint block string, or "" if `output_to` doesn't match
+    any configured entry. Empty return signals the agent to fall
+    back to the [AVAILABLE STORAGE] context.
+
+    Used by `_run_task` to prepend a small "[STORAGE HINT for this task]"
+    block right before [AVAILABLE STORAGE] so the agent doesn't have
+    to guess which entry to use when there are multiple.
+    """
+    if not output_to:
+        return ""
+    refs = _storage_refs_cache.get(role) or []
+    if not refs:
+        return ""
+    target = output_to.strip()
+    # Try name alias first, then full ref
+    matched = None
+    matched_via = ""
+    for s in refs:
+        name = (s.get("name") or "").strip()
+        ref = (s.get("ref") or "").strip()
+        if name and target == name:
+            matched = s
+            matched_via = "alias name"
+            break
+        if ref and target == ref:
+            matched = s
+            matched_via = "full ref"
+            break
+    if not matched:
+        # Not found — return a soft warning so the agent knows
+        return (
+            "--- STORAGE HINT (output_to unresolved) ---\n"
+            f"output_to: {target}\n"
+            f"WARNING: no entry in [AVAILABLE STORAGE] matches this value.\n"
+            "Falling back to [AVAILABLE STORAGE] context — pick the best\n"
+            "entry by hand, or fix the task's output_to and re-dispatch.\n"
+            "--- END STORAGE HINT ---"
+        )
+    name = (matched.get("name") or "").strip()
+    kind = matched.get("kind", "?")
+    ref = matched.get("ref", "?")
+    desc = (matched.get("description") or "").strip()
+    display = f"[{name}] {kind}  {ref}" if name else f"[{kind}] {ref}"
+    lines = [
+        "--- STORAGE HINT (for this task) ---",
+        f"output_to: {target}  (resolved via {matched_via})",
+        f"Target entry: {display}",
+    ]
+    if desc:
+        lines.append(f"Description: {desc}")
+    lines.append("Use THIS specific entry from [AVAILABLE STORAGE] for large outputs.")
+    lines.append("--- END STORAGE HINT ---")
     return "\n".join(lines)
 
 
@@ -374,12 +449,13 @@ def _strip_prompt_echo(s: str) -> str:
     """Strip the prompt template echo that hermes prepends to its output.
 
     The wrapper builds the prompt as:
-        {action}({params})\\n\\n[OUTPUT FORMAT block]\\n\\n[AVAILABLE STORAGE block]\\n\\n--- PROJECT CONTEXT ---\\n{context_block}\\n--- END CONTEXT ---
+        {action}({params})\\n\\n[OUTPUT FORMAT]\\n\\n[STORAGE HINT if params.output_to]\\n\\n[AVAILABLE STORAGE]\\n\\n--- PROJECT CONTEXT ---\\n{context_block}\\n--- END CONTEXT ---
 
     The OUTPUT FORMAT block is always prepended (house style: .md for
-    output, .json only for params, no .results.json). AVAILABLE STORAGE
-    is prepended only if storage_refs is configured for the role.
-    PROJECT CONTEXT is prepended only if a context_block is built.
+    output, .json only for params, no .results.json). STORAGE HINT is
+    prepended only if params.output_to is set on the task. AVAILABLE
+    STORAGE is prepended only if storage_refs is configured for the
+    role. PROJECT CONTEXT is prepended only if a context_block is built.
 
     Hermes echoes this prompt at the top of its stdout (because it was the
     system message it received), so without stripping, the orchestrator's
@@ -390,9 +466,10 @@ def _strip_prompt_echo(s: str) -> str:
 
     We strip the LAST prompt-echo closing marker found near the start
     of the output (whichever is deepest: END OUTPUT FORMAT, then
-    END AVAILABLE STORAGE, then END CONTEXT). Order in the prompt:
-    OUTPUT FORMAT first, then AVAILABLE STORAGE, then PROJECT CONTEXT,
-    so the deepest marker is the right one to strip up to.
+    END STORAGE HINT, then END AVAILABLE STORAGE, then END CONTEXT).
+    Order in the prompt: OUTPUT FORMAT first, then STORAGE HINT, then
+    AVAILABLE STORAGE, then PROJECT CONTEXT, so the deepest marker is
+    the right one to strip up to.
 
     Strategy: only strip if the markers are near the start (first ~2500
     chars -- bigger to accommodate the storage block) -- if the body of
@@ -403,12 +480,13 @@ def _strip_prompt_echo(s: str) -> str:
     # Find the LAST closing marker in the first 2500 chars. Each marker
     # is associated with a block that the agent shouldn't have echoed
     # in the first place. Strip everything up to and including the
-    # deepest closing marker. Order: OUTPUT FORMAT block is prepended
-    # FIRST (always), then AVAILABLE STORAGE (if any), then PROJECT
-    # CONTEXT (if any). The deepest marker is the right one to strip
-    # up to because that's the end of the entire echo.
+    # deepest closing marker. Order: OUTPUT FORMAT (always) → STORAGE
+    # HINT (only if params.output_to set) → AVAILABLE STORAGE (only if
+    # storage_refs configured) → PROJECT CONTEXT (only if context_block
+    # built). The deepest marker is the right one to strip up to.
     end_markers = [
         r"\s*--- END OUTPUT FORMAT ---\s*\n",
+        r"\s*--- END STORAGE HINT ---\s*\n",
         r"\s*--- END AVAILABLE STORAGE ---\s*\n",
         r"\s*--- END CONTEXT ---\s*\n",
     ]
@@ -1520,7 +1598,15 @@ def start(
         params_str = json.dumps(params, ensure_ascii=False) if params else "{}"
         output_format_block = _render_output_format_block()
         storage_block = _render_storage_block(role)
+        # If the task declared `params.output_to` (alias or full ref),
+        # prepend a [STORAGE HINT] block that resolves the alias to its
+        # specific entry. This sits right before [AVAILABLE STORAGE] so
+        # the agent sees the target first, then the full list as context
+        # for the case where output_to points to an unknown name.
+        storage_hint_block = _resolve_storage_hint(role, params.get("output_to") or "")
         prefix_parts = [output_format_block]
+        if storage_hint_block:
+            prefix_parts.append(storage_hint_block)
         if storage_block:
             prefix_parts.append(storage_block)
         if context_block:
