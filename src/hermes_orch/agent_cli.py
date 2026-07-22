@@ -1728,7 +1728,7 @@ def start(
             stdout = (stdout or "").strip()
             stderr = (stderr or "").strip()
             click.echo(
-                f"  exit={rc} stdout_len={len(stdout_bytes)} (cap {MAX_STDOUT_READ_BYTES}) "
+                f"  exit={rc} stdout_len={len(stdout_bytes)} (cap {MAX_INPROC_READ_BYTES}) "
                 f"stderr_len={len(stderr_bytes)}"
             )
             click.echo(f"  full transcript: {stdout_log}")
