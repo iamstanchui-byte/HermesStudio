@@ -151,6 +151,33 @@ def _render_storage_block(role: str) -> str:
     return "\n".join(lines)
 
 
+def _render_output_format_block() -> str:
+    """Render the [OUTPUT FORMAT] block for the task prompt.
+
+    Convention (2026-07-22, user-stated):
+    - .md  : for normal text output (human-readable deliverable)
+    - .json: ONLY for parameter values (machine-readable structured data)
+    - DO NOT write `.results.json` to cache_dir as a status file —
+      task status is reported via the API (status/summary fields),
+      not as a separate file. The wrapper auto-upload loop also
+      skips any `*.results.json` it finds for this reason.
+
+    Always emitted (no opt-in flag) — this is the project's house
+    style and shouldn't change per-profile.
+    """
+    return (
+        "--- OUTPUT FORMAT ---\n"
+        "Output file conventions for the orchestrator's project share:\n"
+        "- .md  : use for normal text output (human-readable deliverable)\n"
+        "- .json: use ONLY for parameter values (machine-readable structured\n"
+        "         data the next step will parse). Never as a status file.\n"
+        "- DO NOT write a `.results.json` to cache_dir. Your task status is\n"
+        "  already reported via the API (status/summary fields on /result).\n"
+        "  The wrapper auto-upload also skips any `*.results.json` it sees.\n"
+        "--- END OUTPUT FORMAT ---"
+    )
+
+
 def _atomic_write(target: Path, content: str) -> None:
     """Atomic write: write to .tmp then rename. Survives partial writes.
 
@@ -347,7 +374,12 @@ def _strip_prompt_echo(s: str) -> str:
     """Strip the prompt template echo that hermes prepends to its output.
 
     The wrapper builds the prompt as:
-        {action}({params})\\n\\n[AVAILABLE STORAGE block]\\n\\n--- PROJECT CONTEXT ---\\n{context_block}\\n--- END CONTEXT ---
+        {action}({params})\\n\\n[OUTPUT FORMAT block]\\n\\n[AVAILABLE STORAGE block]\\n\\n--- PROJECT CONTEXT ---\\n{context_block}\\n--- END CONTEXT ---
+
+    The OUTPUT FORMAT block is always prepended (house style: .md for
+    output, .json only for params, no .results.json). AVAILABLE STORAGE
+    is prepended only if storage_refs is configured for the role.
+    PROJECT CONTEXT is prepended only if a context_block is built.
 
     Hermes echoes this prompt at the top of its stdout (because it was the
     system message it received), so without stripping, the orchestrator's
@@ -357,10 +389,10 @@ def _strip_prompt_echo(s: str) -> str:
     Task Results section that gets injected into future task prompts.
 
     We strip the LAST prompt-echo closing marker found near the start
-    of the output (whichever comes last: END AVAILABLE STORAGE or
-    END CONTEXT). Order matters: the storage block is prepended BEFORE
-    the PROJECT CONTEXT block, so the END marker that's deeper in the
-    output is the right one to strip up to.
+    of the output (whichever is deepest: END OUTPUT FORMAT, then
+    END AVAILABLE STORAGE, then END CONTEXT). Order in the prompt:
+    OUTPUT FORMAT first, then AVAILABLE STORAGE, then PROJECT CONTEXT,
+    so the deepest marker is the right one to strip up to.
 
     Strategy: only strip if the markers are near the start (first ~2500
     chars -- bigger to accommodate the storage block) -- if the body of
@@ -371,8 +403,12 @@ def _strip_prompt_echo(s: str) -> str:
     # Find the LAST closing marker in the first 2500 chars. Each marker
     # is associated with a block that the agent shouldn't have echoed
     # in the first place. Strip everything up to and including the
-    # deepest closing marker.
+    # deepest closing marker. Order: OUTPUT FORMAT block is prepended
+    # FIRST (always), then AVAILABLE STORAGE (if any), then PROJECT
+    # CONTEXT (if any). The deepest marker is the right one to strip
+    # up to because that's the end of the entire echo.
     end_markers = [
+        r"\s*--- END OUTPUT FORMAT ---\s*\n",
         r"\s*--- END AVAILABLE STORAGE ---\s*\n",
         r"\s*--- END CONTEXT ---\s*\n",
     ]
@@ -1473,15 +1509,18 @@ def start(
         except Exception as e:
             click.echo(f"[daemon] failed to load project memory: {e}")
 
-        # Build prompt for hermes. Prepend the [AVAILABLE STORAGE] block
-        # (if any) so the agent knows where to put large outputs BEFORE
-        # it starts thinking about how to structure the work. Without
+        # Build prompt for hermes. Prepend the [OUTPUT FORMAT] block
+        # (always — house style: .md for output, .json only for params,
+        # no .results.json) and the [AVAILABLE STORAGE] block (if any,
+        # so the agent knows where to put large outputs BEFORE it
+        # starts thinking about how to structure the work). Without
         # this, the LLM might default to "write to cache_dir" and hit
         # the 15MB upload cap, then try to chunk or base64 the data
         # through the orch — neither is what we want.
         params_str = json.dumps(params, ensure_ascii=False) if params else "{}"
+        output_format_block = _render_output_format_block()
         storage_block = _render_storage_block(role)
-        prefix_parts = []
+        prefix_parts = [output_format_block]
         if storage_block:
             prefix_parts.append(storage_block)
         if context_block:
@@ -1908,6 +1947,16 @@ def start(
                             # deliverable content). Saves a 64KB+ upload of
                             # mostly-UI-chrome.
                             if rel.startswith("hermes.") and rel.endswith(".log"):
+                                continue
+                            # Skip the agent's structured status files. Per
+                            # house style (2026-07-22): .results.json (or any
+                            # `*.results.json` / `*_results.json` agent-written
+                            # file) is the task status, not a deliverable.
+                            # Real output is .md (human-readable). The agent's
+                            # status is already reported via the API on
+                            # /result, so uploading the file would just
+                            # clutter the artifacts list.
+                            if f.name.endswith(".results.json") or f.name.endswith("_results.json"):
                                 continue
                             # Size check BEFORE read_bytes() — avoid OOM on
                             # huge files (an LLM could write a 10GB log if
