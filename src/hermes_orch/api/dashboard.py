@@ -98,46 +98,56 @@ def _parse_json_fields(row: dict[str, Any], *fields: str) -> dict[str, Any]:
 
 
 def _compute_task_timing(task: dict[str, Any]) -> dict[str, Any]:
-    """Derive start/end/duration for a task from existing DB columns.
+    """Derive start/end/duration for a task from the real DB columns.
 
-    - started_at: last_liveness_at (set when wrapper claimed) or null
-    - completed_at: updated_at if terminal state, else null
-    - duration_seconds: completed_at - started_at, or running duration
+    Reads `started_at` and `ended_at` directly — both set server-side
+    on the actual lifecycle transitions:
+    - started_at: set on /start (assigned → running)
+    - ended_at:   set on /result, /cancel, /interrupt (any terminal)
+
+    The previous implementation hacked duration from
+    `updated_at - last_liveness_at`, which always gave 1-30s because
+    both fields are written within 1-2s of task completion. For
+    pre-migration tasks, started_at / ended_at may be NULL; we fall
+    back to last_liveness_at / updated_at for those rows (best-effort
+    until the one-shot backfill script is run).
+
+    Returns:
+        started_at: ISO timestamp or None
+        completed_at: ISO timestamp (== ended_at, kept for template compat)
+        duration_seconds: float or None
     """
     from datetime import datetime
     TERMINAL = {"completed", "failed", "cancelled", "interrupted", "skipped"}
     result: dict[str, Any] = {"started_at": None, "completed_at": None, "duration_seconds": None}
 
-    # Parse timestamps
     def _parse(s: str | None):
         if not s:
             return None
         try:
-            # Strip trailing Z, replace with +00:00
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
         except (ValueError, TypeError):
             return None
 
-    started = _parse(task.get("last_liveness_at"))
-    if not started and task.get("status") in ("running", "assigned", "pending"):
-        # Not yet started by a wrapper
-        pass
-    elif started and task.get("status") in ("running",):
+    # Prefer the real columns; fall back to last_liveness_at/updated_at
+    # for tasks created before the schema migration.
+    started = _parse(task.get("started_at")) or _parse(task.get("last_liveness_at"))
+    ended = _parse(task.get("ended_at")) or (
+        _parse(task.get("updated_at"))
+        if task.get("status") in TERMINAL
+        else None
+    )
+
+    if started:
+        result["started_at"] = started.isoformat()
+    if ended:
+        result["completed_at"] = ended.isoformat()
+    if started and ended:
+        result["duration_seconds"] = max(0.0, (ended - started).total_seconds())
+    elif started and task.get("status") == "running":
         # Still running — duration so far
         now = datetime.now(started.tzinfo) if started.tzinfo else datetime.now()
-        result["started_at"] = started.isoformat()
         result["duration_seconds"] = max(0, (now - started).total_seconds())
-    elif started:
-        result["started_at"] = started.isoformat()
-
-    completed = None
-    if task.get("status") in TERMINAL:
-        completed = _parse(task.get("updated_at"))
-        if completed:
-            result["completed_at"] = completed.isoformat()
-            if started:
-                delta = (completed - started).total_seconds()
-                result["duration_seconds"] = max(0.0, delta)
 
     return result
 

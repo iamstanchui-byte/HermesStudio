@@ -76,6 +76,14 @@ class Task(BaseModel):
     timeout_seconds: int
     output_path: str | None = None
     last_liveness_at: str | None = None
+    # Real start/end timestamps. started_at is set on /start
+    # (server-side, when the wrapper claims the task and status
+    # flips to 'running'). ended_at is set on /result, /cancel, or
+    # /interrupt (any terminal transition). Both are authoritative —
+    # the dashboard no longer hacks duration from
+    # `updated_at - last_liveness_at`.
+    started_at: str | None = None
+    ended_at: str | None = None
     error: str | None = None
     result: dict[str, Any] | None = None
     required_capability: str | None = None
@@ -323,10 +331,16 @@ async def start_task(task_id: str, request: Request) -> Task:
         raise HTTPException(400, f"Task not in assigned state: {task['status']}")
 
     now = _now_iso()
+    # started_at is set the first time the task flips to 'running' and
+    # preserved across retries. A retry from 'running' → re-assigned →
+    # 'running' would otherwise reset started_at, but in practice retries
+    # are handled by the supervisor (which creates a fresh task row), so
+    # this column is set once and never overwritten.
     await db.execute(
-        "UPDATE tasks SET status = 'running', last_liveness_at = ?, updated_at = ? "
+        "UPDATE tasks SET status = 'running', last_liveness_at = ?, "
+        "started_at = COALESCE(started_at, ?), updated_at = ? "
         "WHERE id = ?",
-        (now, now, task_id),
+        (now, now, now, task_id),
     )
     row = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
     await audit_log(
@@ -389,10 +403,14 @@ async def submit_result(task_id: str, body: TaskResult, request: Request) -> Tas
         }
     )
     now = _now_iso()
+    # ended_at is set on every terminal transition (completed or failed)
+    # so the dashboard's "took" field reflects the real runtime, not the
+    # 1-2s gap between the final liveness poll and this UPDATE.
     await db.execute(
-        "UPDATE tasks SET status = ?, result = ?, error = ?, updated_at = ? "
+        "UPDATE tasks SET status = ?, result = ?, error = ?, ended_at = ?, "
+        "updated_at = ? "
         "WHERE id = ?",
-        (body.status, result_json, body.error, now, task_id),
+        (body.status, result_json, body.error, now, now, task_id),
     )
     # Free the profile so the dashboard reflects "idle" again
     if task.get("assigned_profile_id"):
@@ -586,9 +604,13 @@ async def cancel_task(task_id: str, request: Request) -> Task:
         raise HTTPException(400, f"Task not in cancellable state: {task['status']}")
 
     now = _now_iso()
+    # ended_at is the same as the state transition for cancel; if the
+    # task never started (was 'pending' or 'assigned'), ended_at will
+    # be the cancel time, which is correct (zero or near-zero duration).
     await db.execute(
-        "UPDATE tasks SET status = 'cancelled', updated_at = ? WHERE id = ?",
-        (now, task_id),
+        "UPDATE tasks SET status = 'cancelled', ended_at = ?, updated_at = ? "
+        "WHERE id = ?",
+        (now, now, task_id),
     )
     # Free the profile (only if it was actually assigned to this task)
     if task.get("assigned_profile_id"):
@@ -620,8 +642,9 @@ async def interrupt_task(task_id: str, request: Request) -> Task:
 
     now = _now_iso()
     await db.execute(
-        "UPDATE tasks SET status = 'interrupted', updated_at = ? WHERE id = ?",
-        (now, task_id),
+        "UPDATE tasks SET status = 'interrupted', ended_at = ?, updated_at = ? "
+        "WHERE id = ?",
+        (now, now, task_id),
     )
     if task.get("assigned_profile_id"):
         await db.execute(

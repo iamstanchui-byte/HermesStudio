@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     timeout_seconds INTEGER DEFAULT 1800,
     output_path TEXT,
     last_liveness_at TIMESTAMP,
+    started_at TIMESTAMP,
+    ended_at TIMESTAMP,
     error TEXT,
     result TEXT,
     required_capability TEXT,
@@ -322,6 +324,17 @@ MIGRATIONS = [
     # primary mechanism (alongside OS-level mount) for keeping large
     # data out of the orch's project share folder.
     "ALTER TABLE agent_profiles ADD COLUMN storage_refs TEXT NOT NULL DEFAULT '[]'",
+    # Real task start/end timestamps (set on the server side at /start and
+    # terminal-state transitions). Replaces the old hack of computing
+    # duration from `updated_at - last_liveness_at`, which always gave
+    # 1-30s because both fields were set within 1-2s of task completion
+    # (last poll + final status UPDATE). With these columns, the dashboard
+    # shows the actual hermes subprocess runtime (typically 30-180s for
+    # real work, not 6-30s of false "took"). For pre-migration tasks,
+    # backfill from `last_liveness_at` (≈ wrapper claim) and `updated_at`
+    # (≈ status change to terminal).
+    "ALTER TABLE tasks ADD COLUMN started_at TIMESTAMP",
+    "ALTER TABLE tasks ADD COLUMN ended_at TIMESTAMP",
 ]
 
 
