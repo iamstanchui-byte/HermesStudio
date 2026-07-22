@@ -379,10 +379,53 @@
                         <div class="mt-1 text-xs text-gray-400">No MCP servers configured</div>
                         {% endif %}
                     </details>
+                    {# Storage refs (per-profile list of large-output destinations).
+                       Operator-curated, injected into task prompts as
+                       [AVAILABLE STORAGE] block by the wrapper. Each entry is
+                       {kind, ref, description} where kind ∈ {smb, local,
+                       gdrive, s3, url}. Color-coded by kind so the operator
+                       can scan the kinds at a glance. Always collapsed —
+                       same UX as MCP servers. #}
+                    <details class="mt-2">
+                        <summary class="text-[10px] font-medium text-gray-500 uppercase tracking-wide cursor-pointer select-none hover:text-gray-700">
+                            Storage refs ({{ p.storage_refs|length if p.storage_refs else 0 }})
+                        </summary>
+                        {% if p.storage_refs %}
+                        <div class="mt-1 space-y-0.5">
+                            {% for s in p.storage_refs %}
+                            <div class="text-xs flex items-center gap-1.5 min-w-0">
+                                <span class="px-1 rounded text-[10px] font-mono flex-shrink-0
+                                    {%- if s.kind == 'smb' %} bg-blue-50 text-blue-700
+                                    {%- elif s.kind == 'local' %} bg-gray-100 text-gray-700
+                                    {%- elif s.kind == 'gdrive' %} bg-emerald-50 text-emerald-700
+                                    {%- elif s.kind == 's3' %} bg-orange-50 text-orange-700
+                                    {%- else %} bg-purple-50 text-purple-700
+                                    {%- endif %}"
+                                    title="kind: {{ s.kind }}">[{{ s.kind }}]</span>
+                                <span class="font-mono truncate" title="{{ s.ref }}">{{ s.ref }}</span>
+                                {% if s.description %}<span class="text-gray-500 italic truncate" title="{{ s.description }}">— {{ s.description }}</span>{% endif %}
+                            </div>
+                            {% endfor %}
+                        </div>
+                        {% else %}
+                        <div class="mt-1 text-xs text-gray-400">No storage refs configured — wrapper will not inject an [AVAILABLE STORAGE] block. Add one via the edit form (✎).</div>
+                        {% endif %}
+                    </details>
                     <form id="edit-profile-{{ agent.id }}-{{ p.name }}" class="hidden mt-2 p-2 bg-white border rounded" onsubmit="saveProfileEdit(event, '{{ agent.id }}', '{{ p.name }}')">
                         <textarea name="description" class="w-full text-xs border rounded p-1" rows="2" placeholder="description (optional)">{{ p.description or '' }}</textarea>
                         <label class="block text-[10px] text-gray-500 mt-1 mb-0.5">Capabilities (JSON, e.g. <code>{"mt5": true, "xauusd_feed": true}</code>):</label>
                         <textarea name="capabilities" class="w-full text-xs border rounded p-1 font-mono" rows="2" placeholder='{"mt5": true, "xauusd_feed": false}'>{{ p.capabilities | tojson(indent=2) if p.capabilities else '{}' }}</textarea>
+                        <label class="block text-[10px] text-gray-500 mt-1 mb-0.5">Storage refs (JSON, e.g. <code>[{"kind":"gdrive","ref":"https://drive.google.com/...","description":"stanley/ folder"}]</code>):</label>
+                        <textarea name="storage_refs" class="w-full text-xs border rounded p-1 font-mono" rows="3" placeholder='[{"kind": "gdrive", "ref": "https://drive.google.com/drive/folders/<id>", "description": "stanley/ folder"}]'>{{ p.storage_refs | tojson(indent=2) if p.storage_refs else '[]' }}</textarea>
+                        <div class="mt-1 text-[10px] text-gray-500">
+                            <span class="font-medium">kinds:</span>
+                            <code class="bg-blue-50 text-blue-700 px-1 rounded">smb</code>
+                            <code class="bg-gray-100 text-gray-700 px-1 rounded">local</code>
+                            <code class="bg-emerald-50 text-emerald-700 px-1 rounded">gdrive</code>
+                            <code class="bg-orange-50 text-orange-700 px-1 rounded">s3</code>
+                            <code class="bg-purple-50 text-purple-700 px-1 rounded">url</code>
+                            &nbsp;·&nbsp;changes propagate to wrapper within ~5s (next heartbeat).
+                        </div>
                         <div class="mt-1 flex gap-1">
                             <button type="submit" class="text-xs px-2 py-0.5 bg-blue-600 text-white rounded">Save</button>
                             <button type="button" onclick="editProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs px-2 py-0.5 bg-gray-200 rounded">Cancel</button>
@@ -571,11 +614,39 @@ async function saveProfileEdit(event, agentId, profileName) {
         alert('Capabilities JSON invalid: ' + e.message);
         return;
     }
+    // Parse storage_refs JSON. If empty, send as []. Each entry must be
+    // {kind, ref, description?} with kind non-empty and ref non-empty.
+    // The server's PATCH handler silently drops malformed entries
+    // (operators can fix from the UI), but a friendly client-side
+    // check avoids the silent-drop surprise.
+    const srefsRaw = (form.storage_refs.value || '').trim() || '[]';
+    let srefs;
+    try {
+        srefs = JSON.parse(srefsRaw);
+        if (!Array.isArray(srefs)) {
+            throw new Error('storage_refs must be a JSON array');
+        }
+        for (let i = 0; i < srefs.length; i++) {
+            const s = srefs[i];
+            if (typeof s !== 'object' || !s) {
+                throw new Error(`entry ${i} is not an object`);
+            }
+            if (!s.kind || !String(s.kind).trim()) {
+                throw new Error(`entry ${i} missing non-empty "kind"`);
+            }
+            if (!s.ref || !String(s.ref).trim()) {
+                throw new Error(`entry ${i} missing non-empty "ref"`);
+            }
+        }
+    } catch (e) {
+        alert('Storage refs JSON invalid: ' + e.message);
+        return;
+    }
     try {
         const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}`, {
             method: 'PATCH',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({description: desc, capabilities: caps}),
+            body: JSON.stringify({description: desc, capabilities: caps, storage_refs: srefs}),
         });
         if (r.ok) location.reload();
         else {
