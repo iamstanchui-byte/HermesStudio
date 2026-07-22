@@ -93,6 +93,11 @@ class TaskResult(BaseModel):
     summary: str | None = None
     error: str | None = None
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    # Files the agent created in cache_dir that exceeded the 15MB per-file
+    # cap and were SKIPPED from upload. Stored so the dashboard can show
+    # "N files too large — use share folder at <path>". Each entry has
+    # `{path, size_bytes, reason}`.
+    skipped_artifacts: list[dict[str, Any]] = Field(default_factory=list)
     # Wrapper-reported per-task token usage. Read from the profile's
     # hermes state.db (sessions table) by the wrapper after each hermes
     # subprocess completes. Mapped into the orchestrator's token_usage

@@ -318,12 +318,31 @@ async def read_file(project_id: str, path: str, request: Request) -> Response:
 
 @router.put("/{project_id}/files/{path:path}")
 async def write_file(project_id: str, path: str, request: Request) -> dict:
-    """Write a file (whole content) to the project folder."""
+    """Write a file (whole content) to the project folder.
+
+    Per orch-as-coordinator principle: this endpoint is for SMALL
+    metadata-bearing files (markdown reports, JSON metadata, text
+    summaries). For large data outputs (>15MB), the agent should
+    write directly to its share folder (see agent_profiles.storage_refs)
+    and only store the reference here. Hard cap below prevents
+    accidental DoS or OOM.
+    """
+    # 15MB per-file cap (matches email attachment UX). Bigger files
+    # should go to share folder, not through orch. Constant lives
+    # in one place so we can tune later if needed.
+    MAX_FILE_BYTES = 15 * 1024 * 1024
     db = request.app.state.db
     pdir = _project_dir(request, project_id)
     safe = _validate_relpath(path)
     full = _resolve_inside(pdir, safe)
     body = await request.body()
+    if len(body) > MAX_FILE_BYTES:
+        raise HTTPException(
+            413,
+            f"File too large: {len(body)} bytes (max {MAX_FILE_BYTES // (1024*1024)}MB). "
+            f"Large outputs should go to share folder — see agent_profiles.storage_refs. "
+            f"Store only metadata/reference in orch.",
+        )
     full.parent.mkdir(parents=True, exist_ok=True)
     full.write_bytes(body)
     await audit_log(

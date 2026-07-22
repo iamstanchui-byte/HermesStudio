@@ -1654,46 +1654,70 @@ def start(
 
             if rc == 0:
                 summary = _clean_hermes_output(stdout) if stdout else "(no output)"
-                result = {"status": "completed", "summary": summary}
+                result = {"status": "completed", "summary": summary, "skipped_artifacts": []}
                 # If task declared an output_path: check local cache, upload
                 # to orchestrator via PUT file API, then attach artifact meta.
                 if cache_dir and output_path:
                     output_local = cache_dir / output_path
                     if output_local.exists() and output_local.is_file():
-                        file_bytes = output_local.read_bytes()
-                        file_sha = hashlib.sha256(file_bytes).hexdigest()
-                        # Upload to orchestrator (relative path)
-                        rel = output_path.lstrip("/").replace("\\", "/")
+                        # 15MB per-file cap (matches orch's write_file cap).
+                        # If output_path is too large, skip the upload and
+                        # record in skipped_artifacts so the dashboard
+                        # shows "use share folder" hint.
+                        MAX_OUTPUT_PATH_BYTES = 15 * 1024 * 1024
                         try:
-                            r = httpx.put(
-                                f"{orchestrator_url}/api/projects/{project_id}/files/{rel}",
-                                content=file_bytes,
-                                headers={
-                                    "X-Agent-Id": agent_id,
-                                    "X-Timestamp": str(int(time_mod.time())),
-                                    "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-                                },
-                                timeout=60,
+                            output_size = output_local.stat().st_size
+                        except Exception:
+                            output_size = 0
+                        if output_size > MAX_OUTPUT_PATH_BYTES:
+                            click.echo(
+                                f"  SKIP output_path {output_path}: "
+                                f"{output_size} bytes exceeds "
+                                f"{MAX_OUTPUT_PATH_BYTES // (1024*1024)}MB cap"
                             )
-                            if r.status_code == 200:
-                                click.echo(
-                                    f"  uploaded: {rel} "
-                                    f"({len(file_bytes)} bytes, sha={file_sha[:12]})"
+                            result["skipped_artifacts"].append({
+                                "path": output_path,
+                                "size_bytes": output_size,
+                                "reason": (
+                                    f"exceeds {MAX_OUTPUT_PATH_BYTES // (1024*1024)}MB cap; "
+                                    f"use share folder"
+                                ),
+                            })
+                        else:
+                            file_bytes = output_local.read_bytes()
+                            file_sha = hashlib.sha256(file_bytes).hexdigest()
+                            # Upload to orchestrator (relative path)
+                            rel = output_path.lstrip("/").replace("\\", "/")
+                            try:
+                                r = httpx.put(
+                                    f"{orchestrator_url}/api/projects/{project_id}/files/{rel}",
+                                    content=file_bytes,
+                                    headers={
+                                        "X-Agent-Id": agent_id,
+                                        "X-Timestamp": str(int(time_mod.time())),
+                                        "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
+                                    },
+                                    timeout=60,
                                 )
-                                # Send as artifacts list (standard contract).
-                                # The server registers each entry in the artifacts
-                                # table for browsing / downloading.
-                                result.setdefault("artifacts", []).append({
-                                    "path": rel,
-                                    "size_bytes": len(file_bytes),
-                                    "sha256": file_sha,
-                                })
-                            else:
-                                click.echo(
-                                    f"  WARN: upload {rel} failed: HTTP {r.status_code} {r.text[:200]}"
-                                )
-                        except Exception as e:
-                            click.echo(f"  WARN: upload {rel} error: {e}")
+                                if r.status_code == 200:
+                                    click.echo(
+                                        f"  uploaded: {rel} "
+                                        f"({len(file_bytes)} bytes, sha={file_sha[:12]})"
+                                    )
+                                    # Send as artifacts list (standard contract).
+                                    # The server registers each entry in the artifacts
+                                    # table for browsing / downloading.
+                                    result.setdefault("artifacts", []).append({
+                                        "path": rel,
+                                        "size_bytes": len(file_bytes),
+                                        "sha256": file_sha,
+                                    })
+                                else:
+                                    click.echo(
+                                        f"  WARN: upload {rel} failed: HTTP {r.status_code} {r.text[:200]}"
+                                    )
+                            except Exception as e:
+                                click.echo(f"  WARN: upload {rel} error: {e}")
                     else:
                         click.echo(
                             f"  WARN: task declared output_path={output_path} "
@@ -1704,8 +1728,20 @@ def start(
                 # (regardless of output_path). This catches the common case
                 # where the agent uses a different filename or writes
                 # multiple files. Skip the orchestrator's own dirs.
+                #
+                # Per orch-as-coordinator principle: 15MB per-file cap. Files
+                # larger than the cap are recorded in `skipped_artifacts`
+                # (returned in TaskResult) so the dashboard can show
+                # "N files too large — use share folder". The full path
+                # and size are preserved so the operator can locate the file
+                # on the agent's local cache.
                 if cache_dir and project_id:
                     artifacts_extra = []
+                    skipped_extra = []
+                    # 15MB cap, matches orch server's write_file endpoint.
+                    # Larger files should go to share folder (see
+                    # agent_profiles.storage_refs), not through orch.
+                    MAX_AUTO_UPLOAD_BYTES = 15 * 1024 * 1024
                     try:
                         cache_root = cache_dir.resolve()
                         # Find files modified during this task run. We use a
@@ -1735,6 +1771,35 @@ def start(
                             # Same applies to other low-level control files.
                             if f.name in ("decision.md", "decisions.md",
                                           "status.md", "plan.md"):
+                                continue
+                            # Skip the hermes transcript files we just wrote
+                            # (they're debugging artifacts for the user, not
+                            # deliverable content). Saves a 64KB+ upload of
+                            # mostly-UI-chrome.
+                            if rel.startswith("hermes.") and rel.endswith(".log"):
+                                continue
+                            # Size check BEFORE read_bytes() — avoid OOM on
+                            # huge files (an LLM could write a 10GB log if
+                            # it loops). If too large, record in skipped
+                            # and continue.
+                            try:
+                                file_size = f.stat().st_size
+                            except Exception:
+                                continue
+                            if file_size > MAX_AUTO_UPLOAD_BYTES:
+                                click.echo(
+                                    f"  SKIP {rel}: {file_size} bytes exceeds "
+                                    f"{MAX_AUTO_UPLOAD_BYTES // (1024*1024)}MB cap "
+                                    f"(use share folder)"
+                                )
+                                skipped_extra.append({
+                                    "path": rel,
+                                    "size_bytes": file_size,
+                                    "reason": (
+                                        f"exceeds {MAX_AUTO_UPLOAD_BYTES // (1024*1024)}MB "
+                                        f"cap; use share folder"
+                                    ),
+                                })
                                 continue
                             try:
                                 file_bytes = f.read_bytes()
@@ -1772,6 +1837,11 @@ def start(
                                 click.echo(f"  WARN: auto-upload {rel} error: {e}")
                     except Exception as e:
                         click.echo(f"  WARN: auto-upload scan error: {e}")
+                    # Merge extras into the result
+                    if artifacts_extra:
+                        result.setdefault("artifacts", []).extend(artifacts_extra)
+                    if skipped_extra:
+                        result.setdefault("skipped_artifacts", []).extend(skipped_extra)
                     # Merge extra artifacts into the result
                     if artifacts_extra:
                         result.setdefault("artifacts", []).extend(artifacts_extra)
