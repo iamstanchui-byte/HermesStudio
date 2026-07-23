@@ -101,6 +101,11 @@ print()
 print("[2] Top-level shape")
 # Empty description is allowed (LLM may produce empty; operator can PATCH later)
 expect_ok("empty description still ok", mut() | {"description": ""})
+# Missing description is REJECTED at the validator level — but the call-site
+# defensive code in workflows.py auto-fills it before reaching the validator.
+# This test verifies the validator itself rejects it (defense in depth — if
+# the call-site is bypassed, we still get a clear error).
+expect_fail("missing description rejected by validator", mut() | {"description": None}, "description")
 expect_fail("missing step_template", mut() | {"step_template": []}, "step_template")
 expect_fail("step_template not list", mut() | {"step_template": "not a list"}, "step_template")
 expect_fail("missing variables", mut() | {"variables": []}, "variables")

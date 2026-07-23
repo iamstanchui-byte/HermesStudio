@@ -102,7 +102,9 @@ Output a JSON object describing the workflow:
 - description: a 1-2 sentence summary of what this workflow does
 
 # CRITICAL: output structure (often gets this wrong)
-Your response MUST be a SINGLE JSON OBJECT starting with `{` and ending with `}`. The first line of your response MUST be the opening `{` of the WRAPPER, not the opening `{` of a step object. The wrapper has THREE keys at the TOP level: `description`, `step_template`, `variables`. If you output the steps without the wrapper, the response is invalid.
+Your response MUST be a SINGLE JSON OBJECT starting with `{` and ending with `}`. The first line of your response MUST be the opening `{` of the WRAPPER, not the opening `{` of a step object. The wrapper has THREE keys at the TOP level: `description`, `step_template`, `variables` -- ALL THREE ARE REQUIRED. If you output the steps without the wrapper, the response is invalid. If you forget `description`, the response is invalid (we will fail validation and ask you to retry).
+
+The `description` field MUST be a 1-2 sentence human-readable summary of what the workflow does (e.g. "Fetch HK weather forecast for a given date and write a Markdown report to Google Drive.").
 
 # 4-Layer Separation (mandatory)
 - L0 structure (step count, ordering, dependencies) → KEEP as step ordering + depends_on
@@ -699,6 +701,33 @@ async def promote_project_to_workflow(
     # Operator description overrides LLM description if provided.
     if body.description:
         pkg["description"] = body.description
+
+    # Defensive: the LLM sometimes forgets the top-level `description`
+    # wrapper key (the prompt says it must be there, but M3 occasionally
+    # drops it). Synthesize a sensible default rather than failing.
+    # Operator override above takes precedence; this only kicks in when
+    # pkg has no description AND body.description is empty.
+    if not pkg.get("description"):
+        # Build from project goal + first step action
+        try:
+            n_steps = len(pkg.get("step_template", []))
+            first_action = (pkg["step_template"][0].get("action", "")
+                            if pkg.get("step_template") else "")
+            project_name = (proj.get("name") or proj.get("id") or project_id)
+            if first_action:
+                pkg["description"] = (
+                    f"{first_action} workflow (synthesized from project "
+                    f"{project_name}, {n_steps} step{'s' if n_steps != 1 else ''})"
+                )
+            else:
+                pkg["description"] = (
+                    f"Workflow synthesized from project {project_name} "
+                    f"({n_steps} step{'s' if n_steps != 1 else ''})"
+                )
+        except Exception:
+            pkg["description"] = (
+                f"Workflow synthesized from project {project_id}"
+            )
 
     ok, err = _validate_workflow_package(pkg)
     if not ok:
