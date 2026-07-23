@@ -270,6 +270,63 @@ def main() -> int:
         expect("cleanup: delete new project", r4.status_code in (200, 204))
     print()
 
+    # ---- 9b. Stage 1.5: skill field in step_template (BEFORE delete) ----
+    print("[9b] Stage 1.5: PATCH workflow to add skill reference")
+    # Add `skill: "bus"` to the first step. PATCH validates the new
+    # package structure (including the new `skill` field). Then run
+    # and verify the task params contain `_workflow_skill: "bus"`.
+    step_template_patched = json.loads(json.dumps(wf["step_template"]))  # deep copy
+    if step_template_patched:
+        step_template_patched[0]["skill"] = "bus"
+    r = httpx.patch(
+        f"{BASE}/api/workflows/{wf_id}",
+        json={"step_template": step_template_patched},
+        timeout=10,
+    )
+    expect("PATCH with skill field returns 200", r.status_code == 200,
+           f"status={r.status_code}, body={r.text[:300]}")
+    if r.status_code == 200:
+        r2 = httpx.get(f"{BASE}/api/workflows/{wf_id}", timeout=5)
+        patched = r2.json()
+        expect("patched step 0 has skill='bus'",
+               patched["step_template"][0].get("skill") == "bus")
+        # Run the patched workflow
+        run_variables2: dict[str, Any] = {}
+        for v in patched.get("variables", []):
+            if v.get("required", False) or v.get("default") is not None:
+                if v["type"] in ("string", "path", "choice"):
+                    run_variables2[v["name"]] = f"e2e-skill-{v['name']}"
+                elif v["type"] == "number":
+                    run_variables2[v["name"]] = 42
+        r3 = httpx.post(
+            f"{BASE}/api/workflows/{wf_id}/run",
+            json={"variables": run_variables2,
+                  "project_name": f"e2e-skill-run-{WF_NAME}"},
+            timeout=30,
+        )
+        expect("run after skill PATCH returns 201", r3.status_code == 201,
+               f"status={r3.status_code}, body={r3.text[:300]}")
+        if r3.status_code == 201:
+            new_pid2 = r3.json().get("project_id", "")
+            if new_pid2:
+                r4 = httpx.get(
+                    f"{BASE}/api/tasks/?project_id={new_pid2}",
+                    timeout=5, follow_redirects=True,
+                )
+                if r4.status_code == 200:
+                    tdata = r4.json()
+                    new_tasks = tdata if isinstance(tdata, list) else tdata.get("tasks", [])
+                    found_skill = False
+                    for t in new_tasks:
+                        params = t.get("params", {}) or {}
+                        if params.get("_workflow_skill") == "bus":
+                            found_skill = True
+                            break
+                    expect("at least one task has _workflow_skill='bus' in params",
+                           found_skill)
+            httpx.delete(f"{BASE}/api/projects/{new_pid2}", timeout=5)
+    print()
+
     # ---- 10. DELETE ----
     print("[10] DELETE /api/workflows/{id}")
     r = httpx.delete(f"{BASE}/api/workflows/{wf_id}", timeout=5)

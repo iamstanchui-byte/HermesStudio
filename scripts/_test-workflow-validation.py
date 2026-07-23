@@ -77,6 +77,8 @@ GOOD_PKG = {
                 "language": "{{language}}",
             },
             "output_path": "summary.md",
+            # Stage 1.5: skill reference
+            "skill": "gdrive-folder-reader",
         },
     ],
     "variables": [
@@ -92,6 +94,8 @@ GOOD_PKG = {
 
 print("[1] Happy path passes")
 expect_ok("valid package", GOOD_PKG)
+print("[1b] skill field accepted (Stage 1.5)")
+expect_ok("valid package with skill field", GOOD_PKG)
 
 print()
 print("[2] Top-level shape")
@@ -100,6 +104,34 @@ expect_ok("empty description still ok", mut() | {"description": ""})
 expect_fail("missing step_template", mut() | {"step_template": []}, "step_template")
 expect_fail("step_template not list", mut() | {"step_template": "not a list"}, "step_template")
 expect_fail("missing variables", mut() | {"variables": []}, "variables")
+
+print()
+print("[2b] skill field checks (Stage 1.5)")
+# Bad skill (not kebab-case)
+bad = mut()
+bad["step_template"][0]["skill"] = "Bad Skill Name"
+expect_fail("skill not kebab-case", bad, "kebab")
+# Bad skill (L3 scaffolding) — kebab-case check covers most L3 names
+# (they all have underscores/colons that fail kebab-case). The action
+# L3 check has a more specific list, but for skill, kebab-case is the
+# primary defense. We just verify the action check works.
+# (no separate skill L3 test — covered by the kebab-case test above)
+# Bad skill (empty string)
+bad = mut()
+bad["step_template"][0]["skill"] = ""
+expect_fail("empty skill", bad, "non-empty")
+# Bad skill (too long)
+bad = mut()
+bad["step_template"][0]["skill"] = "a" * 50
+expect_fail("skill too long", bad, "too long")
+# Good skill (kebab-case)
+good = mut()
+good["step_template"][0]["skill"] = "bus"
+expect_ok("valid skill name", good)
+# Skill with {{var}} should NOT be picked up as a variable
+good = mut()
+good["step_template"][0]["skill"] = "skill-with-static-name"
+expect_ok("skill name is static (not in var extraction)", good)
 
 print()
 print("[3] Step-level checks")

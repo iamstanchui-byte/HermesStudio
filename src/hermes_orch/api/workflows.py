@@ -37,7 +37,22 @@ _MAX_VARIABLES_BYTES = 50_000
 # template is portable + read-only-by-the-runner.
 _STEP_FIELDS = (
     "name", "agent_role", "action", "depends_on",
-    "params_template", "output_path",
+    "params_template", "output_path", "skill",
+    # Stage 1.5 (2026-07-23): `skill` is an OPTIONAL reference to
+    # an existing skill. The wrapper reads it from task params as
+    # `_workflow_skill`, looks up `<profile>/skills/<name>/SKILL.md`
+    # on the agent host, and injects the body into the task prompt
+    # as a [SKILL: <name>] block. This is how workflow stays
+    # parameter-light: instead of inlining skill content (huge
+    # prompt, stale data) or re-discovering the data source URL
+    # on every run (token waste), just reference the skill by name.
+)
+# Fields whose VALUES may contain {{var}} placeholders. Excludes
+# `skill` (a static identifier) and `depends_on` (a list of step
+# names — no user variables). If a future field needs variable
+# substitution, add it here.
+_STEP_FIELDS_WITH_VARS = (
+    "name", "agent_role", "action", "params_template", "output_path",
 )
 # Variable types we accept. LLM may pick any; we validate.
 _VALID_VAR_TYPES = {"string", "number", "path", "choice", "boolean"}
@@ -111,7 +126,8 @@ Your response MUST be a SINGLE JSON OBJECT starting with `{` and ending with `}`
         "param1": "{{var1}}",
         "param2": "literal value if it's always the same, e.g. 30"
       }},
-      "output_path": "relative path the step writes (e.g. list_files.results.json)"
+      "output_path": "relative path the step writes (e.g. list_files.results.json)",
+      "skill": "kebab-case skill name (OPTIONAL — only when the source project used an existing skill; see Rule 11 below)"
     }}
   ],
   "variables": [
@@ -148,6 +164,24 @@ Your response MUST be a SINGLE JSON OBJECT starting with `{` and ending with `}`
      - WRONG: `"max_items": {{max_items}}` (unquoted — invalid JSON)
      - WRONG: `"max_items": "{{max_items}}}` (extra closing brace)
 10. L3 scaffolding (PASS/FAIL, [cite:...], task IDs) MUST NOT appear in the output.
+11. **OPTIONAL `skill` field** (Stage 1.5, 2026-07-23). Use this when
+    the source project's tasks referenced a published skill (e.g.
+    the agent had a `bus` skill that knows KMB bus route lookup
+    URLs, or a `mt5-bridge` skill for MT5 trading data). Instead
+    of inlining the skill content (huge, often stale), set:
+      `"skill": "<skill-name>"`
+    The wrapper resolves this at execute time: reads
+    `<profile_root>/skills/<name>/SKILL.md` on the agent host and
+    injects the body as a `[SKILL: <name>]` block in the task
+    prompt. The agent then has the procedure (URLs, API patterns,
+    completion criteria) without re-discovering it on every run.
+    - OMIT `skill` when the step uses generic tools (web_search
+      etc.) — let the agent figure it out from the goal.
+    - DO NOT in skill L2 data (specific values) — skill content
+      is L1 structural; specific dates / IDs / values belong in
+      `params_template` as `{{var}}`.
+    - Skill name MUST be kebab-case, ≤ 40 chars.
+    - WRONG: `"skill": "_iteration_review:1"` (L3 scaffolding)
 
 # Operator hints (use as starting point for variable names + types)
 {operator_hints}
@@ -411,7 +445,7 @@ def _extract_variables_from_template(step_template: list[dict]) -> list[str]:
         # numbers/booleans/None have no placeholders
 
     for step in step_template:
-        for field in _STEP_FIELDS:
+        for field in _STEP_FIELDS_WITH_VARS:
             if field in step:
                 _walk(step[field])
     return sorted(found)
@@ -484,6 +518,18 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
         for d in deps:
             if d not in seen_names:
                 return False, f"step_template[{i}].depends_on references {d!r} which is not an EARLIER step (or doesn't exist)"
+        # skill (optional, Stage 1.5)
+        skill = step.get("skill")
+        if skill is not None:
+            if not isinstance(skill, str) or not skill:
+                return False, f"step_template[{i}].skill must be a non-empty string"
+            if not re.match(r"^[a-z0-9][a-z0-9-]*$", skill):
+                return False, f"step_template[{i}].skill={skill!r} not kebab-case"
+            if len(skill) > 40:
+                return False, f"step_template[{i}].skill={skill!r} too long ({len(skill)} > 40)"
+            # Anti-L3: skill name shouldn't look like an internal action
+            if any(s in skill for s in ("coord_pickup", "handoff:", "_iteration_review")):
+                return False, f"step_template[{i}].skill={skill!r} contains L3 scaffolding"
 
     # Variables
     variables = pkg["variables"]
@@ -1091,6 +1137,17 @@ async def run_workflow(
         # step_template so depends_on (which references earlier tasks)
         # can resolve. We've already done that.
         params = step.get("params_template") or {}
+        # Stage 1.5 (2026-07-23): if the step has a `skill` reference,
+        # pass the skill NAME in the task's params as `_workflow_skill`.
+        # The wrapper reads this at execute time and injects the skill
+        # body as a [SKILL: <name>] block in the task prompt. We pass
+        # the NAME (not the body) so we don't bloat the DB with skill
+        # content that may be hundreds of KB.
+        skill_name = step.get("skill")
+        if skill_name:
+            # Copy params to avoid mutating the substituted template
+            params = dict(params)
+            params["_workflow_skill"] = skill_name
         task_rows.append({
             "id": tid,
             "project_id": new_pid,

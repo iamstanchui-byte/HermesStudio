@@ -226,6 +226,57 @@ def _resolve_storage_hint(role: str, output_to: str) -> str:
     return "\n".join(lines)
 
 
+def _render_workflow_skill_block(
+    profile_root: "Path", skill_name: str, params: dict | None = None
+) -> str:
+    """Render the [SKILL: <name>] block for a workflow-run task.
+
+    Stage 1.5 (2026-07-23): when a workflow step has a `skill`
+    reference, the run endpoint puts `{"_workflow_skill": "<name>"}`
+    in the task's params. The wrapper reads this and injects the
+    skill's body into the task prompt so the agent has the procedure
+    (URLs, API patterns, completion criteria) without having to
+    re-discover the data source on every run.
+
+    Reads from `<profile_root>/skills/<name>/SKILL.md` (the
+    hermes 0.17+ folder layout). If the skill doesn't exist
+    locally, returns "" + logs a warning (the agent will have to
+    figure it out from the goal).
+
+    The body is truncated to 100KB to keep the prompt bounded.
+    """
+    if not skill_name:
+        return ""
+    skill_path = profile_root / "skills" / skill_name / "SKILL.md"
+    if not skill_path.exists():
+        click.echo(
+            f"[daemon] WARNING: workflow-skill {skill_name!r} not found at "
+            f"{skill_path}; task will run without skill body"
+        )
+        return ""
+    try:
+        body = skill_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        click.echo(f"[daemon] failed to read skill {skill_name!r}: {e}")
+        return ""
+    # Truncate to keep prompt bounded. 100KB is enough for any
+    # realistic skill (most are 5-30KB). The LLM gets the procedure
+    # without unbounded token growth.
+    max_bytes = 100_000
+    if len(body.encode("utf-8")) > max_bytes:
+        body = body.encode("utf-8")[:max_bytes].decode("utf-8", errors="replace")
+        body += "\n\n[... truncated to 100KB ...]"
+    return (
+        f"--- SKILL: {skill_name} (workflow reference, body prepended) ---\n"
+        f"{body}\n"
+        f"--- END SKILL: {skill_name} ---\n\n"
+        f"This skill was referenced by a workflow step. Follow its procedure "
+        f"to execute this task. After reading, you may use any tool you have "
+        f"access to.\n"
+        f"--- END SKILL HINT ---"
+    )
+
+
 def _render_output_format_block() -> str:
     """Render the [OUTPUT FORMAT] block for the task prompt.
 
@@ -449,13 +500,15 @@ def _strip_prompt_echo(s: str) -> str:
     """Strip the prompt template echo that hermes prepends to its output.
 
     The wrapper builds the prompt as:
-        {action}({params})\\n\\n[OUTPUT FORMAT]\\n\\n[STORAGE HINT if params.output_to]\\n\\n[AVAILABLE STORAGE]\\n\\n--- PROJECT CONTEXT ---\\n{context_block}\\n--- END CONTEXT ---
+        {action}({params})\n\n[OUTPUT FORMAT]\n\n[STORAGE HINT if params.output_to]\n\n[AVAILABLE STORAGE]\n\n[SKILL: <name> if workflow reference]\n\n--- PROJECT CONTEXT ---\n{context_block}\n--- END CONTEXT ---
 
     The OUTPUT FORMAT block is always prepended (house style: .md for
     output, .json only for params, no .results.json). STORAGE HINT is
     prepended only if params.output_to is set on the task. AVAILABLE
     STORAGE is prepended only if storage_refs is configured for the
-    role. PROJECT CONTEXT is prepended only if a context_block is built.
+    role. SKILL is prepended only if the task was created from a
+    workflow step with a `skill` reference (Stage 1.5, 2026-07-23).
+    PROJECT CONTEXT is prepended only if a context_block is built.
 
     Hermes echoes this prompt at the top of its stdout (because it was the
     system message it received), so without stripping, the orchestrator's
@@ -488,6 +541,8 @@ def _strip_prompt_echo(s: str) -> str:
         r"\s*--- END OUTPUT FORMAT ---\s*\n",
         r"\s*--- END STORAGE HINT ---\s*\n",
         r"\s*--- END AVAILABLE STORAGE ---\s*\n",
+        r"\s*--- END SKILL: \S+ ---\s*\n",
+        r"\s*--- END SKILL HINT ---\s*\n",
         r"\s*--- END CONTEXT ---\s*\n",
     ]
     last_end = -1
@@ -1604,11 +1659,25 @@ def start(
         # the agent sees the target first, then the full list as context
         # for the case where output_to points to an unknown name.
         storage_hint_block = _resolve_storage_hint(role, params.get("output_to") or "")
+        # Stage 1.5 (2026-07-23): if the task was created from a workflow
+        # step with a `skill` reference, the run endpoint put the skill
+        # name in params as `_workflow_skill`. Read it here and inject
+        # the skill body as a [SKILL: <name>] block. Sits right after
+        # STORAGE blocks so the agent has the data-source procedure
+        # before it starts planning the task.
+        workflow_skill_name = (params or {}).get("_workflow_skill")
+        workflow_skill_block = ""
+        if workflow_skill_name:
+            workflow_skill_block = _render_workflow_skill_block(
+                profile_root, workflow_skill_name, params
+            )
         prefix_parts = [output_format_block]
         if storage_hint_block:
             prefix_parts.append(storage_hint_block)
         if storage_block:
             prefix_parts.append(storage_block)
+        if workflow_skill_block:
+            prefix_parts.append(workflow_skill_block)
         if context_block:
             prefix_parts.append(
                 f"--- PROJECT CONTEXT ---\n{context_block}\n--- END CONTEXT ---"
