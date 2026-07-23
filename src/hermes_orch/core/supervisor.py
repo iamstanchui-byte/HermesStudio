@@ -39,6 +39,19 @@ from pathlib import Path  # Path A (#22): read procedure.md at task assign
 log = logging.getLogger("hermes_orch.supervisor")
 
 
+# Task statuses that mean "no more work expected from this task".
+# Used in 'any_nonterm' / 'has_remaining' checks across the supervisor.
+# If you add a new terminal status (e.g. 'superseded'), update this set AND
+# grep for `NOT IN.*completed.*skipped.*cancelled.*failed` to make sure
+# every parallel code path is updated.
+#
+# 2026-07-23 bug: an 'interrupted' task was NOT in this set, so the
+# supervisor never auto-completed a finished project that had an
+# orphan 'interrupted' task. See proj-e4c9e5dd for the receipt.
+_TERMINAL_TASK_STATUSES = ("completed", "skipped", "cancelled", "failed", "interrupted")
+_TERMINAL_TASK_STATUSES_SQL = "('completed', 'skipped', 'cancelled', 'failed', 'interrupted')"
+
+
 async def _load_role_skills(db: Any) -> dict[str, list[str]]:
     """Build a {role_name: [skill_name, ...]} map from the latest applied
     (or pending) profile_configs per profile.
@@ -749,7 +762,7 @@ class Supervisor:
         # Don't iterate while there's work in flight
         nonterm = await self.db.fetchone(
             "SELECT COUNT(*) as n FROM tasks WHERE project_id = ? "
-            "AND status NOT IN ('completed', 'skipped', 'cancelled', 'failed', 'interrupted')",
+            f"AND status NOT IN {_TERMINAL_TASK_STATUSES_SQL}",
             (pid,),
         )
         any_nonterm = (nonterm or {}).get("n", 0) > 0
@@ -762,7 +775,7 @@ class Supervisor:
         existing = await self.db.fetchone(
             "SELECT id, status FROM tasks WHERE project_id = ? "
             "AND action LIKE '_iteration_review:%' "
-            "AND status NOT IN ('completed', 'failed', 'cancelled', 'skipped', 'interrupted') "
+            f"AND status NOT IN {_TERMINAL_TASK_STATUSES_SQL} "
             "ORDER BY created_at DESC LIMIT 1",
             (pid,),
         )
@@ -1068,7 +1081,7 @@ class Supervisor:
         inflight = await self.db.fetchone(
             "SELECT id FROM tasks WHERE project_id = ? "
             "AND action LIKE '_iteration_review:%' "
-            "AND status NOT IN ('completed', 'failed', 'cancelled', 'skipped', 'interrupted') "
+            f"AND status NOT IN {_TERMINAL_TASK_STATUSES_SQL} "
             "LIMIT 1",
             (pid,),
         )
@@ -1363,7 +1376,7 @@ class Supervisor:
         # Any non-terminal task?
         nonterm = await self.db.fetchone(
             "SELECT COUNT(*) as n FROM tasks WHERE project_id = ? "
-            "AND status NOT IN ('completed', 'skipped', 'cancelled', 'failed')",
+            f"AND status NOT IN {_TERMINAL_TASK_STATUSES_SQL}",
             (pid,),
         )
         any_nonterm = (nonterm or {}).get("n", 0) > 0
