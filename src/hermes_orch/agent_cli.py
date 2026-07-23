@@ -807,6 +807,38 @@ def _read_profile_config(profile_root: Path) -> dict:
     return out
 
 
+def _extract_skills_used_from_transcript(transcript_path: Path) -> list[str]:
+    """Parse a hermes transcript for the `📚 skill <name>` markers that
+    indicate which skills the agent actually loaded during the task.
+
+    The hermes CLI prints a line per skill it loads via the skill_view
+    tool, formatted as:
+        ┊ 📚 skill     <name>  <duration>
+        ┊ 📚 skill     <name>  <duration>
+    (Note: multiple spaces between "skill" and the name.)
+
+    Stage 1.5 multi-skill awareness (2026-07-23): the wrapper reports
+    this list in the /result POST so promote-to-workflow can preserve
+    every skill the source used. The orchestrator-side helper does the
+    same parse — kept duplicated on purpose (the server can't read the
+    agent-side transcript directly).
+    """
+    import re
+    pattern = re.compile(r"📚\s+skill\s+(\S+)\s+[\d.]+s")
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        text = transcript_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return out
+    for m in pattern.finditer(text):
+        name = m.group(1).strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
 def _capture_session_tokens(profile_root: Path) -> dict | None:
     """Read the most recent hermes session from ``<profile_root>/state.db``.
 
@@ -2223,6 +2255,14 @@ def start(
                         f"cache_r={token_usage.get('cache_read_tokens', 0)} "
                         f"cache_w={token_usage.get('cache_write_tokens', 0)}"
                     )
+                # Stage 1.5 multi-skill (2026-07-23): parse the hermes
+                # transcript for the `📚 skill <name>` markers and report
+                # the unique list to the orchestrator. promote-to-workflow
+                # uses this to preserve every skill the source used.
+                skills_used = _extract_skills_used_from_transcript(stdout_log)
+                if skills_used:
+                    result["skills_used"] = skills_used
+                    click.echo(f"  skills_used: {skills_used}")
                 # Stop the liveness poller before returning
                 stop_poll.set()
                 return result
@@ -2236,6 +2276,11 @@ def start(
             token_usage = _capture_session_tokens(profile_root)
             if token_usage:
                 failed_result["token_usage"] = token_usage
+            # Same for skills_used — partial transcript may still show
+            # what the agent loaded before failing.
+            skills_used = _extract_skills_used_from_transcript(stdout_log)
+            if skills_used:
+                failed_result["skills_used"] = skills_used
             # Stop the liveness poller before returning
             stop_poll.set()
             return failed_result

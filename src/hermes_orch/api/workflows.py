@@ -184,6 +184,19 @@ The `description` field MUST be a 1-2 sentence human-readable summary of what th
       `params_template` as `{{var}}`.
     - Skill name MUST be kebab-case, ≤ 40 chars.
     - WRONG: `"skill": "_iteration_review:1"` (L3 scaffolding)
+12. **PRESERVE ALL skills the source agent loaded** (Stage 1.5 multi-
+    skill, 2026-07-23). The evidence section lists "Skills the source
+    agent loaded" — these are real skills the agent on the source
+    project actually used (parsed from its transcripts). Your
+    synthesized step(s) MUST reference each one, either:
+      - in the same step's `action` text (agent loads multiple
+        skills at runtime via hermes skill mechanism), or
+      - in a separate step's `skill` field (sequential)
+    If you drop a skill the source used, the workflow loses that
+    capability on every re-run. Real example that bit us: source
+    project used `hk-weather-forecast` + `gdrive-write`; the LLM
+    kept only `hk-weather-forecast` and the workflow never uploaded
+    to GDrive. The user had to PATCH a 2nd step by hand.
 
 # Operator hints (use as starting point for variable names + types)
 {operator_hints}
@@ -218,11 +231,38 @@ async def _gather_workflow_evidence(db, pdir: Path, project_id: str, proj: dict)
     # structured fields the LLM needs. Drop the body of the result —
     # that's L2, would re-introduce stale specific values.
     tasks = await db.fetchall(
-        "SELECT name, agent_role, action, status, depends_on, output_path, params "
+        "SELECT name, agent_role, action, status, depends_on, output_path, params, result "
         "FROM tasks WHERE project_id = ? "
         "ORDER BY created_at ASC",
         (project_id,),
     )
+
+    completed = [t for t in tasks if (t.get("status") or "") == "completed"]
+    failed = [t for t in tasks if (t.get("status") or "") in ("failed", "skipped", "cancelled", "interrupted")]
+
+    # Skills the source agent loaded (parsed from completed task
+    # results — the wrapper reported `skills_used` per task on
+    # /result POST, parsed from the hermes transcript's
+    # `📚 skill <name>` markers).
+    # Without this, the LLM silently drops skill references from the
+    # synthesized step (e.g. original task used hk-weather-forecast +
+    # gdrive-write, synthesis kept only hk-weather-forecast).
+    seen_skills: set[str] = set()
+    skills_used: list[str] = []
+    for t in completed:
+        try:
+            rraw = t.get("result") or ""
+            r = json.loads(rraw) if isinstance(rraw, str) else rraw
+        except Exception:
+            r = {}
+        for s in (r.get("skills_used") or []):
+            if s and s not in seen_skills:
+                seen_skills.add(s)
+                skills_used.append(s)
+    if skills_used:
+        parts.append("\n## Skills the source agent loaded (Stage 1.5 ref: PRESERVE ALL of these in your synthesized step)\n")
+        for s in skills_used:
+            parts.append(f"- `{s}`\n")
 
     def _shape(t: dict) -> str:
         deps = t.get("depends_on") or []
@@ -241,9 +281,6 @@ async def _gather_workflow_evidence(db, pdir: Path, project_id: str, proj: dict)
             f"{deps_str}: action=`{t.get('action') or '?'}`, "
             f"output=`{op}`, params={params_str}\n"
         )
-
-    completed = [t for t in tasks if (t.get("status") or "") == "completed"]
-    failed = [t for t in tasks if (t.get("status") or "") in ("failed", "skipped", "cancelled", "interrupted")]
 
     if completed:
         parts.append("\n## Completed steps (L0 structure + L1 actions, NO L2 values)\n")

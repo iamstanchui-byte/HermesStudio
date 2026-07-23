@@ -112,6 +112,12 @@ class TaskResult(BaseModel):
     # table with call_kind='agent_task'. Optional for backward
     # compatibility — old wrappers that don't report tokens still work.
     token_usage: dict[str, Any] | None = None
+    # Skills the agent actually loaded during the task. Wrapper parses
+    # the hermes transcript (line "┊ 📚 skill     <name>  <duration>") and
+    # reports the unique list. Used by promote-to-workflow so the
+    # synthesized step preserves every skill the source used
+    # (Stage 1.5 multi-skill awareness, 2026-07-23).
+    skills_used: list[str] | None = None
 
 
 class TaskAssign(BaseModel):
@@ -400,6 +406,12 @@ async def submit_result(task_id: str, body: TaskResult, request: Request) -> Tas
             "session_id": body.session_id,
             "error": body.error,
             "artifacts": body.artifacts,
+            # Stage 1.5 multi-skill (2026-07-23): which skills the
+            # agent actually loaded during the task. Wrapper parses
+            # the hermes transcript and reports. Stored in result JSON
+            # so promote-to-workflow can read it without scanning
+            # agent-side cache (which the server can't access).
+            "skills_used": body.skills_used or [],
         }
     )
     now = _now_iso()
