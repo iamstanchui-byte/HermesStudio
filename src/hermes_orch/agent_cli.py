@@ -28,6 +28,19 @@ import httpx
 
 import shutil
 
+# Force UTF-8 on stdout/stderr for NSSM/LocalSystem logs.
+# Without this, any Unicode in click.echo / prompt content (CJK, em-dash,
+# smart quotes) blows up with UnicodeEncodeError on the cp1252 log stream
+# that NSSM uses by default. That failure propagates OUT of _run_task and
+# the supervisor marks the task failed -- even though the actual work
+# (hermes subprocess) never even started.
+# Bug seen 2026-07-23 on proj-1a4a2962 ("Create a skill to get 香港天氣...").
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass  # already closed, or non-standard stream
+
 from hermes_orch.agent_paths import detect_hermes_profiles_dir
 
 
@@ -1689,11 +1702,26 @@ def start(
             )
         else:
             prompt = f"{action}({params_str})"
-        click.echo(f"[daemon] task {tid}: running")
-        click.echo(f"  role={role}  profile_root={profile_root}")
-        click.echo(f"  cache_dir={cache_dir}")
-        click.echo(f"  output_path={output_path}")
-        click.echo(f"  prompt={prompt[:200]}")
+        # Defensive: even with the UTF-8 reconfigure at module top,
+        # click.echo writing to a redirected stream can still fail on
+        # odd terminals. We don't want a logging failure to abort the
+        # task (the hermes subprocess hasn't even been spawned yet).
+        # errors='replace' substitutes ? for unencodable chars.
+        try:
+            click.echo(f"[daemon] task {tid}: running")
+            click.echo(f"  role={role}  profile_root={profile_root}")
+            click.echo(f"  cache_dir={cache_dir}")
+            click.echo(f"  output_path={output_path}")
+            click.echo(f"  prompt={prompt[:200]}")
+        except UnicodeEncodeError:
+            try:
+                # Last-ditch: encode manually with errors='replace' so we
+                # never lose a task to a logging issue.
+                safe_prompt = prompt[:200].encode("ascii", "replace").decode("ascii")
+                click.echo(f"[daemon] task {tid}: running (ascii-safe log)")
+                click.echo(f"  prompt={safe_prompt}")
+            except Exception:
+                click.echo(f"[daemon] task {tid}: running (log print suppressed due to encoding error)")
 
         # Resolve hermes binary (systemd doesn't load .bashrc, and Windows
         # services run as LocalSystem with a different HOME/PATH. Detection
