@@ -17,6 +17,7 @@ import sys
 import time
 import json
 import httpx
+from typing import Any
 
 BASE = "http://localhost:8765"
 SOURCE_PROJECT_ID = "proj-e4c9e5dd"  # Google Drive Access, 4 completed tasks
@@ -201,16 +202,80 @@ def main() -> int:
         expect("description was updated", r.json().get("description") == new_desc)
     print()
 
-    # ---- 9. DELETE ----
-    print("[9] DELETE /api/workflows/{id}")
+    # ---- 9. Stage 2b: POST /api/workflows/{id}/run (BEFORE delete) ----
+    print("[9] Stage 2b: run a workflow with variables")
+    # Build variables dict from declared variables
+    run_variables: dict[str, Any] = {}
+    for v in wf.get("variables", []):
+        if v.get("required", False) or v.get("default") is not None:
+            if v["type"] in ("string", "path", "choice"):
+                run_variables[v["name"]] = f"e2e-{v['name']}"
+            elif v["type"] == "number":
+                run_variables[v["name"]] = 42
+            elif v["type"] == "boolean":
+                run_variables[v["name"]] = True
+    r = httpx.post(
+        f"{BASE}/api/workflows/{wf_id}/run",
+        json={"variables": run_variables,
+              "project_name": f"e2e-run-{WF_NAME}"},
+        timeout=30,
+    )
+    expect("run returns 201", r.status_code == 201,
+           f"status={r.status_code}, body={r.text[:500]}")
+    if r.status_code == 201:
+        run = r.json()
+        new_pid = run.get("project_id", "")
+        expect("run returned project_id", bool(new_pid))
+        expect("run task_count matches step count",
+               run.get("task_count") == len(wf.get("step_template", [])))
+        expect("run returned variables_applied", bool(run.get("variables_applied")))
+        # The new project should have source_workflow_id set
+        if new_pid:
+            r2 = httpx.get(f"{BASE}/api/projects/{new_pid}", timeout=5)
+            new_proj = r2.json()
+            expect("new project has source_workflow_id",
+                   new_proj.get("source_workflow_id") == wf_id)
+            expect("new project state is ready", new_proj.get("state") == "ready")
+            # Fetch the tasks for the new project
+            r3 = httpx.get(
+                f"{BASE}/api/tasks/?project_id={new_pid}",
+                timeout=5, follow_redirects=True,
+            )
+            if r3.status_code == 200:
+                tdata = r3.json()
+                new_tasks = tdata if isinstance(tdata, list) else tdata.get("tasks", [])
+                expect("new project has the right task count",
+                       len(new_tasks) == len(wf.get("step_template", [])))
+                # Verify substitution: at least one of the provided
+                # values should appear in the task params somewhere
+                if new_tasks:
+                    all_params_str = json.dumps(
+                        [t.get("params", {}) for t in new_tasks],
+                        default=str,
+                    )
+                    found_any = False
+                    for k, v in run_variables.items():
+                        if str(v) in all_params_str:
+                            found_any = True
+                            break
+                    expect("at least one substituted value found in task params",
+                           found_any)
+                # Verify depends_on chain: at least one task should
+                # have a non-empty depends_on
+                has_deps = any(t.get("depends_on") for t in new_tasks)
+                expect("depends_on chain is preserved", has_deps)
+        # Cleanup: delete the new project (archive it)
+        r4 = httpx.delete(f"{BASE}/api/projects/{new_pid}", timeout=5)
+        # 204 = archived, 200 = also OK; just check it didn't error
+        expect("cleanup: delete new project", r4.status_code in (200, 204))
+    print()
+
+    # ---- 10. DELETE ----
+    print("[10] DELETE /api/workflows/{id}")
     r = httpx.delete(f"{BASE}/api/workflows/{wf_id}", timeout=5)
     expect("delete returns 200", r.status_code == 200)
     r = httpx.get(f"{BASE}/api/workflows/{wf_id}", timeout=5)
     expect("workflow is gone after delete", r.status_code == 404)
-    print()
-
-    # ---- 10. 409 on duplicate name ----
-    print("[10] re-create to test 409 (skipped — we already deleted)")
     print()
 
     # ---- 11. /workflows HTML page renders ----

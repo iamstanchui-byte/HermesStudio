@@ -34,7 +34,7 @@
     <div class="bg-white border rounded-lg shadow-sm">
         <div class="px-3 py-2 border-b bg-gray-50 flex items-center justify-between">
             <h2 class="text-sm font-semibold text-gray-800">variables</h2>
-            <span class="text-xs text-gray-500">one per {{{{var}}}} in step_template</span>
+            <span class="text-xs text-gray-500">one per <code>{{ '{{var}}' }}</code> in step_template</span>
         </div>
         <pre class="p-3 text-xs font-mono overflow-x-auto whitespace-pre"><code>{{ workflow.variables_pretty }}</code></pre>
     </div>
@@ -60,6 +60,111 @@
         <li>Audit event links the new run back to this workflow package.</li>
     </ul>
 </div>
+
+
+<!-- ===== Run with variables (Stage 2b) =====
+     One input per declared variable, type-aware. On submit, POSTs
+     /api/workflows/{id}/run with the variable values. The new
+     project page opens in a new tab. -->
+<div class="mt-6 bg-white border-2 border-emerald-300 rounded-lg p-5 shadow-sm">
+    <h2 class="text-lg font-semibold text-gray-800 mb-1">▶ Run with variables</h2>
+    <p class="text-sm text-gray-500 mb-4">
+        Fill in the variables below; we'll substitute them into the step_template
+        and spawn a fresh project. The new project will appear in
+        <a href="/projects" class="text-blue-600 hover:underline">/projects</a>
+        with a <code>🔁 from workflow: {{ workflow.name }}</code> badge.
+    </p>
+
+    <form id="run-workflow-form" onsubmit="event.preventDefault(); submitRun();">
+        <div class="space-y-3">
+            {% set ns = namespace(has_required=false) %}
+            {% for v in workflow.variables %}
+            {% if v.required %}
+            {% set ns.has_required = true %}
+            {% endif %}
+            <div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">
+                    <code class="text-emerald-700">{{ v.name }}</code>
+                    <span class="text-xs text-gray-500">({{ v.type }}{% if v.required %}, required{% endif %})</span>
+                    {% if v.description %}<span class="text-xs text-gray-400 ml-1">— {{ v.description }}</span>{% endif %}
+                </label>
+                {% if v.type == 'boolean' %}
+                <select name="var-{{ v.name }}" class="block w-full border rounded px-2 py-1 text-sm">
+                    <option value="">(default: {{ v.default or 'unset' }})</option>
+                    <option value="true">true</option>
+                    <option value="false">false</option>
+                </select>
+                {% elif v.type == 'number' %}
+                <input type="number" name="var-{{ v.name }}" placeholder="{{ v.default or '' }}"
+                    class="block w-full border rounded px-2 py-1 text-sm font-mono">
+                {% else %}
+                <input type="text" name="var-{{ v.name }}" placeholder="{{ v.default or '' }}"
+                    class="block w-full border rounded px-2 py-1 text-sm font-mono">
+                {% endif %}
+            </div>
+            {% endfor %}
+            {% if not workflow.variables %}
+            <p class="text-sm text-gray-500 italic">
+                No variables declared — running will spawn a 1:1 project with no substitutions.
+            </p>
+            {% endif %}
+        </div>
+
+        <label class="block text-sm font-medium text-gray-700 mb-1 mt-4">
+            Project name <span class="text-gray-400">(optional)</span>
+        </label>
+        <input id="run-project-name" type="text"
+            placeholder="default: {{ workflow.name }} run @ &lt;timestamp&gt;"
+            class="block w-full border rounded px-2 py-1 text-sm font-mono">
+
+        <div class="mt-4 flex items-center gap-2">
+            <button id="run-submit-btn" type="submit" class="px-4 py-2 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700">
+                Run workflow
+            </button>
+            <span id="run-status" class="text-sm text-gray-500 ml-2"></span>
+        </div>
+    </form>
+</div>
+
+<script>
+async function submitRun() {
+    const btn = document.getElementById('run-submit-btn');
+    const status = document.getElementById('run-status');
+    btn.disabled = true;
+    status.textContent = 'Running...';
+
+    // Collect all var-* inputs into {name: value}
+    const variables = {};
+    for (const inp of document.querySelectorAll('#run-workflow-form [name^="var-"]')) {
+        const name = inp.name.replace(/^var-/, '');
+        const v = inp.value;
+        if (v !== '') variables[name] = v;  // empty = use default
+    }
+    const body = { variables };
+    const projectName = document.getElementById('run-project-name').value.trim();
+    if (projectName) body.project_name = projectName;
+
+    const wfId = {{ workflow.id | tojson }};
+    try {
+        const r = await _fetchWithTimeout(`/api/workflows/${wfId}/run`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        }, 60_000);
+        const j = await r.json();
+        if (r.status !== 200 && r.status !== 201) {
+            throw new Error(j.detail || `HTTP ${r.status}`);
+        }
+        status.textContent = `Done: ${j.task_count} tasks spawned, project ${j.project_id}`;
+        setTimeout(() => {
+            window.open(`/projects/${j.project_id}`, '_blank');
+        }, 1500);
+    } catch (e) {
+        status.textContent = 'Failed: ' + e.message;
+        btn.disabled = false;
+    }
+}
+</script>
 
 <script>
 async function deleteWorkflow() {

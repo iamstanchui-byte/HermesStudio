@@ -60,6 +60,9 @@ class Project(BaseModel):
     max_iterations: int = 0
     current_iteration: int = 0
     last_iteration_summary: str | None = None
+    # Stage 2b (2026-07-23): link back to the workflow package this
+    # project was spawned from (NULL for projects not from a workflow).
+    source_workflow_id: str | None = None
 
 
 class PlanTask(BaseModel):
@@ -285,7 +288,8 @@ async def get_project(project_id: str, request: Request) -> Project:
     row = await db.fetchone(
         "SELECT id, name, goal, state, created_at, updated_at, "
         "coordinator_role, accept_criteria, deliverable_path, "
-        "max_iterations, current_iteration, last_iteration_summary "
+        "max_iterations, current_iteration, last_iteration_summary, "
+        "source_workflow_id "
         "FROM projects WHERE id = ?",
         (project_id,),
     )

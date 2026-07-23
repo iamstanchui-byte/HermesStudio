@@ -367,6 +367,11 @@ MIGRATIONS = [
     # (≈ status change to terminal).
     "ALTER TABLE tasks ADD COLUMN started_at TIMESTAMP",
     "ALTER TABLE tasks ADD COLUMN ended_at TIMESTAMP",
+    # Workflow packages Stage 2b (2026-07-23): link a run-back project
+    # to the workflow it was created from. The projects-list page can
+    # show a "🔁 from workflow X" badge like the existing schedule
+    # badge. NULL for projects not from a workflow (most projects).
+    "ALTER TABLE projects ADD COLUMN source_workflow_id TEXT DEFAULT ''",
     # Workflow packages (Stage 1, 2026-07-23): schema-versioning
     # safety. If the column was added after some old DBs were created,
     # this ALTER adds it. No-op on fresh DBs (CREATE TABLE above handles).

@@ -759,6 +759,17 @@ async def projects_list_page(
         "WHERE p.source_schedule_id IS NOT NULL AND p.source_schedule_id != ''"
     )
     schedule_map = {r["project_id"]: r["schedule_name"] for r in schedule_rows}
+    # Workflow-run markers (Stage 2b, 2026-07-23): show "🔁 from
+    # workflow <name>" badge for projects created via
+    # POST /api/workflows/{id}/run. Missing workflows (deleted) just
+    # don't show the badge.
+    workflow_rows = await db.fetchall(
+        "SELECT p.id AS project_id, w.name AS workflow_name "
+        "FROM projects p "
+        "JOIN workflow_packages w ON w.id = p.source_workflow_id "
+        "WHERE p.source_workflow_id IS NOT NULL AND p.source_workflow_id != ''"
+    )
+    workflow_map = {r["project_id"]: r["workflow_name"] for r in workflow_rows}
     # Also fetch template markers — show "📋 template" badge for projects
     # that are marked as reusable templates.
     template_ids = {
@@ -774,6 +785,7 @@ async def projects_list_page(
             "projects": projects,
             "token_map": token_map,
             "schedule_map": schedule_map,
+            "workflow_map": workflow_map,
             "template_ids": template_ids,
             "show_archived": show_archived,
             "show_deleted": show_deleted,
@@ -1108,6 +1120,11 @@ async def workflow_detail_page(workflow_id: str, request: Request) -> HTMLRespon
         )
     except Exception:
         d["variables_pretty"] = "[]"
+    # Parsed variables list (for the Run-with-variables form)
+    try:
+        d["variables"] = _json.loads(d.get("variables") or "[]")
+    except Exception:
+        d["variables"] = []
     # Source project name (for "view source" link)
     if d.get("source_project_id"):
         src = await db.fetchone(

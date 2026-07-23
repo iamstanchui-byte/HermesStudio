@@ -186,6 +186,9 @@ document.getElementById('filter-form').addEventListener('submit', (e) => {
                         {% if schedule_map.get(p.id) %}
                         <span class="px-2 py-0.5 bg-purple-100 text-purple-800 rounded text-xs" title="This project was created by a recurring schedule">🔁 {{ schedule_map[p.id] }}</span>
                         {% endif %}
+                        {% if workflow_map.get(p.id) %}
+                        <a href="/workflows" class="px-2 py-0.5 bg-emerald-100 text-emerald-800 rounded text-xs hover:bg-emerald-200" title="Created by workflow: {{ workflow_map[p.id] }}">🔁 from workflow: {{ workflow_map[p.id] }}</a>
+                        {% endif %}
                         {% if p.id in template_ids %}
                         <span class="px-2 py-0.5 bg-amber-100 text-amber-800 rounded text-xs" title="Marked as a reusable template. Schedules can fire this.">📋 template</span>
                         {% endif %}

@@ -319,8 +319,48 @@ async def _call_llm_for_workflow_synthesis(
     if brace < 0:
         raise HTTPException(502, f"LLM response contained no JSON object: {text[:200]!r}")
     text = text[brace:]
+    # Helper: try to wrap a "no outer wrapper" LLM response. Used
+    # by both the success path (json.loads parsed the first bare step
+    # silently) and the exception path (json.loads raised on extra
+    # data). Returns the wrapped dict or None if not applicable.
+    def _try_wrap_missing_wrapper(s: str):
+        if "step_template" in s or "variables" not in s:
+            return None
+        try:
+            var_pos = s.find('"variables"')
+            if var_pos <= 0:
+                return None
+            pre = s[:var_pos].rstrip().rstrip(",").rstrip()
+            # Strip a trailing stray `]` if the LLM accidentally
+            # added one (it sometimes does, since it's confused about
+            # where the step array should close). Without this, we'd
+            # produce `...verify.results.json"}]]` (double `]`) which
+            # is invalid JSON.
+            while pre.endswith("]"):
+                pre = pre[:-1].rstrip()
+            first_obj_start = pre.find("{")
+            if first_obj_start < 0:
+                return None
+            steps_array = "[" + pre[first_obj_start:] + "]"
+            rest = s[var_pos:].rstrip().rstrip("}").rstrip(",").rstrip()
+            wrapped = '{"step_template":' + steps_array + ", " + rest + "}"
+            return json.loads(wrapped)
+        except Exception:
+            return None
+
     try:
         out = json.loads(text)
+        # Post-parse sanity: if json.loads silently parsed the first
+        # bare step object (so no exception), but the LLM response
+        # also has "variables" (suggesting it forgot the wrapper),
+        # try the wrap heuristic.
+        if (isinstance(out, dict)
+                and "step_template" not in out
+                and "variables" not in out):
+            wrapped = _try_wrap_missing_wrapper(text)
+            if wrapped is not None:
+                out = wrapped
+        return out
     except json.JSONDecodeError as e:
         # Dump to a file for diagnosis
         try:
@@ -337,28 +377,12 @@ async def _call_llm_for_workflow_synthesis(
         # implied an array even if it wrote bare objects), wrap as
         # {"step_template": [<everything-before-first-]>], "variables": [...]}].
         if "step_template" not in text and "variables" in text:
-            # The LLM may have written [obj1, obj2, ...] without the
-            # leading "step_template":. Find the start of the array
-            # (the first `]`) and split.
-            try:
-                # Find the position of `"variables"` — the LLM did
-                # produce that. Everything before it is the (unbraced)
-                # step array; everything after is the variables list.
-                var_pos = text.find('"variables"')
-                if var_pos > 0:
-                    pre = text[:var_pos].rstrip().rstrip(",").rstrip()
-                    first_obj_start = pre.find("{")
-                    if first_obj_start < 0:
-                        raise ValueError("no step object found")
-                    # Wrap the bare step objects in `[...]`.
-                    steps_array = "[" + pre[first_obj_start:] + "]"
-                    # Strip the trailing `}` (we'll re-add it).
-                    rest = text[var_pos:].rstrip().rstrip("}").rstrip(",").rstrip()
-                    wrapped = '{"step_template":' + steps_array + ", " + rest + "}"
-                    out2 = json.loads(wrapped)
-                    return out2
-            except Exception:
-                pass
+            # Delegate to the helper (the inline version above is
+            # identical in logic — kept for backward compat with
+            # older debug dumps; the helper is the canonical one).
+            wrapped = _try_wrap_missing_wrapper(text)
+            if wrapped is not None:
+                return wrapped
         raise HTTPException(502, f"LLM returned invalid JSON: {e}; dumped to {dump_path}; first 300 chars: {text[:300]!r}")
     return out
 
@@ -804,3 +828,322 @@ async def delete_workflow(workflow_id: str, request: Request) -> dict:
         payload={"workflow_id": workflow_id, "name": row["name"]},
     )
     return {"deleted": True, "id": workflow_id, "name": row["name"]}
+
+
+# ===== Stage 2b: Run a workflow with variables =====
+
+class WorkflowRunBody(BaseModel):
+    variables: dict[str, Any] = Field(default_factory=dict)
+    project_name: str | None = None  # override project name (default: workflow name)
+
+
+def _substitute_variables(value: Any, vars_provided: dict[str, Any]) -> Any:
+    """Recursively substitute `{{var}}` placeholders in a value.
+
+    Walks dicts, lists, and strings. Every `{{name}}` in a string
+    becomes `vars_provided[name]` (stringified). Unknown placeholders
+    are left as-is (the caller has already validated they're declared
+    in the workflow's variables list, so this should not happen —
+    but defense-in-depth).
+
+    Same regex as `_extract_variables_from_template` for consistency.
+    """
+    _sub_re = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+
+    def _sub_str(s: str) -> str:
+        return _sub_re.sub(
+            lambda m: str(vars_provided.get(m.group(1), m.group(0))),
+            s,
+        )
+
+    if isinstance(value, str):
+        return _sub_str(value)
+    if isinstance(value, dict):
+        return {k: _substitute_variables(v, vars_provided) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_substitute_variables(x, vars_provided) for x in value]
+    return value
+
+
+def _validate_run_variables(
+    declared: list[dict], provided: dict[str, Any]
+) -> tuple[bool, str, dict[str, Any]]:
+    """Validate that all required declared variables are provided.
+
+    Returns (ok, error_message, typecast_values).
+    - `declared` is the workflow's variables list (each has {name, type,
+      required, default?}).
+    - `provided` is what the operator sent in the run body.
+    - `typecast_values` is `provided` with type conversions applied
+      (e.g. "true" -> True for boolean, "5" -> 5 for number).
+
+    Type coercion rules:
+      - string: as-is
+      - number: int(value) if it's a string that parses, else float
+      - path: as-is (just validates non-empty)
+      - choice: must be in (allowed?) — but we don't track allowed
+        choices in the schema yet, so we accept any string
+      - boolean: True/False/yes/no/1/0 strings → bool
+    """
+    out: dict[str, Any] = {}
+    for v in declared:
+        vname = v.get("name", "")
+        vtype = v.get("type", "string")
+        vrequired = bool(v.get("required", False))
+        vdefault = v.get("default")
+        # Resolve: provided > default
+        if vname in provided:
+            val = provided[vname]
+        elif vdefault is not None:
+            val = vdefault
+        else:
+            if vrequired:
+                return False, f"required variable {vname!r} not provided", {}
+            # optional + no default → skip (won't be substituted)
+            continue
+        # Coerce by type
+        try:
+            if vtype == "string" or vtype == "path" or vtype == "choice":
+                out[vname] = str(val) if val is not None else ""
+                if vtype == "path" and not out[vname].strip():
+                    return False, f"variable {vname!r} (type=path) is empty", {}
+            elif vtype == "number":
+                if isinstance(val, bool):
+                    # bool is subclass of int in Python; reject
+                    return False, f"variable {vname!r} (type=number) got a boolean", {}
+                if isinstance(val, (int, float)):
+                    out[vname] = val
+                else:
+                    # try int first, fall back to float
+                    try:
+                        out[vname] = int(str(val))
+                    except (ValueError, TypeError):
+                        out[vname] = float(str(val))
+            elif vtype == "boolean":
+                if isinstance(val, bool):
+                    out[vname] = val
+                elif isinstance(val, (int, float)):
+                    out[vname] = bool(val)
+                else:
+                    s = str(val).strip().lower()
+                    if s in ("true", "yes", "1", "on"):
+                        out[vname] = True
+                    elif s in ("false", "no", "0", "off", ""):
+                        out[vname] = False
+                    else:
+                        return False, f"variable {vname!r} (type=boolean) got {val!r}, cannot coerce", {}
+            else:
+                # Unknown type — pass through as string
+                out[vname] = str(val)
+        except Exception as e:
+            return False, f"variable {vname!r} (type={vtype}) coercion failed: {e}", {}
+    # Allow extra provided vars (operator can override at run time),
+    # but only declared ones are used in substitution.
+    return True, "", out
+
+
+@router.post("/{workflow_id}/run", status_code=201)
+async def run_workflow(
+    workflow_id: str, body: WorkflowRunBody, request: Request
+) -> dict:
+    """Stage 2b: Run a workflow package with concrete variable values.
+
+    Pipeline:
+      1. Load workflow (by id or name)
+      2. Validate provided variables against declared ones
+         (required check, type coercion)
+      3. Substitute `{{var}}` placeholders in step_template
+      4. Create a fresh project (manual mode, tasks added directly)
+      5. Insert one task per substituted step, with proper depends_on
+      6. Audit: `workflow.run` event linking new project to workflow
+
+    The new project has `source_workflow_id` (NEW column) set so
+    the projects-list page can show a "🔁 from workflow X" badge
+    like the existing schedule badge.
+    """
+    db = request.app.state.db
+    from hermes_orch.api.projects import (
+        _project_id, _projects_root, _serialize_plan_md,
+    )
+    from hermes_orch.core.memory import get_memory_writer
+
+    # 1. Load workflow
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        row = await db.fetchone(
+            "SELECT * FROM workflow_packages WHERE name = ?", (workflow_id,)
+        )
+    if not row:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+
+    try:
+        step_template = json.loads(row["step_template"] or "[]")
+    except Exception:
+        step_template = []
+    try:
+        variables_declared = json.loads(row["variables"] or "[]")
+    except Exception:
+        variables_declared = []
+
+    # 2. Validate variables
+    ok, err, vars_typed = _validate_run_variables(
+        variables_declared, body.variables
+    )
+    if not ok:
+        raise HTTPException(400, f"variable validation failed: {err}")
+
+    # 3. Substitute
+    substituted = _substitute_variables(step_template, vars_typed)
+
+    # 4. Create the new project (manual mode: tasks will be added below)
+    new_pid = _project_id()
+    now = _now_iso()
+    project_name = body.project_name or f"{row['name']} run @ {now[:19]}"
+    # Build a goal from the workflow description + substituted values
+    goal = row.get("description") or f"Run of workflow {row['name']}"
+    if vars_typed:
+        goal += "\n\nVariables:\n" + "\n".join(
+            f"- {k} = {v!r}" for k, v in vars_typed.items()
+        )
+    try:
+        await db.insert(
+            "projects",
+            {
+                "id": new_pid,
+                "name": project_name,
+                "goal": goal,
+                "state": "ready",  # manual mode = no planner; tasks are pre-loaded
+                "coordinator_role": "",  # not iterative
+                "accept_criteria": "",
+                "deliverable_path": "",
+                "max_iterations": 0,
+                "current_iteration": 0,
+                "last_iteration_summary": "",
+                "source_workflow_id": row["id"],  # Stage 2b: link back
+            },
+        )
+    except Exception as e:
+        raise HTTPException(500, f"failed to create project: {e}")
+
+    # Initialize project folder + plan.md (matches create_project() in
+    # projects.py so the supervisor + memory hooks work normally)
+    pdir = _projects_root(request) / new_pid
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "agents").mkdir(exist_ok=True)
+    plan_fm = {
+        "project_id": new_pid, "state": "ready", "created_at": now,
+        "tasks": [], "from_workflow": row["name"],
+        "workflow_id": row["id"],
+    }
+    plan_body = (
+        f"\n# Project: {project_name}\n\n"
+        f"## Goal\n\n{goal}\n\n"
+        f"## From workflow\n\n`{row['name']}` (id `{row['id']}`)\n"
+    )
+    (pdir / "plan.md").write_text(
+        _serialize_plan_md(plan_fm, plan_body), encoding="utf-8"
+    )
+    status_fm = {"state": "ready", "last_updated": now}
+    (pdir / "status.md").write_text(
+        _serialize_plan_md(status_fm, "\n# Status\n\nWorkflow run started.\n"),
+        encoding="utf-8",
+    )
+    (pdir / "decisions.md").write_text(
+        _serialize_plan_md({"decisions": []}, "\n# Decisions\n\n"),
+        encoding="utf-8",
+    )
+
+    # Bootstrap facts.md (L2) — same as create_project() does
+    try:
+        memory = get_memory_writer()
+        memory.init_facts_file(new_pid, project_name=project_name)
+        memory.append_fact_L2(
+            project_id=new_pid, section="## Goal", fact_text=goal,
+            cite_id="workflow.run",
+        )
+    except Exception:
+        pass
+
+    # 5. Insert tasks. First pass: insert all tasks and build a
+    # step_name → task_id map for depends_on resolution.
+    name_to_tid: dict[str, str] = {}
+    task_rows: list[dict] = []
+    for i, step in enumerate(substituted):
+        sname = step.get("name") or f"step-{i+1}"
+        tid = "t-" + secrets.token_hex(4)
+        name_to_tid[sname] = tid
+        # Resolve depends_on (which was step names) to task IDs
+        dep_step_names = step.get("depends_on") or []
+        dep_tids = [name_to_tid[d] for d in dep_step_names if d in name_to_tid]
+        # Only first step can have no deps; if a later step references
+        # an unknown step name, it would be lost (we set deps to [] and
+        # log it).
+        if dep_step_names and not dep_tids:
+            await audit_log(
+                db, "task.depends_on_unresolved",
+                actor="workflow-runner", project_id=new_pid, task_id=tid,
+                payload={"step_name": sname,
+                         "unresolved_deps": dep_step_names},
+            )
+        # Reorder: tasks must be inserted in order they appear in
+        # step_template so depends_on (which references earlier tasks)
+        # can resolve. We've already done that.
+        params = step.get("params_template") or {}
+        task_rows.append({
+            "id": tid,
+            "project_id": new_pid,
+            "name": sname,
+            "agent_role": step.get("agent_role") or "",
+            "depends_on": dep_tids,
+            "on_parent_failure": "skip",
+            "status": "pending",
+            "priority": "normal",
+            "action": step.get("action") or "do_task",
+            "params": params,
+            "max_retries": 2,
+            "timeout_seconds": 1800,
+            "output_path": step.get("output_path") or "",
+            "required_capability": None,
+        })
+    # Insert all tasks
+    for t in task_rows:
+        try:
+            await db.insert("tasks", t)
+        except Exception as e:
+            raise HTTPException(
+                500, f"failed to insert task {t['name']!r}: {e}"
+            )
+    # Audit each task.created (one event per task)
+    for t in task_rows:
+        await audit_log(
+            db, "task.created",
+            actor="workflow-runner", project_id=new_pid, task_id=t["id"],
+            payload={"agent_role": t["agent_role"],
+                     "action": t["action"],
+                     "name": t["name"],
+                     "source": "workflow-run"},
+        )
+
+    # 6. Audit the workflow.run event (top-level)
+    await audit_log(
+        db, "workflow.run", actor="operator", project_id=new_pid,
+        payload={
+            "workflow_id": row["id"],
+            "workflow_name": row["name"],
+            "project_id": new_pid,
+            "variables_provided": list(vars_typed.keys()),
+            "task_count": len(task_rows),
+        },
+    )
+
+    return {
+        "project_id": new_pid,
+        "workflow_id": row["id"],
+        "workflow_name": row["name"],
+        "task_count": len(task_rows),
+        "tasks": [{"id": t["id"], "name": t["name"]} for t in task_rows],
+        "variables_applied": vars_typed,
+        "state": "ready",
+    }
