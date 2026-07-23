@@ -127,6 +127,19 @@
 </div>
 
 <script>
+// _fetchWithTimeout: helper for fetch with AbortController. Same as
+// the one in project.html; duplicated here to keep workflow_detail
+// self-contained (the helper isn't in base.html).
+async function _fetchWithTimeout(url, opts = {}, ms = 5000) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), ms);
+    try {
+        return await fetch(url, { ...opts, signal: ctl.signal });
+    } finally {
+        clearTimeout(t);
+    }
+}
+
 async function submitRun() {
     const btn = document.getElementById('run-submit-btn');
     const status = document.getElementById('run-status');
