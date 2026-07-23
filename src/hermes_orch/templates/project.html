@@ -693,6 +693,26 @@ async function _fetchWithTimeout(url, opts = {}, ms = 5000) {
         clearTimeout(t);
     }
 }
+// Render a fetch-error body (r.json() result) into a human-readable string.
+// FastAPI's standard 422 validation response has `detail` as an ARRAY of
+// objects (one per field error). If we just do `new Error(j.detail)` the
+// array gets coerced to "[object Object],[object Object]" -- useless for
+// the operator. This helper extracts a single readable message.
+//
+// Used by all catch blocks that display error.status.textContent.
+function _errDetailToString(detail, status) {
+    if (typeof detail === 'string') return detail;
+    if (Array.isArray(detail)) {
+        // FastAPI 422: [{loc: ['body', 'name'], msg: 'Field required', ...}, ...]
+        return detail.map(e => {
+            const where = Array.isArray(e.loc) ? e.loc.join('.') : '';
+            return where ? `${where}: ${e.msg}` : (e.msg || JSON.stringify(e));
+        }).join('; ') || `HTTP ${status}`;
+    }
+    if (detail && typeof detail === 'object' && detail.msg) return detail.msg;
+    if (detail && typeof detail === 'object') return JSON.stringify(detail);
+    return `HTTP ${status}`;
+}
 async function loadProcedure() {
     const el = document.getElementById('proc-content');
     try {
@@ -1427,7 +1447,11 @@ async function submitPromoteToWorkflow() {
         }, 180_000);  // 3 min for LLM call
         const j = await r.json();
         if (r.status !== 200 && r.status !== 201) {
-            throw new Error(j.detail || `HTTP ${r.status}`);
+            // j.detail may be a STRING (custom HTTPException) or an ARRAY
+            // (FastAPI 422 Pydantic validation). Convert to a readable
+            // string before throwing, otherwise the catch block shows
+            // "Failed: [object Object]".
+            throw new Error(_errDetailToString(j.detail, r.status));
         }
         status.textContent = `Done: ${j.name} (${j.step_count} steps, ${j.variable_count} variables)`;
         setTimeout(() => {
@@ -1436,7 +1460,9 @@ async function submitPromoteToWorkflow() {
             window.open(`/workflows/${j.id}`, '_blank');
         }, 1500);
     } catch (e) {
-        status.textContent = 'Failed: ' + e.message;
+        // e.message is now always a string (we converted j.detail above
+        // for HTTP errors, and fetch/AbortError gives a string too).
+        status.textContent = 'Failed: ' + (e.message || String(e));
         btn.disabled = false;
     }
 }

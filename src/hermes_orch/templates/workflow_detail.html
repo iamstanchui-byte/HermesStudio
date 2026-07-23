@@ -139,6 +139,21 @@ async function _fetchWithTimeout(url, opts = {}, ms = 5000) {
         clearTimeout(t);
     }
 }
+// Render a FastAPI error `detail` field (string OR array of {loc, msg, ...})
+// into a single human-readable string. Without this, "Failed: " + Error
+// shows "[object Object]" when the server returns the standard 422.
+function _errDetailToString(detail, status) {
+    if (typeof detail === 'string') return detail;
+    if (Array.isArray(detail)) {
+        return detail.map(e => {
+            const where = Array.isArray(e.loc) ? e.loc.join('.') : '';
+            return where ? `${where}: ${e.msg}` : (e.msg || JSON.stringify(e));
+        }).join('; ') || `HTTP ${status}`;
+    }
+    if (detail && typeof detail === 'object' && detail.msg) return detail.msg;
+    if (detail && typeof detail === 'object') return JSON.stringify(detail);
+    return `HTTP ${status}`;
+}
 
 async function submitRun() {
     const btn = document.getElementById('run-submit-btn');
@@ -166,14 +181,14 @@ async function submitRun() {
         }, 60_000);
         const j = await r.json();
         if (r.status !== 200 && r.status !== 201) {
-            throw new Error(j.detail || `HTTP ${r.status}`);
+            throw new Error(_errDetailToString(j.detail, r.status));
         }
         status.textContent = `Done: ${j.task_count} tasks spawned, project ${j.project_id}`;
         setTimeout(() => {
             window.open(`/projects/${j.project_id}`, '_blank');
         }, 1500);
     } catch (e) {
-        status.textContent = 'Failed: ' + e.message;
+        status.textContent = 'Failed: ' + (e.message || String(e));
         btn.disabled = false;
     }
 }
@@ -188,11 +203,11 @@ async function deleteWorkflow() {
         const r = await fetch(`/api/workflows/${wfId}`, {method: 'DELETE'});
         if (r.status !== 200) {
             const j = await r.json();
-            throw new Error(j.detail || `HTTP ${r.status}`);
+            throw new Error(_errDetailToString(j.detail, r.status));
         }
         window.location.href = '/workflows';
     } catch (e) {
-        alert('Delete failed: ' + e.message);
+        alert('Delete failed: ' + (e.message || String(e)));
     }
 }
 </script>
