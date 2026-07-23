@@ -2313,7 +2313,23 @@ def start(
     # Hermes 0.17+ only reads the folder layout
     # `skills/<name>/SKILL.md`; flat-file skills/<name>.md is no longer
     # supported (dropped 2026-07-19, commit d5b7c9a).
+    # Subfolder layout `skills/<category>/<name>/SKILL.md` is ALSO supported
+    # (added 2026-07-24, Option B). The wrapper recursively scans up to
+    # 2 levels deep; deeper nesting is unsupported. Names are derived
+    # from the full sub-path: `skills/productivity/xlsx/SKILL.md` →
+    # `name="productivity/xlsx"`. Hermes itself still uses the leaf
+    # directory name to identify a skill, so two skills with the
+    # same leaf name in different subfolders (e.g. `data/xlsx` and
+    # `productivity/xlsx`) will COLLIDE at the hermes layer — the
+    # operator should avoid this. Our DB happily stores both as
+    # distinct records (different file_path, different name).
     _SKILL_FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+    # Subfolder regex allows path-separator (slash) up to 1 level of
+    # nesting. Reuses the same charset as the flat-name regex to keep
+    # the validator simple.
+    _SKILL_SUBFOLDER_RE = re.compile(
+        r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
+    )
     # Per-profile throttle for the periodic auto-sync (don't scan every 5s).
     _SKILL_AUTO_SYNC_INTERVAL = 30  # seconds
     _last_skill_sync: dict[str, float] = {}  # profile_name -> last sync time
@@ -2361,26 +2377,55 @@ def start(
             return 0
         registered = 0
         try:
-            # Two layouts are supported:
-            #   1. Flat file: skills/<name>.md → register <name>
-            #   2. Folder:   skills/<name>/SKILL.md → register <name> (we
-            #      only sync the SKILL.md content; references/ and scripts/
-            #      siblings are NOT registered, they're treated as opaque
-            #      files in the agent host's filesystem).
-            # Flat-file skill support dropped 2026-07-19 (commit d5b7c9a).
-            # Hermes 0.17+ only reads skills/<name>/SKILL.md, so we no
-            # longer scan for skills/<name>.md at the top level.
-            for entry in sorted(skills_dir.iterdir()):
-                if not entry.is_dir():
-                    continue  # skip files (no more flat skills)
-                if not _SKILL_FOLDER_RE.match(entry.name):
+            # Two layouts are supported (2026-07-24: added subfolder):
+            #   1. Flat:  skills/<name>/SKILL.md        → name = "<name>"
+            #   2. Nested: skills/<category>/<name>/SKILL.md  → name = "<category>/<name>"
+            #      (recursive up to 2 levels; deeper nesting is unsupported
+            #       to keep the API simple)
+            #
+            # The DB stores file_path as the full relative path
+            # ("skills/<category>/<name>/SKILL.md") and the `name` is
+            # derived from that. The server's _row_to_skill already
+            # handles this — see agents.py:1253-1254.
+            #
+            # Hermes 0.17+ uses the LEAF directory name to identify a
+            # skill, so `data/xlsx` and `productivity/xlsx` would COLLIDE
+            # at the hermes layer (both register as `xlsx`). Our DB
+            # treats them as distinct records. The operator is
+            # responsible for avoiding the leaf-name collision when
+            # organizing skills into subfolders.
+            #
+            # Flat-file skills/<name>.md is no longer supported
+            # (dropped 2026-07-19, commit d5b7c9a). We only scan for
+            # SKILL.md (capital S) inside a subfolder.
+            for file_path in sorted(skills_dir.rglob("SKILL.md")):
+                if not file_path.is_file():
                     continue
-                file_path = entry / "SKILL.md"
-                if not file_path.exists() or not file_path.is_file():
-                    # Folder exists but no SKILL.md — skip silently
-                    # (could be a partial install or a non-skill dir)
+                # file_path = skills_dir / (optional category/) <name> / SKILL.md
+                # Derive the skill name from the relative path
+                try:
+                    rel = file_path.relative_to(skills_dir)  # e.g. "xlsx/SKILL.md" or "productivity/xlsx/SKILL.md"
+                except ValueError:
                     continue
-                name = entry.name
+                parts = rel.parts  # e.g. ("xlsx", "SKILL.md") or ("productivity", "xlsx", "SKILL.md")
+                if len(parts) == 2:
+                    # Flat: skills/<name>/SKILL.md
+                    name = parts[0]
+                    if not _SKILL_FOLDER_RE.match(name):
+                        click.echo(f"{log_prefix} ({pname}) skip '{rel}': bad name")
+                        continue
+                elif len(parts) == 3:
+                    # Subfolder: skills/<category>/<name>/SKILL.md
+                    name = f"{parts[0]}/{parts[1]}"
+                    if not _SKILL_SUBFOLDER_RE.match(name):
+                        click.echo(f"{log_prefix} ({pname}) skip '{rel}': bad subfolder name")
+                        continue
+                else:
+                    # Deeper nesting (3+ levels) — unsupported
+                    click.echo(
+                        f"{log_prefix} ({pname}) skip '{rel}': depth > 2 not supported"
+                    )
+                    continue
                 try:
                     file_bytes = file_path.read_bytes()
                 except Exception as e:
