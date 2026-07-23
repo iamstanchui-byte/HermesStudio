@@ -1,0 +1,806 @@
+"""Workflow package API + LLM synthesis.
+
+Stage 1 (2026-07-23): synthesize a workflow package from a completed
+project. A workflow package is a reusable execution template with
+{{var}} placeholders + variables list. Stage 2b will add
+POST /api/workflows/{id}/run that substitutes variables and spawns a
+fresh project.
+
+Reuses the 4-layer separation framework from
+api/schedules.py::_SKILL_SYNTHESIS_PROMPT (drop L2/L3, keep L0/L1)
+but the output is JSON, not markdown.
+"""
+from __future__ import annotations
+
+import json
+import re
+import secrets
+import sys
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field
+
+from hermes_orch.core.audit import audit_log
+from hermes_orch.utils import now_iso as _now_iso
+
+
+router = APIRouter(prefix="/api/workflows", tags=["workflows"])
+
+
+# Hard cap on the step_template / variables JSON to keep them sane.
+_MAX_STEP_TEMPLATE_BYTES = 100_000
+_MAX_VARIABLES_BYTES = 50_000
+# Names of fields the LLM is allowed to put in a step. Stricter than the
+# raw tasks table (which has many internal columns) so the synthesized
+# template is portable + read-only-by-the-runner.
+_STEP_FIELDS = (
+    "name", "agent_role", "action", "depends_on",
+    "params_template", "output_path",
+)
+# Variable types we accept. LLM may pick any; we validate.
+_VALID_VAR_TYPES = {"string", "number", "path", "choice", "boolean"}
+
+
+# --- Pydantic request/response models ---
+
+class PromoteToWorkflowBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    description: str = Field("", max_length=500)
+    variable_hints: list[dict] = Field(default_factory=list)
+    # variable_hints: optional operator-provided hints like
+    # [{"name": "folder_id", "type": "string", "description": "..."}]
+    # The LLM can use them as a starting point but is free to add more
+    # {{var}}s based on what it sees in the project trace.
+
+
+class WorkflowSummary(BaseModel):
+    id: str
+    name: str
+    version: str
+    description: str
+    source_project_id: str | None
+    step_count: int
+    variable_count: int
+    created_at: str
+    updated_at: str
+
+
+class WorkflowDetail(WorkflowSummary):
+    step_template: list[dict]
+    variables: list[dict]
+
+
+# --- LLM synthesis ---
+
+# Reuses the 4-layer separation framework from schedules.py, but the
+# output schema is JSON, not markdown. Same anti-dump discipline.
+_WORKFLOW_SYNTHESIS_PROMPT = """You are converting a project execution trace into a reusable workflow package.
+
+A workflow package is a *long-lived reusable asset* — different from a one-off project. Someone (or some schedule) will run this workflow many times with different values. So the package must NOT bake in specific values from this project run; instead, it must PARAMETERIZE every value that would change on a re-run.
+
+# Goal
+Output a JSON object describing the workflow:
+- step_template: ordered list of step objects
+- variables: list of variable definitions (one per unique {{var}} in step_template)
+- description: a 1-2 sentence summary of what this workflow does
+
+# CRITICAL: output structure (often gets this wrong)
+Your response MUST be a SINGLE JSON OBJECT starting with `{` and ending with `}`. The first line of your response MUST be the opening `{` of the WRAPPER, not the opening `{` of a step object. The wrapper has THREE keys at the TOP level: `description`, `step_template`, `variables`. If you output the steps without the wrapper, the response is invalid.
+
+# 4-Layer Separation (mandatory)
+- L0 structure (step count, ordering, dependencies) → KEEP as step ordering + depends_on
+- L1 actions (which tool / API / website / command) → KEEP in step.action
+- L2 data (specific values: folder IDs, dates, coordinates, file names, raw text) → DROP. Replace with `{{var}}` placeholders.
+- L3 decisions (task IDs, PASS/FAIL, coord scaffolding, internal engine names) → DROP entirely.
+
+# When in doubt: would this value be the SAME on a re-run? If yes, hardcode it. If no (depends on user input, target, time, env), parameterize as `{{var}}`.
+
+# Output schema (strict JSON, follow exactly)
+```json
+{{
+  "description": "1-2 sentence summary, third person, no first-person pronouns",
+  "step_template": [
+    {{
+      "name": "kebab-case step name (≤ 40 chars)",
+      "agent_role": "win-agent01|super|super-b|... (which role runs this step; pick ONE)",
+      "action": "verb_thing (snake_case action identifier; same shape as a tasks.action)",
+      "depends_on": ["step_name_of_a_prior_step"],   // list of names; [] if no deps
+      "params_template": {{
+        "param1": "{{var1}}",
+        "param2": "literal value if it's always the same, e.g. 30"
+      }},
+      "output_path": "relative path the step writes (e.g. list_files.results.json)"
+    }}
+  ],
+  "variables": [
+    {{
+      "name": "var1",                           // matches the {{var1}} in step_template
+      "type": "string|number|path|choice|boolean",
+      "description": "what this variable is, ≤ 80 chars",
+      "required": true|false,
+      "default": "optional default value if not required"
+    }}
+  ]
+}}
+```
+
+# Rules (each will be validated)
+1. Output MUST be valid JSON. No markdown wrapper, no preamble, no explanation. The response is parsed with json.loads.
+2. step_template MUST be an ordered list (preserve execution order from the evidence).
+3. depends_on MUST reference step names that appear EARLIER in step_template (no forward refs).
+4. Every `{{var}}` in step_template MUST have a matching entry in variables.
+5. Every entry in variables MUST appear in at least one step_template `{{var}}`.
+6. step name MUST be kebab-case, ≤ 40 chars, unique within the template.
+7. agent_role MUST be one of the role names the operator's agents actually have.
+8. action MUST be a stable identifier (snake_case verb_thing). Drop internal engine names like `_iteration_review:1`, `coord_pickup`.
+9. L2 data (specific values) MUST become `{{var}}`. CRITICAL: use EXACTLY two opening braces and two closing braces. NOT one brace. NOT three. The validator's regex is `\{\{name\}\}` — it will silently miss `{name}` or `{{{name}}}` and the workflow will be rejected.
+   - "folder_id: 1NSWXynTF6HO..."  →  "folder_id": "{{gdrive_folder_id}}"
+   - "date: 2026-07-22"            →  "date": "{{target_date}}"
+   - "city: Taipei"                →  "city": "{{city}}"
+   - "query: XAUUSD 1h data"       →  "query": "{{symbol_timeframe}}"
+   - WRONG: `{gdrive_folder_id}` (single brace — will be ignored)
+   - WRONG: `{{{gdrive_folder_id}}}` (triple brace — invalid)
+   - RIGHT: `{{gdrive_folder_id}}` (double brace — matches regex)
+   - CRITICAL: each `{{var}}` MUST be wrapped in double quotes as a JSON string value:
+     - RIGHT: `"max_items": "{{max_items}}"`
+     - WRONG: `"max_items": {{max_items}}` (unquoted — invalid JSON)
+     - WRONG: `"max_items": "{{max_items}}}` (extra closing brace)
+10. L3 scaffolding (PASS/FAIL, [cite:...], task IDs) MUST NOT appear in the output.
+
+# Operator hints (use as starting point for variable names + types)
+{operator_hints}
+
+# Evidence
+{evidence}
+
+# Output
+Output ONLY the JSON object, starting with `{{`. No preamble, no explanation, no markdown wrapper.
+"""
+
+
+async def _gather_workflow_evidence(db, pdir: Path, project_id: str, proj: dict) -> str:
+    """Build the evidence block for workflow LLM synthesis.
+
+    Reuses the 4-layer pattern from schedules.py::_gather_skill_evidence
+    but trims more aggressively (workflow = structural only, no body
+    samples needed). We DO include the goal (so the LLM knows the use
+    case) but DROP facts.md / decision.md / sample artifacts (those
+    were L2/L3 trace artifacts that should not be re-runnable).
+    """
+    parts: list[str] = ["# Project evidence\n"]
+    parts.append("## Project metadata\n")
+    parts.append(f"- id: {project_id}\n")
+    parts.append(f"- name: {proj.get('name') or project_id}\n")
+    parts.append(f"- state: {proj.get('state', '?')}\n")
+    parts.append(f"- goal: {(proj.get('goal') or '(none)')[:500]}\n")
+    parts.append(f"- coordinator_role: {proj.get('coordinator_role') or '(none)'}\n")
+    parts.append(f"- max_iterations: {proj.get('max_iterations') or 0}\n")
+
+    # Tasks: include ALL terminal ones (completed + failed), with
+    # structured fields the LLM needs. Drop the body of the result —
+    # that's L2, would re-introduce stale specific values.
+    tasks = await db.fetchall(
+        "SELECT name, agent_role, action, status, depends_on, output_path, params "
+        "FROM tasks WHERE project_id = ? "
+        "ORDER BY created_at ASC",
+        (project_id,),
+    )
+
+    def _shape(t: dict) -> str:
+        deps = t.get("depends_on") or []
+        deps_str = f" (after: {', '.join(deps)})" if deps else ""
+        params = t.get("params") or {}
+        try:
+            params_dict = json.loads(params) if isinstance(params, str) else params
+        except Exception:
+            params_dict = {}
+        # Keep only stable-ish param fields; if a value looks like a
+        # specific L2 fact, the LLM should replace with {{var}}.
+        params_str = json.dumps(params_dict, ensure_ascii=False)[:300] if params_dict else "{}"
+        op = t.get("output_path") or "(none)"
+        return (
+            f"- **{t.get('name') or 'task'}** [{t.get('agent_role') or '?'}]"
+            f"{deps_str}: action=`{t.get('action') or '?'}`, "
+            f"output=`{op}`, params={params_str}\n"
+        )
+
+    completed = [t for t in tasks if (t.get("status") or "") == "completed"]
+    failed = [t for t in tasks if (t.get("status") or "") in ("failed", "skipped", "cancelled", "interrupted")]
+
+    if completed:
+        parts.append("\n## Completed steps (L0 structure + L1 actions, NO L2 values)\n")
+        for t in completed:
+            parts.append(_shape(t))
+    if failed:
+        parts.append("\n## Failed/skipped steps (drop these unless they reveal a dead-end the workflow should avoid)\n")
+        for t in failed[:5]:  # cap to 5
+            parts.append(_shape(t))
+
+    return "".join(parts)
+
+
+async def _call_llm_for_workflow_synthesis(
+    evidence: str, llm_cfg: dict, operator_hints: list[dict] | None
+) -> dict:
+    """Call the LLM to synthesize a workflow package (JSON output).
+
+    Same httpx + MiniMax pattern as _call_llm_for_skill_synthesis
+    (schedules.py). Strips <think> traces and outer code-fence wrappers
+    defensively. Output is parsed as JSON.
+    """
+    import httpx
+
+    base_url = (llm_cfg.get("base_url") or "https://api.minimax.io/v1").rstrip("/")
+    api_key = llm_cfg.get("api_key") or ""
+    model = llm_cfg.get("model") or "MiniMax-M3"
+    # Workflow synthesis uses longer evidence blocks than skill
+    # synthesis. Bump default to 240s to survive MiniMax load spikes
+    # (recent runs have hit 60-180s including <think> reasoning trace).
+    timeout = float(llm_cfg.get("timeout_seconds") or 240)
+    if not api_key:
+        raise HTTPException(
+            503,
+            "LLM api_key not configured — set llm.api_key in config.yaml "
+            "before promoting projects to workflows.",
+        )
+
+    hints_block = "None."
+    if operator_hints:
+        hints_block = json.dumps(operator_hints, ensure_ascii=False, indent=2)
+
+    # Use plain str.replace, NOT str.format, because the prompt has
+    # lots of literal `{{var}}` examples (which the LLM needs to see
+    # verbatim) — str.format would interpret those as escape sequences
+    # and produce `{var}` (single braces) in the rendered prompt,
+    # which then makes the LLM use single braces too.
+    prompt = (
+        _WORKFLOW_SYNTHESIS_PROMPT
+        .replace("{operator_hints}", hints_block)
+        .replace("{evidence}", evidence)
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You output JSON only. Strict 4-layer separation. "
+                    "Every value that would change on a re-run must be a "
+                    "{{var}} placeholder, not a literal. "
+                    "Do not emit thinking/reasoning trace."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 8000,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(
+            f"{base_url}/chat/completions", json=payload, headers=headers
+        )
+    if r.status_code != 200:
+        raise HTTPException(
+            502, f"LLM returned HTTP {r.status_code}: {r.text[:300]}"
+        )
+    data = r.json()
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise HTTPException(502, f"LLM response shape unexpected: {e}")
+    print(
+        f"[promote-to-workflow] LLM response: text_len={len(text) if isinstance(text, str) else 'N/A'}, "
+        f"finish_reason={data['choices'][0].get('finish_reason')}, "
+        f"first_100={(text[:100] if isinstance(text, str) else 'N/A')!r}",
+        file=sys.stderr,
+    )
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(502, f"LLM returned empty content (text type={type(text).__name__})")
+    # Strip reasoning traces
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    text = text.strip()
+    # Strip outer code fence (defensive)
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    # Locate the first '{' and parse from there (the LLM may add
+    # leading text despite the prompt)
+    brace = text.find("{")
+    if brace < 0:
+        raise HTTPException(502, f"LLM response contained no JSON object: {text[:200]!r}")
+    text = text[brace:]
+    try:
+        out = json.loads(text)
+    except json.JSONDecodeError as e:
+        # Dump to a file for diagnosis
+        try:
+            dump_path = Path(r"C:\Users\stanley\AppData\Local\Temp\workflow_llm_dump.json")
+            dump_path.write_text(text, encoding="utf-8")
+        except Exception:
+            pass
+        # Heuristic fallback: the LLM may have output the step objects
+        # + variables + closing } WITHOUT the outer {"step_template":
+        # ... wrapper. Detect this by:
+        #   1. response does NOT contain the literal "step_template"
+        #   2. response contains "variables" (the LLM did produce that)
+        # Then try to wrap: find the first `[` (the LLM would have
+        # implied an array even if it wrote bare objects), wrap as
+        # {"step_template": [<everything-before-first-]>], "variables": [...]}].
+        if "step_template" not in text and "variables" in text:
+            # The LLM may have written [obj1, obj2, ...] without the
+            # leading "step_template":. Find the start of the array
+            # (the first `]`) and split.
+            try:
+                # Find the position of `"variables"` — the LLM did
+                # produce that. Everything before it is the (unbraced)
+                # step array; everything after is the variables list.
+                var_pos = text.find('"variables"')
+                if var_pos > 0:
+                    pre = text[:var_pos].rstrip().rstrip(",").rstrip()
+                    first_obj_start = pre.find("{")
+                    if first_obj_start < 0:
+                        raise ValueError("no step object found")
+                    # Wrap the bare step objects in `[...]`.
+                    steps_array = "[" + pre[first_obj_start:] + "]"
+                    # Strip the trailing `}` (we'll re-add it).
+                    rest = text[var_pos:].rstrip().rstrip("}").rstrip(",").rstrip()
+                    wrapped = '{"step_template":' + steps_array + ", " + rest + "}"
+                    out2 = json.loads(wrapped)
+                    return out2
+            except Exception:
+                pass
+        raise HTTPException(502, f"LLM returned invalid JSON: {e}; dumped to {dump_path}; first 300 chars: {text[:300]!r}")
+    return out
+
+
+# --- Variable extraction + validation ---
+
+_VAR_PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+
+
+def _extract_variables_from_template(step_template: list[dict]) -> list[str]:
+    """Scan step_template for {{var}} placeholders. Returns a sorted
+    list of unique variable names found anywhere in the template
+    (params_template values, output_path, etc.)."""
+    found: set[str] = set()
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, str):
+            for m in _VAR_PLACEHOLDER_RE.finditer(value):
+                found.add(m.group(1))
+        elif isinstance(value, dict):
+            for v in value.values():
+                _walk(v)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+        # numbers/booleans/None have no placeholders
+
+    for step in step_template:
+        for field in _STEP_FIELDS:
+            if field in step:
+                _walk(step[field])
+    return sorted(found)
+
+
+def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
+    """Validate the LLM-produced workflow package.
+
+    Returns (ok, error_message). On failure, the caller should refuse
+    to write to DB and tell the user to re-run / hand-fix.
+
+    Checks:
+      1. Required keys present (description, step_template, variables).
+      2. step_template is a non-empty list of dicts.
+      3. Each step has the allowed fields only (no extra noise).
+      4. Step names are unique + kebab-case + ≤ 40 chars.
+      5. depends_on references earlier steps (no forward refs).
+      6. variables is a list of {name, type, ...} dicts.
+      7. Every {{var}} in step_template has a matching variables entry.
+      8. Every variable is referenced in step_template (no orphans).
+      9. variable type is in _VALID_VAR_TYPES.
+     10. step_template JSON < 100KB, variables JSON < 50KB.
+     11. No L3 scaffolding strings: [cite:, task.completed@, DECISION:,
+         coord_pickup, iteration_completed@.
+    """
+    if not isinstance(pkg, dict):
+        return False, f"top-level must be a dict, got {type(pkg).__name__}"
+    for k in ("description", "step_template", "variables"):
+        if k not in pkg:
+            return False, f"missing required key: {k!r}"
+
+    description = pkg["description"]
+    if not isinstance(description, str) or len(description) > 1000:
+        return False, f"description must be str ≤ 1000 chars (got {len(str(description))})"
+
+    step_template = pkg["step_template"]
+    if not isinstance(step_template, list) or not step_template:
+        return False, f"step_template must be a non-empty list (got {type(step_template).__name__})"
+
+    # Step-level checks
+    seen_names: set[str] = set()
+    for i, step in enumerate(step_template):
+        if not isinstance(step, dict):
+            return False, f"step_template[{i}] must be a dict"
+        # Allowed fields only
+        extra = set(step.keys()) - set(_STEP_FIELDS)
+        if extra:
+            return False, f"step_template[{i}] has extra fields: {sorted(extra)}; allowed: {_STEP_FIELDS}"
+        # name
+        name = step.get("name", "")
+        if not isinstance(name, str) or not name:
+            return False, f"step_template[{i}].name missing or empty"
+        if not re.match(r"^[a-z0-9][a-z0-9-]*$", name):
+            return False, f"step_template[{i}].name={name!r} not kebab-case"
+        if len(name) > 40:
+            return False, f"step_template[{i}].name={name!r} too long ({len(name)} > 40)"
+        if name in seen_names:
+            return False, f"step_template[{i}].name={name!r} duplicate (already in {seen_names})"
+        seen_names.add(name)
+        # action
+        action = step.get("action", "")
+        if not isinstance(action, str) or not action:
+            return False, f"step_template[{i}].action missing or empty"
+        if any(s in action for s in ("coord_pickup", "handoff:", "_iteration_review")):
+            return False, f"step_template[{i}].action={action!r} contains L3 scaffolding"
+        # depends_on
+        deps = step.get("depends_on", [])
+        if not isinstance(deps, list):
+            return False, f"step_template[{i}].depends_on must be list"
+        for d in deps:
+            if d not in seen_names:
+                return False, f"step_template[{i}].depends_on references {d!r} which is not an EARLIER step (or doesn't exist)"
+
+    # Variables
+    variables = pkg["variables"]
+    if not isinstance(variables, list):
+        return False, f"variables must be a list (got {type(variables).__name__})"
+    var_names_seen: set[str] = set()
+    for i, v in enumerate(variables):
+        if not isinstance(v, dict):
+            return False, f"variables[{i}] must be a dict"
+        vname = v.get("name", "")
+        if not isinstance(vname, str) or not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", vname):
+            return False, f"variables[{i}].name={vname!r} invalid (must be [a-zA-Z_][a-zA-Z0-9_]*)"
+        if vname in var_names_seen:
+            return False, f"variables[{i}].name={vname!r} duplicate"
+        var_names_seen.add(vname)
+        vtype = v.get("type", "string")
+        if vtype not in _VALID_VAR_TYPES:
+            return False, f"variables[{i}].type={vtype!r} invalid; valid: {sorted(_VALID_VAR_TYPES)}"
+
+    # Cross-check: every {{var}} in step_template must have a variable entry
+    found_vars = _extract_variables_from_template(step_template)
+    missing = set(found_vars) - var_names_seen
+    if missing:
+        return False, f"step_template uses {{var}}s without variables entries: {sorted(missing)}"
+    # And no orphan variables
+    orphan = var_names_seen - set(found_vars)
+    if orphan:
+        return False, f"variables defined but not used in step_template: {sorted(orphan)}"
+
+    # Size caps (JSON-encoded)
+    st_bytes = len(json.dumps(step_template, ensure_ascii=False).encode("utf-8"))
+    if st_bytes > _MAX_STEP_TEMPLATE_BYTES:
+        return False, f"step_template too large: {st_bytes} > {_MAX_STEP_TEMPLATE_BYTES}"
+    v_bytes = len(json.dumps(variables, ensure_ascii=False).encode("utf-8"))
+    if v_bytes > _MAX_VARIABLES_BYTES:
+        return False, f"variables too large: {v_bytes} > {_MAX_VARIABLES_BYTES}"
+
+    # Anti-L3 dump: scan the entire JSON for known scaffolding strings
+    full = json.dumps(pkg, ensure_ascii=False)
+    bad = ("[cite:", "task.completed@", "DECISION: PASS", "DECISION: FAIL",
+           "coord_pickup", "iteration_completed@")
+    for s in bad:
+        if s in full:
+            return False, f"workflow package contains forbidden L3 scaffolding: {s!r}"
+
+    # Defensive: if the LLM produced single-brace {var} placeholders
+    # instead of the required {{var}}, auto-convert. This handles the
+    # common LLM failure mode where the prompt says "double brace" but
+    # the model still emits single braces. Only triggers if NO double
+    # braces are present (so we don't accidentally touch an already-
+    # correct workflow).
+    if not _VAR_PLACEHOLDER_RE.search(full):
+        single_re = re.compile(r"(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})")
+        if single_re.search(full):
+            def _conv(o):
+                if isinstance(o, str):
+                    return single_re.sub(r"{{\1}}", o)
+                if isinstance(o, dict):
+                    return {k: _conv(v) for k, v in o.items()}
+                if isinstance(o, list):
+                    return [_conv(x) for x in o]
+                return o
+            converted = _conv(pkg)
+            # Recurse to re-validate the converted package
+            return _validate_workflow_package(converted)
+
+    return True, ""
+
+
+# --- DB row helpers ---
+
+def _row_to_workflow_summary(row) -> dict:
+    """Convert a DB row to the WorkflowSummary shape (with step_count + variable_count)."""
+    try:
+        st = json.loads(row["step_template"] or "[]")
+    except Exception:
+        st = []
+    try:
+        vs = json.loads(row["variables"] or "[]")
+    except Exception:
+        vs = []
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "version": row["version"],
+        "description": row["description"],
+        "source_project_id": row["source_project_id"],
+        "step_count": len(st) if isinstance(st, list) else 0,
+        "variable_count": len(vs) if isinstance(vs, list) else 0,
+        "created_at": row["created_at"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _row_to_workflow_detail(row) -> dict:
+    """Convert a DB row to the WorkflowDetail shape (with parsed JSON)."""
+    summary = _row_to_workflow_summary(row)
+    try:
+        st = json.loads(row["step_template"] or "[]")
+    except Exception:
+        st = []
+    try:
+        vs = json.loads(row["variables"] or "[]")
+    except Exception:
+        vs = []
+    summary["step_template"] = st
+    summary["variables"] = vs
+    return summary
+
+
+# --- API endpoints ---
+
+@router.post("/from-project/{project_id}")
+async def promote_project_to_workflow(
+    project_id: str, body: PromoteToWorkflowBody, request: Request
+) -> dict:
+    """Synthesize a workflow package from a completed project.
+
+    Pipeline: gather evidence → call LLM (4-layer framework) →
+    validate → write to DB.
+
+    Idempotency: if a workflow with `body.name` already exists, return
+    409. Operator can DELETE the existing one first, or PATCH to update.
+    """
+    from hermes_orch.api.projects import _project_dir
+
+    db = request.app.state.db
+    cfg = request.app.state.config
+
+    proj = await db.fetchone("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(404, f"project {project_id} not found")
+
+    # Refuse to synthesize from a project still in flight — workflow
+    # templates should be from settled projects.
+    if (proj.get("state") or "") not in ("completed", "failed", "cancelled", "interrupted"):
+        raise HTTPException(
+            400,
+            f"project {project_id} is in state={proj.get('state')!r}; "
+            "only terminal projects can be promoted to workflows.",
+        )
+
+    # Name uniqueness
+    existing = await db.fetchone(
+        "SELECT id FROM workflow_packages WHERE name = ?", (body.name,)
+    )
+    if existing:
+        raise HTTPException(
+            409,
+            f"workflow package name={body.name!r} already exists "
+            f"(id={existing['id']}); pick a different name or PATCH the existing one.",
+        )
+
+    pdir = _project_dir(request, project_id)
+    evidence = await _gather_workflow_evidence(db, pdir, project_id, proj)
+    llm_cfg = cfg.get("llm", {})
+
+    try:
+        pkg = await _call_llm_for_workflow_synthesis(
+            evidence, llm_cfg, body.variable_hints
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"workflow LLM synthesis failed: {type(e).__name__}: {e}")
+
+    # Operator description overrides LLM description if provided.
+    if body.description:
+        pkg["description"] = body.description
+
+    ok, err = _validate_workflow_package(pkg)
+    if not ok:
+        # Include the LLM output in the error response so the operator
+        # can see what came back and either re-run or hand-craft via PATCH.
+        # Truncate to keep the error response small.
+        llm_dump = json.dumps(pkg, ensure_ascii=False)[:1500]
+        raise HTTPException(
+            422,
+            f"LLM-produced workflow failed validation: {err}. "
+            f"Try again or hand-craft the workflow via PATCH. "
+            f"LLM output: {llm_dump}",
+        )
+
+    # Write to DB
+    wid = f"wf-{secrets.token_hex(6)}"
+    now = _now_iso()
+    try:
+        await db.execute(
+            "INSERT INTO workflow_packages "
+            "(id, name, version, description, step_template, variables, "
+            " source_project_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                wid, body.name, pkg.get("version", "0.1.0"),
+                pkg["description"],
+                json.dumps(pkg["step_template"], ensure_ascii=False),
+                json.dumps(pkg["variables"], ensure_ascii=False),
+                project_id, now, now,
+            ),
+        )
+    except Exception as e:
+        raise HTTPException(500, f"DB insert failed: {e}")
+
+    await audit_log(
+        db, "workflow.created", actor="operator", project_id=project_id,
+        payload={"workflow_id": wid, "name": body.name,
+                 "step_count": len(pkg["step_template"]),
+                 "variable_count": len(pkg["variables"]),
+                 "source": "promote-from-project"},
+    )
+
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (wid,)
+    )
+    return _row_to_workflow_detail(row)
+
+
+@router.get("/")
+async def list_workflows(request: Request) -> list[dict]:
+    """List all workflow packages (summary view)."""
+    db = request.app.state.db
+    rows = await db.fetchall(
+        "SELECT * FROM workflow_packages ORDER BY updated_at DESC"
+    )
+    return [_row_to_workflow_summary(r) for r in rows]
+
+
+@router.get("/{workflow_id}")
+async def get_workflow(workflow_id: str, request: Request) -> dict:
+    """Get a single workflow package (full detail)."""
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        # Try by name (more user-friendly)
+        row = await db.fetchone(
+            "SELECT * FROM workflow_packages WHERE name = ?", (workflow_id,)
+        )
+    if not row:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+    return _row_to_workflow_detail(row)
+
+
+class WorkflowPatchBody(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=80, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    description: str | None = Field(None, max_length=500)
+    step_template: list[dict] | None = None
+    variables: list[dict] | None = None
+    version: str | None = None
+
+
+@router.patch("/{workflow_id}")
+async def update_workflow(
+    workflow_id: str, body: WorkflowPatchBody, request: Request
+) -> dict:
+    """Update an existing workflow package.
+
+    Operator use case: LLM got it 90% right but the description is
+    wrong, or one step name needs renaming, or a variable is missing.
+    Re-validates the package on save.
+    """
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+
+    # Compose new values
+    new_name = body.name if body.name is not None else row["name"]
+    new_desc = body.description if body.description is not None else row["description"]
+    new_version = body.version if body.version is not None else row["version"]
+    if body.step_template is not None:
+        new_step = body.step_template
+    else:
+        new_step = json.loads(row["step_template"] or "[]")
+    if body.variables is not None:
+        new_vars = body.variables
+    else:
+        new_vars = json.loads(row["variables"] or "[]")
+
+    # Name uniqueness if changing
+    if body.name is not None and body.name != row["name"]:
+        existing = await db.fetchone(
+            "SELECT id FROM workflow_packages WHERE name = ? AND id != ?",
+            (body.name, workflow_id),
+        )
+        if existing:
+            raise HTTPException(
+                409, f"name={body.name!r} already used by workflow {existing['id']}"
+            )
+
+    # Validate
+    fake_pkg = {
+        "description": new_desc,
+        "step_template": new_step,
+        "variables": new_vars,
+    }
+    ok, err = _validate_workflow_package(fake_pkg)
+    if not ok:
+        raise HTTPException(422, f"validation failed: {err}")
+
+    now = _now_iso()
+    await db.execute(
+        "UPDATE workflow_packages SET name=?, description=?, version=?, "
+        "step_template=?, variables=?, updated_at=? WHERE id=?",
+        (
+            new_name, new_desc, new_version,
+            json.dumps(new_step, ensure_ascii=False),
+            json.dumps(new_vars, ensure_ascii=False),
+            now, workflow_id,
+        ),
+    )
+    await audit_log(
+        db, "workflow.updated", actor="operator",
+        payload={"workflow_id": workflow_id, "name": new_name,
+                 "step_count": len(new_step), "variable_count": len(new_vars)},
+    )
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    return _row_to_workflow_detail(row)
+
+
+@router.delete("/{workflow_id}")
+async def delete_workflow(workflow_id: str, request: Request) -> dict:
+    """Delete a workflow package. Source projects are NOT touched
+    (FK is ON DELETE SET NULL on source_project_id, but the inverse
+    doesn't apply — deleting a workflow doesn't affect the source)."""
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+    await db.execute(
+        "DELETE FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    await audit_log(
+        db, "workflow.deleted", actor="operator",
+        payload={"workflow_id": workflow_id, "name": row["name"]},
+    )
+    return {"deleted": True, "id": workflow_id, "name": row["name"]}

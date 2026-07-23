@@ -215,6 +215,38 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_model   ON token_usage(model);
 --   is_template flag on projects marks a project as "reusable for schedules"
 --   source_schedule_id on projects links a run back to the schedule that
 --   created it, so the skip rule and the projects-list badge can find it.
+--
+-- Workflow packages (Stage 1, 2026-07-23): a reusable execution template
+-- synthesized from a completed project. Different from `is_template` /
+-- project_schedules (those are for simple cron-fired re-runs of the same
+-- project). A workflow package is a *long-lived reusable asset* that
+-- contains a parameterized step_template (with {{var}} placeholders) and
+-- a variables list describing each placeholder's type/required/default.
+-- Stage 2b will add POST /api/workflows/{id}/run that substitutes variables
+-- and spawns a fresh project.
+--
+--   source_project_id: which project this was synthesized from (NULL if
+--     authored by hand).
+--   step_template: JSON array of step objects mirroring the tasks table
+--     shape (name, agent_role, action, depends_on, params_template, output_path).
+--     params_template uses {{var}} for any value that should be substituted
+--     at run time.
+--   variables: JSON array of {name, type, description, required, default?}
+--     describing each unique {{var}} in step_template.
+CREATE TABLE IF NOT EXISTS workflow_packages (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,        -- kebab-case, e.g. "google-drive-list-files"
+    version TEXT NOT NULL DEFAULT '0.1.0',
+    description TEXT NOT NULL,
+    step_template TEXT NOT NULL,      -- JSON array (string-encoded)
+    variables TEXT NOT NULL,          -- JSON array (string-encoded)
+    source_project_id TEXT,           -- FK to projects.id (NULL if hand-authored)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (source_project_id) REFERENCES projects(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflows_name ON workflow_packages(name);
+CREATE INDEX IF NOT EXISTS idx_workflows_source ON workflow_packages(source_project_id);
 CREATE TABLE IF NOT EXISTS project_schedules (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -335,6 +367,11 @@ MIGRATIONS = [
     # (≈ status change to terminal).
     "ALTER TABLE tasks ADD COLUMN started_at TIMESTAMP",
     "ALTER TABLE tasks ADD COLUMN ended_at TIMESTAMP",
+    # Workflow packages (Stage 1, 2026-07-23): schema-versioning
+    # safety. If the column was added after some old DBs were created,
+    # this ALTER adds it. No-op on fresh DBs (CREATE TABLE above handles).
+    # (No columns to ALTER for workflow_packages yet — all in CREATE TABLE
+    # block above. Adding this comment as a placeholder for future columns.)
 ]
 
 

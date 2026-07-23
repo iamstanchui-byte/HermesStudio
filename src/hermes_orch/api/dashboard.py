@@ -1031,6 +1031,101 @@ async def schedules_page(
     )
 
 
+@router.get("/workflows", response_class=HTMLResponse)
+async def workflows_page(request: Request) -> HTMLResponse:
+    """Workflow package library (Stage 1, 2026-07-23).
+
+    A workflow package is a reusable, parameterized execution template
+    synthesized from a completed project. Different from `is_template`
+    (which is a 1:1 cron clone) and from skills (which are single-task
+    knowledge). Workflows carry {{var}} placeholders for any value that
+    would change on a re-run, so they can be re-run with different
+    inputs.
+
+    Stage 2b will add a "Run with variables" action that substitutes
+    the {{var}}s and spawns a fresh project.
+    """
+    import json as _json
+    db = request.app.state.db
+    rows = await db.fetchall(
+        "SELECT * FROM workflow_packages ORDER BY updated_at DESC"
+    )
+    workflows = []
+    for r in rows:
+        d = dict(r)
+        try:
+            st = _json.loads(d.get("step_template") or "[]")
+            d["step_count"] = len(st) if isinstance(st, list) else 0
+        except Exception:
+            d["step_count"] = 0
+        try:
+            vs = _json.loads(d.get("variables") or "[]")
+            d["variable_count"] = len(vs) if isinstance(vs, list) else 0
+        except Exception:
+            d["variable_count"] = 0
+        workflows.append(d)
+    return templates.TemplateResponse(
+        request=request,
+        name="workflows.html",
+        context={
+            **_base_context(request, "workflows"),
+            "workflows": workflows,
+        },
+    )
+
+
+@router.get("/workflows/{workflow_id}", response_class=HTMLResponse)
+async def workflow_detail_page(workflow_id: str, request: Request) -> HTMLResponse:
+    """Workflow detail page. Shows step_template + variables as JSON.
+    Stage 2b adds a "Run with variables" form here."""
+    import json as _json
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        # Try by name
+        row = await db.fetchone(
+            "SELECT * FROM workflow_packages WHERE name = ?", (workflow_id,)
+        )
+    if not row:
+        return HTMLResponse(
+            f"<h1>Workflow not found</h1><p>{workflow_id}</p>",
+            status_code=404,
+        )
+    d = dict(row)
+    try:
+        d["step_template_pretty"] = _json.dumps(
+            _json.loads(d.get("step_template") or "[]"),
+            indent=2, ensure_ascii=False,
+        )
+    except Exception:
+        d["step_template_pretty"] = "[]"
+    try:
+        d["variables_pretty"] = _json.dumps(
+            _json.loads(d.get("variables") or "[]"),
+            indent=2, ensure_ascii=False,
+        )
+    except Exception:
+        d["variables_pretty"] = "[]"
+    # Source project name (for "view source" link)
+    if d.get("source_project_id"):
+        src = await db.fetchone(
+            "SELECT name FROM projects WHERE id = ?", (d["source_project_id"],)
+        )
+        d["source_project_name"] = (src or {}).get("name") or ""
+    else:
+        d["source_project_name"] = ""
+    return templates.TemplateResponse(
+        request=request,
+        name="workflow_detail.html",
+        context={
+            **_base_context(request, "workflows"),
+            "workflow": d,
+        },
+    )
+
+
 @router.get("/history", response_class=HTMLResponse)
 async def history_page(
     request: Request,

@@ -160,6 +160,18 @@
                         title="Render this project as a SKILL.md and register it to a target profile. The agent on that profile will see the skill in its available skills list within ~30s.">
                         ✨ Promote to skill
                     </button>
+                    {# Stage 1 (2026-07-23): promote this project to a
+                       reusable workflow package. Different from
+                       "Mark as template" (which is a 1:1 schedule clone
+                       with no parameterization). A workflow is a
+                       parameterized step_template that can be re-run
+                       with different {{var}} values. Requires the
+                       project to be in a terminal state. #}
+                    <button onclick="openPromoteToWorkflowModal()"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-emerald-300 text-emerald-700 hover:bg-emerald-50"
+                        title="Synthesize a reusable workflow package (parameterized step_template + variables list) from this project. Stage 2b will add the 'run with variables' action.">
+                        🔁 Promote to workflow
+                    </button>
                 </div>
             </div>
 
@@ -1333,5 +1345,101 @@ async function deletePreset(agentId, profileName, btn) {
         </form>
     </div>
 </div>
+
+
+<!-- ===== Promote to workflow modal (Stage 1, 2026-07-23) =====
+     LLM synthesizes a parameterized step_template (with {{var}}
+     placeholders for any value that would change on a re-run) plus
+     a variables list. Stage 2b will add a "Run with variables" action
+     that substitutes the {{var}}s and spawns a fresh project.
+
+     Only available when the project is in a terminal state (completed /
+     failed / cancelled / interrupted). The API enforces this; the UI
+     disables the button when not in a terminal state. -->
+<div id="promote-workflow-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center" style="background-color: rgba(0,0,0,0.5);">
+    <div class="bg-white rounded-lg shadow-xl max-w-lg w-full mx-4">
+        <form id="promote-workflow-form" onsubmit="event.preventDefault(); submitPromoteToWorkflow();" class="p-5">
+            <h2 class="text-lg font-semibold text-gray-800 mb-1">&#x1F501; Promote to workflow</h2>
+            <p class="text-sm text-gray-500 mb-4">
+                LLM synthesizes a reusable workflow package from this project. The output is a parameterized
+                step_template with <code>{{ '{{var}}' }}</code> placeholders for any value that would change
+                on a re-run, plus a variables list. Stage 2b will add the run-with-variables action.
+            </p>
+
+            <label class="block text-sm font-medium text-gray-700 mb-1">
+                Workflow name <span class="text-red-500">*</span>
+            </label>
+            <input id="promote-workflow-name" name="workflow_name" required
+                pattern="^[a-z0-9][a-z0-9-]{1,40}$"
+                class="mt-1 mb-3 block w-full border rounded px-2 py-1 text-sm font-mono"
+                placeholder="e.g. google-drive-list-and-summarize">
+            <p class="text-xs text-gray-500 -mt-2 mb-3">lowercase letters, digits, dashes; max 40 chars; must be unique among workflow packages</p>
+
+            <label class="block text-sm font-medium text-gray-700 mb-1">
+                Description <span class="text-gray-400">(optional, overrides LLM's)</span>
+            </label>
+            <textarea id="promote-workflow-description" name="workflow_description" rows="2" maxlength="500"
+                class="mt-1 mb-3 block w-full border rounded px-2 py-1 text-sm"
+                placeholder="Leave blank to use the LLM-synthesized description."></textarea>
+
+            <div class="mt-4 flex items-center gap-2">
+                <button id="promote-workflow-submit-btn" type="submit" class="px-4 py-2 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700">
+                    Synthesize
+                </button>
+                <button type="button" onclick="closePromoteToWorkflowModal()" class="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm hover:bg-gray-200">
+                    Cancel
+                </button>
+                <span id="promote-workflow-status" class="text-sm text-gray-500 ml-2"></span>
+            </div>
+        </form>
+    </div>
+</div>
+
+
+<script>
+// ===== Promote to workflow (Stage 1, 2026-07-23) =====
+function openPromoteToWorkflowModal() {
+    document.getElementById('promote-workflow-name').value = '';
+    document.getElementById('promote-workflow-description').value = '';
+    document.getElementById('promote-workflow-status').textContent = '';
+    document.getElementById('promote-workflow-overlay').classList.remove('hidden');
+    // Default name: slugify project name + '-v1'
+    const projName = (document.querySelector('h1')?.textContent || 'workflow')
+        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 30);
+    document.getElementById('promote-workflow-name').value = projName + '-v1';
+}
+function closePromoteToWorkflowModal() {
+    document.getElementById('promote-workflow-overlay').classList.add('hidden');
+}
+async function submitPromoteToWorkflow() {
+    const btn = document.getElementById('promote-workflow-submit-btn');
+    const status = document.getElementById('promote-workflow-status');
+    const name = (document.getElementById('promote-workflow-name').value || '').trim();
+    const description = (document.getElementById('promote-workflow-description').value || '').trim();
+    if (!name) { status.textContent = 'Name required'; return; }
+    btn.disabled = true;
+    status.textContent = 'Synthesizing via LLM (60-120s)...';
+    try {
+        const r = await _fetchWithTimeout(`/api/workflows/from-project/${PROJECT_ID}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name, description}),
+        }, 180_000);  // 3 min for LLM call
+        const j = await r.json();
+        if (r.status !== 200 && r.status !== 201) {
+            throw new Error(j.detail || `HTTP ${r.status}`);
+        }
+        status.textContent = `Done: ${j.name} (${j.step_count} steps, ${j.variable_count} variables)`;
+        setTimeout(() => {
+            closePromoteToWorkflowModal();
+            // Open the workflow detail page
+            window.open(`/workflows/${j.id}`, '_blank');
+        }, 1500);
+    } catch (e) {
+        status.textContent = 'Failed: ' + e.message;
+        btn.disabled = false;
+    }
+}
+</script>
 
 {% endblock %}

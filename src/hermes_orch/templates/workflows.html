@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-4">
+    <div>
+        <h1 class="text-xl font-bold text-gray-800">Workflow packages</h1>
+        <p class="text-sm text-gray-500 mt-1">
+            Reusable, parameterized execution templates synthesized from completed projects.
+            Each workflow has a step_template with <code>{{ '{{var}}' }}</code> placeholders
+            and a variables list. Stage 2b will add the "Run with variables" action.
+        </p>
+    </div>
+</div>
+
+{% if workflows %}
+<div class="bg-white border rounded-lg shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+        <thead class="bg-gray-50 border-b">
+            <tr>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Name</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Description</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Source project</th>
+                <th class="text-right px-3 py-2 font-medium text-gray-700">Steps</th>
+                <th class="text-right px-3 py-2 font-medium text-gray-700">Vars</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Updated</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for w in workflows %}
+            <tr class="border-b last:border-0 hover:bg-gray-50">
+                <td class="px-3 py-2 font-mono">
+                    <a href="/workflows/{{ w.id }}" class="text-blue-600 hover:underline">{{ w.name }}</a>
+                    <span class="text-xs text-gray-400 ml-1">v{{ w.version }}</span>
+                </td>
+                <td class="px-3 py-2 text-gray-700 max-w-md truncate" title="{{ w.description }}">
+                    {{ w.description or '(no description)' }}
+                </td>
+                <td class="px-3 py-2 text-xs">
+                    {% if w.source_project_id %}
+                        <a href="/projects/{{ w.source_project_id }}" class="text-blue-600 hover:underline">{{ w.source_project_name or w.source_project_id }}</a>
+                    {% else %}
+                        <span class="text-gray-400">hand-authored</span>
+                    {% endif %}
+                </td>
+                <td class="px-3 py-2 text-right tabular-nums">{{ w.step_count }}</td>
+                <td class="px-3 py-2 text-right tabular-nums">{{ w.variable_count }}</td>
+                <td class="px-3 py-2 text-xs text-gray-500">{{ (w.updated_at or '')[:19] }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="bg-white border rounded-lg p-8 text-center text-gray-500">
+    <p class="text-sm">No workflow packages yet.</p>
+    <p class="text-xs mt-2">
+        Open a completed project and click "🔁 Promote to workflow" on the project page to create one.
+    </p>
+</div>
+{% endif %}
+
+<div class="mt-6 bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm text-blue-900">
+    <p class="font-medium mb-1">How to use</p>
+    <ol class="list-decimal list-inside space-y-1 text-xs">
+        <li>Open a completed project (state = completed / failed / cancelled / interrupted).</li>
+        <li>Click "🔁 Promote to workflow" — pick a name + optional description.</li>
+        <li>LLM synthesizes a step_template (with <code>{{ '{{var}}' }}</code> placeholders) + variables list.</li>
+        <li>The new workflow appears here, click to view / edit / delete.</li>
+        <li class="text-blue-700 italic">Stage 2b (next): click "Run with variables" to spawn a fresh project with substituted values.</li>
+    </ol>
+</div>
+
+{% endblock %}

@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-4">
+    <div>
+        <h1 class="text-xl font-bold text-gray-800 font-mono">{{ workflow.name }}</h1>
+        <p class="text-sm text-gray-500 mt-1">
+            <span class="font-mono">{{ workflow.id }}</span> ·
+            v{{ workflow.version }} ·
+            updated {{ (workflow.updated_at or '')[:19] }}
+        </p>
+        {% if workflow.description %}
+        <p class="text-sm text-gray-700 mt-2">{{ workflow.description }}</p>
+        {% endif %}
+    </div>
+    <div class="flex gap-2">
+        <button onclick="deleteWorkflow()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-red-300 text-red-700 hover:bg-red-50"
+            title="Permanently delete this workflow package. Source project is NOT touched.">
+            Delete
+        </button>
+    </div>
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div class="bg-white border rounded-lg shadow-sm">
+        <div class="px-3 py-2 border-b bg-gray-50 flex items-center justify-between">
+            <h2 class="text-sm font-semibold text-gray-800">step_template</h2>
+            <span class="text-xs text-gray-500">ordered execution plan</span>
+        </div>
+        <pre class="p-3 text-xs font-mono overflow-x-auto whitespace-pre"><code>{{ workflow.step_template_pretty }}</code></pre>
+    </div>
+
+    <div class="bg-white border rounded-lg shadow-sm">
+        <div class="px-3 py-2 border-b bg-gray-50 flex items-center justify-between">
+            <h2 class="text-sm font-semibold text-gray-800">variables</h2>
+            <span class="text-xs text-gray-500">one per {{{{var}}}} in step_template</span>
+        </div>
+        <pre class="p-3 text-xs font-mono overflow-x-auto whitespace-pre"><code>{{ workflow.variables_pretty }}</code></pre>
+    </div>
+</div>
+
+{% if workflow.source_project_id %}
+<div class="mt-4 bg-emerald-50 border border-emerald-200 rounded-lg p-4 text-sm text-emerald-900">
+    <p class="font-medium mb-1">Source project</p>
+    <p class="text-xs">
+        Synthesized from
+        <a href="/projects/{{ workflow.source_project_id }}" class="text-blue-600 hover:underline font-mono">{{ workflow.source_project_name or workflow.source_project_id }}</a>
+        on {{ (workflow.created_at or '')[:19] }}.
+    </p>
+</div>
+{% endif %}
+
+<div class="mt-6 bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900">
+    <p class="font-medium mb-1">Stage 2b will add:</p>
+    <ul class="list-disc list-inside space-y-1 text-xs">
+        <li>"Run with variables" button — form with one input per variable in the list above.</li>
+        <li>Variable substitution into step_template's <code>{{ '{{var}}' }}</code> placeholders.</li>
+        <li>Spawn a fresh project 1:1 from the template, with substituted values baked in.</li>
+        <li>Audit event links the new run back to this workflow package.</li>
+    </ul>
+</div>
+
+<script>
+async function deleteWorkflow() {
+    const wfName = {{ workflow.name | tojson }};
+    const wfId = {{ workflow.id | tojson }};
+    if (!confirm(`Delete workflow "${wfName}"?\n\nThis is permanent. The source project (if any) is NOT affected.`)) return;
+    try {
+        const r = await fetch(`/api/workflows/${wfId}`, {method: 'DELETE'});
+        if (r.status !== 200) {
+            const j = await r.json();
+            throw new Error(j.detail || `HTTP ${r.status}`);
+        }
+        window.location.href = '/workflows';
+    } catch (e) {
+        alert('Delete failed: ' + e.message);
+    }
+}
+</script>
+
+{% endblock %}
