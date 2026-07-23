@@ -471,6 +471,7 @@
                                 <div class="flex items-center justify-between text-xs bg-white border rounded px-2 py-1">
                                     <div class="flex items-center gap-2 flex-1 min-w-0">
                                         <span class="font-mono text-gray-700 truncate" title="{{ s.file_path }}">{{ s.name }}</span>
+                                        {% if '/' in s.name %}<span class="px-1 rounded text-[10px] bg-blue-100 text-blue-800">{{ s.name.split('/')[0] }}</span>{% endif %}
                                         <span class="px-1 rounded text-[10px]
                                             {% if s.status == 'applied' %}bg-green-100 text-green-800
                                             {% elif s.status == 'pending' or s.status == 'applying' %}bg-yellow-100 text-yellow-800
@@ -481,6 +482,7 @@
                                         <span class="text-gray-400">{{ s.size }}b</span>
                                     </div>
                                     <div class="flex items-center gap-1 flex-shrink-0">
+                                        <button onclick="copySkillTo('{{ agent.id }}', '{{ p.name }}', '{{ s.name }}', {{ agent.profiles|map(attribute='name')|list|tojson }})" class="text-blue-600 hover:underline" title="Copy this skill to another profile on the same agent">⎘</button>
                                         <button onclick="deleteSkill('{{ agent.id }}', '{{ p.name }}', '{{ s.name }}')" class="text-red-600 hover:underline" title="Delete this skill (wrapper will remove the folder)">&times;</button>
                                     </div>
                                 </div>
@@ -838,6 +840,54 @@ async function deleteSkill(agentId, profileName, skillName) {
         }
     } catch (err) {
         alert('Error: ' + err.message);
+    }
+}
+
+// Copy a skill to another profile on the SAME agent (cross-host copy
+// is not supported — the wrapper that needs to write the file lives
+// on one host only). Pops a quick prompt to pick the target profile.
+async function copySkillTo(agentId, srcProfile, skillName, allProfiles) {
+    const candidates = allProfiles.filter(n => n !== srcProfile);
+    if (candidates.length === 0) {
+        alert('No other profiles on this agent to copy to.');
+        return;
+    }
+    const to = prompt(
+        `Copy skill "${skillName}" from "${srcProfile}" to which profile?\n\n` +
+        `Available: ${candidates.join(', ')}\n\n` +
+        `Type the target profile name (case-sensitive):`,
+        candidates[0],
+    );
+    if (!to || !candidates.includes(to)) {
+        if (to !== null) alert('Unknown target profile. Copy cancelled.');
+        return;
+    }
+    if (to === srcProfile) {
+        alert('Source and target are the same. Copy cancelled.');
+        return;
+    }
+    const overwrite = confirm(
+        `Overwrite if "${to}" already has skill "${skillName}"?\n\n` +
+        `OK = overwrite (existing content replaced)\nCancel = skip if exists (returns 409)`
+    );
+    try {
+        const r = await _fetchWithTimeout(
+            `/api/agents/${agentId}/profiles/${encodeURIComponent(srcProfile)}/skills/${encodeURIComponent(skillName)}/copy?to_profile=${encodeURIComponent(to)}`,
+            {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({overwrite}),
+            },
+            30000,
+        );
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok && r.status !== 201) {
+            throw new Error(_errDetailToString(j.detail, r.status));
+        }
+        alert(`Copied "${skillName}" to ${to}.\nThe wrapper on ${to} will write the file on its next config poll (within 5s).`);
+        setTimeout(() => location.reload(), 600);
+    } catch (err) {
+        alert('Copy failed: ' + (err.message || String(err)));
     }
 }
 

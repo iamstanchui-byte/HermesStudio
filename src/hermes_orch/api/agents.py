@@ -1492,3 +1492,94 @@ async def delete_skill(
     )
     return _row_to_config(row)
 
+
+@router.post(
+    "/{agent_id}/profiles/{profile_name}/skills/{skill_name}/copy",
+    response_model=ProfileConfig,
+    status_code=201,
+)
+async def copy_skill_to_profile(
+    agent_id: str,
+    profile_name: str,
+    skill_name: str,
+    to_profile: str,
+    request: Request,
+) -> ProfileConfig:
+    """Copy a skill from one profile to another (same agent).
+
+    Reads the source skill's desired_content from profile_configs and
+    writes a new pending row for the target profile with the same
+    content. The wrapper on the target host will pick up the pending
+    row and write the file to disk. The source profile is unchanged
+    (copy, not move).
+
+    Optional body: { "overwrite": false } — if true, allows overwriting
+    an existing skill with the same name on the target profile. Default
+    false (returns 409 if target already has this skill).
+
+    Path layout: the source skill's file_path is preserved (e.g.
+    `skills/productivity/xlsx/SKILL.md` → target gets the SAME
+    file_path). The target wrapper will create the subfolder on disk
+    if it doesn't exist.
+    """
+    db = request.app.state.db
+    # Read source
+    src_profile = await _find_profile(db, agent_id, profile_name)
+    src_cfg = await _latest_skill_config(db, src_profile["id"], skill_name)
+    if not src_cfg:
+        raise HTTPException(404, f"Skill not found: {skill_name} in {profile_name}")
+    src_content = src_cfg.get("desired_content") or ""
+    if not src_content:
+        raise HTTPException(400, f"Source skill {skill_name!r} has empty content (deleted?)")
+    # Validate target
+    name = _validate_skill_name(skill_name)
+    dst_profile = await _find_profile(db, agent_id, to_profile)
+    if dst_profile["id"] == src_profile["id"]:
+        raise HTTPException(400, f"Source and target profile are the same: {profile_name}")
+    # Read overwrite flag from body (default false)
+    body_bytes = await request.body()
+    overwrite = False
+    if body_bytes:
+        try:
+            body = json.loads(body_bytes)
+            overwrite = bool(body.get("overwrite", False))
+        except Exception:
+            pass
+    # Check collision
+    if not overwrite:
+        existing = await _latest_skill_config(db, dst_profile["id"], name)
+        if existing and (existing.get("desired_content") or ""):
+            raise HTTPException(
+                409, f"Target {to_profile} already has skill {name!r}; pass overwrite=true to replace"
+            )
+    # Write new pending config
+    file_path = _skill_file_path(name)
+    cfg_id = str(uuid.uuid4())
+    sha = hashlib.sha256(src_content.encode("utf-8")).hexdigest()
+    await db.insert(
+        "profile_configs",
+        {
+            "id": cfg_id,
+            "profile_id": dst_profile["id"],
+            "file_path": file_path,
+            "desired_sha256": sha,
+            "desired_content": src_content,
+            "status": "pending",
+        },
+    )
+    row = await db.fetchone("SELECT * FROM profile_configs WHERE id = ?", (cfg_id,))
+    await audit_log(
+        db, "profile.skill_copied",
+        actor="operator",
+        agent_id=agent_id,
+        payload={
+            "src_profile": profile_name,
+            "dst_profile": to_profile,
+            "skill_name": name,
+            "file_path": file_path,
+            "bytes": len(src_content),
+            "overwrite": overwrite,
+        },
+    )
+    return _row_to_config(row)
+
