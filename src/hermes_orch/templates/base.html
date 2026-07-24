@@ -5,6 +5,36 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Hermes Orchestrator{% endblock %}</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    {# Shared fetch helpers. Defined in <head> so every page that
+       extends base.html gets them BEFORE any page-specific script
+       runs. Without this, pages like project.html that call
+       loadProcedure() synchronously at script execution time
+       would hit a ReferenceError because the helpers are defined
+       in a later <script> block at the bottom of base.html. #}
+    <script>
+    async function _fetchWithTimeout(url, opts = {}, ms = 5000) {
+        const ctl = new AbortController();
+        const t = setTimeout(() => ctl.abort(), ms);
+        try {
+            return await fetch(url, { ...opts, signal: ctl.signal });
+        } finally {
+            clearTimeout(t);
+        }
+    }
+    function _errDetailToString(detail, status) {
+        if (typeof detail === 'string') return detail;
+        if (Array.isArray(detail)) {
+            // FastAPI 422: [{loc: ['body', 'name'], msg: 'Field required', ...}, ...]
+            return detail.map(e => {
+                const where = Array.isArray(e.loc) ? e.loc.join('.') : '';
+                return where ? `${where}: ${e.msg}` : (e.msg || JSON.stringify(e));
+            }).join('; ') || `HTTP ${status}`;
+        }
+        if (detail && typeof detail === 'object' && detail.msg) return detail.msg;
+        if (detail && typeof detail === 'object') return JSON.stringify(detail);
+        return `HTTP ${status}`;
+    }
+    </script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft JhengHei", sans-serif; background: #f9fafb; }
         pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -337,48 +367,6 @@
     document.addEventListener('focusout', (e) => {
         if (e.target.matches('input, textarea, select')) startPolling();
     });
-    </script>
-
-    {# Shared fetch helpers. Used by every page that posts to the API
-       (project, workflow, agents, etc.). Defining them here in
-       base.html means each page no longer has to redefine them — and
-       fixes the "icon shows but does nothing" bug where agents.html
-       called these without ever defining them. #}
-    <script>
-    // Wraps fetch with a hard 5s timeout so the UI never sits on
-    // "Loading..." forever if the server is slow / network is wedged.
-    // 5s is generous for a local LAN call without being annoying. The
-    // copy-skill flow passes ms=30000 to give the wrapper time to
-    // sync the new file across to the target profile (5s poll ×
-    // a few retries while the write replicates).
-    async function _fetchWithTimeout(url, opts = {}, ms = 5000) {
-        const ctl = new AbortController();
-        const t = setTimeout(() => ctl.abort(), ms);
-        try {
-            return await fetch(url, { ...opts, signal: ctl.signal });
-        } finally {
-            clearTimeout(t);
-        }
-    }
-    // Render a fetch-error body (r.json() result) into a human-readable
-    // string. FastAPI's standard 422 validation response has `detail` as
-    // an ARRAY of objects (one per field error). If we just do
-    // `new Error(j.detail)` the array gets coerced to "[object Object]"
-    // -- useless for the operator. This helper extracts one readable
-    // message. Handles string / array / object-with-msg / null.
-    function _errDetailToString(detail, status) {
-        if (typeof detail === 'string') return detail;
-        if (Array.isArray(detail)) {
-            // FastAPI 422: [{loc: ['body', 'name'], msg: 'Field required', ...}, ...]
-            return detail.map(e => {
-                const where = Array.isArray(e.loc) ? e.loc.join('.') : '';
-                return where ? `${where}: ${e.msg}` : (e.msg || JSON.stringify(e));
-            }).join('; ') || `HTTP ${status}`;
-        }
-        if (detail && typeof detail === 'object' && detail.msg) return detail.msg;
-        if (detail && typeof detail === 'object') return JSON.stringify(detail);
-        return `HTTP ${status}`;
-    }
     </script>
 </body>
 </html>
