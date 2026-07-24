@@ -30,9 +30,11 @@ function Stop-Server {
     try {
         $null = taskkill /F /IM hermes-orch.exe /T 2>&1
     } catch { }
-    try {
-        $null = taskkill /F /IM "hermes-orch-agent.exe" /T 2>&1
-    } catch { }
+    # NOTE: do NOT blanket-kill hermes-orch-agent.exe here. The wrapper
+    # is now managed by scripts/wrapper-ctl.py (no longer NSSM). Use
+    #   python scripts/wrapper-ctl.py restart
+    # to bounce the wrapper, or it'll keep running and pick up new
+    # code via its self-restart watchdog (touch agent_cli.py).
     Start-Sleep -Milliseconds 500
     $procs = Get-CimInstance Win32_Process | Where-Object {
         # Match the venv python running the orchestrator (cmdline has
