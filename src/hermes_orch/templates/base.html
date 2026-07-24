@@ -5,6 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Hermes Orchestrator{% endblock %}</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    {# Per-page head content (extra CSS, deferred JS, etc.). Visual
+       builder (Phase 1, 2026-07-24) uses this block to load drawflow
+       + dagre + visual_workflow.js. Without this block, child
+       templates' {% block head %} content is silently dropped by Jinja
+       — debugged 2026-07-24 when the visual page rendered no cards
+       because none of its defer scripts ever registered. #}
+    {% block head %}{% endblock %}
     {# Shared fetch helpers. Defined in <head> so every page that
        extends base.html gets them BEFORE any page-specific script
        runs. Without this, pages like project.html that call

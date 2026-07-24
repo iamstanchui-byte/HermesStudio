@@ -213,7 +213,9 @@
      data-workflow-id="{{ workflow.id }}"
      data-step-template='{{ workflow.step_template | tojson }}'
      data-variables='{{ workflow.variables | tojson }}'>
-    <div id="vf-drawflow-target"></div>
+    {# Drawflow injects its DOM directly into this wrap. The side
+       panel below is a sibling (position: absolute), so it floats
+       over the canvas (z-index: 10) without affecting layout. #}
 
     {# Side panel — Phase 1.3 (skeleton just shows the selected step). #}
     <div class="vf-side-panel" id="vf-side-panel">

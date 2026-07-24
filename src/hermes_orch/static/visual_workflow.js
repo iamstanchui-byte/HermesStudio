@@ -87,16 +87,28 @@
 
     function _render() {
         const wrap = _canvas();
-        const target = document.getElementById('vf-drawflow-target');
-        if (!target) {
-            console.error('visual_workflow: target element not found');
+        // Pass the wrap itself (not an inner div) so drawflow injects
+        // its DOM as a direct child of the wrap. The side panel is
+        // a sibling of drawflow's injected div, both inside the wrap;
+        // the side panel uses position: absolute so it floats over
+        // the canvas (z-index 10) without affecting layout.
+        if (!wrap) {
+            console.error('visual_workflow: vf-canvas wrap not found');
             return;
         }
         // First-time init: build the editor
         if (!_editor) {
-            _editor = new Drawflow(target);
-            _editor.reroute = true;
-            _editor.start();
+            console.log('visual_workflow: init Drawflow on wrap', wrap);
+            try {
+                _editor = new Drawflow(wrap);
+                _editor.reroute = true;
+                _editor.start();
+                console.log('visual_workflow: Drawflow started OK');
+            } catch (e) {
+                console.error('visual_workflow: Drawflow init failed:', e);
+                _showInitError(e);
+                return;
+            }
         }
         // Always clear and re-render from canonical state
         _editor.clear();
@@ -107,52 +119,84 @@
         // stack vertically with 120px between cards.
         const x = 50, y = 50, dy = 120;
         const nameToNodeId = {};
-        _stepTemplate.forEach((step, i) => {
-            const html = _stepToCardHtml(step);
-            const data = {
-                name: step.name,
-                role: step.agent_role,
-                action: step.action,
-            };
-            _editor.addNode(
-                html,                                  // html
-                ['vf-input'],                          // inputs (1 input point on the left)
-                ['vf-output'],                         // outputs (1 output point on the right)
-                x, y + i * dy,                         // pos
-                'vf-node',                             // class
-                data,                                  // data
-                step.name,                             // name as drawn on node
-            );
-            // Drawflow names new nodes node-<n> where n is an internal counter.
-            // We rely on the editor's last node id.
-            const lastId = Object.keys(_editor.drawflow.drawflow)
-                .map((k) => parseInt(k.replace('node-', ''), 10))
-                .reduce((a, b) => Math.max(a, b), 0);
-            nameToNodeId[step.name] = `node-${lastId}`;
-        });
+        try {
+            _stepTemplate.forEach((step, i) => {
+                const html = _stepToCardHtml(step);
+                const data = {
+                    name: step.name,
+                    role: step.agent_role,
+                    action: step.action,
+                };
+                _editor.addNode(
+                    html,                                  // html
+                    ['vf-input'],                          // inputs (1 input point on the left)
+                    ['vf-output'],                         // outputs (1 output point on the right)
+                    x, y + i * dy,                         // pos
+                    'vf-node',                             // class
+                    data,                                  // data
+                    step.name,                             // name as drawn on node
+                );
+                // Drawflow names new nodes node-<n> where n is an internal counter.
+                // We rely on the editor's last node id.
+                const lastId = Object.keys(_editor.drawflow.drawflow)
+                    .map((k) => parseInt(k.replace('node-', ''), 10))
+                    .reduce((a, b) => Math.max(a, b), 0);
+                nameToNodeId[step.name] = `node-${lastId}`;
+            });
+        } catch (e) {
+            console.error('visual_workflow: addNode failed:', e);
+            _showInitError(e);
+            return;
+        }
 
         // Wire depends_on: for each step B with deps ["A","C"], find
         // node A and C, and connect A's output -> B's input.
-        _stepTemplate.forEach((step) => {
-            const targetNodeId = nameToNodeId[step.name];
-            if (!targetNodeId) return;
-            (step.depends_on || []).forEach((depName) => {
-                const sourceNodeId = nameToNodeId[depName];
-                if (!sourceNodeId) return;
-                // Drawflow addConnection: sourceNode, sourceOutput, targetNode, targetInput
-                // Each node has 1 output (index 0) and 1 input (index 0).
-                _editor.addConnection(sourceNodeId, targetNodeId, 'output_1', 'input_1');
+        try {
+            _stepTemplate.forEach((step) => {
+                const targetNodeId = nameToNodeId[step.name];
+                if (!targetNodeId) return;
+                (step.depends_on || []).forEach((depName) => {
+                    const sourceNodeId = nameToNodeId[depName];
+                    if (!sourceNodeId) return;
+                    // Drawflow addConnection: sourceNode, sourceOutput, targetNode, targetInput
+                    // Each node has 1 output (index 0) and 1 input (index 0).
+                    _editor.addConnection(sourceNodeId, targetNodeId, 'output_1', 'input_1');
+                });
             });
-        });
+        } catch (e) {
+            console.error('visual_workflow: addConnection failed:', e);
+            // Non-fatal: cards still show, just no edges
+        }
 
         // Click handler: open the side panel with details
-        target.addEventListener('click', (ev) => {
-            const nodeEl = ev.target.closest('.drawflow-node');
-            if (!nodeEl) return;
-            // The element id is e.g. "node-3"
-            const id = nodeEl.id;
-            window.visualBuilder.openSidePanel(id);
-        }, { once: false });
+        // We bind to the wrap, not the inner target, so clicks
+        // anywhere in the canvas area can reach us.
+        if (!wrap._vfClickBound) {
+            wrap.addEventListener('click', (ev) => {
+                const nodeEl = ev.target.closest('.drawflow-node');
+                if (!nodeEl) return;
+                // The element id is e.g. "node-3"
+                const id = nodeEl.id;
+                window.visualBuilder.openSidePanel(id);
+            });
+            wrap._vfClickBound = true;
+        }
+    }
+
+    function _showInitError(err) {
+        // Render a visible error inside the canvas wrap so the user
+        // can see WHY no cards appeared, without opening F12.
+        const wrap = _canvas();
+        if (!wrap) return;
+        const msg = document.createElement('div');
+        msg.style.cssText = 'padding: 16px; background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; border-radius: 6px; margin: 16px; font-size: 12px; font-family: monospace;';
+        msg.innerHTML = `
+            <strong>Visual builder failed to initialize.</strong><br>
+            ${(err && err.message) ? err.message : err}<br><br>
+            Open F12 → Console for the full stack trace. The most common
+            cause is the drawflow CDN not loading — check the Network tab.
+        `;
+        wrap.appendChild(msg);
     }
 
     function _findStepByNodeId(nodeId) {
