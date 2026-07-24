@@ -324,7 +324,9 @@
                             <span class="px-1.5 py-0.5 text-[10px] rounded
                                 {% if p.status == 'busy' %}bg-amber-100 text-amber-800
                                 {% elif p.status == 'idle' %}bg-gray-200 text-gray-700
-                                {% else %}bg-yellow-100 text-yellow-800{% endif %}">
+                                {% elif p.status == 'stale' %}bg-red-100 text-red-800
+                                {% else %}bg-yellow-100 text-yellow-800{% endif %}"
+                                {% if p.status == 'stale' %}title="Wrapper is offline (agent heartbeat > 90s old). Profile was reset to idle; current task will be re-detected as stuck on next supervisor tick."{% endif %}">
                                 {{ p.status }}
                             </span>
                             {# LLM model badge — wrapper-reported via heartbeat #}

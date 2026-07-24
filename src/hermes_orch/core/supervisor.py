@@ -251,6 +251,54 @@ class Supervisor:
         except Exception as e:
             log.debug(f"stale-agent scan failed: {e}")
 
+        # Stale-profile check: for any profile on a stale agent, mark
+        # the profile 'stale' and free its current_task_id. Without
+        # this, a dead wrapper leaves its profiles stuck 'busy'
+        # forever (e.g. the win-agent02 case where the agent had
+        # been up for hours, then the wrapper crashed, and the
+        # dashboard kept showing 'busy' for a task that no one was
+        # running). The profile status mirrors the parent agent's
+        # liveness — if the agent can't heartbeat, the profile
+        # can't be doing real work either.
+        try:
+            now = _now_iso()
+            cur = await self.db.execute(
+                "UPDATE agent_profiles "
+                "SET status = 'stale', current_task_id = NULL, updated_at = ? "
+                "WHERE status = 'busy' AND current_task_id IS NOT NULL "
+                "AND agent_id IN (SELECT id FROM agents WHERE status = 'stale')",
+                (now,),
+            )
+            if cur.rowcount:
+                log.info(f"freed {cur.rowcount} busy profile(s) on stale agents")
+        except Exception as e:
+            log.debug(f"stale-profile scan failed: {e}")
+
+        # Ghost-reference cleanup: a profile's current_task_id may
+        # point to a task ID that no longer exists in the tasks
+        # table (e.g. the task row was deleted by project cleanup,
+        # or the task was created in a different DB and we're
+        # looking at a fresh restore). The stuck-task check below
+        # only matches tasks that still exist; without this scan,
+        # the profile would be stuck 'busy' on a phantom task
+        # forever. The same fix in agents.py:heartbeat() only
+        # handles TERMINAL tasks; the supervisor handles the
+        # non-existent case (where the heartbeat path never sees
+        # it because the wrapper is also dead).
+        try:
+            now = _now_iso()
+            cur = await self.db.execute(
+                "UPDATE agent_profiles "
+                "SET status = 'idle', current_task_id = NULL, updated_at = ? "
+                "WHERE current_task_id IS NOT NULL "
+                "AND current_task_id NOT IN (SELECT id FROM tasks)",
+                (now,),
+            )
+            if cur.rowcount:
+                log.info(f"cleared {cur.rowcount} ghost current_task_id reference(s)")
+        except Exception as e:
+            log.debug(f"ghost-ref scan failed: {e}")
+
         # Stuck-task check: if a 'running' task's last_liveness_at is
         # stale (>3 min), the wrapper has either died, lost network,
         # or its liveness poller is hung. Mark the task as failed so

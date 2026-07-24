@@ -28,7 +28,15 @@ router = APIRouter()
 
 # Templates directory (relative to this file: src/hermes_orch/api/dashboard.py)
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
+# auto_reload=True so template edits show up on the next request without
+# a full server restart. Important during dev (the wrapper has a
+# self-restart watchdog but the server is manually started, so this
+# avoids a second manual step). Jinja2's FileSystemLoader checks the
+# mtime of every template on every request, which is a few ms — fine
+# for a local-LAN dashboard. Set to False in production to skip the
+# stat calls.
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+templates.env.auto_reload = True
 
 
 def _llm_configured(cfg: dict[str, Any] | None) -> bool:
