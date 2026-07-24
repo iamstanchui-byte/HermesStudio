@@ -755,6 +755,14 @@ class Supervisor:
         pid = proj["id"]
         # 1. Propagate failures: any failed task marks downstream pending/assigned as skipped
         await self._propagate_failures(pid)
+        # 1.5. Loop-back check (Phase 0 of visual workflow builder, 2026-07-24):
+        # if any failed task is referenced by another task's feedback_to,
+        # cascade-reset the target + its dependents so the whole chain
+        # re-runs. Must run AFTER _propagate_failures (failed tasks are
+        # visible) and BEFORE _find_ready_tasks (cascade-reset tasks are
+        # picked up in the same tick). Idempotent and safe to skip if
+        # the project has no feedback_to anywhere (returns False fast).
+        await self._maybe_loop_back(pid)
         # 2. Find pending tasks ready to be assigned (all deps completed)
         ready = await self._find_ready_tasks(pid)
         no_progress = True  # assume no progress until we actually do something
@@ -1429,6 +1437,262 @@ class Supervisor:
                     payload={"reason": "parent_failed"},
                 )
                 log.info(f"task {t['id']} ({t['name']!r}) skipped (parent failed)")
+
+    # ===== Phase 0 of visual workflow builder (2026-07-24):
+    # cascading invalidation + loop-back. Re-dispatches a task when one
+    # of its `feedback_to` references fails, and transitively resets all
+    # dependents (via depends_on) so downstream analysis agents don't
+    # keep stale output. The fundamental correctness primitive of the
+    # search→analyze→audit→re-run-search loop-back pattern.
+
+    async def _maybe_loop_back(self, project_id: str) -> bool:
+        """If any FAILED task in this project is named in some other
+        task's `feedback_to` list, AND the project hasn't hit
+        max_iterations, run cascade-reset on those other tasks and
+        increment current_iteration.
+
+        Returns True if a loop-back was fired (so the next _find_ready
+        picks up the now-pending tasks). Returns False otherwise
+        (no failure, no feedback_to, max_iter=0, or cap reached).
+
+        Decision matrix:
+          max_iter == 0  →  disabled (user opted out). No-op, no mark.
+          max_iter > 0:
+            no failed tasks                →  no-op
+            no candidates with feedback_to →  no-op
+            cur_iter >= max_iter           →  mark project failed, no-op
+            else                           →  fire (cascade + increment)
+
+        MUST be called AFTER _propagate_failures (so failed tasks are
+        visible in 'failed' state) and BEFORE _find_ready_tasks (so
+        the cascade-reset tasks are picked up in the same tick).
+        """
+        proj = await self.db.fetchone(
+            "SELECT id, max_iterations, current_iteration FROM projects WHERE id = ?",
+            (project_id,),
+        )
+        if not proj:
+            return False
+        max_iter = int(proj.get("max_iterations") or 0)
+        cur_iter = int(proj.get("current_iteration") or 0)
+        # max_iter == 0 means the user explicitly opted out of loop-back
+        # (the safe default for projects that didn't set feedback_to).
+        # Don't fire, don't mark failed — the project just continues
+        # the normal failure-propagation path (downstream gets skipped
+        # by _propagate_failures, the project ends in 'failed' state
+        # via the existing flow, no special "loopback.cap_reached" event).
+        if max_iter <= 0:
+            return False
+
+        # Find all failed tasks in this project (by NAME, since
+        # feedback_to references step names, not task IDs).
+        failed = await self.db.fetchall(
+            "SELECT id, name FROM tasks WHERE project_id = ? "
+            "AND status = 'failed'",
+            (project_id,),
+        )
+        if not failed:
+            return False
+        failed_names = {f["name"] for f in failed if f.get("name")}
+        if not failed_names:
+            return False
+
+        # Find tasks in this project whose feedback_to overlaps with
+        # the set of failed step names. JSON LIKE is too crude
+        # (substring matches across names), so we load all candidates
+        # and filter in Python.
+        candidates = await self.db.fetchall(
+            "SELECT id, name, feedback_to FROM tasks WHERE project_id = ? "
+            "AND feedback_to IS NOT NULL AND feedback_to != '[]'",
+            (project_id,),
+        )
+        # Map: target task_id -> set of failed step names that triggered it
+        targets: dict[str, set[str]] = {}
+        for c in candidates:
+            # Self-reference guard: skip candidates whose name IS in
+            # the trigger set. run_workflow already drops self-refs at
+            # insert time, but a row could have been hand-edited or
+            # migrated from an older schema, so we defend in depth.
+            cname = c.get("name")
+            if not cname or cname in failed_names:
+                continue
+            try:
+                fb = json.loads(c.get("feedback_to") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(fb, list):
+                continue
+            triggers = set(fb) & failed_names
+            if triggers:
+                targets[c["id"]] = triggers
+
+        if not targets:
+            return False
+
+        # Cap: max_iter > 0 (already checked) but cur_iter >= max_iter.
+        # The user opted in to looping, we WANTED to fire, but the
+        # cap stops us. Mark the project failed with a readable summary
+        # so the operator knows what to investigate.
+        if cur_iter >= max_iter:
+            failed_task_names = sorted(
+                f["name"] for f in failed if f.get("name")
+            )
+            target_names = sorted(
+                t["name"] for t in candidates if t["id"] in targets
+            )
+            await self.db.execute(
+                "UPDATE projects SET state = 'failed', "
+                "last_iteration_summary = ?, updated_at = ? WHERE id = ?",
+                (
+                    f"Loop-back cap reached after {cur_iter} iteration(s). "
+                    f"Failed steps: {', '.join(failed_task_names)}. "
+                    f"Steps that wanted to re-dispatch: {', '.join(target_names)}. "
+                    f"Please review the params or increase max_iterations.",
+                    _now_iso(), project_id,
+                ),
+            )
+            await audit_log(
+                self.db, "loopback.cap_reached",
+                actor="supervisor", project_id=project_id,
+                payload={
+                    "current_iteration": cur_iter,
+                    "max_iterations": max_iter,
+                    "failed_step_names": sorted(failed_names),
+                    "would_re_dispatch": target_names,
+                },
+            )
+            return False
+
+        # Fire! Increment iteration counter and cascade-reset each target.
+        new_iter = cur_iter + 1
+        await self.db.execute(
+            "UPDATE projects SET current_iteration = ?, updated_at = ? "
+            "WHERE id = ?",
+            (new_iter, _now_iso(), project_id),
+        )
+
+        fired_count = 0
+        for tid, triggers in targets.items():
+            reset_ids = await self._cascade_reset(project_id, tid)
+            target_name = next(
+                (c["name"] for c in candidates if c["id"] == tid),
+                tid,
+            )
+            await audit_log(
+                self.db, "loopback.fired",
+                actor="supervisor", project_id=project_id, task_id=tid,
+                payload={
+                    "iteration": new_iter,
+                    "triggers": sorted(triggers),
+                    "target_step": target_name,
+                    "reset_count": len(reset_ids),
+                    "reset_task_ids": reset_ids,
+                },
+            )
+            log.info(
+                f"project {project_id}: loop-back iteration {new_iter} — "
+                f"re-dispatched {target_name!r} (triggers: {sorted(triggers)}); "
+                f"cascade reset {len(reset_ids)} task(s)"
+            )
+            fired_count += 1
+
+        return fired_count > 0
+
+    async def _cascade_reset(
+        self, project_id: str, root_task_id: str
+    ) -> list[str]:
+        """BFS through the depends_on graph, resetting terminal-state
+        descendants of `root_task_id` (and root_task_id itself) to
+        'pending'. Returns the list of task IDs that were reset (for
+        audit logging).
+
+        Why cascade is needed (the user-stated 2026-07-24 stale-data bug):
+        If we only re-dispatch the target step (e.g. `search`), then
+        `analyze` (which depends on search) keeps its STALE result
+        and the project looks complete but is based on old data.
+        The whole chain — search, analyze, audit, deliver — must be
+        reset so each step re-runs against the corrected search output.
+
+        Reset semantics:
+          - status: terminal (completed/failed/skipped/cancelled/interrupted)
+            → 'pending'. Non-terminal (assigned/running) → untouched
+            (we don't want to kill an in-flight wrapper).
+          - result, error, started_at, ended_at → cleared
+          - retry_count → 0 (so the wrapper gets a fresh budget)
+          - Any agent_profile currently busy on a reset task → freed
+            (set back to idle). The dispatcher will reassign in the
+            same tick.
+
+        BFS uses a `seen` set so the diamond DAG case (two paths to
+        the same node) doesn't double-reset.
+        """
+        reset_ids: list[str] = []
+        seen: set[str] = {root_task_id}
+        # BFS through dependents. We start at root_task_id (inclusive)
+        # and then explore tasks whose depends_on contains any node
+        # in the frontier.
+        queue: list[str] = [root_task_id]
+        now = _now_iso()
+        # We need the project's task map (id -> depends_on) to walk the
+        # graph in SQL. Load once for efficiency.
+        all_tasks = await self.db.fetchall(
+            "SELECT id, depends_on FROM tasks WHERE project_id = ?",
+            (project_id,),
+        )
+        # Build dep_tid -> [task_id] reverse index once.
+        reverse_deps: dict[str, list[str]] = {}
+        for t in all_tasks:
+            try:
+                deps = json.loads(t.get("depends_on") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                deps = []
+            if not isinstance(deps, list):
+                deps = []
+            for d in deps:
+                reverse_deps.setdefault(d, []).append(t["id"])
+
+        while queue:
+            current = queue.pop(0)
+            # Reset this task IF it's in a terminal state. Don't touch
+            # assigned/running (in-flight work stays in-flight; the
+            # wrapper may finish and pick up the next dispatch on its
+            # own heartbeat).
+            cur = await self.db.execute(
+                "UPDATE tasks SET status = 'pending', result = NULL, "
+                "error = NULL, started_at = NULL, ended_at = NULL, "
+                "retry_count = 0, last_liveness_at = NULL, "
+                "updated_at = ? "
+                "WHERE id = ? AND status IN "
+                "('completed', 'failed', 'skipped', 'cancelled', 'interrupted')",
+                (now, current),
+            )
+            if getattr(cur, "rowcount", 0) > 0:
+                reset_ids.append(current)
+                await audit_log(
+                    self.db, "task.cascade_reset",
+                    actor="supervisor",
+                    project_id=project_id,
+                    task_id=current,
+                    payload={"root": root_task_id},
+                )
+
+            # Enqueue dependents (BFS forward through depends_on).
+            for child in reverse_deps.get(current, []):
+                if child not in seen:
+                    seen.add(child)
+                    queue.append(child)
+
+        # Free any profile that was busy on a now-reset task. The
+        # dispatcher in the same tick will pick the task up again
+        # if the profile still matches the role.
+        for tid in reset_ids:
+            await self.db.execute(
+                "UPDATE agent_profiles SET status = 'idle', "
+                "current_task_id = NULL, updated_at = ? "
+                "WHERE current_task_id = ? AND status = 'busy'",
+                (now, tid),
+            )
+        return reset_ids
 
     async def _maybe_advance_project_state(self, proj: dict[str, Any], no_progress: bool) -> None:
         """ready -> running (first task runs); running -> completed (all done)."""

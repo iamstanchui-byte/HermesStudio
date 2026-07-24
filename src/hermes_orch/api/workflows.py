@@ -46,6 +46,13 @@ _STEP_FIELDS = (
     # parameter-light: instead of inlining skill content (huge
     # prompt, stale data) or re-discovering the data source URL
     # on every run (token waste), just reference the skill by name.
+    # Phase 0 of visual workflow builder (2026-07-24):
+    # `feedback_to` is an OPTIONAL list of EARLIER step names. If any
+    # of those steps fails, this step is re-dispatched (and so are all
+    # its transitive dependents via cascading invalidation). Used to
+    # implement the search→analyze→audit→re-run-search loop-back pattern.
+    # Default: null/omitted (no loop-back). Cap: project.max_iterations.
+    "feedback_to",
 )
 # Fields whose VALUES may contain {{var}} placeholders. Excludes
 # `skill` (a static identifier) and `depends_on` (a list of step
@@ -129,7 +136,8 @@ The `description` field MUST be a 1-2 sentence human-readable summary of what th
         "param2": "literal value if it's always the same, e.g. 30"
       }},
       "output_path": "relative path the step writes (e.g. list_files.results.json)",
-      "skill": "kebab-case skill name (OPTIONAL — only when the source project used an existing skill; see Rule 11 below)"
+      "skill": "kebab-case skill name (OPTIONAL — only when the source project used an existing skill; see Rule 11 below)",
+      "feedback_to": ["earlier_step_name"]   // OPTIONAL — list of earlier step names whose failure re-dispatches this step (Rule 13)
     }}
   ],
   "variables": [
@@ -197,6 +205,58 @@ The `description` field MUST be a 1-2 sentence human-readable summary of what th
     project used `hk-weather-forecast` + `gdrive-write`; the LLM
     kept only `hk-weather-forecast` and the workflow never uploaded
     to GDrive. The user had to PATCH a 2nd step by hand.
+13. **OPTIONAL `feedback_to` for the search→analyze→audit loop-back
+    pattern** (Phase 0 of visual workflow builder, 2026-07-24).
+    When a later step AUDITS the output of an earlier step (e.g.
+    `audit-quality` checks `analyze-report`), and the audit can
+    fail in a way that requires the earlier step to re-run with
+    new inputs, set the earlier step's `feedback_to` to the audit
+    step's name. The supervisor's loop-back logic will, on audit
+    failure: (a) re-dispatch the earlier step, (b) **cascade** reset
+    all its transitive dependents to `pending` (so analyze doesn't
+    keep the stale report), (c) increment `current_iteration`, and
+    (d) bail out at `max_iterations` (project-level cap).
+    - `feedback_to` is a LIST of earlier step names. Self-reference
+      is a silent no-op.
+    - OMIT `feedback_to` when no loop-back is needed (the safe
+      default). Forgetting it is OK; including it incorrectly
+      (e.g. pointing to a step that doesn't actually audit this
+      step) just means the loop never fires — safe failure.
+    - Cap: `feedback_to` may reference MULTIPLE earlier steps (the
+      earlier step is re-dispatched if ANY of them fails).
+    - Real example (search→analyze→audit→deliver):
+      ```
+      step_template: [
+        {{ "name": "search",  "depends_on": [],  ... }},
+        {{ "name": "analyze", "depends_on": ["search"], ... }},
+        {{ "name": "audit",   "depends_on": ["analyze"], ... }},
+        {{ "name": "deliver", "depends_on": ["audit"], ... }}
+      ]
+      ```
+      WRONG (no feedback_to — audit fails, downstream still runs
+      with stale data):
+      ```
+      // no feedback_to anywhere → audit fails → project fails
+      // (downstream tasks get SKIPPED by _propagate_failures, but
+      // the user has to manually re-run)
+      ```
+      WRONG (only audit gets feedback_to — re-runs audit, but
+      analyze still uses old data — STALE OUTPUT BUG the user
+      caught on 2026-07-24):
+      ```
+      {{ "name": "audit", "feedback_to": ["audit"], ... }}
+      // self-reference — silent no-op
+      ```
+      RIGHT (search re-dispatched on audit fail; cascade resets
+      analyze, audit, deliver to pending so they re-run with
+      fresh search data):
+      ```
+      {{ "name": "search",  "feedback_to": ["audit"], ... }},
+      // search has no earlier steps; feedback_to=["audit"] means:
+      //   "if audit fails, re-run me"
+      // analyze/audit/deliver need NO feedback_to — the cascade
+      // follows depends_on backwards from search automatically
+      ```
 
 # Operator hints (use as starting point for variable names + types)
 {operator_hints}
@@ -569,6 +629,26 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
             # Anti-L3: skill name shouldn't look like an internal action
             if any(s in skill for s in ("coord_pickup", "handoff:", "_iteration_review")):
                 return False, f"step_template[{i}].skill={skill!r} contains L3 scaffolding"
+        # feedback_to (optional, Phase 0 of visual builder, 2026-07-24).
+        # List of EARLIER step names whose failure should re-dispatch
+        # this step. null/omitted = no loop-back. Empty list = no loop-back.
+        # Each name must reference an earlier step (same forward-ref rule
+        # as depends_on). Self-reference is a no-op (skip silently).
+        fb = step.get("feedback_to")
+        if fb is not None:
+            if not isinstance(fb, list):
+                return False, f"step_template[{i}].feedback_to must be a list (got {type(fb).__name__})"
+            for fname in fb:
+                if not isinstance(fname, str) or not fname:
+                    return False, f"step_template[{i}].feedback_to contains non-string entry: {fname!r}"
+                # Forward-ref check: feedback_to can only point to EARLIER
+                # steps (a step can't react to the failure of a step that
+                # hasn't run yet — that doesn't make sense).
+                if fname not in seen_names:
+                    return False, f"step_template[{i}].feedback_to references {fname!r} which is not an EARLIER step (or doesn't exist)"
+                # Self-reference is silently dropped at runtime; we don't
+                # reject it because the LLM sometimes produces it
+                # defensively. It's just a no-op.
 
     # Variables
     variables = pkg["variables"]
@@ -1235,6 +1315,18 @@ async def run_workflow(
             # Copy params to avoid mutating the substituted template
             params = dict(params)
             params["_workflow_skill"] = skill_name
+        # Phase 0 of visual workflow builder (2026-07-24): copy
+        # step.feedback_to (a list of earlier step names) into the
+        # task row. Supervisor reads this on every tick; if any named
+        # step fails, this task is cascade-reset to pending. Default
+        # '[]' = no loop-back (safe; matches pre-Phase-0 behavior).
+        # Self-references (step name appears in its own feedback_to)
+        # are silently dropped — a step can't react to its own failure.
+        raw_fb = step.get("feedback_to") or []
+        if isinstance(raw_fb, list):
+            feedback_to = [f for f in raw_fb if f != sname]
+        else:
+            feedback_to = []
         task_rows.append({
             "id": tid,
             "project_id": new_pid,
@@ -1250,6 +1342,7 @@ async def run_workflow(
             "timeout_seconds": 1800,
             "output_path": step.get("output_path") or "",
             "required_capability": None,
+            "feedback_to": json.dumps(feedback_to),
         })
     # Insert all tasks
     for t in task_rows:

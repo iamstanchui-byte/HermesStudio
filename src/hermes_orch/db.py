@@ -80,6 +80,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     error TEXT,
     result TEXT,
     required_capability TEXT,
+    -- feedback_to: list of EARLIER step names whose failure should
+    -- re-dispatch this task (visual workflow builder Phase 0, 2026-07-24).
+    -- JSON-encoded list, e.g. '["audit"]'. Default '[]' = no loop-back.
+    -- Populated at workflow-run time from the step's feedback_to field.
+    -- The supervisor reads this on every tick to decide whether to
+    -- cascade-reset this task when one of its referenced steps fails.
+    feedback_to TEXT NOT NULL DEFAULT '[]',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -377,6 +384,11 @@ MIGRATIONS = [
     # this ALTER adds it. No-op on fresh DBs (CREATE TABLE above handles).
     # (No columns to ALTER for workflow_packages yet — all in CREATE TABLE
     # block above. Adding this comment as a placeholder for future columns.)
+    # Visual workflow builder Phase 0 (2026-07-24): feedback_to on tasks.
+    # Default '[]' — every existing task gets an empty list, which means
+    # "no loop-back" (safe default; old workflows behave exactly as before).
+    # workflow-run populates this from step.feedback_to at creation time.
+    "ALTER TABLE tasks ADD COLUMN feedback_to TEXT NOT NULL DEFAULT '[]'",
 ]
 
 
