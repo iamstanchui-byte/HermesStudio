@@ -1305,16 +1305,26 @@ async def list_skills(
     """
     db = request.app.state.db
     profile = await _find_profile(db, agent_id, profile_name)
+    # Sort: flat skills first (alphabetical), then subfolder skills
+    # (also alphabetical — the full "cat/name" string sorts as
+    # "category prefix then skill name" naturally). The CASE puts
+    # flat (no '/') at the top, subfolder at the bottom. User
+    # asked for this ordering on 2026-07-24 because the previous
+    # created_at DESC order was just insertion-order and made the
+    # list hard to scan when there's a mix of flat and subfolder.
     rows = await db.fetchall(
         "SELECT * FROM profile_configs WHERE profile_id = ? "
         "AND file_path LIKE 'skills/%/SKILL.md' "
-        "ORDER BY created_at DESC",
+        "ORDER BY (CASE WHEN file_path LIKE 'skills/%/%/SKILL.md' THEN 1 ELSE 0 END), "
+        "file_path ASC",
         (profile["id"],),
     )
     include_deleted = request.query_params.get("include_deleted") == "1"
     # Flat-path support dropped 2026-07-19 (commit d5b7c9a), so we
     # only ever have one record per (profile, skill_name). The
-    # newest one wins by created_at DESC + LIMIT 1 dedup.
+    # newest one wins; ORDER BY in the SQL gives stable order
+    # (flat first, then subfolder, both alphabetical). The dedup
+    # loop preserves that order.
     seen: set[str] = set()
     out: list[SkillInfo] = []
     for r in rows:
@@ -1327,8 +1337,6 @@ async def list_skills(
         if info.status == "deleted" and not include_deleted:
             continue
         out.append(info)
-    # Sort by name for stable display
-    out.sort(key=lambda s: s.name)
     return out
 
 
