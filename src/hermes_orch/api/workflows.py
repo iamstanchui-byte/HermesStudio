@@ -1112,7 +1112,28 @@ async def run_workflow(
     # 4. Create the new project (manual mode: tasks will be added below)
     new_pid = _project_id()
     now = _now_iso()
-    project_name = body.project_name or f"{row['name']} run @ {now[:19]}"
+    # Auto-name format: include variables so each run is identifiable
+    # by what it was given. Prefer the variables over a timestamp
+    # (the timestamp is in the row's created_at column on the right
+    # of the dashboard, so duplicating it in the name just makes
+    # the row longer / pushes the right column off-screen). The
+    # operator can still pass project_name in the request body to
+    # fully override.
+    if body.project_name:
+        project_name = body.project_name
+    elif vars_typed:
+        # Show only the first 2 variables in the name to keep it
+        # compact; the rest are in the goal field below. e.g.
+        # "monthlyclaimtraffic-v1 (report_month=May2026)".
+        var_items = list(vars_typed.items())
+        shown = ", ".join(f"{k}={v!r}" for k, v in var_items[:2])
+        if len(var_items) > 2:
+            shown += f", +{len(var_items) - 2} more"
+        project_name = f"{row['name']} ({shown})"
+    else:
+        # No variables — just the workflow name (timestamp lives
+        # in created_at on the right of the row).
+        project_name = f"{row['name']} @ {now[:10]}"
     # Build a goal from the workflow description + substituted values
     goal = row.get("description") or f"Run of workflow {row['name']}"
     if vars_typed:

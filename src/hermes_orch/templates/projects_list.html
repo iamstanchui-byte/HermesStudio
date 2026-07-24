@@ -179,24 +179,31 @@ document.getElementById('filter-form').addEventListener('submit', (e) => {
     <div class="bg-white border rounded-lg p-4 shadow-sm hover:bg-gray-50 flex items-start gap-3">
         <input type="checkbox" class="project-checkbox mt-2" data-project-id="{{ p.id }}" onclick="updateBulkToolbar()" title="Select for bulk action">
         <a href="/projects/{{ p.id }}" class="flex-1 min-w-0">
-            <div class="flex items-center justify-between">
-                <div>
-                    <div class="flex items-center gap-2">
-                        <div class="font-mono text-sm text-gray-500">{{ p.id }}</div>
+            <div class="flex items-center justify-between gap-3">
+                {# LEFT: id + badges, name, goal. min-w-0 + overflow-hidden so
+                   long content doesn't push the right column off-screen.
+                   truncate on the inner divs adds ellipsis. #}
+                <div class="min-w-0 flex-1 overflow-hidden">
+                    <div class="flex items-center gap-2 min-w-0">
+                        <div class="font-mono text-sm text-gray-500 shrink-0">{{ p.id }}</div>
+                        <div class="flex items-center gap-2 min-w-0 flex-wrap">
                         {% if schedule_map.get(p.id) %}
-                        <span class="px-2 py-0.5 bg-purple-100 text-purple-800 rounded text-xs" title="This project was created by a recurring schedule">🔁 {{ schedule_map[p.id] }}</span>
+                        <span class="px-2 py-0.5 bg-purple-100 text-purple-800 rounded text-xs shrink-0" title="This project was created by a recurring schedule">🔁 {{ schedule_map[p.id] }}</span>
                         {% endif %}
                         {% if workflow_map.get(p.id) %}
-                        <a href="/workflows" class="px-2 py-0.5 bg-emerald-100 text-emerald-800 rounded text-xs hover:bg-emerald-200" title="Created by workflow: {{ workflow_map[p.id] }}">🔁 from workflow: {{ workflow_map[p.id] }}</a>
+                        <span class="px-2 py-0.5 bg-emerald-100 text-emerald-800 rounded text-xs shrink-0" title="Created by workflow: {{ workflow_map[p.id] }}">🔁 from workflow: {{ workflow_map[p.id] }}</span>
                         {% endif %}
                         {% if p.id in template_ids %}
-                        <span class="px-2 py-0.5 bg-amber-100 text-amber-800 rounded text-xs" title="Marked as a reusable template. Schedules can fire this.">📋 template</span>
+                        <span class="px-2 py-0.5 bg-amber-100 text-amber-800 rounded text-xs shrink-0" title="Marked as a reusable template. Schedules can fire this.">📋 template</span>
                         {% endif %}
+                        </div>
                     </div>
-                    <div class="font-semibold text-gray-800">{{ p.name or '(unnamed)' }}</div>
-                    <div class="text-sm text-gray-600 mt-1">{{ p.goal or '-' }}</div>
+                    <div class="font-semibold text-gray-800 truncate" title="{{ p.name or '(unnamed)' }}">{{ p.name or '(unnamed)' }}</div>
+                    <div class="text-sm text-gray-600 mt-1 truncate" title="{{ p.goal or '-' }}">{{ p.goal or '-' }}</div>
                 </div>
-                <div class="text-right">
+                {# RIGHT: state, tokens, created_at. shrink-0 so it never
+                   loses width — we always want to see the timestamp. #}
+                <div class="text-right shrink-0">
                     <span class="px-2 py-0.5 text-xs rounded
                         {% if p.state == 'running' %}bg-blue-100 text-blue-800
                         {% elif p.state == 'completed' %}bg-green-100 text-green-800
@@ -209,10 +216,10 @@ document.getElementById('filter-form').addEventListener('submit', (e) => {
                     {% set tk = token_map.get(p.id, 0) %}
                     {% if tk %}
                     <div class="mt-1">
-                        <span class="px-2 py-0.5 text-xs rounded bg-purple-50 text-purple-700" title="Total LLM tokens consumed by this project across all tasks">{% if tk >= 1000000 %}{{ '%.1f' % (tk / 1000000) }}M{% else %}{{ '%.1f' % (tk / 1000) }}K{% endif %} tokens</span>
+                        <span class="px-2 py-0.5 text-xs rounded bg-purple-50 text-purple-700 whitespace-nowrap" title="Total LLM tokens consumed by this project across all tasks">{% if tk >= 1000000 %}{{ '%.1f' % (tk / 1000000) }}M{% else %}{{ '%.1f' % (tk / 1000) }}K{% endif %} tokens</span>
                     </div>
                     {% endif %}
-                    <div class="text-xs text-gray-500 mt-1">{{ p.created_at }}</div>
+                    <div class="text-xs text-gray-500 mt-1 whitespace-nowrap">{{ p.created_at }}</div>
                 </div>
             </div>
         </a>
