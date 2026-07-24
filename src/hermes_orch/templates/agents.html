@@ -484,7 +484,13 @@
                                         <span class="text-gray-400">{{ s.size }}b</span>
                                     </div>
                                     <div class="flex items-center gap-1 flex-shrink-0">
-                                        <button onclick="copySkillTo('{{ agent.id }}', '{{ p.name }}', '{{ s.name }}', {{ agent.profiles|map(attribute='name')|list|tojson }})" class="text-blue-600 hover:underline" title="Copy this skill to another profile on the same agent">⎘</button>
+                                        {# NOTE: onclick attribute uses single quotes so the tojson
+                                           output (which contains double quotes) doesn't terminate
+                                           the HTML attribute prematurely. Without this the
+                                           page's inline JS would fail to parse with
+                                           "Uncaught SyntaxError: Unexpected end of input"
+                                           and the copy button would do nothing. #}
+                                        <button onclick='copySkillTo("{{ agent.id }}", "{{ p.name }}", "{{ s.name }}", {{ agent.profiles|map(attribute="name")|list|tojson }})' class="text-blue-600 hover:underline px-1" title="Copy this skill to another profile on the same agent">Copy</button>
                                         <button onclick="deleteSkill('{{ agent.id }}', '{{ p.name }}', '{{ s.name }}')" class="text-red-600 hover:underline" title="Delete this skill (wrapper will remove the folder)">&times;</button>
                                     </div>
                                 </div>

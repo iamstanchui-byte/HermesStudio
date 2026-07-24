@@ -274,6 +274,30 @@ class Supervisor:
         except Exception as e:
             log.debug(f"stale-profile scan failed: {e}")
 
+        # Stale-recovery check: when an agent comes back to 'verified'
+        # (heartbeat resumed), any profile that was previously marked
+        # 'stale' should be re-evaluated. The stale-profile check above
+        # only moves profiles FROM 'busy' TO 'stale'; it doesn't
+        # reverse that when the agent recovers. Without this, the
+        # dashboard shows a red 'stale' badge forever even though
+        # the wrapper is happily heartbeating again. We move stale
+        # profiles back to 'idle' when their parent agent is verified
+        # AND they have no current_task_id (i.e. they're not
+        # genuinely busy).
+        try:
+            now = _now_iso()
+            cur = await self.db.execute(
+                "UPDATE agent_profiles "
+                "SET status = 'idle', updated_at = ? "
+                "WHERE status = 'stale' AND current_task_id IS NULL "
+                "AND agent_id IN (SELECT id FROM agents WHERE status = 'verified')",
+                (now,),
+            )
+            if cur.rowcount:
+                log.info(f"recovered {cur.rowcount} stale profile(s) on verified agents")
+        except Exception as e:
+            log.debug(f"stale-recovery scan failed: {e}")
+
         # Ghost-reference cleanup: a profile's current_task_id may
         # point to a task ID that no longer exists in the tasks
         # table (e.g. the task row was deleted by project cleanup,
