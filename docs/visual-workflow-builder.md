@@ -708,4 +708,75 @@ MVP) on your signal.
 
 ---
 
-*End of design report. Phase 0 shipped; Phase 1 awaiting go-ahead.*
+## 13. Phase 4+ vision: visual project page (2026-07-24, future)
+
+**User-stated (2026-07-24)**: workflow 圖像化 only ships the workflow
+piece. The final vision is to ALSO visually operate the project page:
+
+> "現在只是 workflow, 做完 workflow 圖像化後, 最後在 project 也是要加
+> 這個圖像化 create task, import skill, storage_refs, workflow 等
+> resource"
+
+This means the project page should let the operator:
+
+1. **Create task visually** — drag-add a step card onto the project
+   timeline (similar to a workflow but live, not a reusable asset).
+2. **Import skill visually** — pick from the agent's installed skill
+   library and attach to a step.
+3. **Manage storage_refs visually** — add/edit/remove storage paths
+   the agent can write to.
+4. **Pick workflow as a resource** — choose a workflow package from
+   the library and launch it as the project's "starter template".
+
+### Why this is a separate phase (not Phase 1-3)
+
+- **Different lifecycle**: workflow = long-lived reusable asset;
+  project = short-lived execution container. Their visual models
+  differ. The workflow editor cares about reusable composition; the
+  project editor cares about live execution + iteration.
+- **Different audience impact**: workflow editor helps power-users
+  + semi-tech users DESIGN workflows. Project visual helps operators
+  (and end-users) LAUNCH them and inspect mid-run state.
+- **Reuse, don't rewrite**: the visual patterns from workflow
+  (drawflow cards, edge wiring, side panel, palette, save) are
+  reusable as React-style components. The project visual is a
+  different page that composes them, not a separate framework.
+
+### Reusable patterns from workflow (Phase 1)
+
+After Phase 1 ships, the following are extracted and reusable:
+
+- `card.{name, agent_role, action, params_template, output_path, skill, feedback_to}`
+- `palette.addStepFromTemplate(template)` (4 default templates)
+- `edge.depends_on` (drawflow connection)
+- `edge.feedback_to` (Phase 2, red dashed loop-back)
+- `sidePanel.{open, close, editField, save}`
+- `save.{patch, onSuccess, onError, statusBanner}`
+
+The project visual page can import these and compose them with
+**project-specific affordances**: live task status, run history,
+iteration log, agent profile.
+
+### Phase 4+ roadmap (sketch — review needed)
+
+| Phase | Effort | Scope |
+|---|---|---|
+| 4.1 | 1-2 days | Reusable JS components: `vf-card`, `vf-edge`, `vf-side-panel`, `vf-palette` extracted into `src/hermes_orch/static/vf-components.js`. Each component has a documented public API. |
+| 4.2 | 1 week | Project page visual: `/projects/{id}/visual` route. Live task cards (color-coded by status: pending / running / completed / failed). `import skill` picker (opens a side panel listing the agent's installed skills). `storage_refs` manager (add/remove paths, validation against current OS mount). |
+| 4.3 | 1 week | `pick workflow as resource` flow: a "Use a workflow" button on a new project page that opens a workflow library picker, then the chosen workflow's `step_template` is rendered as the project's initial task graph. |
+| 4.4 | 1 week | Live execution view: tasks animate as the supervisor transitions them; iteration counter increments visibly; `loopback.fired` events get a visual ripple on the affected cards. |
+| 4.5 | 1-2 weeks | Optional: shared editing of a project by 2+ operators, undo/redo, project export to workflow (the reverse of "promote from project"). |
+
+### Re-evaluate at Phase 3 planning
+
+When Phase 3 (visual builder polish) ships, re-decide whether to
+start Phase 4. The cost-benefit depends on:
+- How many operators actually use the visual builder daily
+- How much time they save vs editing JSON
+- Whether the user-stated "final vision" has shifted
+
+---
+
+*End of design report. Phase 0 shipped; Phase 1 skeleton shipped
+(commits bc26a85 through b59b56d). Phase 2+ awaiting decisions.
+Phase 4+ vision captured for future reference.*
