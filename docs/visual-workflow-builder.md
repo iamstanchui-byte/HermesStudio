@@ -537,102 +537,93 @@ the same task depends on two different tasks, both of which got reset).
 
 These are the things I'm **assuming** but want to confirm before writing code.
 
-### Q1: Phase 0 first?
+**Status**: all 9 questions reviewed on 2026-07-24. Answers below.
 
-You can either:
-- **(a)** start with Phase 0 (cascade + feedback_to schema) — recommended,
-  because every later phase needs it
-- **(b)** skip Phase 0 and start with Phase 1 (visual MVP) — works
-  because the visual MVP doesn't need loop-back to be useful; loop-back
-  is added in Phase 2 anyway
-- **(c)** something else
+### Q1: Phase 0 first? → **(a) Phase 0 first**
 
-I recommend (a) because the cascade primitive is risky to get wrong, and
-testing it in isolation is much easier before the visual layer is on top.
-But if you want to see the visual builder sooner, (b) is fine — we just
-have to make sure Phase 2's wiring correctly invokes the cascade that
-Phase 0 would have shipped earlier.
+Phase 0 ships the cascade primitive + `feedback_to` schema + LLM synth
+rule + 13 unit tests. Logic foundation verified before any visual
+layer is built on top. (Done — commit `bc26a85`.)
 
-### Q2: Which JS library for the visual canvas?
+### Q2: Which JS library for the visual canvas? → **(a) drawflow**
 
-- **(a)** drawflow (MIT, simple, n8n-style) — my recommendation
-- **(b)** React Flow (MIT, more powerful, but adds a build step)
-- **(c)** something else (d3, mxgraph, jointjs)
+MIT, simple, n8n-style, JSON in/out, single CDN include (no build
+step). We can swap to React Flow in Phase 3 if we outgrow it.
 
-I lean (a) because it's a single CDN include, no build pipeline, and the
-80% of features we need are all there. We can swap to (b) in Phase 3 if
-we outgrow it.
+### Q3: Loop-back UI — handle or palette? → **(a) Third "loop-back handle"**
 
-### Q3: Loop-back UI — handle or palette?
+Each card has 3 handles: input (left), output (right), loop-back
+(bottom). User drags from card Y's loop-back handle → card X's input
+handle to set `X.feedback_to = [Y.name]`. Visual: red dashed arrow
+from Y back to X, labeled "on Y's fail, re-run X". Consistency with
+the other handles wins over the simpler "side panel dropdown".
 
-When a user wants to wire `audit` → re-run `search`:
-- **(a)** every card has a third "loop-back handle" (output handle on
-  the right, input handle on the left, loop-back handle on the bottom)
-- **(b)** a separate "Connections" tab in the side panel where the user
-  picks the source and target from dropdowns
-- **(c)** both
+### Q4: Keep the text edit form? → **(c) Hidden but kept**
 
-I lean (a) for consistency with the rest of the visual model, but (b) is
-simpler to implement and easier to discover for non-technical users.
+The text form on `workflow_detail.html` is hidden by default (UI
+collapse) but accessible via a small toggle in the corner. Power users
+get bulk-edit + LLM synth output lands here. Semi-tech users won't
+see it unless they ask.
 
-### Q4: Keep the text edit form?
+### Q5: max_iterations default? → **(a) 0 (opt-in)**
 
-- **(a)** yes, keep as fallback for power users + for the LLM-synth
-  output to land in (the visual editor loads the JSON and shows it)
-- **(b)** no, deprecate once the visual builder is stable
+`max_iterations=0` is the default for all projects. Loop-back is fully
+disabled until a project explicitly sets `max_iterations > 0`. Safe
+default; old workflows unchanged.
 
-I lean (a) — the text form is the bootstrap surface for the LLM synth
-and is the only way to do bulk edits (e.g. paste a 50-step workflow from
-somewhere else).
+### Q6: Show loop-back in the project execution log? → **(a) New "Iterations" tab**
 
-### Q5: max_iterations default?
+`project.html` gets a new "Iterations" tab that joins on `audit_log`
+events with type `loopback.fired` and `loopback.cap_reached`. Renders:
 
-- **(a)** 0 (no loop-back allowed unless user explicitly sets it)
-- **(b)** 3 (sensible default, user can override)
-- **(c)** ask in the form
+```
+Iteration 1 (2026-07-24 12:34:56):
+  - search: completed
+  - analyze: completed
+  - audit: FAILED  ← trigger
+  → re-dispatched: search
+  → cascade reset: 3 task(s) [analyze, audit, deliver]
 
-I lean (a) for safety. A user who doesn't set `max_iterations` gets no
-loop-back; a user who sets it gets that cap. We can change the default
-in a later release.
+Iteration 2 (2026-07-24 12:36:12):
+  - search: completed (with new params)
+  ...
+```
 
-### Q6: Show loop-back in the project execution log?
+Phase 2 ships this together with the loop-back handle.
 
-When a loop-back fires, the project log should clearly show:
-- "Iteration 1: search ran, analyze ran, audit FAILED → re-dispatching
-  search"
-- "Iteration 2: search ran, analyze ran, audit PASSED → continue to
-  deliver"
+### Q7: Skills + loop-back interaction? → **(a) Same skill, same params, same agent**
 
-I plan to render this in `project.html` under a new "Iterations" tab
-(joining on `audit_log` events with `loopback.fired` type). The visual
-builder doesn't need to do anything here — this is a project-page
-enhancement. Want me to include it in Phase 2, or punt to Phase 3?
+When a task re-runs via loop-back, the skill reference, agent_role,
+and params_template (with substituted values) are identical to the
+original run. The only thing that changes is the **data inputs**
+(variables re-read from the world, e.g. a fresh URL). Supervisor code
+needs no special handling — the task row is already populated with
+everything except `result`/`started_at`/`ended_at`, which is exactly
+what the wrapper expects to start fresh.
 
-### Q7: Skills + loop-back interaction?
+### Q8: Manual loop-back trigger? → **(b) No, automatic only**
 
-When a step re-runs via loop-back, does it use the same skill? Same
-params? Same agent? I think **yes to all three** (the user already
-configured the step; they're just asking for it to re-execute), but
-want to confirm. The only thing that should change is the **data inputs**
-(variables that get re-read from the world, e.g. a fresh URL).
+We do NOT add a manual "Re-run" button. Use cases the user explored:
+- "Config wrong, auto didn't fire" → fix the config; not a UX issue
+- "Result unsatisfactory" → change params + re-run the whole workflow
+- "Test new params" → same
+- "A/B test" → duplicate the workflow with a different name
 
-### Q8: Manual loop-back trigger?
+All four are better served by re-running the workflow than by a manual
+trigger. The cost of building the button (new state, new audit event,
+cascading concerns) is not justified.
 
-Should the user be able to click a button in the project UI to
-**manually** trigger a loop-back (e.g. "I don't like the search
-result, re-run it")? This is essentially "undo the last completed task
-in the chain". Easy to add in Phase 3 if you want it.
+### Q9: Out-of-scope confirmation? → **(a) All 5 confirmed in-scope**
 
-### Q9: Out-of-scope confirmation
+5 items confirmed **NOT in this design** (Phase 3+ or never):
 
-Confirming these are NOT in this design:
-- Multi-user real-time collaboration
-- Workflow marketplace / community sharing
-- Visual diff between versions
-- Live execution preview
-- Workflow permissions (who can run what)
+1. Multi-user real-time collaboration
+2. Workflow marketplace / community sharing
+3. Visual diff between workflow versions
+4. Live execution preview
+5. Workflow permissions (who can run what)
 
-These are Phase 3-or-later or "not gonna do".
+Phase 1/2/3 plans are unaffected. Re-evaluate at Phase 3 planning.
 
 ---
 
@@ -698,4 +689,23 @@ perfectly reasonable answer to this design review — just say
 
 ---
 
-*End of design report. Awaiting review.*
+## 12. Review summary (2026-07-24)
+
+| # | Question | Answer |
+|---|---|---|
+| Q1 | Phase 0 first? | **(a) Phase 0 first** ✅ shipped (`bc26a85`) |
+| Q2 | Which JS library? | **(a) drawflow** |
+| Q3 | Loop-back UI? | **(a) Third "loop-back handle"** (red dashed arrow) |
+| Q4 | Keep text edit form? | **(c) Hidden but kept** (toggle in corner) |
+| Q5 | max_iterations default? | **(a) 0 (opt-in)** — already shipped |
+| Q6 | Show loop-back in log? | **(a) New "Iterations" tab** (Phase 2) |
+| Q7 | Skills + loop-back? | **(a) Same skill/params/agent re-run** |
+| Q8 | Manual loop-back trigger? | **(b) No, automatic only** |
+| Q9 | Out-of-scope confirm? | **(a) All 5 in-scope** (not in design) |
+
+All 9 questions answered. Phase 0 done. Ready to start Phase 1 (visual
+MVP) on your signal.
+
+---
+
+*End of design report. Phase 0 shipped; Phase 1 awaiting go-ahead.*
