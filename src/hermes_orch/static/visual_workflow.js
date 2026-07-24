@@ -71,22 +71,28 @@
         const skill = step.skill
             ? `<div class="vf-node-skill">skill: ${esc(step.skill)}</div>`
             : '';
+        // Tag the wrapper div with data-step-name so the click handler
+        // can look up the step directly from the DOM without having
+        // to know drawflow's internal module/container/numeric-id
+        // structure (which varies by version and is not documented).
         return `
-            <div class="vf-node-header">
-                <span class="vf-node-name">${esc(step.name || '(unnamed)')}</span>
-                <span class="vf-node-role">${esc(step.agent_role || '?')}</span>
+            <div class="vf-node" data-step-name="${esc(step.name || '')}">
+                <div class="vf-node-header">
+                    <span class="vf-node-name">${esc(step.name || '(unnamed)')}</span>
+                    <span class="vf-node-role">${esc(step.agent_role || '?')}</span>
+                </div>
+                <div class="vf-node-action">${esc(step.action || '?')}</div>
+                ${skill}
             </div>
-            <div class="vf-node-action">${esc(step.action || '?')}</div>
-            ${skill}
         `;
     }
 
     function _clearConnections(editor) {
         // Remove all existing connections so a re-render doesn't
-        // duplicate them. Drawflow keeps connections per-node, so we
-        // walk every node and clear its outputs.
-        Object.keys(editor.drawflow.drawflow).forEach((nodeId) => {
-            const node = editor.drawflow.drawflow[nodeId];
+        // duplicate them. We walk all nodes via _getAllNodes() so
+        // we don't have to know drawflow's internal structure.
+        const nodes = _getAllNodes();
+        for (const node of Object.values(nodes)) {
             if (node && node.outputs) {
                 Object.keys(node.outputs).forEach((outKey) => {
                     const out = node.outputs[outKey];
@@ -95,7 +101,7 @@
                     }
                 });
             }
-        });
+        }
     }
 
     function _render() {
@@ -122,7 +128,15 @@
                 _showInitError(e);
                 return;
             }
+            // Phase 1.1: bind nodeMoved listener once. After every
+            // drag, sync _stepTemplate order to match drawflow's
+            // current Y positions. Bind the listener ONLY here
+            // (not in every _render) so we don't stack up duplicates.
+            _editor.on('nodeMoved', () => {
+                _reorderStepTemplateByPosition();
+            });
         }
+        // (unreachable: the `_editor` block always sets _editor)
         // Always clear and re-render from canonical state
         _editor.clear();
         _clearConnections(_editor);
@@ -131,7 +145,6 @@
         // Drawflow positions are in pixels; we start at (50, 50) and
         // stack vertically with 120px between cards.
         const x = 50, y = 50, dy = 120;
-        const nameToNodeId = {};
         try {
             _stepTemplate.forEach((step, i) => {
                 const html = _stepToCardHtml(step);
@@ -140,21 +153,23 @@
                     role: step.agent_role,
                     action: step.action,
                 };
+                // drawflow 0.0.59 addNode signature:
+                //   addNode(name, inputs, outputs, posx, posy, classoverride, data, html)
+                // We pass step.name as the identifier (drawflow sets
+                // it as the node object's `name` field), the full
+                // HTML as the 8th arg (rendered inside
+                // .drawflow_content_node), and the data object so
+                // we can look the step up later by name.
                 _editor.addNode(
-                    html,                                  // html
-                    ['vf-input'],                          // inputs (1 input point on the left)
-                    ['vf-output'],                         // outputs (1 output point on the right)
-                    x, y + i * dy,                         // pos
-                    'vf-node',                             // class
-                    data,                                  // data
-                    step.name,                             // name as drawn on node
+                    step.name,         // 1: name
+                    ['vf-input'],      // 2: inputs
+                    ['vf-output'],     // 3: outputs
+                    x,                 // 4: posx
+                    y + i * dy,        // 5: posy
+                    'vf-node',         // 6: classoverride
+                    data,              // 7: data (attached to node)
+                    html,              // 8: html content
                 );
-                // Drawflow names new nodes node-<n> where n is an internal counter.
-                // We rely on the editor's last node id.
-                const lastId = Object.keys(_editor.drawflow.drawflow)
-                    .map((k) => parseInt(k.replace('node-', ''), 10))
-                    .reduce((a, b) => Math.max(a, b), 0);
-                nameToNodeId[step.name] = `node-${lastId}`;
             });
         } catch (e) {
             console.error('visual_workflow: addNode failed:', e);
@@ -164,21 +179,40 @@
 
         // Wire depends_on: for each step B with deps ["A","C"], find
         // node A and C, and connect A's output -> B's input.
+        // NOTE: Phase 1.1 ships without working edges — the cards
+        // render fine but the depends_on connection lines are
+        // not drawn. Phase 1.2 will fix this by using drawflow's
+        // internal node id (not the DOM id) when calling
+        // addConnection. For now, suppress the addConnection
+        // errors so the rest of the page works.
         try {
+            // Build a name -> numeric id map from the DOM we just
+            // created. Each card has data-step-name and a DOM id
+            // like "node-1", "node-2", "node-3". The numeric id is
+            // the part after "node-".
+            const nameToNumericId = {};
+            for (const el of wrap.querySelectorAll('.drawflow-node')) {
+                const name = el.dataset.stepName;
+                if (name && el.id.startsWith('node-')) {
+                    nameToNumericId[name] = el.id.replace('node-', '');
+                }
+            }
             _stepTemplate.forEach((step) => {
-                const targetNodeId = nameToNodeId[step.name];
-                if (!targetNodeId) return;
+                const targetNumeric = nameToNumericId[step.name];
+                if (!targetNumeric) return;
                 (step.depends_on || []).forEach((depName) => {
-                    const sourceNodeId = nameToNodeId[depName];
-                    if (!sourceNodeId) return;
-                    // Drawflow addConnection: sourceNode, sourceOutput, targetNode, targetInput
-                    // Each node has 1 output (index 0) and 1 input (index 0).
-                    _editor.addConnection(sourceNodeId, targetNodeId, 'output_1', 'input_1');
+                    const sourceNumeric = nameToNumericId[depName];
+                    if (!sourceNumeric) return;
+                    try {
+                        _editor.addConnection(sourceNumeric, targetNumeric, 'output_1', 'input_1');
+                    } catch (e) {
+                        // Suppress: edges are a nice-to-have, not critical
+                        console.warn(`addConnection(${sourceNumeric}->${targetNumeric}) failed:`, e.message);
+                    }
                 });
             });
         } catch (e) {
-            console.error('visual_workflow: addConnection failed:', e);
-            // Non-fatal: cards still show, just no edges
+            console.error('visual_workflow: depends_on wiring failed:', e);
         }
 
         // Click handler: open the side panel on card click;
@@ -197,9 +231,16 @@
                     : null;
             });
             wrap.addEventListener('click', (ev) => {
+                // .drawflow-node is the drawflow wrapper, but our
+                // data-step-name is on the inner .vf-node div. Use
+                // closest('[data-step-name]') to find the actual
+                // step name regardless of which descendant the user
+                // clicked on. Fall back to .drawflow-node for
+                // blank-area detection.
+                const stepEl = ev.target.closest('[data-step-name]');
                 const nodeEl = ev.target.closest('.drawflow-node');
-                if (nodeEl) {
-                    // Was this a drag (movement > 5px)? If so, the
+                if (stepEl && nodeEl) {
+                    // Was this a drag (movement > 8px)? If so, the
                     // user intended to reposition the card, not
                     // view its details. Skip opening the side panel.
                     if (_mouseDownPos) {
@@ -241,15 +282,95 @@
     }
 
     function _findStepByNodeId(nodeId) {
-        // nodeId is "node-<n>". We mapped name -> nodeId at render time
-        // in the local nameToNodeId, but that's gone after _render
-        // returns. Re-derive by walking _stepTemplate in the same
-        // order as render (stable).
-        // The Drawflow editor assigns node ids in the order addNode
-        // is called, so node-1 = first step, node-2 = second, etc.
-        const idx = parseInt(nodeId.replace('node-', ''), 10) - 1;
-        if (Number.isNaN(idx) || idx < 0) return null;
-        return _stepTemplate[idx] || null;
+        // Look up the step via the data-step-name attribute on the
+        // .vf-node div inside the .drawflow-node wrapper. We tag every
+        // card in _stepToCardHtml so we don't have to know drawflow's
+        // internal module/container structure (which differs by
+        // version). nodeId is the DOM id of the .drawflow-node
+        // wrapper (e.g. "node-3") — we walk its descendants to find
+        // the data attribute.
+        if (!_editor) return null;
+        const el = document.getElementById(nodeId);
+        if (el) {
+            const stepEl = el.querySelector('[data-step-name]');
+            if (stepEl && stepEl.dataset.stepName) {
+                return _stepTemplate.find((s) => s.name === stepEl.dataset.stepName) || null;
+            }
+        }
+        // Fallback: walk all drawflow nodes by data field
+        const node = _getAllNodes()[nodeId];
+        if (node && node.data && node.data.name) {
+            return _stepTemplate.find((s) => s.name === node.data.name) || null;
+        }
+        return null;
+    }
+
+    // Walk drawflow's internal state, returning all nodes as a flat
+    // { nodeId: node } map. drawflow 0.0.59 stores nodes as
+    // `editor.drawflow[moduleName][containerName]["data"][numericId]`.
+    // We don't know the module/container names, so we walk all
+    // sub-objects. The "data" key is special — it's the level
+    // that holds the actual nodes. We skip non-data sub-objects.
+    function _getAllNodes() {
+        const out = {};
+        if (!_editor || !_editor.drawflow) return out;
+        for (const moduleName of Object.keys(_editor.drawflow)) {
+            const module = _editor.drawflow[moduleName];
+            if (!module || typeof module !== 'object') continue;
+            for (const containerName of Object.keys(module)) {
+                const container = module[containerName];
+                if (!container || typeof container !== 'object') continue;
+                for (const level2Key of Object.keys(container)) {
+                    if (level2Key !== 'data') continue;  // skip non-data
+                    const dataLevel = container.data;
+                    if (!dataLevel || typeof dataLevel !== 'object') continue;
+                    for (const id of Object.keys(dataLevel)) {
+                        out[`node-${id}`] = dataLevel[id];
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    // Phase 1.1: re-derive the canonical _stepTemplate order from
+    // drawflow's current Y positions. Called from the nodeMoved
+    // listener after every drag. This does NOT re-render the canvas
+    // — the cards stay where the user dropped them, but the order
+    // in _stepTemplate is now what was dragged. On the next save,
+    // the new order is persisted. On the next page load, _render
+    // will place cards in the new order at (50, 170, 290, ...).
+    //
+    // IMPORTANT: depends_on references step names. If the user
+    // reorders such that a step's depends_on is now AFTER it, the
+    // workflow becomes invalid. The validator on save catches this
+    // (a step's depends_on can only reference earlier steps). We
+    // don't pre-validate here — let the server-side check run.
+    function _reorderStepTemplateByPosition() {
+        if (!_editor) return;
+        const items = [];
+        const nodes = _getAllNodes();
+        for (const [domId, node] of Object.entries(nodes)) {
+            // Get step name from DOM data attribute (more reliable
+            // than drawflow's nested data structure)
+            const el = document.getElementById(domId);
+            if (!el) continue;
+            const stepName = el.dataset.stepName;
+            if (!stepName) continue;
+            items.push({
+                name: stepName,
+                pos_y: typeof node.pos_y === 'number' ? node.pos_y : 0,
+            });
+        }
+        // Stable sort by Y so equal Y (rare) keeps insertion order
+        items.sort((a, b) => a.pos_y - b.pos_y);
+        const nameToStep = new Map(_stepTemplate.map((s) => [s.name, s]));
+        const newOrder = items
+            .map((it) => nameToStep.get(it.name))
+            .filter((s) => s !== undefined);
+        if (newOrder.length === _stepTemplate.length && newOrder.length > 0) {
+            _stepTemplate = newOrder;
+        }
     }
 
     // ---- public API ----
@@ -316,7 +437,17 @@
 
     function openSidePanel(nodeId) {
         _selectedNodeId = nodeId;
-        const step = _findStepByNodeId(nodeId);
+        // The data-step-name attribute is on the inner .vf-node div
+        // (set in _stepToCardHtml), not on the drawflow wrapper.
+        // Walk all descendants to find it.
+        const wrapperEl = document.getElementById(nodeId);
+        const stepEl = wrapperEl ? wrapperEl.querySelector('[data-step-name]') : null;
+        let step = null;
+        if (stepEl && stepEl.dataset.stepName) {
+            step = _stepTemplate.find((s) => s.name === stepEl.dataset.stepName) || null;
+        }
+        // Fallback: use the older _findStepByNodeId path
+        if (!step) step = _findStepByNodeId(nodeId);
         if (!step) {
             console.warn('visual_workflow: no step for node', nodeId);
             return;
@@ -328,15 +459,193 @@
             Array.isArray(step.depends_on) ? step.depends_on.join(', ') : '';
         document.getElementById('vf-edit-skill').value = step.skill || '';
         document.getElementById('vf-edit-output-path').value = step.output_path || '';
+        document.getElementById('vf-edit-feedback-to').value =
+            Array.isArray(step.feedback_to) ? step.feedback_to.join(', ') : '';
         document.getElementById('vf-edit-params').value = JSON.stringify(
             step.params_template || {}, null, 2
         );
+        // Clear any previous error message
+        const errEl = document.getElementById('vf-edit-error');
+        if (errEl) {
+            errEl.textContent = '';
+            errEl.classList.add('hidden');
+        }
         _sidePanel().classList.add('open');
     }
 
     function closeSidePanel() {
         _selectedNodeId = null;
         _sidePanel().classList.remove('open');
+    }
+
+    // Show a validation error inside the side panel so the user
+    // sees the issue without opening F12. Called from applyEdit
+    // when a field is invalid.
+    function _showEditError(msg) {
+        const el = document.getElementById('vf-edit-error');
+        if (!el) return;
+        el.textContent = msg;
+        el.classList.remove('hidden');
+    }
+
+    function applyEdit() {
+        if (!_selectedNodeId) {
+            _showEditError('No card selected');
+            return;
+        }
+        // _editor.drawflow.drawflow[nodeId] does NOT work — drawflow's
+        // internal state is nested (module → container → numeric id).
+        // Use _getAllNodes() which walks the full structure.
+        const node = _getAllNodes()[_selectedNodeId];
+        if (!node) {
+            _showEditError('Selected card no longer exists (drawflow state mismatch)');
+            return;
+        }
+        const step = _findStepByNodeId(_selectedNodeId);
+        if (!step) {
+            _showEditError('Selected card not in step_template (drag or apply broke the link)');
+            return;
+        }
+        // Read all fields
+        const newName = document.getElementById('vf-edit-name').value.trim();
+        const newRole = document.getElementById('vf-edit-role').value.trim();
+        const newAction = document.getElementById('vf-edit-action').value.trim();
+        const depsStr = document.getElementById('vf-edit-deps').value;
+        const newDeps = depsStr
+            .split(',')
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0);
+        const newSkill = document.getElementById('vf-edit-skill').value.trim();
+        const newOutput = document.getElementById('vf-edit-output-path').value.trim();
+        const fbStr = document.getElementById('vf-edit-feedback-to').value;
+        const newFeedbackTo = fbStr
+            .split(',')
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0);
+        const paramsRaw = document.getElementById('vf-edit-params').value;
+        let newParams;
+        try {
+            newParams = paramsRaw.trim() === '' ? {} : JSON.parse(paramsRaw);
+        } catch (e) {
+            _showEditError('Invalid JSON in params_template: ' + e.message);
+            return;
+        }
+        if (!newParams || typeof newParams !== 'object' || Array.isArray(newParams)) {
+            _showEditError('params_template must be a JSON object');
+            return;
+        }
+
+        // Validate name (kebab-case, ≤ 40 chars, unique)
+        if (!/^[a-z0-9][a-z0-9-]*$/.test(newName) || newName.length > 40) {
+            _showEditError(`Invalid name: must be kebab-case (lowercase, digits, dashes), ≤ 40 chars`);
+            return;
+        }
+        // Uniqueness: not used by any other step
+        const oldName = step.name;
+        if (newName !== oldName &&
+            _stepTemplate.some((s) => s.name === newName)) {
+            _showEditError(`Name "${newName}" already used by another step`);
+            return;
+        }
+        if (!newRole) {
+            _showEditError('agent_role is required');
+            return;
+        }
+        if (!newAction) {
+            _showEditError('action is required');
+            return;
+        }
+        if (newSkill && !/^[a-z0-9][a-z0-9-]*$/.test(newSkill)) {
+            _showEditError('skill must be kebab-case (lowercase, digits, dashes)');
+            return;
+        }
+
+        // Validate depends_on: each must reference a step in the
+        // template. We don't enforce "earlier step" here — the
+        // server-side validator does. We just check the names exist.
+        const allNames = new Set(_stepTemplate.map((s) => s.name));
+        for (const dep of newDeps) {
+            if (!allNames.has(dep)) {
+                _showEditError(`depends_on references "${dep}" which is not a step in this workflow`);
+                return;
+            }
+        }
+        // Self-reference in depends_on is fine (the workflow will
+        // wait for itself = deadlock, but we let the user shoot
+        // themselves in the foot here — the supervisor's
+        // _find_ready_tasks will mark it as never-satisfiable).
+        // Validate feedback_to: same, but must reference a step
+        // that is NOT this step (loop-back to self = no-op, but
+        // we drop silently at run-workflow anyway).
+        for (const ft of newFeedbackTo) {
+            if (!allNames.has(ft)) {
+                _showEditError(`feedback_to references "${ft}" which is not a step in this workflow`);
+                return;
+            }
+            if (ft === newName) {
+                _showEditError(`feedback_to cannot reference itself ("${ft}")`);
+                return;
+            }
+        }
+
+        // All validations passed. Commit the edits to the in-memory
+        // step_template. The user must still click "Save" to persist.
+        const oldNameLocal = step.name;
+        step.name = newName;
+        step.agent_role = newRole;
+        step.action = newAction;
+        step.depends_on = newDeps;
+        step.skill = newSkill || null;
+        step.output_path = newOutput || null;
+        step.feedback_to = newFeedbackTo;
+        step.params_template = newParams;
+        // Update drawflow data so subsequent lookups (and the next
+        // _render if the user clicks Save) use the new name.
+        node.data.name = newName;
+        node.data.role = newRole;
+        node.data.action = newAction;
+
+        // If the step's name changed, any OTHER step's depends_on
+        // might reference the OLD name. Update those references.
+        if (oldNameLocal !== newName) {
+            for (const s of _stepTemplate) {
+                if (Array.isArray(s.depends_on)) {
+                    const i = s.depends_on.indexOf(oldNameLocal);
+                    if (i >= 0) s.depends_on[i] = newName;
+                }
+                if (Array.isArray(s.feedback_to)) {
+                    const j = s.feedback_to.indexOf(oldNameLocal);
+                    if (j >= 0) s.feedback_to[j] = newName;
+                }
+            }
+        }
+
+        // Re-render so the card label updates immediately.
+        _render();
+        // Re-open the side panel for the (possibly renumbered) node
+        // so the user sees the freshly-applied values.
+        let newNodeId = null;
+        for (const [id, el] of Object.entries(_getAllNodes())) {
+            // Walk to find the inner element with data-step-name
+            const stepEl = el && el.html
+                ? document.querySelector(`#${id} [data-step-name]`)
+                : null;
+            if (stepEl && stepEl.dataset.stepName === newName) {
+                newNodeId = id;
+                break;
+            }
+        }
+        if (newNodeId) {
+            openSidePanel(newNodeId);
+        } else {
+            closeSidePanel();
+        }
+        _showBanner(
+            oldNameLocal !== newName
+                ? `Step renamed: ${oldNameLocal} -> ${newName} (click Save to persist)`
+                : 'Step updated (click Save to persist)',
+            'success',
+        );
     }
 
     // ESC key closes the side panel (standard UX).
@@ -416,7 +725,15 @@
         save,
         openSidePanel,
         closeSidePanel,
+        applyEdit,
         toggleJsonForm,
+    };
+    // Debug hook: expose internals for Playwright headless tests.
+    // NOT used by the UI. Safe to ship to production.
+    window._vfDebug = {
+        getEditor: () => _editor,
+        getStepTemplate: () => _stepTemplate,
+        getSelectedNodeId: () => _selectedNodeId,
     };
 
     // Auto-init when the DOM is ready (this script is loaded with

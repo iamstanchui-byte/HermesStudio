@@ -217,7 +217,9 @@
        panel below is a sibling (position: absolute), so it floats
        over the canvas (z-index: 10) without affecting layout. #}
 
-    {# Side panel — Phase 1.3 (skeleton just shows the selected step). #}
+    {# Side panel — Phase 1.3 (now editable). Click a card to open,
+       edit fields, click "Apply" to commit the changes to the
+       in-memory step_template. Then click "Save" to persist to DB. #}
     <div class="vf-side-panel" id="vf-side-panel">
         <div class="flex items-center justify-between mb-2">
             <h3>Step details</h3>
@@ -225,42 +227,47 @@
                 class="text-gray-400 hover:text-gray-700 text-sm">×</button>
         </div>
         <p class="text-xs text-gray-500 mb-3" id="vf-side-panel-hint">
-            Click a card to view its details. Editing fields (name,
-            role, action, params, etc.) ships in Phase 1.3.
+            Click a card to view + edit its details. Click
+            <strong>Apply</strong> to commit changes; then <strong>Save</strong>
+            to persist to the database.
         </p>
         <div id="vf-side-panel-body">
-            <label>name</label>
-            <input type="text" id="vf-edit-name" disabled
-                class="bg-gray-50">
+            <label>name (kebab-case, ≤ 40 chars)</label>
+            <input type="text" id="vf-edit-name">
             <label>agent_role</label>
-            <input type="text" id="vf-edit-role" disabled
-                class="bg-gray-50">
+            <input type="text" id="vf-edit-role">
             <label>action</label>
-            <input type="text" id="vf-edit-action" disabled
-                class="bg-gray-50">
-            <label>depends_on (read-only this iteration)</label>
-            <input type="text" id="vf-edit-deps" disabled
-                class="bg-gray-50">
-            <label>skill (optional)</label>
-            <input type="text" id="vf-edit-skill" disabled
-                class="bg-gray-50">
+            <input type="text" id="vf-edit-action">
+            <label>depends_on (comma-separated step names, no forward refs)</label>
+            <input type="text" id="vf-edit-deps"
+                placeholder="step-a, step-b">
+            <label>skill (optional kebab-case)</label>
+            <input type="text" id="vf-edit-skill">
             <label>output_path (optional)</label>
-            <input type="text" id="vf-edit-output-path" disabled
-                class="bg-gray-50">
+            <input type="text" id="vf-edit-output-path">
+            <label>feedback_to (Phase 0 loop-back, optional)</label>
+            <input type="text" id="vf-edit-feedback-to"
+                placeholder="audit-step, deliver-step">
             <label>params_template (JSON)</label>
-            <textarea id="vf-edit-params" disabled
-                class="bg-gray-50 font-mono text-xs"></textarea>
+            <textarea id="vf-edit-params"
+                class="font-mono text-xs"></textarea>
+            <p class="text-xs text-red-600 mt-1 hidden" id="vf-edit-error"></p>
         </div>
-        <p class="text-xs text-gray-400 mt-3">
-            Phase 1.3 will make these fields editable. For now use
-            "Edit as JSON" above to change step details.
-        </p>
-        <div class="mt-4 pt-3 border-t border-gray-200">
+        <div class="mt-4 flex gap-2">
+            <button onclick="window.visualBuilder.applyEdit()"
+                class="flex-1 px-3 py-2 text-sm font-medium rounded bg-blue-600 text-white hover:bg-blue-700"
+                title="Commit changes to in-memory step_template. Click Save to persist.">
+                Apply
+            </button>
             <button onclick="window.visualBuilder.closeSidePanel()"
-                class="w-full px-3 py-2 text-sm font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50">
-                ← Close (or press ESC, or click empty area)
+                class="flex-1 px-3 py-2 text-sm font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50">
+                Cancel
             </button>
         </div>
+        <p class="text-xs text-gray-400 mt-2">
+            Or press ESC to discard changes. Edit is not saved
+            until you click <strong>Save</strong> at the top.
+        </p>
     </div>
 </div>
 
