@@ -37,7 +37,7 @@
         height: 100% !important;
     }
     .vf-node {
-        width: 220px;
+        width: 220px !important;
         min-height: 80px;
         padding: 8px 10px;
         background: #fff;
@@ -46,6 +46,7 @@
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         font-size: 12px;
         line-height: 1.4;
+        box-sizing: border-box;
     }
     .vf-node-header {
         display: flex;
@@ -85,6 +86,22 @@
     }
     /* Hide drawflow's default delete button (we use the side panel) */
     .drawflow-node .btn-delete { display: none !important; }
+    /* Phase 1.2 polish (2026-07-24): the .parent-node wrapper that
+       drawflow creates around each .drawflow-node had a default
+       200px width, so the cyan "selected" highlight box was smaller
+       than the actual card (220px). Match the wrapper width to the
+       card. The .parent-node element is positioned absolutely by
+       drawflow; we just size it correctly. */
+    .drawflow .parent-node {
+        width: 220px !important;
+    }
+    /* drawflow's selected highlight sits BEHIND the card. We want
+       the card to appear on top of the highlight so the card is
+       always fully visible (the highlight is just a visual cue). */
+    .drawflow .parent-node .drawflow-node {
+        position: relative;
+        z-index: 2;
+    }
     /* Side panel: shown when a card is selected */
     .vf-side-panel {
         position: absolute;
