@@ -2628,6 +2628,12 @@ def start(
         return applied
 
     try:
+        # Record the process start time used by the self-restart
+        # watchdog (see the sleep-loop block below). Snapshot once at
+        # startup so we compare against a stable reference; using
+        # "previous tick" would falsely trigger on .pyc regeneration
+        # by our own imports.
+        _self_start_ts = time_mod.time()
         # Agent-level heartbeat in a daemon thread (independent of the
         # main loop). Without this, a long-running hermes subprocess
         # (3+ min) blocks the main loop's heartbeat call, so the
@@ -2726,6 +2732,46 @@ def start(
                 if stop_flag["stop"]:
                     break
                 time_mod.sleep(1)
+            # Self-restart on source change: if any watched .py in our
+            # package has been edited since this process started, exit
+            # cleanly so NSSM (or whatever supervisor is running us)
+            # respawns us with the new code. Without this, editing
+            # `agent_cli.py` has no effect on the running wrapper —
+            # the user would have to manually bounce NSSM, which on
+            # Windows 11 requires admin and a slow stop/start cycle.
+            # Detected within `interval` seconds of the save.
+            #
+            # The check compares the source .py mtime against the
+            # process start time, NOT against the previous tick. This
+            # avoids a self-trigger loop where the running process's
+            # imports regenerate .pyc files (changing their mtime but
+            # not the .py mtime) and falsely restart us. We watch
+            # agent_cli.py and agent_paths.py since those are the
+            # only two hermes_orch modules the wrapper imports.
+            #
+            # Opt-out: set HERMES_WRAPPER_NO_SELF_RESTART=1 (useful
+            # for production deployments where the supervisor manages
+            # restarts itself).
+            if os.environ.get("HERMES_WRAPPER_NO_SELF_RESTART") != "1":
+                try:
+                    _src_dir = os.path.dirname(os.path.abspath(__file__))
+                    _watched = [
+                        os.path.join(_src_dir, "agent_cli.py"),
+                        os.path.join(_src_dir, "agent_paths.py"),
+                    ]
+                    _now = time_mod.time()
+                    for _wp in _watched:
+                        if not os.path.exists(_wp):
+                            continue
+                        if os.path.getmtime(_wp) > _self_start_ts:
+                            click.echo(
+                                f"[daemon] source changed ({os.path.basename(_wp)} "
+                                f"mtime > start time) — exiting for self-restart"
+                            )
+                            return
+                except Exception as _e:
+                    # Never let the watchdog crash the daemon
+                    click.echo(f"[daemon] self-restart check error: {_e}")
     finally:
         click.echo("[daemon] stopped")
 

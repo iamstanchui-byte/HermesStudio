@@ -681,38 +681,8 @@ async function unmarkTemplate(projectId, name) {
 // Here we just GET/PUT the raw file via the existing file API.
 // (PROJECT_ID is declared earlier in the same script block — don't
 // redeclare or the page errors out silently.)
-// Wraps fetch with a hard 5s timeout so the UI never sits on "Loading..."
-// forever if the server is slow / network is wedged. 8s was too long for
-// a local LAN call; 5s is generous without being annoying.
-async function _fetchWithTimeout(url, opts = {}, ms = 5000) {
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), ms);
-    try {
-        return await fetch(url, { ...opts, signal: ctl.signal });
-    } finally {
-        clearTimeout(t);
-    }
-}
-// Render a fetch-error body (r.json() result) into a human-readable string.
-// FastAPI's standard 422 validation response has `detail` as an ARRAY of
-// objects (one per field error). If we just do `new Error(j.detail)` the
-// array gets coerced to "[object Object],[object Object]" -- useless for
-// the operator. This helper extracts a single readable message.
-//
-// Used by all catch blocks that display error.status.textContent.
-function _errDetailToString(detail, status) {
-    if (typeof detail === 'string') return detail;
-    if (Array.isArray(detail)) {
-        // FastAPI 422: [{loc: ['body', 'name'], msg: 'Field required', ...}, ...]
-        return detail.map(e => {
-            const where = Array.isArray(e.loc) ? e.loc.join('.') : '';
-            return where ? `${where}: ${e.msg}` : (e.msg || JSON.stringify(e));
-        }).join('; ') || `HTTP ${status}`;
-    }
-    if (detail && typeof detail === 'object' && detail.msg) return detail.msg;
-    if (detail && typeof detail === 'object') return JSON.stringify(detail);
-    return `HTTP ${status}`;
-}
+// _fetchWithTimeout and _errDetailToString are defined in base.html so
+// every page gets them; no per-page redefinition needed.
 async function loadProcedure() {
     const el = document.getElementById('proc-content');
     try {

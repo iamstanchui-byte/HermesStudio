@@ -127,33 +127,8 @@
 </div>
 
 <script>
-// _fetchWithTimeout: helper for fetch with AbortController. Same as
-// the one in project.html; duplicated here to keep workflow_detail
-// self-contained (the helper isn't in base.html).
-async function _fetchWithTimeout(url, opts = {}, ms = 5000) {
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), ms);
-    try {
-        return await fetch(url, { ...opts, signal: ctl.signal });
-    } finally {
-        clearTimeout(t);
-    }
-}
-// Render a FastAPI error `detail` field (string OR array of {loc, msg, ...})
-// into a single human-readable string. Without this, "Failed: " + Error
-// shows "[object Object]" when the server returns the standard 422.
-function _errDetailToString(detail, status) {
-    if (typeof detail === 'string') return detail;
-    if (Array.isArray(detail)) {
-        return detail.map(e => {
-            const where = Array.isArray(e.loc) ? e.loc.join('.') : '';
-            return where ? `${where}: ${e.msg}` : (e.msg || JSON.stringify(e));
-        }).join('; ') || `HTTP ${status}`;
-    }
-    if (detail && typeof detail === 'object' && detail.msg) return detail.msg;
-    if (detail && typeof detail === 'object') return JSON.stringify(detail);
-    return `HTTP ${status}`;
-}
+// _fetchWithTimeout and _errDetailToString are defined in base.html so
+// every page gets them; no per-page redefinition needed.
 
 async function submitRun() {
     const btn = document.getElementById('run-submit-btn');

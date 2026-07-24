@@ -1182,17 +1182,32 @@ async def session_cleanup_ack(
 
 import re as _re
 
-# Skill names map directly to a filename under the profile root:
-#   profile_root / skills / <name>.md
-# We restrict the name to a safe filename subset so it can never escape
-# the skills/ directory on the agent host. The wrapper applies via
-# atomic_write(profile_root / file_path, content); with this name rule
-# the resolved path always stays inside the profile.
-_SKILL_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+# Skill names map directly to a relative path under the profile root:
+#   profile_root / skills / <name> / SKILL.md       (flat: "xlsx")
+#   profile_root / skills / <cat> / <name> / SKILL.md   (subfolder: "productivity/xlsx")
+# We restrict each path segment to a safe filename subset so it can never
+# escape the skills/ directory on the agent host. The wrapper applies via
+# atomic_write(profile_root / file_path, content); with this rule the
+# resolved path always stays inside the profile.
+#
+# Subfolder support was added 2026-07-24 alongside the wrapper's
+# recursive rglob("SKILL.md") discovery (commit 56f9ed0). We allow at
+# most one level of nesting ("<cat>/<name>") to keep the API surface
+# simple and match the wrapper's depth cap. Anything deeper (e.g.
+# "a/b/c/SKILL.md") is rejected here; the wrapper also skips it.
+_SKILL_SEGMENT_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+_SKILL_NAME_RE = _re.compile(
+    rf"^(?:{_SKILL_SEGMENT_RE}|{_SKILL_SEGMENT_RE}/{_SKILL_SEGMENT_RE})$"
+)
 
 
 def _validate_skill_name(name: str) -> str:
-    """Validate and return a safe skill name, else raise HTTPException."""
+    """Validate and return a safe skill name, else raise HTTPException.
+
+    Accepts either a flat name ("xlsx") or a one-level subfolder
+    category ("productivity/xlsx"). Rejects empty, ".", "..", and any
+    name with more than one "/".
+    """
     if not name or not isinstance(name, str):
         raise HTTPException(400, "skill name is required")
     if name in (".", "..") or not _SKILL_NAME_RE.match(name):
@@ -1318,7 +1333,7 @@ async def list_skills(
 
 
 @router.get(
-    "/{agent_id}/profiles/{profile_name}/skills/{skill_name}",
+    "/{agent_id}/profiles/{profile_name}/skills/{skill_name:path}",
     response_model=SkillInfo,
 )
 async def get_skill(
@@ -1443,7 +1458,7 @@ async def request_skill_sync(
 
 
 @router.delete(
-    "/{agent_id}/profiles/{profile_name}/skills/{skill_name}",
+    "/{agent_id}/profiles/{profile_name}/skills/{skill_name:path}",
     response_model=ProfileConfig,
     status_code=201,
 )
@@ -1494,7 +1509,7 @@ async def delete_skill(
 
 
 @router.post(
-    "/{agent_id}/profiles/{profile_name}/skills/{skill_name}/copy",
+    "/{agent_id}/profiles/{profile_name}/skills/{skill_name:path}/copy",
     response_model=ProfileConfig,
     status_code=201,
 )
