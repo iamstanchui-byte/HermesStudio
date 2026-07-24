@@ -34,7 +34,19 @@ import json
 DEFAULT_HOST = "192.168.2.161"
 DEFAULT_USER = "stanley"
 DEFAULT_PROFILES = ["super", "super-b"]
-DEFAULT_SITE = "/home/stanley/.hermes-orchestrator/venv/lib/python3.12/site-packages/hermes_orch"
+# Layout on the Linux install (a pip install in a venv):
+#   /home/stanley/.hermes-orchestrator/                  <- WRAPPER_DIR (venv root's parent)
+#     venv/                                              <- venv root
+#       bin/hermes-orch-agent                            <- the wrapper exe shim
+#       lib/python3.12/site-packages/hermes_orch/        <- SITE_DIR (the actual code)
+#         agent_cli.py
+#         agent_paths.py
+# os.path.dirname(SITE_DIR) gives the venv root, not the
+# wrapper install dir. The wrapper exe is at WRAPPER_DIR +
+# '/venv/bin/hermes-orch-agent'. The wrapper config is at
+# WRAPPER_DIR + '/wrapper-config.json'.
+WRAPPER_DIR = "/home/stanley/.hermes-orchestrator"
+SITE_DIR = WRAPPER_DIR + "/venv/lib/python3.12/site-packages/hermes_orch"
 SRC = (
     r"C:\Project\minimax code\hermes-orchestrator\src\hermes_orch"
     if os.name == "nt"
@@ -63,7 +75,7 @@ def _scp(local, remote, timeout=30):
 
 def deploy(host: str, user: str, profiles: list[str]) -> int:
     ssh_dest = f"{user}@{host}"
-    site = DEFAULT_SITE
+    site = SITE_DIR
 
     # 1. Backup existing files on Linux
     print("--- 1. Backup existing wrapper files on Linux ---")
@@ -108,10 +120,11 @@ def deploy(host: str, user: str, profiles: list[str]) -> int:
 
     # 5. Start new wrapper, fully detached
     print("--- 5. Start new wrapper ---")
-    wrapper_dir = os.path.dirname(site)
+    # WRAPPER_DIR is the venv's PARENT (the install root). The exe
+    # is at venv/bin/, the config is at the install root.
     start_cmd = (
-        f'setsid nohup {wrapper_dir}/venv/bin/hermes-orch-agent start '
-        f'--config {wrapper_dir}/wrapper-config.json --interval 5 '
+        f'setsid nohup {WRAPPER_DIR}/venv/bin/hermes-orch-agent start '
+        f'--config {WRAPPER_DIR}/wrapper-config.json --interval 5 '
         f'> /tmp/hermes-orch-agent.log 2>&1 < /dev/null &'
     )
     r = _ssh(ssh_dest, start_cmd, timeout=10)
