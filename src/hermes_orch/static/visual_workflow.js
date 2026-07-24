@@ -130,10 +130,14 @@
             }
             // Phase 1.1: bind nodeMoved listener once. After every
             // drag, sync _stepTemplate order to match drawflow's
-            // current Y positions. Bind the listener ONLY here
-            // (not in every _render) so we don't stack up duplicates.
+            // current Y positions, AND re-compute all connection
+            // paths (drawflow only updates the source side of
+            // connections for the dragged node). Bind the listener
+            // ONLY here (not in every _render) so we don't stack
+            // up duplicates.
             _editor.on('nodeMoved', () => {
                 _reorderStepTemplateByPosition();
+                requestAnimationFrame(_recomputeAllConnectionPaths);
             });
             // Phase 1.2: bind connectionCreated listener. When the
             // user drags an output handle to an input handle, add
@@ -246,6 +250,25 @@
         } catch (e) {
             console.error('visual_workflow: depends_on wiring failed:', e);
         }
+        // Force re-compute of all connection paths after every render.
+        // Without this, drawflow's SVG path `d` attribute may keep
+        // STALE endpoint positions from before the re-render,
+        // making edges look "misaligned" (curving to a phantom
+        // location while the cards sit at their new positions).
+        //
+        // We use our own _recomputeAllConnectionPaths() instead of
+        // drawflow's updateConnectionNodes, because:
+        //  - updateConnectionNodes only updates paths where the
+        //    given node is the SOURCE (not the TARGET).
+        //  - drawflow's updateConnection(x, y) is a drag handler
+        //    that crashes when called outside a drag.
+        // Our helper reads the current handle positions via
+        // getBoundingClientRect and sets each path's d-attr using
+        // drawflow's createCurvature — same math drawflow uses
+        // internally, but applied to BOTH endpoints of EVERY path.
+        requestAnimationFrame(() => {
+            _recomputeAllConnectionPaths();
+        });
 
         // Click handler: open the side panel on card click;
         // close the side panel on click of the wrap's blank area
@@ -403,6 +426,72 @@
         if (newOrder.length === _stepTemplate.length && newOrder.length > 0) {
             _stepTemplate = newOrder;
         }
+    }
+
+    // Phase 1.2 + drag: re-compute all connection SVG path d-attrs
+    // using the CURRENT handle positions. This fixes drawflow 0.0.59's
+    // stale-path bug:
+    //   - drawflow.updateConnectionNodes(nodeId) only updates paths
+    //     where the given node is the SOURCE. Paths where the node is
+    //     a TARGET keep their old d-attr (which may be from a stale
+    //     render or from before another card was dragged).
+    //   - When the user drags a card, drawflow's mousemove handler
+    //     updates the source side of all connections, but the target
+    //     side stays at its last computed position.
+    //   - On an initial render, addConnection internally calls
+    //     updateConnectionNodes, but if the addNode loop is still
+    //     mutating the DOM, getBoundingClientRect may return stale
+    //     values and the computed path d-attr becomes wrong from
+    //     the start. The next render (or any drag) re-uses that
+    //     wrong d-attr.
+    //
+    // Solution: for each <svg.connection> in the container, find
+    // the source and target node's input/output handle via DOM,
+    // compute current screen-relative positions, and set the path's
+    // `d` attribute using drawflow's internal createCurvature.
+    // Called from nodeMoved (after every drag) AND from the rAF
+    // block in _render (after initial render settles).
+    function _recomputeAllConnectionPaths() {
+        if (!_editor || !_editor.precanvas || !_editor.container) return;
+        const pre = _editor.precanvas;
+        const preRect = pre.getBoundingClientRect();
+        const curvature = (typeof _editor.curvature === 'number') ? _editor.curvature : 0.5;
+        const zoom = _editor.zoom || 1;
+        const ux = (pre.clientWidth * zoom) ? (pre.clientWidth / (pre.clientWidth * zoom)) : 1;
+        const uy = (pre.clientHeight * zoom) ? (pre.clientHeight / (pre.clientHeight * zoom)) : 1;
+        const svgs = _editor.container.querySelectorAll('svg.connection');
+        let updated = 0;
+        svgs.forEach(svg => {
+            const classes = (svg.getAttribute('class') || '').split(/\s+/);
+            let sourceId = null, targetId = null, outputClass = null, inputClass = null;
+            for (const cls of classes) {
+                if (cls.startsWith('node_in_')) targetId = cls.slice(8);
+                else if (cls.startsWith('node_out_')) sourceId = cls.slice(9);
+                else if (cls.startsWith('output_')) outputClass = cls;
+                else if (cls.startsWith('input_')) inputClass = cls;
+            }
+            if (!sourceId || !targetId || !outputClass || !inputClass) return;
+            const sourceEl = _editor.container.querySelector('#node-' + sourceId + ' .' + outputClass);
+            const targetEl = _editor.container.querySelector('#node-' + targetId + ' .' + inputClass);
+            if (!sourceEl || !targetEl) return;
+            const sr = sourceEl.getBoundingClientRect();
+            const tr = targetEl.getBoundingClientRect();
+            const srcX = sourceEl.offsetWidth / 2 + (sr.x - preRect.x) * ux;
+            const srcY = sourceEl.offsetHeight / 2 + (sr.y - preRect.y) * uy;
+            const tgtX = targetEl.offsetWidth / 2 + (tr.x - preRect.x) * ux;
+            const tgtY = targetEl.offsetHeight / 2 + (tr.y - preRect.y) * uy;
+            try {
+                const d = _editor.createCurvature(srcX, srcY, tgtX, tgtY, curvature, "openclose");
+                const path = svg.querySelector('path.main-path');
+                if (path) {
+                    path.setAttributeNS(null, 'd', d);
+                    updated++;
+                }
+            } catch (e) {
+                // Suppress per-connection errors
+            }
+        });
+        return updated;
     }
 
     // Look up a step name from a drawflow connection endpoint.

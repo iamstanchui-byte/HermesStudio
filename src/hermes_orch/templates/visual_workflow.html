@@ -40,8 +40,8 @@
         width: 220px !important;
         min-height: 80px;
         padding: 8px 10px;
-        background: #fff;
-        border: 1px solid #d1d5db;
+        background: #fff !important;
+        border: 1px solid #d1d5db !important;
         border-radius: 6px;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         font-size: 12px;
@@ -95,13 +95,14 @@
     .drawflow .parent-node {
         width: 220px !important;
     }
-    /* drawflow's selected highlight sits BEHIND the card. We want
-       the card to appear on top of the highlight so the card is
-       always fully visible (the highlight is just a visual cue). */
-    .drawflow .parent-node .drawflow-node {
-        position: relative;
-        z-index: 2;
-    }
+    /* drawflow's default `.drawflow-node { position: absolute; z-index: 2 }`
+       already puts the card on top of the selected highlight.
+       Do NOT override `position` to `relative` — that would make
+       the card stack in normal flow (each .parent-node adds the
+       previous card's height to the offset), shifting cards 1+
+       down by 114px (one card height) and breaking the SVG path
+       alignment. We only need to widen the card via the earlier
+       .vf-node rule. */
     /* Side panel: shown when a card is selected */
     .vf-side-panel {
         position: absolute;
