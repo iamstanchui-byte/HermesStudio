@@ -31,6 +31,19 @@
     let _stepTemplate = [];      // canonical list of step dicts
     let _variables = [];         // canonical list of variable dicts
     let _selectedNodeId = null;  // drawflow node id (e.g. "node-3") of the focused card
+    // Track mousedown position so we can distinguish a pure click
+    // (no movement → open the side panel) from a drag (movement > 5px
+    // → leave the card where the user dropped it, do not auto-open).
+    // Phase 1.1 (drag-to-reorder) will replace this with real
+    // reorder logic that ACTUALLY moves the card in _stepTemplate.
+    let _mouseDownPos = null;
+    // 8px threshold for "is this a drag?" Detected at click time by
+    // comparing the recorded mousedown position to the current click
+    // position. < 8px movement = treat as a click (open side panel).
+    // >= 8px = treat as a drag (drop the card, do not open).
+    // The threshold is intentionally lenient — a few px of mouse
+    // jitter during a click should NOT skip opening the side panel.
+    const _DRAG_THRESHOLD_PX = 8;
 
     // ---- DOM lookup ----
     function _canvas() { return document.getElementById('vf-canvas'); }
@@ -171,11 +184,31 @@
         // Click handler: open the side panel on card click;
         // close the side panel on click of the wrap's blank area
         // (the user asked for an obvious way to "go back out").
+        // We track mousedown so a drag (movement > 5px) does NOT
+        // open the side panel — drawflow's default behavior is to
+        // fire click after drag-end, which is misleading to users
+        // who intended to reorder. Phase 1.1 (drag-to-reorder) will
+        // override this and actually move the card in _stepTemplate.
         if (!wrap._vfClickBound) {
+            wrap.addEventListener('mousedown', (ev) => {
+                const nodeEl = ev.target.closest('.drawflow-node');
+                _mouseDownPos = nodeEl
+                    ? { x: ev.clientX, y: ev.clientY }
+                    : null;
+            });
             wrap.addEventListener('click', (ev) => {
                 const nodeEl = ev.target.closest('.drawflow-node');
                 if (nodeEl) {
-                    // Click on a card → open its details
+                    // Was this a drag (movement > 5px)? If so, the
+                    // user intended to reposition the card, not
+                    // view its details. Skip opening the side panel.
+                    if (_mouseDownPos) {
+                        const dx = ev.clientX - _mouseDownPos.x;
+                        const dy = ev.clientY - _mouseDownPos.y;
+                        if (Math.sqrt(dx * dx + dy * dy) > _DRAG_THRESHOLD_PX) {
+                            return;
+                        }
+                    }
                     window.visualBuilder.openSidePanel(nodeEl.id);
                 } else {
                     // Click on the wrap's blank area (not a card) →
