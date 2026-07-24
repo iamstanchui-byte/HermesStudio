@@ -135,6 +135,34 @@
             _editor.on('nodeMoved', () => {
                 _reorderStepTemplateByPosition();
             });
+            // Phase 1.2: bind connectionCreated listener. When the
+            // user drags an output handle to an input handle, add
+            // the source step's name to the target step's
+            // depends_on. drawflow 0.0.59 fires this event with
+            // payload { output_id, input_id, output_class,
+            // input_class }.
+            _editor.on('connectionCreated', (connection) => {
+                _onConnectionCreated(connection);
+            });
+            // drawflow 0.0.59 does NOT fire a connectionRemoved event
+            // when the user removes a wire. We patch
+            // _editor.removeConnection to call _onConnectionRemoved
+            // ourselves with the same shape.
+            if (!_editor._vfRemoveConnectionPatched) {
+                const _origRemove = _editor.removeConnection.bind(_editor);
+                _editor.removeConnection = function (
+                    sourceId, targetId, sourceOutput, targetInput
+                ) {
+                    _origRemove(sourceId, targetId, sourceOutput, targetInput);
+                    _onConnectionRemoved({
+                        output_id: sourceId,
+                        input_id: targetId,
+                        output_class: sourceOutput,
+                        input_class: targetInput,
+                    });
+                };
+                _editor._vfRemoveConnectionPatched = true;
+            }
         }
         // (unreachable: the `_editor` block always sets _editor)
         // Always clear and re-render from canonical state
@@ -154,16 +182,19 @@
                     action: step.action,
                 };
                 // drawflow 0.0.59 addNode signature:
-                //   addNode(name, inputs, outputs, posx, posy, classoverride, data, html)
-                // We pass step.name as the identifier (drawflow sets
-                // it as the node object's `name` field), the full
-                // HTML as the 8th arg (rendered inside
-                // .drawflow_content_node), and the data object so
-                // we can look the step up later by name.
+                //   addNode(name, n_inputs, n_outputs, posx, posy, classoverride, data, html)
+                // The inputs/outputs args are NUMBERS (count of
+                // connection points), not class names. drawflow
+                // auto-generates class names "input_1", "input_2",
+                // ... and "output_1", "output_2", ... on the
+                // rendered elements. We pass 1 each so each card
+                // has one input handle (left) and one output handle
+                // (right). CSS in visual_workflow.html targets the
+                // .input_1 / .output_1 classes.
                 _editor.addNode(
                     step.name,         // 1: name
-                    ['vf-input'],      // 2: inputs
-                    ['vf-output'],     // 3: outputs
+                    1,                 // 2: number of inputs
+                    1,                 // 3: number of outputs
                     x,                 // 4: posx
                     y + i * dy,        // 5: posy
                     'vf-node',         // 6: classoverride
@@ -179,20 +210,18 @@
 
         // Wire depends_on: for each step B with deps ["A","C"], find
         // node A and C, and connect A's output -> B's input.
-        // NOTE: Phase 1.1 ships without working edges — the cards
-        // render fine but the depends_on connection lines are
-        // not drawn. Phase 1.2 will fix this by using drawflow's
-        // internal node id (not the DOM id) when calling
-        // addConnection. For now, suppress the addConnection
-        // errors so the rest of the page works.
+        // The 3rd and 4th args of addConnection are the OUTPUT and
+        // INPUT class names, which must match what we passed to
+        // addNode (output_1 / input_1, the default).
         try {
             // Build a name -> numeric id map from the DOM we just
-            // created. Each card has data-step-name and a DOM id
-            // like "node-1", "node-2", "node-3". The numeric id is
-            // the part after "node-".
+            // created. Each card has data-step-name on the inner
+            // .vf-node div (set in _stepToCardHtml). The outer
+            // .drawflow-node has the DOM id like "node-1".
             const nameToNumericId = {};
             for (const el of wrap.querySelectorAll('.drawflow-node')) {
-                const name = el.dataset.stepName;
+                const inner = el.querySelector('[data-step-name]');
+                const name = inner ? inner.dataset.stepName : null;
                 if (name && el.id.startsWith('node-')) {
                     nameToNumericId[name] = el.id.replace('node-', '');
                 }
@@ -204,7 +233,10 @@
                     const sourceNumeric = nameToNumericId[depName];
                     if (!sourceNumeric) return;
                     try {
-                        _editor.addConnection(sourceNumeric, targetNumeric, 'output_1', 'input_1');
+                        _editor.addConnection(
+                            sourceNumeric, targetNumeric,
+                            'output_1', 'input_1',
+                        );
                     } catch (e) {
                         // Suppress: edges are a nice-to-have, not critical
                         console.warn(`addConnection(${sourceNumeric}->${targetNumeric}) failed:`, e.message);
@@ -370,6 +402,101 @@
             .filter((s) => s !== undefined);
         if (newOrder.length === _stepTemplate.length && newOrder.length > 0) {
             _stepTemplate = newOrder;
+        }
+    }
+
+    // Look up a step name from a drawflow connection endpoint.
+    // drawflow passes either a numeric id (in older API) or the
+    // full node object. We try both.
+    function _getConnectionEndpointName(endpoint) {
+        if (endpoint == null) return null;
+        if (typeof endpoint === 'object') {
+            // Could be a node with .data.name, or a {id, ...} ref
+            if (endpoint.data && endpoint.data.name) return endpoint.data.name;
+            if (endpoint.name) return endpoint.name;
+        }
+        if (typeof endpoint === 'number' || typeof endpoint === 'string') {
+            const idStr = String(endpoint);
+            const el = document.getElementById(`node-${idStr}`);
+            if (el) {
+                const stepEl = el.querySelector('[data-step-name]');
+                if (stepEl && stepEl.dataset.stepName) {
+                    return stepEl.dataset.stepName;
+                }
+            }
+        }
+        return null;
+    }
+
+    // Normalize a connection event/payload to a { source, target,
+    // sourceClass, targetClass } shape. drawflow 0.0.59 uses
+    // { output_id, input_id, output_class, input_class }; older
+    // versions used { sourceId, targetId, sourceClass, targetClass }.
+    function _normalizeConnection(conn) {
+        const sourceId = conn.output_id !== undefined ? conn.output_id : conn.sourceId;
+        const targetId = conn.input_id !== undefined ? conn.input_id : conn.targetId;
+        const sourceClass = conn.output_class !== undefined ? conn.output_class : conn.sourceClass;
+        const targetClass = conn.input_class !== undefined ? conn.input_class : conn.targetClass;
+        return { sourceId, targetId, sourceClass, targetClass };
+    }
+
+    // Phase 1.2: when the user wires two cards (drag from card A's
+    // output handle to card B's input handle), add A's name to B's
+    // depends_on. We DON'T add B to A.depends_on — that's the wrong
+    // direction. depends_on is "I depend on these earlier steps".
+    // Note: We do NOT add a self-reference. Drawing an edge from
+    // A back to A is a common user mistake; we silently ignore it.
+    function _onConnectionCreated(connection) {
+        const { sourceId, targetId } = _normalizeConnection(connection);
+        const sourceName = _getConnectionEndpointName(sourceId);
+        const targetName = _getConnectionEndpointName(targetId);
+        if (!sourceName || !targetName) {
+            console.warn('connectionCreated: missing source/target name', connection);
+            return;
+        }
+        if (sourceName === targetName) {
+            // Self-reference: drop the connection visually (the
+            // user probably didn't mean it) and don't update state.
+            // We can't undo the addConnection from here easily,
+            // but the next save will reject it via validator.
+            console.warn('connectionCreated: ignored self-reference', sourceName);
+            return;
+        }
+        const target = _stepTemplate.find((s) => s.name === targetName);
+        if (!target) {
+            console.warn('connectionCreated: target step not in template', targetName);
+            return;
+        }
+        if (!Array.isArray(target.depends_on)) target.depends_on = [];
+        if (!target.depends_on.includes(sourceName)) {
+            target.depends_on.push(sourceName);
+            _showBanner(
+                `Wired ${sourceName} -> ${targetName}. Click Save to persist.`,
+                'success',
+            );
+        }
+    }
+
+    // Phase 1.2: when the user removes a wire, remove the source's
+    // name from the target's depends_on.
+    // NOTE: drawflow 0.0.59 does NOT fire a connectionRemoved event
+    // when the user removes a wire (only connectionCreated fires on
+    // add). We wrap _editor.removeConnection in the init block to
+    // call this handler manually.
+    function _onConnectionRemoved(connection) {
+        const { sourceId, targetId } = _normalizeConnection(connection);
+        const sourceName = _getConnectionEndpointName(sourceId);
+        const targetName = _getConnectionEndpointName(targetId);
+        if (!sourceName || !targetName) return;
+        const target = _stepTemplate.find((s) => s.name === targetName);
+        if (!target || !Array.isArray(target.depends_on)) return;
+        const i = target.depends_on.indexOf(sourceName);
+        if (i >= 0) {
+            target.depends_on.splice(i, 1);
+            _showBanner(
+                `Unwired ${sourceName} -/-> ${targetName}. Click Save to persist.`,
+                'success',
+            );
         }
     }
 
