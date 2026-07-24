@@ -168,16 +168,24 @@
             // Non-fatal: cards still show, just no edges
         }
 
-        // Click handler: open the side panel with details
-        // We bind to the wrap, not the inner target, so clicks
-        // anywhere in the canvas area can reach us.
+        // Click handler: open the side panel on card click;
+        // close the side panel on click of the wrap's blank area
+        // (the user asked for an obvious way to "go back out").
         if (!wrap._vfClickBound) {
             wrap.addEventListener('click', (ev) => {
                 const nodeEl = ev.target.closest('.drawflow-node');
-                if (!nodeEl) return;
-                // The element id is e.g. "node-3"
-                const id = nodeEl.id;
-                window.visualBuilder.openSidePanel(id);
+                if (nodeEl) {
+                    // Click on a card → open its details
+                    window.visualBuilder.openSidePanel(nodeEl.id);
+                } else {
+                    // Click on the wrap's blank area (not a card) →
+                    // close the side panel if it's open. Don't open
+                    // on background click — only on explicit card click.
+                    const sp = _sidePanel();
+                    if (sp.classList.contains('open')) {
+                        closeSidePanel();
+                    }
+                }
             });
             wrap._vfClickBound = true;
         }
@@ -232,6 +240,7 @@
             _variables = [];
         }
         _render();
+        _bindGlobalShortcuts();
         // Bind palette chip clicks (Phase 1.4: stub — appends a blank step)
         document.querySelectorAll('.vf-palette-chip').forEach((chip) => {
             chip.addEventListener('click', () => {
@@ -295,6 +304,21 @@
     function closeSidePanel() {
         _selectedNodeId = null;
         _sidePanel().classList.remove('open');
+    }
+
+    // ESC key closes the side panel (standard UX).
+    // Bound once on init().
+    function _bindGlobalShortcuts() {
+        if (window._vfShortcutsBound) return;
+        window._vfShortcutsBound = true;
+        document.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Escape') {
+                const sp = _sidePanel();
+                if (sp.classList.contains('open')) {
+                    closeSidePanel();
+                }
+            }
+        });
     }
 
     function toggleJsonForm() {
