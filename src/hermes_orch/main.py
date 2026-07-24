@@ -87,6 +87,14 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Static files (Phase 1 of visual workflow builder, 2026-07-24).
+    # The visual builder's JS lives at src/hermes_orch/static/.
+    # Templates reference /static/visual_workflow.js.
+    from fastapi.staticfiles import StaticFiles
+    static_dir = Path(__file__).parent / "static"
+    static_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
     # Cache-Control: no-store for the agents router. The dashboard's
     # 10s polling does location.reload() which can keep serving stale
     # page-cached JSON responses (e.g. after we fixed the skill layout

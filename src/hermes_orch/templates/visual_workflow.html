@@ -1,0 +1,262 @@
+{% extends "base.html" %}
+
+{# Visual workflow builder — Phase 1 skeleton (2026-07-24).
+   User-stated design: Q2 (a) drawflow + Q3 (a) third "loop-back handle"
+   (Phase 2 adds the red dashed arrow). This skeleton ships the
+   canvas + render + save + add-step palette + hidden text form
+   toggle (Q4 c). Drag-reorder, drag-wire, and side-panel edit are
+   Phase 1.1 / 1.2 / 1.3. #}
+
+{% block head %}
+{# drawflow + dagre from CDN (no build step per Q2 a).
+   drawflow 0.0.59 — n8n-style node editor, JSON in/out.
+   dagre 0.8.5 — directed graph layout, used by drawflow under the hood. #}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+{# _visual_workflow.js is loaded by the page at the bottom of <body>;
+   it depends on drawflow being parsed first. We use `defer` above so
+   the order is preserved. #}
+<script defer src="/static/visual_workflow.js?v=2026-07-24-1"></script>
+<style>
+    /* Page-specific layout. The body uses Tailwind, but drawflow
+       ships its own styles for nodes + connections which we keep
+       mostly untouched. */
+    .vf-canvas-wrap {
+        width: 100%;
+        height: calc(100vh - 220px);
+        min-height: 480px;
+        background: #f9fafb;
+        border: 1px solid #e5e7eb;
+        border-radius: 0.5rem;
+        position: relative;
+    }
+    /* Drawflow injects this into the wrap; we just size it. */
+    .vf-canvas-wrap > div {
+        width: 100% !important;
+        height: 100% !important;
+    }
+    .vf-node {
+        width: 220px;
+        min-height: 80px;
+        padding: 8px 10px;
+        background: #fff;
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        line-height: 1.4;
+    }
+    .vf-node-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 4px;
+    }
+    .vf-node-name {
+        font-weight: 600;
+        color: #111827;
+        text-transform: lowercase;
+    }
+    .vf-node-role {
+        font-size: 10px;
+        color: #6b7280;
+        background: #f3f4f6;
+        padding: 1px 5px;
+        border-radius: 3px;
+    }
+    .vf-node-action {
+        color: #2563eb;
+        font-size: 11px;
+    }
+    .vf-node-skill {
+        color: #7c3aed;
+        font-size: 10px;
+        margin-top: 3px;
+    }
+    /* drawflow uses these classes for connection points */
+    .vf-input, .vf-output {
+        width: 12px !important;
+        height: 12px !important;
+        background: #6b7280 !important;
+        border: 2px solid #fff !important;
+    }
+    /* Hide drawflow's default delete button (we use the side panel) */
+    .drawflow-node .btn-delete { display: none !important; }
+    /* Side panel: shown when a card is selected */
+    .vf-side-panel {
+        position: absolute;
+        right: 0;
+        top: 0;
+        width: 360px;
+        height: 100%;
+        background: #fff;
+        border-left: 1px solid #e5e7eb;
+        box-shadow: -4px 0 16px rgba(0,0,0,0.04);
+        transform: translateX(100%);
+        transition: transform 0.2s ease;
+        z-index: 10;
+        padding: 16px;
+        overflow-y: auto;
+    }
+    .vf-side-panel.open { transform: translateX(0); }
+    .vf-side-panel h3 {
+        font-size: 14px; font-weight: 600; color: #111827; margin-bottom: 12px;
+    }
+    .vf-side-panel label {
+        display: block; font-size: 11px; color: #6b7280;
+        margin-top: 8px; margin-bottom: 2px; font-weight: 500;
+    }
+    .vf-side-panel input, .vf-side-panel select, .vf-side-panel textarea {
+        width: 100%; padding: 6px 8px; font-size: 12px;
+        border: 1px solid #d1d5db; border-radius: 4px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .vf-side-panel textarea { min-height: 80px; resize: vertical; }
+    /* Palette chips */
+    .vf-palette-chip {
+        display: inline-block;
+        padding: 6px 10px;
+        margin: 2px 4px 2px 0;
+        background: #eff6ff;
+        border: 1px solid #bfdbfe;
+        color: #1d4ed8;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 500;
+        cursor: pointer;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .vf-palette-chip:hover { background: #dbeafe; }
+    /* Hidden text form (Q4 c) */
+    .vf-json-form {
+        display: none;
+        margin-top: 12px;
+    }
+    .vf-json-form.open { display: block; }
+    /* Save status banner */
+    .vf-save-banner {
+        position: fixed; top: 16px; right: 16px;
+        padding: 8px 16px; border-radius: 6px;
+        font-size: 12px; font-weight: 500;
+        opacity: 0; transition: opacity 0.2s;
+        z-index: 50;
+    }
+    .vf-save-banner.show { opacity: 1; }
+    .vf-save-banner.success { background: #d1fae5; color: #065f46; }
+    .vf-save-banner.error { background: #fee2e2; color: #991b1b; }
+</style>
+{% endblock %}
+
+{% block content %}
+{# Pass the workflow data to JS via a data attribute on the wrap.
+   We use a JSON blob so the JS can do a single JSON.parse instead
+   of DOM-scraping the (later) text form. #}
+<div class="flex items-center justify-between mb-3">
+    <div>
+        <h1 class="text-lg font-bold text-gray-800 font-mono">
+            <a href="/workflows/{{ workflow.id }}" class="text-blue-600 hover:underline">{{ workflow.name }}</a>
+            <span class="text-gray-400 font-normal">/ visual</span>
+        </h1>
+        <p class="text-xs text-gray-500 mt-0.5">
+            v{{ workflow.version }} ·
+            {{ workflow.step_count if workflow.step_count is defined else '?' }} step(s) ·
+            Phase 1 skeleton
+        </p>
+    </div>
+    <div class="flex gap-2">
+        <button onclick="window.visualBuilder.toggleJsonForm()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            title="Q4 (c): show/hide the raw JSON text form (hidden by default for semi-tech users)">
+            Edit as JSON
+        </button>
+        <button onclick="window.visualBuilder.save()"
+            class="px-3 py-1.5 text-xs font-medium rounded bg-blue-600 text-white hover:bg-blue-700"
+            title="PUT step_template + variables back to the API">
+            Save
+        </button>
+    </div>
+</div>
+
+{# Hidden JSON form (Q4 c): toggled by the button above. Body filled
+   by JS after load. We render the server-side text version inside
+   initially so users who DO flip the toggle see the current state. #}
+<div class="vf-json-form" id="vf-json-form">
+    <label class="text-xs font-semibold text-gray-700">step_template (JSON)</label>
+    <textarea id="vf-step-template-json" class="w-full text-xs font-mono border rounded p-2"
+        style="min-height: 280px;">{{ workflow.step_template_pretty if workflow.step_template_pretty is defined else '[]' }}</textarea>
+    <label class="text-xs font-semibold text-gray-700 mt-3 block">variables (JSON)</label>
+    <textarea id="vf-variables-json" class="w-full text-xs font-mono border rounded p-2"
+        style="min-height: 120px;">{{ workflow.variables_pretty if workflow.variables_pretty is defined else '[]' }}</textarea>
+    <p class="text-xs text-gray-500 mt-1">
+        Edit JSON directly, then click Save. The visual canvas and
+        the JSON stay in sync after each save.
+    </p>
+</div>
+
+{# Add Step palette (Phase 1.4 in design). 4 templates pre-fill a
+   new step card. Phase 1 skeleton ships the chips + a stub handler. #}
+<div class="bg-white border rounded-lg p-2 mb-2 flex items-center gap-2">
+    <span class="text-xs font-semibold text-gray-700">Add step:</span>
+    <span class="vf-palette-chip" data-template="search">search</span>
+    <span class="vf-palette-chip" data-template="analyze">analyze</span>
+    <span class="vf-palette-chip" data-template="audit">audit</span>
+    <span class="vf-palette-chip" data-template="write">write</span>
+    <span class="text-xs text-gray-400 ml-2">click to add a new step (skeleton: stub)</span>
+</div>
+
+{# The drawflow canvas + side panel. The data attribute holds the
+   initial step_template + variables as JSON so the JS can render
+   without a second round-trip. #}
+<div class="vf-canvas-wrap relative"
+     id="vf-canvas"
+     data-workflow-id="{{ workflow.id }}"
+     data-step-template='{{ workflow.step_template | tojson }}'
+     data-variables='{{ workflow.variables | tojson }}'>
+    <div id="vf-drawflow-target"></div>
+
+    {# Side panel — Phase 1.3 (skeleton just shows the selected step). #}
+    <div class="vf-side-panel" id="vf-side-panel">
+        <div class="flex items-center justify-between mb-2">
+            <h3>Step details</h3>
+            <button onclick="window.visualBuilder.closeSidePanel()"
+                class="text-gray-400 hover:text-gray-700 text-sm">×</button>
+        </div>
+        <p class="text-xs text-gray-500 mb-3" id="vf-side-panel-hint">
+            Click a card to view its details. Editing fields (name,
+            role, action, params, etc.) ships in Phase 1.3.
+        </p>
+        <div id="vf-side-panel-body">
+            <label>name</label>
+            <input type="text" id="vf-edit-name" disabled
+                class="bg-gray-50">
+            <label>agent_role</label>
+            <input type="text" id="vf-edit-role" disabled
+                class="bg-gray-50">
+            <label>action</label>
+            <input type="text" id="vf-edit-action" disabled
+                class="bg-gray-50">
+            <label>depends_on (read-only this iteration)</label>
+            <input type="text" id="vf-edit-deps" disabled
+                class="bg-gray-50">
+            <label>skill (optional)</label>
+            <input type="text" id="vf-edit-skill" disabled
+                class="bg-gray-50">
+            <label>output_path (optional)</label>
+            <input type="text" id="vf-edit-output-path" disabled
+                class="bg-gray-50">
+            <label>params_template (JSON)</label>
+            <textarea id="vf-edit-params" disabled
+                class="bg-gray-50 font-mono text-xs"></textarea>
+        </div>
+        <p class="text-xs text-gray-400 mt-3">
+            Phase 1.3 will make these fields editable. For now use
+            "Edit as JSON" above to change step details.
+        </p>
+    </div>
+</div>
+
+{# Save status banner — top right. #}
+<div class="vf-save-banner" id="vf-save-banner"></div>
+
+{% endblock %}

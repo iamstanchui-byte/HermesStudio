@@ -1166,6 +1166,64 @@ async def workflow_detail_page(workflow_id: str, request: Request) -> HTMLRespon
     )
 
 
+@router.get("/workflows/{workflow_id}/visual", response_class=HTMLResponse)
+async def workflow_visual_page(workflow_id: str, request: Request) -> HTMLResponse:
+    """Visual workflow builder (Phase 1 of visual-builder rollout, 2026-07-24).
+
+    Renders the workflow as a drawflow canvas of cards + edges. The user
+    can drag-reorder, drag-wire (depends_on), edit a step's metadata in
+    a side panel, add a step from a 4-template palette, and Save
+    (PUT /api/workflows/{id}) to persist.
+
+    The text edit form on `workflow_detail.html` is hidden by default
+    per Q4 (c) of the visual-builder design review — accessible via
+    a small "Edit as JSON" link in the corner of this page.
+    """
+    import json as _json
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        # Try by name (consistent with the text detail page above)
+        row = await db.fetchone(
+            "SELECT * FROM workflow_packages WHERE name = ?", (workflow_id,)
+        )
+    if not row:
+        return HTMLResponse(
+            f"<h1>Workflow not found</h1><p>{workflow_id}</p>",
+            status_code=404,
+        )
+    d = dict(row)
+    # Parse step_template + variables into Python objects so the
+    # template's `| tojson` filter encodes them as JSON arrays (not
+    # JSON-encoded strings). The JS does a single JSON.parse.
+    try:
+        d["step_template"] = _json.loads(d.get("step_template") or "[]")
+    except Exception:
+        d["step_template"] = []
+    try:
+        d["variables"] = _json.loads(d.get("variables") or "[]")
+    except Exception:
+        d["variables"] = []
+    # Pretty-printed for the "Edit as JSON" toggle (Phase 1.5).
+    d["step_template_pretty"] = _json.dumps(
+        d["step_template"], indent=2, ensure_ascii=False
+    )
+    d["variables_pretty"] = _json.dumps(
+        d["variables"], indent=2, ensure_ascii=False
+    )
+    d["step_count"] = len(d["step_template"]) if isinstance(d["step_template"], list) else 0
+    return templates.TemplateResponse(
+        request=request,
+        name="visual_workflow.html",
+        context={
+            **_base_context(request, "workflows"),
+            "workflow": d,
+        },
+    )
+
+
 @router.get("/history", response_class=HTMLResponse)
 async def history_page(
     request: Request,

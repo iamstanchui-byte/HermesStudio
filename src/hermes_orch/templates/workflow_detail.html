@@ -14,6 +14,11 @@
         {% endif %}
     </div>
     <div class="flex gap-2">
+        <a href="/workflows/{{ workflow.id }}/visual"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-blue-300 text-blue-700 hover:bg-blue-50"
+            title="Open the visual workflow builder (Phase 1 of visual builder, 2026-07-24)">
+            Open visual editor
+        </a>
         <button onclick="deleteWorkflow()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-red-300 text-red-700 hover:bg-red-50"
             title="Permanently delete this workflow package. Source project is NOT touched.">
