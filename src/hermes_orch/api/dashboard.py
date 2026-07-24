@@ -313,7 +313,21 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
 
 
 async def _load_profile_skills(db: Any, profile_id: str) -> list[dict[str, Any]]:
-    """Return latest version of each skill for a profile, ordered by name.
+    """Return latest version of each skill for a profile.
+
+    Sort order: flat skills first (alphabetical), then subfolder
+    skills (alphabetical by category then name). The CASE in the
+    ORDER BY groups flat (0) and subfolder (1) separately so
+    subfolder skills don't appear at the top of the list just
+    because "apple/..." sorts before "browser-automation"
+    alphabetically. The file_path ASC tiebreak keeps each group
+    in canonical name order within itself.
+
+    The same sort is applied in agents.py:list_skills; keep them
+    in sync so the API and the HTML page show the same order.
+    User requested this on 2026-07-24 — the previous ORDER BY
+    file_path ASC mixed flat and subfolder alphabetically which
+    made the list hard to scan when there are 80+ skills.
 
     A skill is `profile_configs.file_path` of the form `skills/<name>/SKILL.md`
     (hermes 0.17+ folder layout; flat `skills/<name>.md` was dropped in
@@ -324,7 +338,8 @@ async def _load_profile_skills(db: Any, profile_id: str) -> list[dict[str, Any]]
     rows = await db.fetchall(
         "SELECT * FROM profile_configs WHERE profile_id = ? "
         "AND file_path LIKE 'skills/%/SKILL.md' "
-        "ORDER BY file_path ASC, created_at DESC",
+        "ORDER BY (CASE WHEN file_path LIKE 'skills/%/%/SKILL.md' THEN 1 ELSE 0 END), "
+        "file_path ASC, created_at DESC",
         (profile_id,),
     )
     seen: set[str] = set()
