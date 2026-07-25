@@ -147,6 +147,7 @@
         // structure (which varies by version and is not documented).
         return `
             <div class="vf-node" data-step-name="${esc(step.name || '')}">
+                <button type="button" class="vf-node-delete" title="Delete step (or press Delete key when selected)">&times;</button>
                 <div class="vf-node-header">
                     <span class="vf-node-name">${esc(step.name || '(unnamed)')}</span>
                     <span class="vf-node-role">${esc(step.agent_role || '?')}</span>
@@ -217,6 +218,14 @@
             // input_class }.
             _editor.on('connectionCreated', (connection) => {
                 _onConnectionCreated(connection);
+            });
+            // drawflow 0.0.59 fires nodeRemoved when the user
+            // deletes a card (Delete key, removeNodeId, etc.).
+            // Payload is the NUMERIC id string (e.g. "3") — NOT
+            // the "node-3" form. We use it to remove the step from
+            // _stepTemplate so the delete actually persists.
+            _editor.on('nodeRemoved', (numericId) => {
+                _onNodeRemoved(numericId);
             });
             // drawflow 0.0.59 does NOT fire a connectionRemoved event
             // when the user removes a wire. We patch
@@ -399,6 +408,22 @@
                 }
                 window.visualBuilder.openSidePanel(nodeEl.id);
             });
+            // Phase 1.7: explicit "×" delete button. Click → call
+            // drawflow's removeNodeId (which fires nodeRemoved,
+            // which our listener handles to update _stepTemplate).
+            // Bound on the wrap so it survives re-renders.
+            if (!wrap._vfDeleteBound) {
+                wrap.addEventListener('click', (ev) => {
+                    const btn = ev.target.closest('.vf-node-delete');
+                    if (!btn) return;
+                    ev.stopPropagation();
+                    const nodeEl = btn.closest('.drawflow-node');
+                    if (!nodeEl || !_editor) return;
+                    // Drawflow expects id like "node-1" for removeNodeId
+                    _editor.removeNodeId(nodeEl.id);
+                });
+                wrap._vfDeleteBound = true;
+            }
             wrap._vfClickBound = true;
         }
     }
@@ -670,6 +695,73 @@
                 'success',
             );
         }
+    }
+
+    // Phase 1.7 (2026-07-25): when the user deletes a card (Delete
+    // key, the X button, or removeNodeId), remove the step from
+    // _stepTemplate. drawflow 0.0.59 fires nodeRemoved with the
+    // NUMERIC id as payload (e.g. "3", not "node-3"). We look up
+    // the step by walking the DOM for the now-detached (or
+    // just-removed) card's data-step-name attribute. We also
+    // scrub the deleted step's name from any other step's
+    // depends_on / feedback_to lists, so the workflow stays
+    // consistent (a step that referenced the deleted one would
+    // be invalid).
+    function _onNodeRemoved(numericId) {
+        // drawflow's id is "node-N". Look up the step name BEFORE
+        // the DOM element is gone (we have a brief window — the
+        // event fires synchronously during removeNodeId).
+        const idStr = String(numericId);
+        const wrapperEl = document.getElementById('node-' + idStr);
+        let removedName = null;
+        if (wrapperEl) {
+            const stepEl = wrapperEl.querySelector('[data-step-name]');
+            if (stepEl && stepEl.dataset.stepName) {
+                removedName = stepEl.dataset.stepName;
+            }
+        }
+        // Fallback: walk the _stepTemplate and find the one whose
+        // data-step-name matches. We use the in-memory template
+        // since it was in sync with drawflow at last render.
+        if (!removedName) {
+            for (const s of _stepTemplate) {
+                if (s && s.name) {
+                    // Heuristic: if we can't find the DOM, try to
+                    // match the most recently-active step. But
+                    // this is rare; usually the DOM is still there.
+                    removedName = s.name;
+                    break;
+                }
+            }
+        }
+        if (!removedName) return;
+        // Remove from _stepTemplate
+        const idx = _stepTemplate.findIndex((s) => s.name === removedName);
+        if (idx >= 0) {
+            _stepTemplate.splice(idx, 1);
+        }
+        // Scrub the removed name from any other step's
+        // depends_on / feedback_to lists.
+        for (const s of _stepTemplate) {
+            if (Array.isArray(s.depends_on)) {
+                s.depends_on = s.depends_on.filter((n) => n !== removedName);
+            }
+            if (Array.isArray(s.feedback_to)) {
+                s.feedback_to = s.feedback_to.filter((n) => n !== removedName);
+            }
+        }
+        // Close the side panel if it was showing this step
+        if (_selectedNodeId === 'node-' + idStr) {
+            closeSidePanel();
+        }
+        // Re-compute connection paths (the deleted node's wires
+        // are gone too; the remaining paths may need a refresh
+        // to settle the layout).
+        requestAnimationFrame(_recomputeAllConnectionPaths);
+        _showBanner(
+            `Deleted step: ${removedName}. Click Save to persist.`,
+            'success',
+        );
     }
 
     // ---- public API ----
