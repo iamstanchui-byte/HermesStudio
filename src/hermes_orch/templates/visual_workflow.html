@@ -366,6 +366,13 @@
                 <span class="font-mono text-[10px]">red handle</span>
                 to draw a loop-back. Empty = no re-run on failure.
             </p>
+            <p class="text-xs text-amber-700 mt-1 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                <strong>Heads up:</strong> loop-back only fires if the
+                spawned project has <code>max_iterations &gt; 0</code>.
+                Default is <strong>3</strong> when run via the workflow
+                detail page (set to 0 to disable). Older runs defaulted
+                to 0, which silently ignored feedback_to.
+            </p>
             <label>params_template (JSON)</label>
             <textarea id="vf-edit-params"
                 class="font-mono text-xs"></textarea>

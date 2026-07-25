@@ -1066,6 +1066,13 @@ async def delete_workflow(workflow_id: str, request: Request) -> dict:
 class WorkflowRunBody(BaseModel):
     variables: dict[str, Any] = Field(default_factory=dict)
     project_name: str | None = None  # override project name (default: workflow name)
+    # 2026-07-25: gap fix. Without this, the spawned project always
+    # gets max_iterations=0 (the hardcoded safe default), and the
+    # supervisor's _maybe_loop_back returns False fast — meaning any
+    # step.feedback_to in the workflow silently does nothing. Operator
+    # can override here (3 is a sensible default; the supervisor caps
+    # at 3 by convention so the project can't loop forever).
+    max_iterations: int = 3
 
 
 def _substitute_variables(value: Any, vars_provided: dict[str, Any]) -> Any:
@@ -1270,7 +1277,7 @@ async def run_workflow(
                 "coordinator_role": "",  # not iterative
                 "accept_criteria": "",
                 "deliverable_path": "",
-                "max_iterations": 0,
+                "max_iterations": body.max_iterations,  # 2026-07-25: was hardcoded 0, see WorkflowRunBody
                 "current_iteration": 0,
                 "last_iteration_summary": "",
                 "source_workflow_id": row["id"],  # Stage 2b: link back

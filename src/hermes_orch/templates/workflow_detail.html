@@ -122,6 +122,30 @@
             placeholder="default: {{ workflow.name }} run @ &lt;timestamp&gt;"
             class="block w-full border rounded px-2 py-1 text-sm font-mono">
 
+        <div class="mt-4 border-t pt-3">
+            <label class="block text-sm font-medium text-gray-700 mb-1">
+                Loop-back cap
+                <span class="text-xs text-gray-400 font-normal"
+                    title="How many times the supervisor should re-dispatch upstream steps when a feedback_to target fails. 0 disables loop-back entirely (any step.feedback_to becomes a no-op). Default 3 — enough to recover from 1-2 transient failures, low enough to prevent infinite loops.">
+                    (?)
+                </span>
+            </label>
+            <select id="run-max-iterations" class="block w-full border rounded px-2 py-1 text-sm">
+                <option value="0">0 (disable loop-back)</option>
+                <option value="1">1 (retry once)</option>
+                <option value="3" selected>3 (default — 2-3 retries)</option>
+                <option value="5">5 (aggressive)</option>
+                <option value="10">10 (very aggressive)</option>
+            </select>
+            <p class="text-xs text-gray-500 mt-1">
+                <strong>Set this to 3+ to make any step's
+                <code>feedback_to</code> actually fire.</strong> Default
+                of 0 (used by older runs) silently disables loop-back
+                even if you've drawn red dashed wires in the visual
+                builder.
+            </p>
+        </div>
+
         <div class="mt-4 flex items-center gap-2">
             <button id="run-submit-btn" type="submit" class="px-4 py-2 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700">
                 Run workflow
@@ -151,6 +175,11 @@ async function submitRun() {
     const body = { variables };
     const projectName = document.getElementById('run-project-name').value.trim();
     if (projectName) body.project_name = projectName;
+    // 2026-07-25: pass max_iterations so the spawned project actually
+    // fires loop-back. Without this, every run defaults to 0 and the
+    // supervisor's _maybe_loop_back returns False fast.
+    const maxIterEl = document.getElementById('run-max-iterations');
+    if (maxIterEl) body.max_iterations = parseInt(maxIterEl.value, 10);
 
     const wfId = {{ workflow.id | tojson }};
     try {
