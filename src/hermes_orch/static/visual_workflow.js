@@ -786,16 +786,72 @@
         }
         _render();
         _bindGlobalShortcuts();
-        // Bind palette chip clicks (Phase 1.4: stub — appends a blank step)
+        // Phase 1.4 (2026-07-25): click a palette chip to add a
+        // step + auto-place at the next Y slot + auto-wire to
+        // the last step (chain mode). Most workflows are linear
+        // pipelines (search → analyze → write), so chain mode
+        // covers the common case. If the user wants tree/branch,
+        // they can re-wire after the chip click (the new card
+        // starts with depends_on=[last] but the user can
+        // edit the panel to clear or add more).
+        //
+        // The auto-wire fires drawflow's addConnection which
+        // triggers our connectionCreated listener (Phase 1.2)
+        // which adds the source name to target.depends_on. We
+        // also pre-set depends_on BEFORE addConnection so the
+        // /save PATCH is correct even if the addConnection
+        // event fires before the listener is bound (race).
         document.querySelectorAll('.vf-palette-chip').forEach((chip) => {
             chip.addEventListener('click', () => {
                 const tmpl = chip.dataset.template;
                 const newStep = _newStepFromTemplate(tmpl);
+                // Pre-wire: depends_on = [last step's name]
+                // (chain mode). Skip if no prior step.
+                const lastStep = _stepTemplate.length > 0
+                    ? _stepTemplate[_stepTemplate.length - 1]
+                    : null;
+                if (lastStep) {
+                    newStep.depends_on = [lastStep.name];
+                }
                 _stepTemplate.push(newStep);
                 _render();
-                _showBanner(`Added step: ${newStep.name}`, 'success');
+                // After _render, drawflow has the new card but
+                // not the visual edge. Add it explicitly so the
+                // user sees the chain immediately.
+                if (lastStep) {
+                    const allNodes = _getAllNodes();
+                    const targetId = _findNodeIdByStepName(newStep.name, allNodes);
+                    const sourceId = _findNodeIdByStepName(lastStep.name, allNodes);
+                    if (targetId && sourceId) {
+                        try {
+                            _editor.addConnection(sourceId, targetId, 'output_1', 'input_1');
+                        } catch (e) {
+                            // Duplicate or other addConnection issue
+                            // (non-fatal; depends_on is already set)
+                            console.warn('auto-wire addConnection failed:', e.message);
+                        }
+                    }
+                }
+                _showBanner(
+                    `Added step: ${newStep.name}` +
+                    (lastStep ? ` (auto-wired from ${lastStep.name}). Click Save to persist.` : '. Click Save to persist.'),
+                    'success'
+                );
             });
         });
+    }
+
+    // Find drawflow's node id (e.g. "node-7") for a step name.
+    // Used by auto-wire after a render where the new cards are
+    // already on the canvas but the connection hasn't been drawn
+    // yet.
+    function _findNodeIdByStepName(stepName, allNodes) {
+        for (const [id, node] of Object.entries(allNodes)) {
+            if (node && node.data && node.data.name === stepName) {
+                return id;
+            }
+        }
+        return null;
     }
 
     function _newStepFromTemplate(tmpl) {
