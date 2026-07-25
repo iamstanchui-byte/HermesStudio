@@ -1778,7 +1778,7 @@ function renderSuggestion(s, idx, messageId) {
             <div class="font-medium text-gray-800">${escapeHtml(label)}</div>
             <div class="text-gray-500 truncate" title="${escapeHtml(desc)}">${escapeHtml(desc)}</div>
         </div>
-        <button onclick="applySuggestion(${messageId || 0}, ${idx})"
+        <button onclick="applySuggestion(${messageId || 0}, ${idx}, event)"
             class="px-2 py-0.5 bg-green-600 text-white rounded text-xs hover:bg-green-700 shrink-0">
             Apply
         </button>
@@ -1839,11 +1839,12 @@ async function sendChatMessage() {
     }
 }
 
-async function applySuggestion(messageId, suggestionIdx) {
-    // Find the suggestion in the current messages list
-    const messages = document.querySelectorAll('#chat-messages > div');
-    // We need the raw data; easier to just call /chat again? No,
-    // we stored the data in DOM. Re-fetch from server to be safe.
+async function applySuggestion(messageId, suggestionIdx, ev) {
+    // IMPORTANT: capture the clicked button BEFORE the first await.
+    // The original `event` object is lost across async boundaries
+    // in older browsers / strict mode. Pass `ev` from the inline
+    // onclick (we read ev.currentTarget) and stash it for later.
+    const btn = ev ? (ev.currentTarget || ev.target) : null;
     try {
         const r = await _fetchWithTimeout(`/api/projects/${PROJECT_ID}/chat`, {}, 10000);
         if (!r.ok) return;
@@ -1876,9 +1877,11 @@ async function applySuggestion(messageId, suggestionIdx) {
         }
         status.textContent = 'Applied: ' + (adata.type || '?');
         status.className = 'text-xs text-green-600 mt-1 h-4';
-        // Mark the suggestion as applied in the UI
-        event.target.disabled = true;
-        event.target.textContent = '✓ Applied';
+        // Mark the suggestion as applied in the UI (using stashed btn)
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = '✓ Applied';
+        }
         // Reload page to show new state if it was create_task / run / replan
         setTimeout(() => location.reload(), 1500);
     } catch (e) {

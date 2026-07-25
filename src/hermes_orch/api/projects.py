@@ -2266,8 +2266,28 @@ async def apply_chat_suggestion(
         action = (s.get("action") or "").strip()
         if not action:
             raise HTTPException(400, "create_task suggestion missing 'action'")
-        # agent_role defaults to a known profile if missing
-        if not agent_role:
+        # agent_role: validate if provided, default to first if not.
+        # LLM can invent non-existent profile names; we reject with
+        # a clear error + a list of available names so the user can
+        # either pick one or re-ask the assistant.
+        if agent_role:
+            prof = await db.fetchone(
+                "SELECT id FROM agent_profiles WHERE name = ?",
+                (agent_role,),
+            )
+            if not prof:
+                available = await db.fetchall(
+                    "SELECT name FROM agent_profiles ORDER BY name"
+                )
+                names = [p["name"] for p in available]
+                raise HTTPException(
+                    400,
+                    f"agent_role '{agent_role}' is not a registered profile. "
+                    f"Available profiles: {names}. Either pick one and re-ask the "
+                    f"assistant, or click 'Apply' again with no agent_role to "
+                    f"default to the first one ({names[0] if names else 'none'}).",
+                )
+        else:
             profiles = await db.fetchall(
                 "SELECT name FROM agent_profiles ORDER BY name LIMIT 1"
             )
