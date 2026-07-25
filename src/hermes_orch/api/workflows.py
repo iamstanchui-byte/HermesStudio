@@ -1115,6 +1115,13 @@ def _validate_run_variables(
     - `typecast_values` is `provided` with type conversions applied
       (e.g. "true" -> True for boolean, "5" -> 5 for number).
 
+    2026-07-25: also reject unknown provided variables (typo trap).
+    Previously the comment said 'allow extra provided vars ... but only
+    declared ones are used' — this caused a silent-no-op bug where a
+    user typo like `gdrive_folder_idd` instead of `gdrive_folder_id`
+    was silently dropped, the real var got its default, and the task
+    failed with empty params. Now we fail loud.
+
     Type coercion rules:
       - string: as-is
       - number: int(value) if it's a string that parses, else float
@@ -1175,8 +1182,11 @@ def _validate_run_variables(
                 out[vname] = str(val)
         except Exception as e:
             return False, f"variable {vname!r} (type={vtype}) coercion failed: {e}", {}
-    # Allow extra provided vars (operator can override at run time),
-    # but only declared ones are used in substitution.
+    # Reject unknown provided variables (typo trap — see docstring).
+    declared_names = {v.get("name") for v in declared}
+    unknown = set(provided.keys()) - declared_names
+    if unknown:
+        return False, f"unknown variable(s) provided: {sorted(unknown)}; declared: {sorted(declared_names)}", {}
     return True, "", out
 
 
