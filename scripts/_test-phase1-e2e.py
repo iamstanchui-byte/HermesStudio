@@ -93,7 +93,14 @@ while time.time() < deadline:
     r = client.get(f"{base}/api/tasks?project_id={proj_id}", headers=auth())
     tasks_payload = r.json() if r.status_code == 200 else {}
     tasks = tasks_payload.get("tasks", []) if isinstance(tasks_payload, dict) else tasks_payload
-    sig = " | ".join(f"{t['name'][:18]}:{t['status'][:4]}" for t in tasks)
+    # 2026-07-25: defensive filter — if any task entry isn't a dict
+    # (e.g. an API regression that returns strings or other shapes),
+    # skip it instead of crashing the poll loop. The sig line is
+    # best-effort; the canonical task state is the API response.
+    sig = " | ".join(
+        f"{t['name'][:18]}:{t['status'][:4]}"
+        for t in tasks if isinstance(t, dict) and 'name' in t and 'status' in t
+    )
 
     # facts.md
     facts = read_facts(proj_id) or ""
@@ -141,8 +148,14 @@ print("=" * 60)
 r = client.get(f"{base}/api/tasks?project_id={proj_id}", headers=auth())
 payload = r.json()
 final_tasks = payload.get("tasks", []) if isinstance(payload, dict) else payload
+# Defensive: skip non-dict entries (same fix as the poll loop)
 for t in final_tasks:
-    print(f"  {t['id']:30s} {t['status']:10s} {t['name']}")
+    if not isinstance(t, dict):
+        continue
+    tid = t.get("id", "?")
+    tstatus = t.get("status", "?")
+    tname = t.get("name", "?")
+    print(f"  {tid:30s} {tstatus:10s} {tname}")
 
 print()
 print(f"Project: {proj_id}")
