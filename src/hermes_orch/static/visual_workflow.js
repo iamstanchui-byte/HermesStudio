@@ -271,13 +271,16 @@
                 // auto-generates class names "input_1", "input_2",
                 // ... and "output_1", "output_2", ... on the
                 // rendered elements. We pass 1 each so each card
-                // has one input handle (left) and one output handle
-                // (right). CSS in visual_workflow.html targets the
-                // .input_1 / .output_1 classes.
+                // has one input handle (left) and TWO output handles
+                // (right): output_1 for normal depends_on chain, and
+                // output_2 for the loop-back (feedback_to) edge —
+                // styled red dashed so the two kinds are visually
+                // distinct. CSS in visual_workflow.html targets the
+                // .output_2 class for the loop-back style.
                 _editor.addNode(
                     step.name,         // 1: name
                     1,                 // 2: number of inputs
-                    1,                 // 3: number of outputs
+                    2,                 // 3: number of outputs (1 normal + 1 loop-back)
                     x,                 // 4: posx
                     y + i * dy,        // 5: posy
                     'vf-node',         // 6: classoverride
@@ -289,6 +292,24 @@
             console.error('visual_workflow: addNode failed:', e);
             _showInitError(e);
             return;
+        }
+
+        // Phase 2: add tooltips to the two output handles so the
+        // user can tell them apart. drawflow creates the .output_1
+        // and .output_2 divs inside each .drawflow-node but doesn't
+        // add title attributes; we do it here after addNode returns.
+        // The hint tells the user: output_1 is the normal chain
+        // edge (sets target.depends_on), output_2 is the loop-back
+        // edge (sets target.feedback_to, red dashed).
+        try {
+            for (const el of wrap.querySelectorAll('.drawflow-node')) {
+                const o1 = el.querySelector('.output_1');
+                const o2 = el.querySelector('.output_2');
+                if (o1) o1.title = 'chain (depends_on)';
+                if (o2) o2.title = 'loop-back (feedback_to)';
+            }
+        } catch (e) {
+            console.warn('tooltip assignment failed (non-fatal):', e.message);
         }
 
         // Wire depends_on: for each step B with deps ["A","C"], find
@@ -312,6 +333,14 @@
             _stepTemplate.forEach((step) => {
                 const targetNumeric = nameToNumericId[step.name];
                 if (!targetNumeric) return;
+                // Phase 2: depends_on uses output_1 (chain edge,
+                // default styling). feedback_to uses output_2
+                // (loop-back edge, red dashed). The
+                // _onConnectionCreated handler does NOT need to
+                // be re-fired on initial render (the data is
+                // already in _stepTemplate), so we don't pass
+                // a flag to skip the event — we just rely on
+                // the handler's "already there" dedup check.
                 (step.depends_on || []).forEach((depName) => {
                     const sourceNumeric = nameToNumericId[depName];
                     if (!sourceNumeric) return;
@@ -321,8 +350,19 @@
                             'output_1', 'input_1',
                         );
                     } catch (e) {
-                        // Suppress: edges are a nice-to-have, not critical
-                        console.warn(`addConnection(${sourceNumeric}->${targetNumeric}) failed:`, e.message);
+                        console.warn(`addConnection(chain ${sourceNumeric}->${targetNumeric}) failed:`, e.message);
+                    }
+                });
+                (step.feedback_to || []).forEach((fbName) => {
+                    const sourceNumeric = nameToNumericId[fbName];
+                    if (!sourceNumeric) return;
+                    try {
+                        _editor.addConnection(
+                            sourceNumeric, targetNumeric,
+                            'output_2', 'input_1',
+                        );
+                    } catch (e) {
+                        console.warn(`addConnection(loop-back ${sourceNumeric}->${targetNumeric}) failed:`, e.message);
                     }
                 });
             });
@@ -637,14 +677,25 @@
         return { sourceId, targetId, sourceClass, targetClass };
     }
 
-    // Phase 1.2: when the user wires two cards (drag from card A's
-    // output handle to card B's input handle), add A's name to B's
-    // depends_on. We DON'T add B to A.depends_on — that's the wrong
-    // direction. depends_on is "I depend on these earlier steps".
-    // Note: We do NOT add a self-reference. Drawing an edge from
-    // A back to A is a common user mistake; we silently ignore it.
+    // Phase 1.2 + Phase 2: when the user wires two cards, route
+    // the wire to the right field based on the source's output
+    // class:
+    //   output_1 (normal):  target.depends_on += [source]
+    //   output_2 (feedback): target.feedback_to += [source]
+    // Both go in the same direction (source's name added to
+    // target's list), but feedback_to is the loop-back signal:
+    // "if I (target) need to be re-run because of a failure,
+    // listen for source's failure." The visual wire from
+    // output_2 is red dashed so the two edge kinds are
+    // distinguishable at a glance.
+    //
+    // We do NOT add a self-reference. Drawing an edge from A
+    // back to A is a common user mistake; we silently ignore
+    // it (the server-side validator would reject it on save
+    // anyway, but we drop the in-memory state too so the next
+    // save doesn't try to persist a forbidden ref).
     function _onConnectionCreated(connection) {
-        const { sourceId, targetId } = _normalizeConnection(connection);
+        const { sourceId, targetId, sourceClass } = _normalizeConnection(connection);
         const sourceName = _getConnectionEndpointName(sourceId);
         const targetName = _getConnectionEndpointName(targetId);
         if (!sourceName || !targetName) {
@@ -652,10 +703,6 @@
             return;
         }
         if (sourceName === targetName) {
-            // Self-reference: drop the connection visually (the
-            // user probably didn't mean it) and don't update state.
-            // We can't undo the addConnection from here easily,
-            // but the next save will reject it via validator.
             console.warn('connectionCreated: ignored self-reference', sourceName);
             return;
         }
@@ -664,11 +711,15 @@
             console.warn('connectionCreated: target step not in template', targetName);
             return;
         }
-        if (!Array.isArray(target.depends_on)) target.depends_on = [];
-        if (!target.depends_on.includes(sourceName)) {
-            target.depends_on.push(sourceName);
+        // output_2 = feedback_to (Phase 2 loop-back). output_1 = depends_on.
+        const isFeedback = sourceClass === 'output_2';
+        const fieldName = isFeedback ? 'feedback_to' : 'depends_on';
+        const edgeLabel = isFeedback ? 'loop-back' : 'chain';
+        if (!Array.isArray(target[fieldName])) target[fieldName] = [];
+        if (!target[fieldName].includes(sourceName)) {
+            target[fieldName].push(sourceName);
             _showBanner(
-                `Wired ${sourceName} -> ${targetName}. Click Save to persist.`,
+                `Wired ${sourceName} --${edgeLabel}--> ${targetName}. Click Save to persist.`,
                 'success',
             );
         }
@@ -681,17 +732,22 @@
     // add). We wrap _editor.removeConnection in the init block to
     // call this handler manually.
     function _onConnectionRemoved(connection) {
-        const { sourceId, targetId } = _normalizeConnection(connection);
+        const { sourceId, targetId, sourceClass } = _normalizeConnection(connection);
         const sourceName = _getConnectionEndpointName(sourceId);
         const targetName = _getConnectionEndpointName(targetId);
         if (!sourceName || !targetName) return;
         const target = _stepTemplate.find((s) => s.name === targetName);
-        if (!target || !Array.isArray(target.depends_on)) return;
-        const i = target.depends_on.indexOf(sourceName);
+        if (!target) return;
+        // output_2 = feedback_to; output_1 = depends_on. Route
+        // unwire to the same field the wire originally wrote.
+        const fieldName = sourceClass === 'output_2' ? 'feedback_to' : 'depends_on';
+        const edgeLabel = sourceClass === 'output_2' ? 'loop-back' : 'chain';
+        if (!Array.isArray(target[fieldName])) return;
+        const i = target[fieldName].indexOf(sourceName);
         if (i >= 0) {
-            target.depends_on.splice(i, 1);
+            target[fieldName].splice(i, 1);
             _showBanner(
-                `Unwired ${sourceName} -/-> ${targetName}. Click Save to persist.`,
+                `Unwired ${sourceName} -/-> ${targetName} (${edgeLabel}). Click Save to persist.`,
                 'success',
             );
         }

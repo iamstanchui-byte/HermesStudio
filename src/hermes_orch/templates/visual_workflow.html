@@ -108,13 +108,54 @@
     }
     .vf-node { position: relative; } /* anchor for the absolute delete button */
     /* drawflow auto-generates these classes for connection points
-       (when n_inputs=1, the only input is .input_1; same for
-       output_1). Phase 1.2 wire/unwire uses these. */
+       (when n_inputs=1, the only input is .input_1; for n_outputs=2
+       the outputs are .output_1 + .output_2). Phase 1.2 wire/unwire
+       uses .input_1 / .output_1. Phase 2 loop-back uses .output_2
+       (red dashed, signals feedback_to not depends_on). */
     .input_1, .output_1 {
         width: 12px !important;
         height: 12px !important;
         background: #6b7280 !important;
         border: 2px solid #fff !important;
+    }
+    /* Phase 2: loop-back handle (output_2). Red, dashed border,
+       positioned LOWER on the right side so the two outputs are
+       visually distinct. drawflow's default puts both outputs at
+       top:50% which would overlap; we override to 70% (closer to
+       bottom) and offset right by 0px. */
+    .drawflow .drawflow-node .output_2 {
+        background: #dc2626 !important;
+        border: 2px dashed #fca5a5 !important;
+        top: 70% !important;
+        right: -4px !important;
+    }
+    .drawflow .drawflow-node .output_2::after {
+        content: "↻";
+        position: absolute;
+        top: -2px;
+        right: -16px;
+        font-size: 10px;
+        color: #dc2626;
+        font-weight: bold;
+        pointer-events: none;
+    }
+    /* Phase 2: loop-back connection (output_2 source). Red dashed
+       stroke to match the handle color. The CSS class on the
+       connection SVG includes the output class name. */
+    svg.connection.output_2 .main-path {
+        stroke: #dc2626;
+        stroke-width: 1.5;
+        stroke-dasharray: 5 3;
+    }
+    /* Tooltip hint: the user might not know the difference
+       between output_1 (chain) and output_2 (loop-back). Add a
+       subtle hint on the handle via CSS title attr (set by JS in
+       _stepToCardHtml below). */
+    .drawflow .drawflow-node .output_1:hover {
+        background: #374151 !important;
+    }
+    .drawflow .drawflow-node .output_2:hover {
+        background: #b91c1c !important;
     }
     /* Hide drawflow's default delete button (we use the side panel) */
     .drawflow-node .btn-delete { display: none !important; }
