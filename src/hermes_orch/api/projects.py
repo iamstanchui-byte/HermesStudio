@@ -1810,3 +1810,583 @@ async def apply_soul_presets(
     )
     return written
 
+
+# ===== Project chat box (Phase 4+ #25, 2026-07-25) =====
+#
+# The project page now has an LLM chat assistant that can:
+#   1. Analyze the project's current state (tasks + audit summary)
+#   2. Generate a list of workflow steps (LLM-suggested tasks for
+#      the user to add manually)
+#   3. Identify which tasks are "script-able" (don't need an LLM
+#      agent; can be a small Python script the operator runs
+#      directly, saving tokens)
+#   4. Look at recent task results and suggest next steps
+#
+# Architecture: the chat is a per-project running conversation.
+# Each turn is stored in `project_chat_messages` (role, content,
+# optional structured suggestions). The endpoint calls the same
+# MiniMax M3 endpoint as everything else (cfg.llm). The
+# suggestions are extracted from a fenced JSON block the LLM
+# emits at the end of its response (if it has concrete actions
+# to propose). The user clicks "Apply" on a suggestion and the
+# frontend POSTs /api/projects/{id}/chat/apply with the
+# suggestion's type + params. This keeps the LLM's tool-calls
+# server-side: the assistant can suggest a structure, the user
+# confirms, and the action runs through the normal API.
+
+# System prompt for the chat assistant. Kept terse — the LLM
+# already knows what a project is, so we just remind it of the
+# project-page context and the 4 capabilities.
+_CHAT_SYSTEM_PROMPT = """\
+You are the orchestrator chat assistant for a single project in
+hermes-orchestrator. The operator sees you as a panel in the
+project page. They can ask you to:
+
+  1. ANALYZE project status (read-only summary of tasks +
+     recent audit events)
+  2. GENERATE workflow steps (return a list of suggested tasks
+     the operator can add with one click)
+  3. IDENTIFY script-able tasks (which current/pending tasks
+     could be done by a small Python script instead of an LLM
+     agent, saving tokens)
+  4. SUGGEST next steps (after a task completes, what should
+     happen next, given the project's goal)
+
+You will see a JSON snapshot of the project (goal, state, tasks
+with status/result, recent audit events) before each user
+message. Use it to ground every response.
+
+Output rules:
+  - Plain markdown, 1-15 lines, terse.
+  - If you have CONCRETE actions to propose (create tasks, run,
+    re-plan, etc.), end with EXACTLY ONE fenced JSON block:
+    ```json
+    {"suggestions": [{"type": "create_task", "name": "...", ...}]}
+    ```
+  - If the user just asks a question (no concrete action), no
+    JSON block. Just answer.
+  - Never suggest actions you don't have a type for. The
+    allowed types are: create_task, run, replan.
+
+Allowed suggestion types (all optional, only when relevant):
+  - create_task: {type, name, agent_role, action, params (dict, optional), depends_on (list of names, optional)}
+  - run: {type, note: "click Run to dispatch pending tasks"}
+  - replan: {type, goal: "<updated goal text>"}
+
+Do not invent other fields. The frontend parses the JSON block
+verbatim and uses those exact fields. Keep the JSON to a single
+line if possible; no comments.
+
+Respond in the operator's language. They write in mixed Cantonese
+/ Mandarin / English; mirror their tone.
+"""
+
+
+class ChatRequest(BaseModel):
+    """Body for POST /chat."""
+    message: str  # user's current turn
+    # History is OPTIONAL. If omitted, server reads the last N
+    # messages from DB. If provided, server appends to the DB
+    # row + uses for the LLM call. Max 30 turns (defensive cap).
+    history: list[dict] | None = None  # [{role, content}, ...]
+
+
+class ChatApplyRequest(BaseModel):
+    """Body for POST /chat/apply. The frontend takes a suggestion
+    from a chat message and submits it here for execution."""
+    suggestion: dict  # the exact suggestion dict from the chat
+    # Optional: which chat message this suggestion came from
+    # (for audit). If None, we just log the action with the
+    # raw suggestion dict.
+    message_id: int | None = None
+
+
+@router.get("/{project_id}/chat")
+async def list_chat_messages(
+    project_id: str, request: Request, limit: int = 50
+) -> dict:
+    """List chat messages for a project (newest first).
+
+    Limit defaults to 50; cap at 200 to prevent OOM on a project
+    with thousands of turns. Returns the message list + a
+    `next_offset` for pagination (we use offset-based not
+    cursor-based for simplicity — the chat is small).
+    """
+    if limit > 200:
+        limit = 200
+    db = request.app.state.db
+    # Confirm project exists (404 vs empty list)
+    proj = await db.fetchone("SELECT id FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    rows = await db.fetchall(
+        "SELECT id, role, content, suggestions_json, created_at "
+        "FROM project_chat_messages WHERE project_id = ? "
+        "ORDER BY id ASC LIMIT ?",
+        (project_id, limit),
+    )
+    messages = []
+    for r in rows:
+        m = {
+            "id": r["id"],
+            "role": r["role"],
+            "content": r["content"],
+            "created_at": r["created_at"],
+        }
+        if r["suggestions_json"]:
+            try:
+                m["suggestions"] = json.loads(r["suggestions_json"])
+            except (json.JSONDecodeError, TypeError):
+                m["suggestions"] = None
+        else:
+            m["suggestions"] = None
+        messages.append(m)
+    return {"messages": messages, "count": len(messages)}
+
+
+async def _build_chat_context(project_id: str, db) -> dict:
+    """Build a JSON snapshot of the project for the LLM. Capped
+    sizes so the prompt doesn't blow up on a 100-task project."""
+    proj = await db.fetchone(
+        "SELECT id, name, goal, state, max_iterations, current_iteration "
+        "FROM projects WHERE id = ?", (project_id,),
+    )
+    if not proj:
+        return None
+    # Tasks: cap at 50 most recent (chat shouldn't need more)
+    tasks = await db.fetchall(
+        "SELECT id, name, agent_role, action, status, depends_on, "
+        "       result, error, created_at "
+        "FROM tasks WHERE project_id = ? "
+        "ORDER BY created_at DESC LIMIT 50",
+        (project_id,),
+    )
+    # Recent audit: cap at 20
+    audit = await db.fetchall(
+        "SELECT event_type, payload, created_at FROM audit_log "
+        "WHERE project_id = ? ORDER BY id DESC LIMIT 20",
+        (project_id,),
+    )
+    def _clean_result(r):
+        if not r:
+            return None
+        if isinstance(r, str):
+            try:
+                d = json.loads(r)
+                if isinstance(d, dict):
+                    return {
+                        "summary": (d.get("summary") or "")[:300],
+                        "error": (d.get("error") or "")[:200],
+                        "artifacts_count": len(d.get("artifacts") or []),
+                        "session_id": (d.get("session_id") or "")[:16] if d.get("session_id") else None,
+                    }
+            except (json.JSONDecodeError, TypeError):
+                return {"raw": r[:300]}
+        return None
+    task_list = []
+    for t in tasks:
+        dep_ids_raw = t.get("depends_on")
+        # depends_on may be a JSON string (in the tasks table) or
+        # already a list. Normalize.
+        if isinstance(dep_ids_raw, str):
+            try:
+                dep_ids = json.loads(dep_ids_raw) or []
+            except (json.JSONDecodeError, TypeError):
+                dep_ids = []
+        else:
+            dep_ids = dep_ids_raw or []
+        dep_names = []
+        if dep_ids:
+            placeholders = ",".join("?" * len(dep_ids))
+            dep_rows = await db.fetchall(
+                f"SELECT id, name FROM tasks WHERE id IN ({placeholders})",
+                tuple(dep_ids),
+            )
+            dep_names = [(r["name"] or r["id"]) for r in dep_rows]
+        task_list.append({
+            "id": t["id"],
+            "name": t["name"],
+            "agent_role": t["agent_role"],
+            "action": t["action"],
+            "status": t["status"],
+            "depends_on": dep_names,
+            "result": _clean_result(t.get("result")),
+            "error": (t.get("error") or "")[:200] if t.get("error") else None,
+        })
+    audit_list = []
+    for a in audit:
+        try:
+            payload = json.loads(a["payload"]) if a["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            payload = {"raw": (a["payload"] or "")[:200]}
+        audit_list.append({
+            "event_type": a["event_type"],
+            "summary": {k: str(v)[:200] for k, v in payload.items()},
+            "created_at": a["created_at"][:19] if a["created_at"] else None,
+        })
+    return {
+        "project": {
+            "id": proj["id"],
+            "name": proj["name"],
+            "goal": proj["goal"],
+            "state": proj["state"],
+            "max_iterations": proj["max_iterations"],
+            "current_iteration": proj["current_iteration"],
+        },
+        "tasks": task_list,
+        "audit_tail": audit_list,
+    }
+
+
+_SUGGESTION_RE = re.compile(
+    r"```json\s*\n?(.*?)\n?\s*```",
+    re.DOTALL,
+)
+
+
+def _extract_suggestions(llm_text: str) -> tuple[str, list[dict] | None]:
+    """Split LLM response into (display_text, suggestions).
+
+    Suggestions are extracted from the LAST fenced JSON block
+    in the response. The JSON must have a 'suggestions' key
+    with a list value. Everything before the JSON block is
+    shown to the user as plain markdown.
+
+    Returns (text_without_json_block, suggestions_list_or_None).
+    """
+    if not llm_text:
+        return llm_text, None
+    matches = list(_SUGGESTION_RE.finditer(llm_text))
+    if not matches:
+        return llm_text.strip(), None
+    # Use the last JSON block (LLM may have written a code
+    # example earlier; we only want the action suggestions)
+    last = matches[-1]
+    raw_json = last.group(1).strip()
+    try:
+        parsed = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        return llm_text.strip(), None
+    suggestions = parsed.get("suggestions") if isinstance(parsed, dict) else None
+    if not isinstance(suggestions, list):
+        return llm_text.strip(), None
+    # Strip the JSON block from display text
+    display = (llm_text[: last.start()] + llm_text[last.end():]).strip()
+    # Validate each suggestion has a type
+    valid = []
+    for s in suggestions:
+        if isinstance(s, dict) and isinstance(s.get("type"), str):
+            valid.append(s)
+    return display, valid or None
+
+
+@router.post("/{project_id}/chat")
+async def chat_with_project(
+    project_id: str, body: ChatRequest, request: Request
+) -> dict:
+    """Send a message to the LLM chat assistant.
+
+    Pipeline:
+      1. Build the project context snapshot (capped sizes)
+      2. Load recent chat history from DB (or use body.history)
+      3. Call LLM with system prompt + context + history + new msg
+      4. Extract suggestions (last ```json``` fenced block)
+      5. Persist user + assistant messages with suggestions
+      6. Return {message, suggestions, message_id, history_count}
+    """
+    if not body.message or not body.message.strip():
+        raise HTTPException(400, "message is required")
+    db = request.app.state.db
+    cfg = request.app.state.config
+    proj = await db.fetchone("SELECT id FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    # Build context
+    ctx = await _build_chat_context(project_id, db)
+    if ctx is None:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    # Load recent history (last 30 turns). If body.history is
+    # provided, we trust the frontend to have the right list
+    # (e.g. after the operator cleared the conversation client-
+    # side). Otherwise we read from DB.
+    history = body.history
+    if history is None:
+        rows = await db.fetchall(
+            "SELECT role, content FROM project_chat_messages "
+            "WHERE project_id = ? ORDER BY id DESC LIMIT 30",
+            (project_id,),
+        )
+        history = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    if len(history) > 30:
+        history = history[-30:]
+    # Persist user message
+    now = _now_iso()
+    await db.insert("project_chat_messages", {
+        "project_id": project_id,
+        "role": "user",
+        "content": body.message,
+        "suggestions_json": None,
+        "created_at": now,
+    })
+    # Build LLM messages
+    llm_messages = [
+        {"role": "system", "content": _CHAT_SYSTEM_PROMPT + "\n\nProject snapshot:\n" + json.dumps(ctx, ensure_ascii=False, indent=2)},
+    ]
+    for h in history:
+        role = h.get("role")
+        content = h.get("content", "")
+        if role in ("user", "assistant") and content:
+            llm_messages.append({"role": role, "content": content})
+    llm_messages.append({"role": "user", "content": body.message})
+    # LLM call
+    llm_cfg = cfg.get("llm", {})
+    base_url = (llm_cfg.get("base_url") or "https://api.minimax.io/v1").rstrip("/")
+    api_key = llm_cfg.get("api_key") or ""
+    model = llm_cfg.get("model") or "MiniMax-M3"
+    timeout = float(llm_cfg.get("timeout_seconds") or 90)
+    if not api_key:
+        raise HTTPException(
+            503, "LLM api_key not configured — set llm.api_key in config.yaml"
+        )
+    payload = {
+        "model": model,
+        "messages": llm_messages,
+        "temperature": 0.4,
+        "max_tokens": 1500,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(
+                f"{base_url}/chat/completions",
+                json=payload, headers=headers,
+            )
+        if r.status_code != 200:
+            raise HTTPException(502, f"LLM returned HTTP {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        try:
+            text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise HTTPException(502, f"LLM response shape unexpected: {e}")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(502, "LLM returned empty content")
+    except httpx.HTTPError as e:
+        log.warning(f"chat LLM call failed for {project_id}: {e}")
+        raise HTTPException(502, f"LLM unreachable: {e}")
+    # Strip <think> traces (MiniMax M3 emits them before the answer)
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    # Extract suggestions
+    display_text, suggestions = _extract_suggestions(text)
+    # Persist assistant message
+    sugg_json = json.dumps(suggestions) if suggestions else None
+    assistant_now = _now_iso()
+    cursor = await db.execute(
+        "INSERT INTO project_chat_messages "
+        "(project_id, role, content, suggestions_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (project_id, "assistant", display_text, sugg_json, assistant_now),
+    )
+    msg_id = cursor.lastrowid if hasattr(cursor, "lastrowid") else None
+    await audit_log(
+        db, "project.chat_message",
+        actor="operator",
+        project_id=project_id,
+        payload={"message_id": msg_id, "has_suggestions": bool(suggestions)},
+    )
+    return {
+        "message": display_text,
+        "suggestions": suggestions or [],
+        "message_id": msg_id,
+        "history_count": len(history) + 2,  # user + assistant just added
+    }
+
+
+@router.post("/{project_id}/chat/clear")
+async def clear_chat(project_id: str, request: Request) -> dict:
+    """Clear all chat history for a project. Audit logs the
+    clear with the count of messages removed."""
+    db = request.app.state.db
+    proj = await db.fetchone("SELECT id FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    cur = await db.execute(
+        "DELETE FROM project_chat_messages WHERE project_id = ?",
+        (project_id,),
+    )
+    removed = cur.rowcount if hasattr(cur, "rowcount") else 0
+    await audit_log(
+        db, "project.chat_cleared",
+        actor="operator",
+        project_id=project_id,
+        payload={"removed_count": removed},
+    )
+    return {"project_id": project_id, "removed": removed}
+
+
+@router.post("/{project_id}/chat/apply")
+async def apply_chat_suggestion(
+    project_id: str, body: ChatApplyRequest, request: Request
+) -> dict:
+    """Apply a structured suggestion from a chat message.
+
+    Supported types:
+      - create_task: calls /api/tasks/ with the suggestion's
+        name/agent_role/action/params/depends_on
+      - run: calls /api/projects/{id}/run (state planned -> ready)
+      - replan: calls /api/projects/{id}/replan with new goal
+
+    For create_task, depends_on names are resolved to task IDs
+    in the same project. Missing names return 400 (operator
+    can pick different names or use a workflow to get the
+    chain right).
+
+    For replan, this triggers the supervisor to call the LLM
+    planner. After it returns, the project is in 'planned' state
+    (not auto-dispatched; user clicks Run separately).
+    """
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    s = body.suggestion
+    if not isinstance(s, dict) or not isinstance(s.get("type"), str):
+        raise HTTPException(400, "suggestion must be a dict with a 'type' field")
+    stype = s["type"]
+    db = request.app.state.db
+    proj = await db.fetchone("SELECT id FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    if stype == "create_task":
+        # Build task body
+        name = (s.get("name") or "").strip()
+        agent_role = (s.get("agent_role") or "").strip()
+        action = (s.get("action") or "").strip()
+        if not action:
+            raise HTTPException(400, "create_task suggestion missing 'action'")
+        # agent_role defaults to a known profile if missing
+        if not agent_role:
+            profiles = await db.fetchall(
+                "SELECT name FROM agent_profiles ORDER BY name LIMIT 1"
+            )
+            if not profiles:
+                raise HTTPException(
+                    400,
+                    "create_task suggestion has no agent_role and no profiles are registered",
+                )
+            agent_role = profiles[0]["name"]
+        params = s.get("params") or {}
+        if not isinstance(params, dict):
+            raise HTTPException(400, "create_task suggestion 'params' must be a dict")
+        # Resolve depends_on names to ids
+        dep_names = s.get("depends_on") or []
+        if not isinstance(dep_names, list):
+            raise HTTPException(400, "create_task suggestion 'depends_on' must be a list")
+        dep_ids: list[str] = []
+        for n in dep_names:
+            if not isinstance(n, str):
+                continue
+            row = await db.fetchone(
+                "SELECT id FROM tasks WHERE project_id = ? AND name = ?",
+                (project_id, n),
+            )
+            if not row:
+                raise HTTPException(
+                    400,
+                    f"create_task: depends_on references '{n}' which doesn't exist "
+                    f"in this project. Add that task first, or remove from depends_on.",
+                )
+            dep_ids.append(row["id"])
+        # Insert task
+        import uuid as _uuid
+        task_id = "t-" + _uuid.uuid4().hex[:8]
+        now = _now_iso()
+        await db.insert("tasks", {
+            "id": task_id,
+            "project_id": project_id,
+            "name": name or None,
+            "agent_role": agent_role,
+            "action": action,
+            "depends_on": json.dumps(dep_ids),
+            "on_parent_failure": "skip",
+            "status": "pending",
+            "priority": "normal",
+            "params": json.dumps(params),
+            "retry_count": 0,
+            "max_retries": 2,
+            "timeout_seconds": 1800,
+        })
+        await audit_log(
+            db, "task.created",
+            actor="operator:chat",
+            project_id=project_id,
+            payload={"task_id": task_id, "name": name, "source": "chat_suggestion"},
+        )
+        return {"applied": True, "type": "create_task", "task_id": task_id, "name": name}
+    if stype == "run":
+        # Reuse the /run endpoint logic in-place (avoids an HTTP
+        # round-trip to ourselves). Mirrors the run_project() body.
+        project = await db.fetchone(
+            "SELECT id, state FROM projects WHERE id = ?", (project_id,),
+        )
+        cur_state = project["state"]
+        if cur_state in ("completed", "cancelled", "archived", "deleted"):
+            raise HTTPException(400, f"Cannot Run in state '{cur_state}' (terminal).")
+        if cur_state in ("ready", "running"):
+            return {"applied": True, "type": "run", "noop": True, "state": cur_state}
+        if cur_state != "planned":
+            raise HTTPException(
+                400, f"Cannot Run in state '{cur_state}'; wait for planning."
+            )
+        tc = await db.fetchone(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?", (project_id,),
+        )
+        if not tc or tc["n"] == 0:
+            raise HTTPException(400, "No tasks yet — add tasks first, then Run.")
+        await db.execute(
+            "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
+            (_now_iso(), project_id),
+        )
+        await audit_log(
+            db, "project.run_requested",
+            actor="operator:chat",
+            project_id=project_id,
+            payload={"previous_state": cur_state, "task_count": tc["n"], "source": "chat_suggestion"},
+        )
+        return {"applied": True, "type": "run", "state": "ready", "task_count": tc["n"]}
+    if stype == "replan":
+        new_goal = (s.get("goal") or "").strip()
+        if not new_goal:
+            raise HTTPException(400, "replan suggestion missing 'goal'")
+        # Reuse replan logic in-place. clear_tasks defaults True
+        # (chat is a fresh plan, not a tweak).
+        if (await db.fetchone("SELECT state FROM projects WHERE id = ?", (project_id,))) is None:
+            raise HTTPException(404, f"Project not found: {project_id}")
+        await db.execute(
+            "DELETE FROM tasks WHERE project_id = ? "
+            "AND status IN ('pending', 'assigned', 'running', 'failed', 'cancelled', 'skipped', 'interrupted')",
+            (project_id,),
+        )
+        await db.execute(
+            "UPDATE projects SET state = 'planning', current_iteration = 0, "
+            "last_iteration_summary = '', goal = ?, updated_at = ? "
+            "WHERE id = ?",
+            (new_goal, _now_iso(), project_id),
+        )
+        try:
+            dpath = _project_dir(request, project_id) / "decision.md"
+            if dpath.exists():
+                dpath.unlink()
+        except Exception:
+            pass
+        await audit_log(
+            db, "project.replan_requested",
+            actor="operator:chat",
+            project_id=project_id,
+            payload={"new_goal_preview": new_goal[:200], "source": "chat_suggestion"},
+        )
+        return {"applied": True, "type": "replan", "state": "planning", "goal": new_goal}
+    raise HTTPException(400, f"unknown suggestion type: {stype!r}. Allowed: create_task, run, replan.")
+

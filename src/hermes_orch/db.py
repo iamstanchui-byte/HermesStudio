@@ -193,6 +193,24 @@ CREATE INDEX IF NOT EXISTS idx_proj_sessions_project ON project_sessions(project
 CREATE INDEX IF NOT EXISTS idx_proj_sessions_status ON project_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_proj_sessions_last_used ON project_sessions(last_used_at);
 
+-- Phase 4+ chat box (2026-07-25): the project-page LLM chat assistant
+-- stores one row per turn. role: 'user' or 'assistant'. content: the
+-- raw markdown response. suggestions_json: optional JSON list of
+-- structured actions the assistant proposed (create_task, run, replan).
+-- CASCADE on project delete so cleanup is automatic. The chat is a
+-- per-project running conversation — no per-user identity yet.
+CREATE TABLE IF NOT EXISTS project_chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    suggestions_json TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_proj_chat_project_created
+    ON project_chat_messages(project_id, created_at);
+
 -- Per-call LLM token usage log. Every planner / synthesis / wrapper
 -- LLM call should write one row, with the prompt/completion/total
 -- token counts from the OpenAI-compatible `usage` field. The dashboard

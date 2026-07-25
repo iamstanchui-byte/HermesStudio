@@ -1638,4 +1638,285 @@ async function submitPromoteToWorkflow() {
 }
 </script>
 
+<!-- ===== Phase 4+ #25: LLM chat box (2026-07-25) =====
+     Floating panel on the right side. Toggle button in the
+     bottom-right corner. The panel slides in from the right
+     and shows a per-project running conversation with the
+     orchestrator LLM. The LLM can analyze, plan, identify
+     script-able tasks, and suggest next steps. Suggestions
+     (structured JSON) are extracted from the LLM response
+     and rendered as one-click Apply buttons. -->
+<button id="chat-toggle-btn" onclick="toggleChatPanel()"
+    class="fixed bottom-6 right-6 z-40 w-14 h-14 rounded-full bg-blue-600 text-white text-2xl shadow-lg hover:bg-blue-700 flex items-center justify-center"
+    title="Open LLM chat assistant">
+    💬
+</button>
+<div id="chat-panel" class="hidden fixed inset-y-0 right-0 z-50 w-96 max-w-full bg-white shadow-2xl border-l border-gray-200 flex flex-col">
+    <div class="flex items-center justify-between p-3 border-b border-gray-200 bg-gray-50">
+        <div>
+            <div class="font-semibold text-gray-800">💬 Orchestrator assistant</div>
+            <div class="text-xs text-gray-500">Analyzes state, plans, suggests. LLM-driven, applies only when you click.</div>
+        </div>
+        <div class="flex items-center gap-2">
+            <button onclick="clearChat()" class="text-xs text-gray-500 hover:text-red-600" title="Clear chat history">Clear</button>
+            <button onclick="toggleChatPanel()" class="text-gray-500 hover:text-gray-800 text-xl" title="Close panel">×</button>
+        </div>
+    </div>
+    <div id="chat-messages" class="flex-1 overflow-y-auto p-3 space-y-2 text-sm">
+        <div class="text-center text-gray-400 italic py-8 text-xs">
+            Ask the assistant to analyze the project, suggest tasks, identify which tasks are script-able, or recommend next steps.
+        </div>
+    </div>
+    <div class="border-t border-gray-200 p-3">
+        <div class="flex items-end gap-2">
+            <textarea id="chat-input" rows="2"
+                class="flex-1 border rounded px-2 py-1 text-sm resize-none"
+                placeholder="Ask something... (Enter to send, Shift+Enter for newline)"
+                onkeydown="if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendChatMessage(); }"></textarea>
+            <button id="chat-send-btn" onclick="sendChatMessage()"
+                class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50"
+                title="Send (Enter)">Send</button>
+        </div>
+        <div id="chat-status" class="text-xs text-gray-500 mt-1 h-4"></div>
+    </div>
+</div>
+
+<script>
+// Phase 4+ #25 (2026-07-25): LLM chat assistant
+// _fetchWithTimeout + _errDetailToString are defined in base.html now
+// (moved from project.html in commit 3bbf5aa), so they're available here.
+
+let _chatPanelOpen = false;
+
+function toggleChatPanel() {
+    const panel = document.getElementById('chat-panel');
+    _chatPanelOpen = !_chatPanelOpen;
+    if (_chatPanelOpen) {
+        panel.classList.remove('hidden');
+        if (document.getElementById('chat-messages').children.length <= 1) {
+            loadChatHistory();
+        }
+        setTimeout(() => document.getElementById('chat-input').focus(), 50);
+    } else {
+        panel.classList.add('hidden');
+    }
+}
+
+async function loadChatHistory() {
+    try {
+        const r = await _fetchWithTimeout(`/api/projects/${PROJECT_ID}/chat`, {}, 10000);
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            document.getElementById('chat-messages').innerHTML =
+                `<div class="text-red-600 text-xs">Failed to load history: ${_errDetailToString(err.detail, r.status)}</div>`;
+            return;
+        }
+        const data = await r.json();
+        renderChatMessages(data.messages || []);
+    } catch (e) {
+        if (e.name !== 'AbortError') {
+            document.getElementById('chat-messages').innerHTML =
+                `<div class="text-red-600 text-xs">Load error: ${e.message}</div>`;
+        }
+    }
+}
+
+function renderChatMessages(messages) {
+    const wrap = document.getElementById('chat-messages');
+    if (!messages.length) {
+        wrap.innerHTML = `<div class="text-center text-gray-400 italic py-8 text-xs">
+            Ask the assistant to analyze the project, suggest tasks, identify which tasks are script-able, or recommend next steps.
+        </div>`;
+        return;
+    }
+    wrap.innerHTML = '';
+    for (const m of messages) {
+        wrap.appendChild(renderChatMessage(m));
+    }
+    // Scroll to bottom
+    wrap.scrollTop = wrap.scrollHeight;
+}
+
+function renderChatMessage(m) {
+    const div = document.createElement('div');
+    if (m.role === 'user') {
+        div.className = 'bg-blue-50 border border-blue-200 rounded p-2 ml-8';
+        div.innerHTML = `<div class="text-xs text-gray-500 mb-1">You</div>
+            <div class="whitespace-pre-wrap">${escapeHtml(m.content)}</div>`;
+    } else {
+        div.className = 'bg-gray-50 border border-gray-200 rounded p-2 mr-8';
+        let html = `<div class="text-xs text-gray-500 mb-1">Assistant</div>
+            <div class="prose-sm whitespace-pre-wrap">${escapeHtml(m.content)}</div>`;
+        if (m.suggestions && m.suggestions.length) {
+            html += `<div class="mt-2 space-y-1">${m.suggestions.map((s, i) =>
+                renderSuggestion(s, i, m.id)).join('')}</div>`;
+        }
+        div.innerHTML = html;
+    }
+    return div;
+}
+
+function renderSuggestion(s, idx, messageId) {
+    const type = s.type || 'unknown';
+    let label, desc;
+    if (type === 'create_task') {
+        label = `➕ Add task: ${s.name || s.action || '(unnamed)'}`;
+        desc = `agent=${s.agent_role || '?'}, action=${s.action || '?'}` +
+            (s.depends_on && s.depends_on.length ? `, after=[${s.depends_on.join(', ')}]` : '');
+    } else if (type === 'run') {
+        label = '▶️ Run project';
+        desc = s.note || 'Dispatch all pending tasks';
+    } else if (type === 'replan') {
+        label = '✨ Replan';
+        desc = `goal: ${(s.goal || '').slice(0, 80)}${(s.goal || '').length > 80 ? '…' : ''}`;
+    } else {
+        label = `? ${type}`;
+        desc = JSON.stringify(s).slice(0, 80);
+    }
+    return `<div class="flex items-center justify-between gap-2 bg-white border border-gray-300 rounded px-2 py-1 text-xs">
+        <div class="flex-1 min-w-0">
+            <div class="font-medium text-gray-800">${escapeHtml(label)}</div>
+            <div class="text-gray-500 truncate" title="${escapeHtml(desc)}">${escapeHtml(desc)}</div>
+        </div>
+        <button onclick="applySuggestion(${messageId || 0}, ${idx})"
+            class="px-2 py-0.5 bg-green-600 text-white rounded text-xs hover:bg-green-700 shrink-0">
+            Apply
+        </button>
+    </div>`;
+}
+
+async function sendChatMessage() {
+    const input = document.getElementById('chat-input');
+    const text = input.value.trim();
+    if (!text) return;
+    const sendBtn = document.getElementById('chat-send-btn');
+    const status = document.getElementById('chat-status');
+    input.value = '';
+    sendBtn.disabled = true;
+    status.textContent = 'Sending...';
+    // Optimistic: render the user message immediately
+    const wrap = document.getElementById('chat-messages');
+    if (wrap.querySelector('.italic')) wrap.innerHTML = '';
+    wrap.appendChild(renderChatMessage({role: 'user', content: text}));
+    wrap.scrollTop = wrap.scrollHeight;
+    try {
+        const r = await _fetchWithTimeout(
+            `/api/projects/${PROJECT_ID}/chat`,
+            {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({message: text}),
+            },
+            60000,  // 60s for LLM
+        );
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            status.textContent = 'Error: ' + _errDetailToString(err.detail, r.status);
+            status.className = 'text-xs text-red-600 mt-1 h-4';
+            // Reload history to sync (in case the user message
+            // was persisted but the assistant failed)
+            loadChatHistory();
+            return;
+        }
+        const data = await r.json();
+        status.textContent = 'Sent';
+        status.className = 'text-xs text-green-600 mt-1 h-4';
+        // Append the assistant message
+        wrap.appendChild(renderChatMessage({
+            role: 'assistant',
+            content: data.message || '(empty response)',
+            suggestions: data.suggestions || [],
+            id: data.message_id,
+        }));
+        wrap.scrollTop = wrap.scrollHeight;
+    } catch (e) {
+        const reason = e.name === 'AbortError' ? 'request timed out (>60s)' : e.message;
+        status.textContent = 'Error: ' + reason;
+        status.className = 'text-xs text-red-600 mt-1 h-4';
+    } finally {
+        sendBtn.disabled = false;
+        input.focus();
+    }
+}
+
+async function applySuggestion(messageId, suggestionIdx) {
+    // Find the suggestion in the current messages list
+    const messages = document.querySelectorAll('#chat-messages > div');
+    // We need the raw data; easier to just call /chat again? No,
+    // we stored the data in DOM. Re-fetch from server to be safe.
+    try {
+        const r = await _fetchWithTimeout(`/api/projects/${PROJECT_ID}/chat`, {}, 10000);
+        if (!r.ok) return;
+        const data = await r.json();
+        const msg = (data.messages || []).find(m => m.id === messageId);
+        if (!msg || !msg.suggestions || !msg.suggestions[suggestionIdx]) {
+            alert('Suggestion no longer available. Reopen the chat to refresh.');
+            return;
+        }
+        const suggestion = msg.suggestions[suggestionIdx];
+        const confirmMsg = `Apply this action?\n\n${JSON.stringify(suggestion, null, 2)}`;
+        if (!confirm(confirmMsg)) return;
+        const status = document.getElementById('chat-status');
+        status.textContent = 'Applying...';
+        status.className = 'text-xs text-gray-500 mt-1 h-4';
+        const ar = await _fetchWithTimeout(
+            `/api/projects/${PROJECT_ID}/chat/apply`,
+            {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({suggestion, message_id: messageId}),
+            },
+            30000,
+        );
+        const adata = await ar.json().catch(() => ({}));
+        if (!ar.ok) {
+            status.textContent = 'Apply failed: ' + _errDetailToString(adata.detail, ar.status);
+            status.className = 'text-xs text-red-600 mt-1 h-4';
+            return;
+        }
+        status.textContent = 'Applied: ' + (adata.type || '?');
+        status.className = 'text-xs text-green-600 mt-1 h-4';
+        // Mark the suggestion as applied in the UI
+        event.target.disabled = true;
+        event.target.textContent = '✓ Applied';
+        // Reload page to show new state if it was create_task / run / replan
+        setTimeout(() => location.reload(), 1500);
+    } catch (e) {
+        const reason = e.name === 'AbortError' ? 'timed out' : e.message;
+        document.getElementById('chat-status').textContent = 'Error: ' + reason;
+        document.getElementById('chat-status').className = 'text-xs text-red-600 mt-1 h-4';
+    }
+}
+
+async function clearChat() {
+    if (!confirm('Clear all chat history for this project? This cannot be undone.')) return;
+    try {
+        const r = await _fetchWithTimeout(
+            `/api/projects/${PROJECT_ID}/chat/clear`,
+            {method: 'POST'},
+            10000,
+        );
+        if (r.ok) {
+            document.getElementById('chat-messages').innerHTML =
+                `<div class="text-center text-gray-400 italic py-8 text-xs">Chat cleared.</div>`;
+        } else {
+            const err = await r.json().catch(() => ({}));
+            alert('Clear failed: ' + _errDetailToString(err.detail, r.status));
+        }
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
+}
+
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+</script>
+
 {% endblock %}
