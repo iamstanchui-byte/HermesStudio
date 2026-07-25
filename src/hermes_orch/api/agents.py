@@ -1368,14 +1368,26 @@ async def get_skill(
     status_code=201,
 )
 async def create_or_update_skill(
-    agent_id: str, profile_name: str, body: SkillCreate, request: Request
+    agent_id: str, profile_name: str, body: SkillCreate, request: Request, response: Response
 ) -> ProfileConfig:
-    """Create or update a skill.
+    """Create or update a skill (UPSERT by content SHA).
 
-    Appends a new profile_configs entry (status=pending). The wrapper picks
-    it up on its next tick, writes the file to `<profile_root>/skills/<name>.md`,
-    and acks. Use empty content to mark a skill for deletion (wrapper removes
+    If the latest row for (profile_id, file_path) already has the same
+    `desired_sha256` as the new submission, return that row with HTTP 200
+    and skip the INSERT. This is defense-in-depth against runaway
+    re-upload loops (2026-07-25: list_skills SQL bug caused 35k duplicate
+    rows because the wrapper's SHA cache was stale). Now even if the
+    SHA cache is wrong, the server will not let duplicates pile up.
+
+    On a real change (different SHA), insert a new profile_configs row
+    with status=pending. The wrapper picks it up on its next tick,
+    writes the file to `<profile_root>/skills/<name>.md`, and acks.
+    Use empty content to mark a skill for deletion (wrapper removes
     the file from the agent host).
+
+    Status codes:
+      - 201 Created: new row inserted (content differs from latest).
+      - 200 OK:      no-op, content matches latest row's SHA.
 
     When the caller is the wrapper pushing a self-taught skill (e.g. agent
     just learned a new capability and wrote `skills/foo.md` on its own host),
@@ -1386,9 +1398,31 @@ async def create_or_update_skill(
     profile = await _find_profile(db, agent_id, profile_name)
     name = _validate_skill_name(body.name)
     content = body.content or ""
-    cfg_id = str(uuid.uuid4())
     sha = hashlib.sha256(content.encode()).hexdigest()
     file_path = _skill_file_path(name)
+
+    # UPSERT check: if the latest row for this (profile, file_path)
+    # already has the same SHA, return it without inserting. This is
+    # the defense-in-depth check that would have prevented the 35k-row
+    # bloat of 2026-07-25 even if the upstream list_skills SQL had
+    # been wrong. We look up the newest row first to also cover the
+    # "operator edits, saves same content" case (e.g. accidental
+    # double-click on Save).
+    existing = await db.fetchone(
+        "SELECT * FROM profile_configs "
+        "WHERE profile_id = ? AND file_path = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (profile["id"], file_path),
+    )
+    if existing and existing["desired_sha256"] == sha:
+        # No-op: content unchanged. Return 200 + existing row.
+        # The wrapper checks `if r.status_code == 201` to decide
+        # whether to ack — 200 means "server already has this
+        # content, no need to apply or ack".
+        response.status_code = 200
+        return _row_to_config(existing)
+
+    cfg_id = str(uuid.uuid4())
     await db.insert(
         "profile_configs",
         {

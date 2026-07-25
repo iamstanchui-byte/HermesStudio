@@ -149,6 +149,13 @@ class Supervisor:
         # Last time the project-cleanup sweep ran (None = never). Used
         # by _maybe_sweep_projects to throttle to once per ~24h.
         self._last_project_sweep_at: "datetime | None" = None
+        # Last time the audit_log rotation ran (None = never). Used by
+        # _maybe_rotate_audit_log to throttle to once per ~24h. The
+        # audit_log table grows monotonically and once caused a 1GB
+        # DB bloat (2026-07-25: 132k rows from a runaway skill-upload
+        # loop); auto-rotation keeps the main DB small without the
+        # operator having to remember to cron it.
+        self._last_audit_sweep_at: "datetime | None" = None
         # CleanupJob reference (set by main.py after construction).
         # supervisor only invokes it; the same instance is also exposed
         # via app.state.cleanup for the API endpoints.
@@ -226,6 +233,13 @@ class Supervisor:
                 await self._maybe_sweep_projects()
             except Exception as e:
                 log.exception(f"project sweep crashed: {e}")
+            # Daily audit_log rotation. Moves old rows to a separate
+            # archive DB to keep the main DB small. Off by default
+            # (operator opt-in via cleanup.audit_log_daily_sweep=true).
+            try:
+                await self._maybe_rotate_audit_log()
+            except Exception as e:
+                log.exception(f"audit log rotation crashed: {e}")
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval)
             except asyncio.TimeoutError:
@@ -692,6 +706,82 @@ class Supervisor:
             await job.run(trigger="auto")
         except Exception as e:
             log.exception(f"project sweep failed: {e}")
+
+    # ===== audit_log rotation sweeper =====
+
+    def _audit_sweep_interval_seconds(self) -> int:
+        return int(
+            (self.cfg.get("cleanup") or {}).get("audit_log_sweep_interval_seconds", 86400)
+        )
+
+    def _audit_retention_days(self) -> int:
+        return int((self.cfg.get("cleanup") or {}).get("audit_log_retention_days", 30))
+
+    def _audit_daily_sweep_enabled(self) -> bool:
+        # Off by default — operator opt-in. The audit log is genuinely
+        # useful for post-mortem debugging, and auto-rotation deletes
+        # data. Most operators will want to set this explicitly.
+        return bool((self.cfg.get("cleanup") or {}).get("audit_log_daily_sweep", False))
+
+    async def _maybe_rotate_audit_log(self) -> None:
+        """Throttled daily audit_log rotation.
+
+        Mirrors _maybe_sweep_projects. Moves rows older than
+        `cleanup.audit_log_retention_days` to a separate SQLite file
+        (~/.hermes-orchestrator/audit_log.archive.db) and VACUUMs the
+        main DB. Disabled unless `cleanup.audit_log_daily_sweep=true`
+        in config.
+
+        The actual rotation logic lives in scripts/rotate_audit_log.py
+        — we shell out to it so the same script works as a manual
+        operator command and an automatic supervisor sweep.
+        """
+        if not self._audit_daily_sweep_enabled():
+            return
+        if self._audit_retention_days() <= 0:
+            return  # auto-rotation disabled (retention_days=0)
+        interval = self._audit_sweep_interval_seconds()
+        now = now_aware()
+        if (
+            self._last_audit_sweep_at is not None
+            and (now - self._last_audit_sweep_at).total_seconds() < interval
+        ):
+            return
+        self._last_audit_sweep_at = now
+        try:
+            import subprocess
+            from pathlib import Path
+            script = (
+                Path(__file__).resolve().parent.parent.parent
+                / "scripts"
+                / "rotate_audit_log.py"
+            )
+            # Run synchronously in a thread (subprocess is blocking).
+            # We don't await the result — rotation can take 10s+ on a
+            # large table and we don't want to block the main tick.
+            # If a previous rotation is still running, skip this tick
+            # (the next tick will retry).
+            proc = await asyncio.create_subprocess_exec(
+                "python",
+                str(script),
+                "--keep-days",
+                str(self._audit_retention_days()),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                log.warning(
+                    f"audit log rotation failed (rc={proc.returncode}): "
+                    f"{stderr.decode(errors='replace')[:500]}"
+                )
+            else:
+                log.info(
+                    f"audit log rotation completed: "
+                    f"{stdout.decode(errors='replace').strip().splitlines()[-1] if stdout else '?'}"
+                )
+        except Exception as e:
+            log.exception(f"audit log rotation failed: {e}")
 
     async def sweep_sessions(self, *, ttl_days: int, dry_run: bool = False) -> dict:
         """Delete hermes sessions older than `ttl_days` from the

@@ -83,6 +83,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "retention_days": 30,
         "daily_sweep": True,
         "sweep_interval_seconds": 86400,
+        # Audit-log rotation (separate from project cleanup above).
+        # The audit_log table grows monotonically and once caused a
+        # 1GB DB bloat (2026-07-25: 132k rows from a runaway skill-
+        # upload loop). On the daily tick, rows older than
+        # `audit_log_retention_days` are moved to a separate
+        # `~/.hermes-orchestrator/audit_log.archive.db` file and
+        # the main DB is VACUUMed. Off by default because the audit
+        # log is genuinely useful for post-mortems — set this to
+        # true to opt in. You can also run it manually:
+        #   python scripts/rotate_audit_log.py --keep-days 30
+        "audit_log_daily_sweep": False,
+        "audit_log_retention_days": 30,
+        "audit_log_sweep_interval_seconds": 86400,
     },
 }
 
