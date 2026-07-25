@@ -46,11 +46,15 @@ _STEP_FIELDS = (
     # parameter-light: instead of inlining skill content (huge
     # prompt, stale data) or re-discovering the data source URL
     # on every run (token waste), just reference the skill by name.
-    # Phase 0 of visual workflow builder (2026-07-24):
-    # `feedback_to` is an OPTIONAL list of EARLIER step names. If any
+    # Phase 0 of visual workflow builder (2026-07-24, updated 2026-07-25
+    # for Phase 2): `feedback_to` is an OPTIONAL list of step names
+    # (NOT restricted to earlier ones — it's a TRIGGER semantic). If any
     # of those steps fails, this step is re-dispatched (and so are all
     # its transitive dependents via cascading invalidation). Used to
     # implement the search→analyze→audit→re-run-search loop-back pattern.
+    # The wire direction in the visual builder is source→target, and
+    # target.feedback_to += [source] — counter-intuitive but consistent:
+    # target listens for source's failure and gets re-run on it.
     # Default: null/omitted (no loop-back). Cap: project.max_iterations.
     "feedback_to",
 )
@@ -137,7 +141,7 @@ The `description` field MUST be a 1-2 sentence human-readable summary of what th
       }},
       "output_path": "relative path the step writes (e.g. list_files.results.json)",
       "skill": "kebab-case skill name (OPTIONAL — only when the source project used an existing skill; see Rule 11 below)",
-      "feedback_to": ["earlier_step_name"]   // OPTIONAL — list of earlier step names whose failure re-dispatches this step (Rule 13)
+      "feedback_to": ["step_name"]   // OPTIONAL — list of step names (NOT just earlier ones; trigger semantic) whose failure re-dispatches this step (Rule 13)
     }}
   ],
   "variables": [
@@ -206,7 +210,10 @@ The `description` field MUST be a 1-2 sentence human-readable summary of what th
     kept only `hk-weather-forecast` and the workflow never uploaded
     to GDrive. The user had to PATCH a 2nd step by hand.
 13. **OPTIONAL `feedback_to` for the search→analyze→audit loop-back
-    pattern** (Phase 0 of visual workflow builder, 2026-07-24).
+    pattern** (Phase 0 of visual workflow builder, 2026-07-24,
+    updated 2026-07-25 for Phase 2 — feedback_to can now reference
+    ANY step in the workflow, not just earlier ones; it's a TRIGGER
+    semantic).
     When a later step AUDITS the output of an earlier step (e.g.
     `audit-quality` checks `analyze-report`), and the audit can
     fail in a way that requires the earlier step to re-run with
@@ -216,14 +223,16 @@ The `description` field MUST be a 1-2 sentence human-readable summary of what th
     all its transitive dependents to `pending` (so analyze doesn't
     keep the stale report), (c) increment `current_iteration`, and
     (d) bail out at `max_iterations` (project-level cap).
-    - `feedback_to` is a LIST of earlier step names. Self-reference
-      is a silent no-op.
+    - `feedback_to` is a LIST of step names (NOT restricted to
+      earlier ones — it can reference any step in the workflow;
+      the validator just checks that the name exists).
+      Self-reference is a silent no-op.
     - OMIT `feedback_to` when no loop-back is needed (the safe
       default). Forgetting it is OK; including it incorrectly
       (e.g. pointing to a step that doesn't actually audit this
       step) just means the loop never fires — safe failure.
-    - Cap: `feedback_to` may reference MULTIPLE earlier steps (the
-      earlier step is re-dispatched if ANY of them fails).
+    - Cap: `feedback_to` may reference MULTIPLE steps (the
+      target step is re-dispatched if ANY of them fails).
     - Real example (search→analyze→audit→deliver):
       ```
       step_template: [
@@ -249,11 +258,13 @@ The `description` field MUST be a 1-2 sentence human-readable summary of what th
       ```
       RIGHT (search re-dispatched on audit fail; cascade resets
       analyze, audit, deliver to pending so they re-run with
-      fresh search data):
+      fresh search data). NOTE: search.feedback_to references
+      audit, which is LATER in step_template — this is now valid
+      because feedback_to is a trigger, not a dependency:
       ```
       {{ "name": "search",  "feedback_to": ["audit"], ... }},
-      // search has no earlier steps; feedback_to=["audit"] means:
-      //   "if audit fails, re-run me"
+      // feedback_to=["audit"] means:
+      //   "if audit fails, re-run me (search)"
       // analyze/audit/deliver need NO feedback_to — the cascade
       // follows depends_on backwards from search automatically
       ```
@@ -584,6 +595,24 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
     if not isinstance(step_template, list) or not step_template:
         return False, f"step_template must be a non-empty list (got {type(step_template).__name__})"
 
+    # Pre-pass: collect all step names so feedback_to validation can
+    # reference the FULL workflow (not just earlier steps — feedback_to
+    # is a TRIGGER semantic and order doesn't constrain it).
+    all_step_names: set[str] = set()
+    for i, step in enumerate(step_template):
+        if not isinstance(step, dict):
+            return False, f"step_template[{i}] must be a dict"
+        name = step.get("name", "")
+        if not isinstance(name, str) or not name:
+            return False, f"step_template[{i}].name missing or empty"
+        if not re.match(r"^[a-z0-9][a-z0-9-]*$", name):
+            return False, f"step_template[{i}].name={name!r} not kebab-case"
+        if len(name) > 40:
+            return False, f"step_template[{i}].name={name!r} too long ({len(name)} > 40)"
+        if name in all_step_names:
+            return False, f"step_template[{i}].name={name!r} duplicate (already in {sorted(all_step_names)})"
+        all_step_names.add(name)
+
     # Step-level checks
     seen_names: set[str] = set()
     for i, step in enumerate(step_template):
@@ -601,8 +630,8 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
             return False, f"step_template[{i}].name={name!r} not kebab-case"
         if len(name) > 40:
             return False, f"step_template[{i}].name={name!r} too long ({len(name)} > 40)"
-        if name in seen_names:
-            return False, f"step_template[{i}].name={name!r} duplicate (already in {seen_names})"
+        # Duplicate name check already done in pre-pass; keep seen_names
+        # for the depends_on forward-ref check.
         seen_names.add(name)
         # action
         action = step.get("action", "")
@@ -629,11 +658,21 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
             # Anti-L3: skill name shouldn't look like an internal action
             if any(s in skill for s in ("coord_pickup", "handoff:", "_iteration_review")):
                 return False, f"step_template[{i}].skill={skill!r} contains L3 scaffolding"
-        # feedback_to (optional, Phase 0 of visual builder, 2026-07-24).
-        # List of EARLIER step names whose failure should re-dispatch
-        # this step. null/omitted = no loop-back. Empty list = no loop-back.
-        # Each name must reference an earlier step (same forward-ref rule
-        # as depends_on). Self-reference is a no-op (skip silently).
+        # feedback_to (optional, Phase 0 of visual builder, 2026-07-24,
+        # updated 2026-07-25 for Phase 2 red dashed handle).
+        # List of step names whose failure should re-dispatch THIS step.
+        # null/omitted = no loop-back. Empty list = no loop-back.
+        # Semantic: target.feedback_to = [source] means "if source fails,
+        # re-run me (target)". It's a TRIGGER relationship — source is the
+        # listener, target is the re-runner. Order does NOT matter; target
+        # can be anywhere relative to source in step_template. The wire
+        # goes source → target, and source is the one that gets re-run on
+        # target's failure (intentionally counter-intuitive; see the
+        # _STEP_FIELDS docstring + the LLM-synth prompt rules 13 for the
+        # full example).
+        # Each name must reference SOME step in the workflow (existence
+        # check) but is NOT required to be earlier — only depends_on has
+        # the forward-ref rule. Self-reference is a no-op (skip silently).
         fb = step.get("feedback_to")
         if fb is not None:
             if not isinstance(fb, list):
@@ -641,11 +680,11 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
             for fname in fb:
                 if not isinstance(fname, str) or not fname:
                     return False, f"step_template[{i}].feedback_to contains non-string entry: {fname!r}"
-                # Forward-ref check: feedback_to can only point to EARLIER
-                # steps (a step can't react to the failure of a step that
-                # hasn't run yet — that doesn't make sense).
-                if fname not in seen_names:
-                    return False, f"step_template[{i}].feedback_to references {fname!r} which is not an EARLIER step (or doesn't exist)"
+                # Existence check against the FULL workflow (not just
+                # earlier steps). feedback_to is a TRIGGER, not a
+                # dependency — order doesn't constrain it.
+                if fname not in all_step_names:
+                    return False, f"step_template[{i}].feedback_to references {fname!r} which doesn't exist in this workflow"
                 # Self-reference is silently dropped at runtime; we don't
                 # reject it because the LLM sometimes produces it
                 # defensively. It's just a no-op.

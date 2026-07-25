@@ -400,24 +400,14 @@ async def test_loop_back_max_iter_zero_disables_loop():
 # ----- validator tests (workflows.py) -----
 
 def test_validator_accepts_feedback_to():
-    """feedback_to as a list of earlier step names is accepted."""
+    """feedback_to as a list of valid step names is accepted.
+
+    Phase 2 (2026-07-25): feedback_to can reference ANY step in the
+    workflow, not just earlier ones. The earlier restriction was wrong —
+    the canonical search→analyze→audit loop-back pattern needs
+    search.feedback_to=['audit'] (a LATER step) to mean "re-run me
+    if audit fails". This is the trigger semantic."""
     from hermes_orch.api.workflows import _validate_workflow_package
-    pkg = {
-        "description": "test",
-        "step_template": [
-            {"name": "search", "agent_role": "r1", "action": "a",
-             "depends_on": [], "params_template": {}},
-            {"name": "analyze", "agent_role": "r1", "action": "a",
-             "depends_on": ["search"], "params_template": {},
-             "feedback_to": ["search"]},  # WRONG: forward ref to itself
-            # actually for "search" feedback_to=["analyze"] is the right
-            # pattern. Let me fix:
-        ],
-        "variables": [],
-    }
-    # The above has a forward-ref bug — analyze can't point to itself
-    # in feedback_to (its own failure doesn't make sense; only
-    # failures of EARLIER steps). Let me redo the test cleanly:
     pkg = {
         "description": "test",
         "step_template": [
@@ -427,30 +417,29 @@ def test_validator_accepts_feedback_to():
              "depends_on": ["search"], "params_template": {}},
             {"name": "audit", "agent_role": "r1", "action": "a",
              "depends_on": ["analyze"], "params_template": {}},
-            {"name": "search", "agent_role": "r1", "action": "a",
+            {"name": "deliver", "agent_role": "r1", "action": "a",
              "depends_on": ["audit"], "params_template": {},
-             "feedback_to": ["audit"]},  # re-dispatch search if audit fails
-            # Wait, the fourth step has the same name as step 0. That's
-            # a duplicate name which is also rejected. Let me use a
-            # different name.
+             "feedback_to": ["audit"]},  # re-dispatch deliver if audit fails
         ],
         "variables": [],
     }
-    pkg["step_template"][3]["name"] = "deliver"
     ok, err = _validate_workflow_package(pkg)
     assert ok, f"valid package rejected: {err}"
 
 
-def test_validator_rejects_forward_feedback_to():
-    """feedback_to can only reference EARLIER steps. A forward ref is
-    rejected with a clear error."""
+def test_validator_accepts_forward_feedback_to():
+    """Phase 2 (2026-07-25): feedback_to with a FORWARD ref is now
+    accepted. The earlier 'must be earlier step' rule was wrong
+    (see _validate_workflow_package docstring). The canonical pattern
+    is search.feedback_to=['audit'] where 'audit' is a LATER step —
+    that's the search→analyze→audit loop-back semantic."""
     from hermes_orch.api.workflows import _validate_workflow_package
     pkg = {
         "description": "test",
         "step_template": [
             {"name": "search", "agent_role": "r1", "action": "a",
              "depends_on": [], "params_template": {},
-             "feedback_to": ["audit"]},  # WRONG: 'audit' comes later
+             "feedback_to": ["audit"]},  # 'audit' is a LATER step, but valid
             {"name": "analyze", "agent_role": "r1", "action": "a",
              "depends_on": ["search"], "params_template": {}},
             {"name": "audit", "agent_role": "r1", "action": "a",
@@ -459,8 +448,27 @@ def test_validator_rejects_forward_feedback_to():
         "variables": [],
     }
     ok, err = _validate_workflow_package(pkg)
+    assert ok, f"valid package (forward feedback_to) rejected: {err}"
+
+
+def test_validator_rejects_nonexistent_feedback_to():
+    """feedback_to that references a step that doesn't exist in the
+    workflow is rejected (existence check, not order check)."""
+    from hermes_orch.api.workflows import _validate_workflow_package
+    pkg = {
+        "description": "test",
+        "step_template": [
+            {"name": "search", "agent_role": "r1", "action": "a",
+             "depends_on": [], "params_template": {},
+             "feedback_to": ["nonexistent-step"]},  # WRONG: doesn't exist
+            {"name": "analyze", "agent_role": "r1", "action": "a",
+             "depends_on": ["search"], "params_template": {}},
+        ],
+        "variables": [],
+    }
+    ok, err = _validate_workflow_package(pkg)
     assert not ok
-    assert "feedback_to" in err or "audit" in err
+    assert "feedback_to" in err or "nonexistent-step" in err
 
 
 def test_validator_rejects_non_list_feedback_to():
