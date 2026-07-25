@@ -2302,6 +2302,174 @@ async def clear_chat(project_id: str, request: Request) -> dict:
     return {"project_id": project_id, "removed": removed}
 
 
+@router.post("/{project_id}/chat/reformat")
+async def reformat_chat_message(
+    project_id: str, body: ChatRequest, request: Request
+) -> dict:
+    """Dedicated endpoint to reformat the LLM's plain-text action
+    description into a structured suggestion. LLM-fooling pattern
+    #9: the LLM sometimes describes actions in text without a
+    JSON block, so the UI can't show Apply buttons. This
+    endpoint makes a FRESH LLM call with a focused, single-purpose
+    system prompt: 'return ONLY a JSON object with a suggestions
+    array, no other text'. This is far more reliable than
+    appending a reformat suffix to the chat (the chat has too
+    much other context for the LLM to consistently follow
+    format rules).
+
+    The result is persisted to project_chat_messages as a new
+    assistant turn so the history stays complete.
+
+    Body: {message: str} — the last user message (or the action
+    they want reformatted). We re-ask the LLM to format THIS
+    request as a structured suggestion.
+    """
+    if not body.message or not body.message.strip():
+        raise HTTPException(400, "message is required")
+    db = request.app.state.db
+    cfg = request.app.state.config
+    proj = await db.fetchone("SELECT id FROM projects WHERE id = ?", (project_id,))
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    # Build a focused, single-purpose system prompt. The LLM's
+    # job is JUST to convert the user's request into structured
+    # suggestions. No analysis, no explanation, no other text.
+    reformat_system = """\
+You are a JSON formatter for a workflow assistant. The user
+just asked the assistant to do something, but the assistant
+described it in plain text instead of returning a JSON block.
+
+YOUR JOB: convert the user's request into a structured JSON
+object with a "suggestions" array. Return ONLY the JSON object.
+No other text. No preamble. No explanation. No markdown fence.
+
+Allowed suggestion types:
+  - create_task: {type, name, agent_role, action, depends_on (optional)}
+  - run: {type, note}
+  - replan: {type, goal}
+
+If the user's request is just a question (no concrete action),
+return {"suggestions": []}.
+
+Pick agent_role from this list (verbatim, no other names):
+{available_profiles_inline}
+
+Return ONLY valid JSON. Start with { and end with }. No other
+characters before or after the JSON.
+"""
+    profile_names = await db.fetchall(
+        "SELECT name FROM agent_profiles ORDER BY name"
+    )
+    names = [p["name"] for p in profile_names]
+    inline = ", ".join(f"`{n}`" for n in names) if names else "(no profiles registered)"
+    reformat_system = reformat_system.replace(
+        "{available_profiles_inline}", inline
+    )
+    # LLM call
+    llm_cfg = cfg.get("llm", {})
+    base_url = (llm_cfg.get("base_url") or "https://api.minimax.io/v1").rstrip("/")
+    api_key = llm_cfg.get("api_key") or ""
+    model = llm_cfg.get("model") or "MiniMax-M3"
+    timeout = float(llm_cfg.get("timeout_seconds") or 60)
+    if not api_key:
+        raise HTTPException(503, "LLM api_key not configured")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": reformat_system},
+            {"role": "user", "content": body.message},
+        ],
+        "temperature": 0.2,  # very low — we want deterministic JSON
+        "max_tokens": 800,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(
+                f"{base_url}/chat/completions",
+                json=payload, headers=headers,
+            )
+        if r.status_code != 200:
+            raise HTTPException(502, f"LLM returned HTTP {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        try:
+            text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise HTTPException(502, f"LLM response shape unexpected: {e}")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(502, "LLM returned empty content")
+    except httpx.HTTPError as e:
+        log.warning(f"chat reformat LLM call failed for {project_id}: {e}")
+        raise HTTPException(502, f"LLM unreachable: {e}")
+    # Strip <think> blocks (MiniMax M3 emits them before the answer)
+    text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    # Strip markdown fences in case the LLM still added them
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    # Parse the JSON. The system prompt is very emphatic, but
+    # the LLM may still wrap in fences or add preamble. Try
+    # to find the JSON object directly.
+    parsed = None
+    # First try direct parse
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Then try to find { ... } in the text
+    if parsed is None:
+        m = re.search(r"(\{.*\})", text, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group(1))
+            except (json.JSONDecodeError, TypeError):
+                pass
+    if not isinstance(parsed, dict):
+        raise HTTPException(502, f"LLM did not return valid JSON: {text[:200]}")
+    suggestions = parsed.get("suggestions")
+    if not isinstance(suggestions, list):
+        suggestions = []
+    # Validate each suggestion
+    valid = [s for s in suggestions
+             if isinstance(s, dict) and isinstance(s.get("type"), str)]
+    # Build a brief user-facing message describing what we did
+    if valid:
+        message = f"Reformatted as {len(valid)} action(s). Click Apply on any to execute."
+    else:
+        message = "No structured actions found in the request. The user may have asked a question rather than an action."
+    # Persist as a new assistant turn
+    sugg_json = json.dumps(valid) if valid else None
+    now = _now_iso()
+    cursor = await db.execute(
+        "INSERT INTO project_chat_messages "
+        "(project_id, role, content, suggestions_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (project_id, "assistant", message, sugg_json, now),
+    )
+    msg_id = cursor.lastrowid if hasattr(cursor, "lastrowid") else None
+    await audit_log(
+        db, "project.chat_reformatted",
+        actor="operator",
+        project_id=project_id,
+        payload={"message_id": msg_id, "suggestion_count": len(valid)},
+    )
+    return {
+        "message": message,
+        "suggestions": valid,
+        "message_id": msg_id,
+    }
+
+
 @router.post("/{project_id}/chat/apply")
 async def apply_chat_suggestion(
     project_id: str, body: ChatApplyRequest, request: Request
