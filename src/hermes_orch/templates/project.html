@@ -100,6 +100,11 @@
                         title="Open the project folder in File Explorer (only works if your browser is on the orchestrator host)">
                         Open folder
                     </button>
+                    <a href="/projects/{{ project.id }}/visual"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-emerald-300 text-emerald-700 hover:bg-emerald-50"
+                        title="Phase 4 visual project page — see all tasks as cards with status colors, token counts, and artifact counts. Read-only in Stage 1; interactivity in Stage 2+.">
+                        🎨 Visual view
+                    </a>
                     <button onclick="openReplanModal('{{ project.id }}')"
                         class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
                         title="Re-trigger the LLM planner: set/update the project goal and configure iter-loop settings. Existing pending tasks are kept unless you also tick 'clear tasks'.">

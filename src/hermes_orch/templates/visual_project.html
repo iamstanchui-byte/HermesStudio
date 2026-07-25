@@ -1,0 +1,249 @@
+{% extends "base.html" %}
+
+{# Phase 4 Stage 1 (2026-07-25) — Visual Project Page.
+   Read-only card view of every task. Status colors + tokens + artifacts.
+   No interactivity in this stage (Stage 2 adds side panel, Stage 3 adds
+   drag-to-edit, Stage 4 adds live polling on top of the 30s reload). #}
+
+{% block head %}
+<style>
+.vp-wrap { max-width: 1400px; margin: 0 auto; padding: 16px; }
+.vp-card {
+    border: 1px solid #d1d5db;
+    border-radius: 8px;
+    background: #fff;
+    padding: 12px;
+    min-height: 120px;
+    position: relative;
+    transition: box-shadow 0.15s, transform 0.15s;
+}
+.vp-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.08); transform: translateY(-1px); }
+.vp-card .vp-status {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #fff;
+}
+.vp-card .vp-name {
+    font-weight: 600;
+    font-size: 14px;
+    margin: 8px 0 4px;
+    word-break: break-all;
+}
+.vp-card .vp-role {
+    font-size: 11px;
+    color: #6b7280;
+    font-family: ui-monospace, monospace;
+}
+.vp-card .vp-metrics {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+}
+.vp-card .vp-metric {
+    font-size: 11px;
+    color: #4b5563;
+    background: #f3f4f6;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: ui-monospace, monospace;
+}
+.vp-card .vp-deps {
+    margin-top: 8px;
+    font-size: 10px;
+    color: #9ca3af;
+    font-family: ui-monospace, monospace;
+}
+.vp-card .vp-actions {
+    margin-top: 8px;
+    font-size: 10px;
+    color: #9ca3af;
+    font-style: italic;
+}
+/* status colors */
+.vp-status-pending    { background: #9ca3af; }
+.vp-status-assigned   { background: #3b82f6; }
+.vp-status-running    { background: #f59e0b; }
+.vp-status-completed  { background: #10b981; }
+.vp-status-failed     { background: #ef4444; }
+.vp-status-cancelled  { background: #6b7280; }
+.vp-status-interrupted{ background: #dc2626; }
+.vp-status-skipped    { background: #94a3b8; }
+.vp-status-unknown    { background: #4b5563; }
+.vp-card-status-pending    { border-left: 4px solid #9ca3af; }
+.vp-card-status-assigned   { border-left: 4px solid #3b82f6; }
+.vp-card-status-running    { border-left: 4px solid #f59e0b; }
+.vp-card-status-completed  { border-left: 4px solid #10b981; }
+.vp-card-status-failed     { border-left: 4px solid #ef4444; }
+.vp-card-status-cancelled  { border-left: 4px solid #6b7280; }
+.vp-card-status-interrupted{ border-left: 4px solid #dc2626; }
+.vp-card-status-skipped    { border-left: 4px solid #94a3b8; }
+.vp-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 12px;
+    margin-top: 16px;
+}
+.vp-status-bar {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+    padding: 8px 0;
+}
+.vp-status-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 12px;
+    border: 1px solid #e5e7eb;
+    background: #fff;
+    cursor: default;
+}
+.vp-status-chip-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+.vp-stage-banner {
+    background: #f0f9ff;
+    border: 1px solid #bae6fd;
+    color: #075985;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    margin-bottom: 12px;
+}
+.vp-empty {
+    text-align: center;
+    padding: 60px 20px;
+    color: #9ca3af;
+    font-size: 14px;
+}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="vp-wrap">
+
+    <div class="flex items-center justify-between mb-2">
+        <div>
+            <h1 class="text-xl font-semibold text-gray-800">
+                {{ project.name }}
+                <a href="/projects/{{ project.id }}" class="text-sm font-normal text-blue-600 hover:underline ml-2">
+                    ← back to text view
+                </a>
+            </h1>
+            <p class="text-xs text-gray-500 mt-0.5">
+                <span class="font-mono">{{ project.id }}</span>
+                · state: <span class="font-mono">{{ project.state }}</span>
+                · {{ tasks|length }} task{{ '' if tasks|length == 1 else 's' }}
+                · visual view (Phase 4 Stage 1 — read-only)
+            </p>
+        </div>
+        <div class="text-xs text-gray-400">
+            auto-refresh: 30s
+        </div>
+    </div>
+
+    <div class="vp-stage-banner">
+        <strong>Stage 1 minimum:</strong> read-only card view, no interactivity.
+        Stage 2 will add dblclick → side panel (edit params, retry, cancel).
+        Stage 3 will add drag-to-wire depends_on.
+        <a href="/projects/{{ project.id }}" class="underline">Switch to text view</a> for the full task list.
+    </div>
+
+    {% if not tasks %}
+    <div class="vp-empty">
+        No tasks yet. Tasks are created by the planner when the project enters 'planning', or by the workflow runner for workflow-spawned projects. Refresh in a few seconds.
+    </div>
+    {% else %}
+
+    <div class="vp-status-bar">
+        <span class="text-xs text-gray-500 mr-2">Status:</span>
+        {% set status_order = ['pending', 'assigned', 'running', 'completed', 'failed', 'cancelled', 'interrupted', 'skipped'] %}
+        {% for s in status_order %}
+            {% if status_counts.get(s, 0) > 0 %}
+            <span class="vp-status-chip">
+                <span class="vp-status-chip-dot vp-status-{{ s }}"></span>
+                {{ s }} · {{ status_counts[s] }}
+            </span>
+            {% endif %}
+        {% endfor %}
+        {% for s in status_counts %}
+            {% if s not in status_order %}
+            <span class="vp-status-chip">
+                <span class="vp-status-chip-dot vp-status-unknown"></span>
+                {{ s }} · {{ status_counts[s] }}
+            </span>
+            {% endif %}
+        {% endfor %}
+    </div>
+
+    <div class="vp-grid">
+        {% for t in tasks %}
+            {% set status = t.get('status', 'unknown') %}
+            {% set tok = token_by_task.get(t.id, {}) %}
+            {% set art = art_by_task.get(t.id, {}) %}
+            {% set deps = t.get('depends_on', []) or [] %}
+        <div class="vp-card vp-card-status-{{ status }}">
+            <span class="vp-status vp-status-{{ status }}">{{ status }}</span>
+            <div class="vp-name">{{ t.name }}</div>
+            <div class="vp-role">{{ t.agent_role or '?' }}</div>
+            <div class="vp-metrics">
+                <span class="vp-metric" title="Tokens used (prompt + completion)">
+                    {% if tok.get('total') %}
+                        🪙 {{ "{:,}".format(tok['total']) }} tok
+                    {% else %}
+                        🪙 0 tok
+                    {% endif %}
+                </span>
+                <span class="vp-metric" title="Artifacts produced">
+                    {% if art.get('n') %}
+                        📄 {{ art['n'] }} art
+                    {% else %}
+                        📄 0 art
+                    {% endif %}
+                </span>
+                <span class="vp-metric" title="Execution time">
+                    {% if t.timing.took_sec %}
+                        ⏱ {{ t.timing.took_sec }}s
+                    {% else %}
+                        ⏱ —
+                    {% endif %}
+                </span>
+            </div>
+            {% if deps %}
+            <div class="vp-deps">
+                ⇠ deps: {{ deps|join(', ') }}
+            </div>
+            {% endif %}
+            {% if status == 'running' %}
+            <div class="vp-actions">in flight…</div>
+            {% elif status == 'failed' %}
+            <div class="vp-actions">click to retry (Stage 2)</div>
+            {% elif status == 'completed' %}
+            <div class="vp-actions">click to view result (Stage 2)</div>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+
+    {% endif %}
+
+</div>
+
+<script>
+// Phase 4 Stage 1: 30s reload for live updates. Real WebSocket or
+// incremental re-render comes in Stage 4 (after we know the UX
+// pattern from Stage 2-3 is settled).
+setTimeout(function() { location.reload(); }, 30000);
+</script>
+{% endblock %}

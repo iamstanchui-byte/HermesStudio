@@ -1026,6 +1026,86 @@ async def project_page(
     )
 
 
+@router.get("/projects/{project_id}/visual", response_class=HTMLResponse)
+async def project_visual_page(
+    project_id: str,
+    request: Request,
+) -> HTMLResponse:
+    """Phase 4 Stage 1 (2026-07-25): visual project page.
+
+    Read-only card view of every task in the project, with status
+    colors, token counts, artifact counts, and depends_on shown as
+    a small list. Reuses project_page's queries; just renders them
+    in a card layout instead of a table.
+
+    No interactivity in Stage 1 — Stage 2 adds side panel, Stage 3
+    adds drag-to-edit depends_on, Stage 4 adds live polling on top
+    of the current 30s refresh.
+    """
+    db = request.app.state.db
+    project = await db.fetchone("SELECT * FROM projects WHERE id = ?", (project_id,))
+    if not project:
+        raise HTTPException(404, f"Project not found: {project_id}")
+
+    # All tasks (no pagination — visual page shows all)
+    task_rows = await db.fetchall(
+        "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC",
+        (project_id,),
+    )
+    tasks = [
+        _parse_json_fields(dict(r), "depends_on", "params", "result")
+        for r in task_rows
+    ]
+    for t in tasks:
+        t["timing"] = _compute_task_timing(t)
+    # Annotate artifacts with on-disk existence
+    from pathlib import Path
+    cfg = request.app.state.config
+    projects_root_p = Path(cfg["projects"]["storage_root"]).resolve()
+    for t in tasks:
+        _annotate_artifact_exists(t, projects_root_p)
+
+    # Per-task token counts (group by task_id; project_id also filtered
+    # to be safe with the index). Sum of total_tokens for each task.
+    token_rows = await db.fetchall(
+        "SELECT task_id, COALESCE(SUM(total_tokens), 0) AS total, "
+        "COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+        "COALESCE(SUM(completion_tokens), 0) AS completion "
+        "FROM token_usage WHERE project_id = ? AND task_id IS NOT NULL "
+        "GROUP BY task_id",
+        (project_id,),
+    )
+    token_by_task = {r["task_id"]: dict(r) for r in token_rows}
+
+    # Per-task artifact counts
+    art_rows = await db.fetchall(
+        "SELECT task_id, COUNT(*) AS n, "
+        "COALESCE(SUM(size_bytes), 0) AS total_bytes "
+        "FROM artifacts WHERE project_id = ? GROUP BY task_id",
+        (project_id,),
+    )
+    art_by_task = {r["task_id"]: dict(r) for r in art_rows}
+
+    # Status counts for the filter bar
+    status_counts: dict[str, int] = {}
+    for t in tasks:
+        s = t.get("status") or "unknown"
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    return templates.TemplateResponse(
+        request=request,
+        name="visual_project.html",
+        context={
+            **_base_context(request, "projects"),
+            "project": project,
+            "tasks": tasks,
+            "token_by_task": token_by_task,
+            "art_by_task": art_by_task,
+            "status_counts": status_counts,
+        },
+    )
+
+
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request) -> HTMLResponse:
     """Settings page (LLM + Telegram + Project Storage + Cleanup)."""
