@@ -59,6 +59,76 @@
         setTimeout(() => { b.className = 'vf-save-banner'; }, 2400);
     }
 
+    // Extract all `{{var_name}}` placeholders from a string.
+    // Returns an array of unique names. Whitespace inside braces
+    // is trimmed. Non-identifier characters in the name are kept
+    // (the validator will reject them with a clear message).
+    function _extractPlaceholders(text) {
+        if (typeof text !== 'string' || !text) return [];
+        const out = new Set();
+        const re = /\{\{\s*([^{}]+?)\s*\}\}/g;
+        let m;
+        while ((m = re.exec(text)) !== null) {
+            out.add(m[1].trim());
+        }
+        return Array.from(out);
+    }
+
+    // Recursively walk a value and return all `{{var}}` placeholders.
+    // Handles string leaves, dict leaves, and list elements. Skips
+    // nulls and primitives. This catches placeholders in nested
+    // params_template values like {"a": "{{x}}", "b": ["{{y}}"]}.
+    function _collectPlaceholdersInValue(v, out) {
+        out = out || new Set();
+        if (v == null) return out;
+        if (typeof v === 'string') {
+            for (const n of _extractPlaceholders(v)) out.add(n);
+        } else if (Array.isArray(v)) {
+            for (const item of v) _collectPlaceholdersInValue(item, out);
+        } else if (typeof v === 'object') {
+            for (const val of Object.values(v)) {
+                _collectPlaceholdersInValue(val, out);
+            }
+        }
+        return out;
+    }
+
+    // Auto-add any `{{var}}` placeholders found in step_template's
+    // params_template to _variables (so the validator accepts the
+    // save). Returns the list of newly added variable names.
+    //
+    // This is "do the right thing" for semi-tech users: they type
+    // `{{my_var}}` in a step's params, click Apply, and the system
+    // silently creates the variable. No separate "Variables"
+    // section to learn.
+    //
+    // Default type is "string" with required=true. The user can
+    // edit the type / default / description via the JSON form or
+    // a future Variables UI.
+    function _autoAddVariablesFromParams() {
+        if (!Array.isArray(_variables)) _variables = [];
+        const existing = new Set(_variables.map((v) => v.name));
+        const placeholders = new Set();
+        for (const step of _stepTemplate) {
+            if (step && step.params_template) {
+                _collectPlaceholdersInValue(step.params_template, placeholders);
+            }
+        }
+        const added = [];
+        for (const name of placeholders) {
+            if (!existing.has(name)) {
+                _variables.push({
+                    name,
+                    type: 'string',
+                    description: `Auto-added for {{${name}}}`,
+                    required: true,
+                });
+                added.push(name);
+            }
+        }
+        return added;
+    }
+
     function _stepToCardHtml(step) {
         // Escape any HTML in the step name/role/action so a malicious
         // LLM-generated name can't inject markup. step.name etc.
@@ -899,6 +969,17 @@
                 : 'Step updated (click Save to persist)',
             'success',
         );
+        // Phase 1.6: auto-add any new {{var}} placeholders from
+        // this step's params_template. Showing the banner right
+        // after Apply gives immediate feedback (the var will also
+        // be re-checked at save time, defensively).
+        const addedVars = _autoAddVariablesFromParams();
+        if (addedVars.length > 0) {
+            _showBanner(
+                `Added variable${addedVars.length > 1 ? 's' : ''}: ${addedVars.join(', ')}. Click Save to persist.`,
+                'info'
+            );
+        }
     }
 
     // ESC key closes the side panel (standard UX).
@@ -962,6 +1043,20 @@
                 'success'
             );
             stepTemplate = _stepTemplate;
+        }
+        // Phase 1.6 (2026-07-25): auto-add any new {{var}}
+        // placeholders to _variables. The server-side validator
+        // requires every {{var}} in step_template to have a
+        // matching variables entry. We scan all params_templates
+        // and add missing ones (type=string default) so the user
+        // doesn't have to manage variables separately.
+        const addedVars = _autoAddVariablesFromParams();
+        if (addedVars.length > 0) {
+            _showBanner(
+                `Added variable${addedVars.length > 1 ? 's' : ''}: ${addedVars.join(', ')}. Edit type/default in Edit as JSON.`,
+                'info'
+            );
+            variables = _variables;
         }
         const url = `/api/workflows/${encodeURIComponent(_workflowId)}`;
         const body = {
