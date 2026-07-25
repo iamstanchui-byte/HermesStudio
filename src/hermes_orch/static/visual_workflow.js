@@ -948,6 +948,21 @@
             stepTemplate = _stepTemplate;
             variables = _variables;
         }
+        // Phase 1.5 (2026-07-25): if the user has forward-ref
+        // depends_on (because they dragged cards around without
+        // thinking about execution order), auto-reorder the
+        // step_template topologically so the server-side validator
+        // accepts it. The visual layout (Y positions) is reset to
+        // match the new order. We show a banner so the user knows
+        // the layout changed.
+        const reordered = _topoSortSteps();
+        if (reordered) {
+            _showBanner(
+                'Reordered steps to satisfy depends_on (top → bottom = execution order).',
+                'success'
+            );
+            stepTemplate = _stepTemplate;
+        }
         const url = `/api/workflows/${encodeURIComponent(_workflowId)}`;
         const body = {
             step_template: stepTemplate,
@@ -973,6 +988,78 @@
         }
     }
 
+    // Topological sort of _stepTemplate by depends_on. Returns
+    // true if the order changed (and _stepTemplate + visual Y
+    // positions were updated). Steps with no dependencies come
+    // first, in their existing relative order. Ties are broken
+    // by the existing Y position (top-of-canvas first), so the
+    // sort is stable for users who arranged cards in dependency
+    // order already.
+    //
+    // This is the "do the right thing" workaround for the
+    // forward-ref validator rule: instead of telling the user
+    // "drag search-1 to the top", we just rearrange for them
+    // when they Save. The user can re-drag cards to customize
+    // if they want a different layout, but the step_template
+    // order is always consistent with the dependency graph.
+    function _topoSortSteps() {
+        if (!_stepTemplate || _stepTemplate.length <= 1) return false;
+        const byName = new Map(_stepTemplate.map((s) => [s.name, s]));
+        // Build adjacency: dep -> [dependents], plus in-degree
+        // count (number of dependencies each step has).
+        const depsOf = new Map();
+        for (const s of _stepTemplate) depsOf.set(s.name, []);
+        for (const s of _stepTemplate) {
+            const ds = Array.isArray(s.depends_on) ? s.depends_on : [];
+            for (const d of ds) {
+                if (!depsOf.has(d)) continue; // skip dangling refs
+                depsOf.get(d).push(s.name);
+            }
+        }
+        // Kahn's algorithm with stable order: process nodes whose
+        // dependencies are all already-placed, in their existing
+        // step_template order.
+        const placed = new Set();
+        const order = [];
+        let changed = false;
+        // We need to iterate in a stable way: at each step, pick
+        // the first unplaced step whose deps are all in 'placed'.
+        while (order.length < _stepTemplate.length) {
+            let picked = null;
+            for (const s of _stepTemplate) {
+                if (placed.has(s.name)) continue;
+                const ds = Array.isArray(s.depends_on) ? s.depends_on : [];
+                if (ds.every((d) => placed.has(d) || !depsOf.has(d))) {
+                    picked = s.name;
+                    break;
+                }
+            }
+            if (picked === null) {
+                // Cycle or unsatisfiable — bail, leave order alone
+                return false;
+            }
+            if (order[order.length] !== picked &&
+                _stepTemplate[order.length] !== byName.get(picked)) {
+                changed = true;
+            }
+            order.push(picked);
+            placed.add(picked);
+        }
+        // Detect change: did the order differ from the input?
+        const inputOrder = _stepTemplate.map((s) => s.name);
+        if (order.every((n, i) => n === inputOrder[i])) {
+            return false; // already in order, no re-layout needed
+        }
+        // Apply the new order to _stepTemplate
+        const reordered = order.map((n) => byName.get(n));
+        _stepTemplate = reordered;
+        // Re-render so visual Y positions match the new order.
+        // _render uses a simple Y = 50 + i*120 layout, so cards
+        // end up stacked top-to-bottom in execution order.
+        _render();
+        return true;
+    }
+
     window.visualBuilder = {
         init,
         save,
@@ -980,6 +1067,15 @@
         closeSidePanel,
         applyEdit,
         toggleJsonForm,
+        topoSort: () => {
+            const changed = _topoSortSteps();
+            _showBanner(
+                changed
+                    ? 'Reordered steps to satisfy depends_on (top → bottom = execution order).'
+                    : 'Already in execution order — no change.',
+                changed ? 'success' : 'info'
+            );
+        },
     };
     // Debug hook: expose internals for Playwright headless tests.
     // NOT used by the UI. Safe to ship to production.
