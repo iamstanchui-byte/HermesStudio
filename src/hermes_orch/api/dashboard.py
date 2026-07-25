@@ -1092,6 +1092,17 @@ async def project_visual_page(
         s = t.get("status") or "unknown"
         status_counts[s] = status_counts.get(s, 0) + 1
 
+    # Phase 4 Stage 3.5 (2026-07-26): pass available agent profiles
+    # so the edit form can render the agent_role <select>. Same
+    # source-of-truth as the chat /chat apply endpoint uses.
+    profile_rows = await db.fetchall(
+        "SELECT name, agent_id FROM agent_profiles ORDER BY agent_id, name"
+    )
+    all_profiles = [
+        {"name": p["name"], "agent_id": p["agent_id"]} for p in profile_rows
+    ]
+    profile_names = [p["name"] for p in all_profiles]
+
     return templates.TemplateResponse(
         request=request,
         name="visual_project.html",
@@ -1102,6 +1113,8 @@ async def project_visual_page(
             "token_by_task": token_by_task,
             "art_by_task": art_by_task,
             "status_counts": status_counts,
+            "profile_names": profile_names,
+            "all_profiles": all_profiles,
         },
     )
 

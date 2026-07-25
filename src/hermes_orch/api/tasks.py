@@ -19,6 +19,7 @@ State transitions handled by:
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import secrets
 import uuid
@@ -26,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 
@@ -870,6 +871,274 @@ async def retry_task(task_id: str, request: Request) -> Task:
         },
     )
     return _row_to_task(row)
+
+
+# ===== PATCH (edit task structure) — Phase 4 Stage 3.5 (2026-07-26) =====
+#
+# The visual project page now lets the operator add/edit/delete
+# tasks directly (the "plan builder" UX). These endpoints back
+# those UI actions.
+#
+# Edit policy (intentionally simple for v1):
+#   - Only edit tasks in non-terminal state (pending/assigned).
+#     Running tasks are owned by the wrapper; the operator
+#     should interrupt first. Completed/failed/interrupted/
+#     cancelled/skipped are terminal — operator should retry,
+#     not edit in place. (Re-running with a different structure
+#     is the cleanest path; mid-flight edits would race with
+#     the wrapper's polling.)
+#   - All editable fields are optional. Pass only the ones you
+#     want to change. name/agent_role/action/depends_on/params
+#     are supported.
+#   - depends_on is a list of task IDs (NOT names) in this
+#     endpoint. The frontend resolves names -> IDs before
+#     calling (matches the chat-apply pattern).
+
+
+class TaskPatch(BaseModel):
+    """Body for PATCH /api/tasks/{id}. All fields optional."""
+    name: str | None = None
+    agent_role: str | None = None
+    action: str | None = None
+    depends_on: list[str] | None = None  # list of task IDs
+    params: dict[str, Any] | None = None
+    output_path: str | None = None
+    priority: str | None = None  # 'low' | 'normal' | 'high'
+    on_parent_failure: str | None = None  # 'skip' | 'fail' | 'wait'
+
+
+# Tasks that can be safely edited (not in flight, not terminal).
+_EDITABLE_STATUSES = ("pending", "assigned")
+
+
+@router.patch("/{task_id}", response_model=Task)
+async def patch_task(
+    task_id: str, body: TaskPatch, request: Request
+) -> Task:
+    """Edit a task's structure (name, agent_role, action,
+    depends_on, params, etc.). Used by the visual project page
+    'plan builder' UX.
+
+    Refuses to edit running or terminal tasks (400). For
+    completed/failed/interrupted tasks, use POST /retry to
+    re-dispatch, or use the supervisor's loop-back mechanism
+    via project.feedback_to.
+
+    depends_on is a list of task IDs; the server validates that
+    every referenced ID exists in the same project. Self-refs
+    are silently dropped. Forward refs (depends on a later
+    task in the same project) are allowed (supervisor's
+    _maybe_loop_back can use them for loop-back semantics).
+    """
+    db = request.app.state.db
+    task = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    if not task:
+        raise HTTPException(404, f"Task not found: {task_id}")
+    if task["status"] not in _EDITABLE_STATUSES:
+        raise HTTPException(
+            400,
+            f"Cannot edit task in state {task['status']!r}. "
+            f"Editable states: {list(_EDITABLE_STATUSES)}. For terminal "
+            f"tasks use POST /retry (or supervisor loop-back).",
+        )
+    project_id = task["project_id"]
+    set_parts: list[str] = []
+    set_params: list[Any] = []
+    # name
+    if body.name is not None:
+        clean_name = (body.name or "").strip()
+        if not clean_name:
+            raise HTTPException(400, "name cannot be empty")
+        # Ensure uniqueness within project (other tasks)
+        dup = await db.fetchone(
+            "SELECT id FROM tasks WHERE project_id = ? AND name = ? AND id != ?",
+            (project_id, clean_name, task_id),
+        )
+        if dup:
+            raise HTTPException(
+                400, f"name '{clean_name}' already used by task {dup['id']} in this project"
+            )
+        set_parts.append("name = ?")
+        set_params.append(clean_name)
+    # agent_role
+    if body.agent_role is not None:
+        role = (body.agent_role or "").strip()
+        if role:
+            prof = await db.fetchone(
+                "SELECT id FROM agent_profiles WHERE name = ?", (role,),
+            )
+            if not prof:
+                available = await db.fetchall(
+                    "SELECT name FROM agent_profiles ORDER BY name"
+                )
+                names = [p["name"] for p in available]
+                raise HTTPException(
+                    400,
+                    f"agent_role '{role}' is not a registered profile. "
+                    f"Available profiles: {names}.",
+                )
+        set_parts.append("agent_role = ?")
+        set_params.append(role)
+    # action
+    if body.action is not None:
+        clean_action = (body.action or "").strip()
+        if not clean_action:
+            raise HTTPException(400, "action cannot be empty")
+        set_parts.append("action = ?")
+        set_params.append(clean_action)
+    # depends_on
+    if body.depends_on is not None:
+        # Validate: every ID must exist in the same project,
+        # and must not be self. Dedupe.
+        new_deps = []
+        seen: set[str] = set()
+        for did in body.depends_on:
+            if not isinstance(did, str) or did == task_id or did in seen:
+                continue
+            other = await db.fetchone(
+                "SELECT id FROM tasks WHERE id = ? AND project_id = ?",
+                (did, project_id),
+            )
+            if not other:
+                raise HTTPException(
+                    400, f"depends_on references '{did}' which is not in this project"
+                )
+            new_deps.append(did)
+            seen.add(did)
+        set_parts.append("depends_on = ?")
+        set_params.append(json.dumps(new_deps))
+    # params
+    if body.params is not None:
+        set_parts.append("params = ?")
+        set_params.append(json.dumps(body.params))
+    # output_path
+    if body.output_path is not None:
+        set_parts.append("output_path = ?")
+        set_params.append((body.output_path or "").strip() or None)
+    # priority
+    if body.priority is not None:
+        if body.priority not in ("low", "normal", "high"):
+            raise HTTPException(
+                400, f"priority must be one of low/normal/high, got {body.priority!r}"
+            )
+        set_parts.append("priority = ?")
+        set_params.append(body.priority)
+    # on_parent_failure
+    if body.on_parent_failure is not None:
+        if body.on_parent_failure not in ("skip", "fail", "wait"):
+            raise HTTPException(
+                400,
+                f"on_parent_failure must be one of skip/fail/wait, got {body.on_parent_failure!r}",
+            )
+        set_parts.append("on_parent_failure = ?")
+        set_params.append(body.on_parent_failure)
+    if not set_parts:
+        # No-op patch; return current row
+        return _row_to_task(task)
+    set_parts.append("updated_at = ?")
+    set_params.append(_now_iso())
+    set_params.append(task_id)
+    await db.execute(
+        f"UPDATE tasks SET {', '.join(set_parts)} WHERE id = ?",
+        tuple(set_params),
+    )
+    # If name or action changed, also clear cached values in
+    # dependent tables (artifacts.output_path, etc. — not
+    # implemented for v1 but the hooks are here).
+    await audit_log(
+        db, "task.patched",
+        actor="operator",
+        project_id=project_id,
+        task_id=task_id,
+        agent_id=task.get("assigned_agent_id"),
+        payload={"fields_changed": [p.split(" =")[0] for p in set_parts]},
+    )
+    row = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    return _row_to_task(row)
+
+
+# ===== DELETE (remove task from plan) — Phase 4 Stage 3.5 (2026-07-26) =====
+
+
+@router.delete("/{task_id}", status_code=204)
+async def delete_task(task_id: str, request: Request):
+    """Delete a task from a project (plan builder UX).
+
+    Behavior:
+      - Refuses to delete running or terminal tasks. Only
+        pending/assigned tasks can be deleted (same as PATCH).
+        Operator should interrupt or retry first.
+      - Scrubs depends_on references in sibling tasks. If
+        task A depends on task X, and X is deleted, A's
+        depends_on is updated to remove X (instead of leaving
+        a dangling reference that would crash the dispatcher).
+      - Hard-deletes the row. Audit log: task.deleted.
+
+    Idempotent: a second DELETE on the same task is 404
+    (the row is already gone).
+    """
+    db = request.app.state.db
+    task = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    if not task:
+        raise HTTPException(404, f"Task not found: {task_id}")
+    if task["status"] not in _EDITABLE_STATUSES:
+        raise HTTPException(
+            400,
+            f"Cannot delete task in state {task['status']!r}. "
+            f"Deletable states: {list(_EDITABLE_STATUSES)}. For terminal "
+            f"tasks, the result is preserved; just leave them.",
+        )
+    project_id = task["project_id"]
+    # Scrub depends_on references in siblings. Load all
+    # tasks in the project, parse their depends_on JSON,
+    # remove the deleted id, write back.
+    siblings = await db.fetchall(
+        "SELECT id, depends_on FROM tasks WHERE project_id = ? AND id != ?",
+        (project_id, task_id),
+    )
+    now = _now_iso()
+    scrubbed = []
+    for s in siblings:
+        deps_raw = s.get("depends_on")
+        if not deps_raw:
+            continue
+        if isinstance(deps_raw, str):
+            try:
+                deps = json.loads(deps_raw) or []
+            except (json.JSONDecodeError, TypeError):
+                continue
+        else:
+            deps = deps_raw or []
+        if task_id not in deps:
+            continue
+        new_deps = [d for d in deps if d != task_id]
+        await db.execute(
+            "UPDATE tasks SET depends_on = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(new_deps), now, s["id"]),
+        )
+        scrubbed.append(s["id"])
+    # Free profile if assigned (defensive — pending tasks
+    # shouldn't have one, but assigned might)
+    if task.get("assigned_profile_id"):
+        await db.execute(
+            "UPDATE agent_profiles SET status = 'idle', current_task_id = NULL, "
+            "updated_at = ? WHERE id = ? AND current_task_id = ?",
+            (now, task["assigned_profile_id"], task_id),
+        )
+    # Hard-delete the row. CASCADE will clean up artifacts.
+    await db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    await audit_log(
+        db, "task.deleted",
+        actor="operator",
+        project_id=project_id,
+        task_id=task_id,
+        agent_id=task.get("assigned_agent_id"),
+        payload={
+            "name": task.get("name"),
+            "scrubbed_dependents": scrubbed,
+        },
+    )
+    return Response(status_code=204)
 
 
 # ===== Failure propagation (§4.3) =====

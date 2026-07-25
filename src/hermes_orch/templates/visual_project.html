@@ -336,6 +336,128 @@ svg.connection.output_2 path {
     border-color: #dc2626;
 }
 .vp-sp-btn-warn:hover:not(:disabled) { background: #b91c1c; }
+/* Stage 3.5 (2026-07-26) — editable form fields */
+.vp-sp-edit-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin: 6px 0 4px;
+    flex-direction: column;
+}
+.vp-sp-edit-label {
+    font-size: 10px;
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+}
+.vp-sp-input {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    font-size: 13px;
+    background: #fff;
+    color: #1f2937;
+    box-sizing: border-box;
+    font-family: inherit;
+}
+.vp-sp-input:focus {
+    outline: none;
+    border-color: #2563eb;
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+.vp-sp-textarea {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid #d1d5db;
+    border-radius: 4px;
+    font-size: 12px;
+    background: #f9fafb;
+    color: #1f2937;
+    box-sizing: border-box;
+    font-family: ui-monospace, monospace;
+    resize: vertical;
+    min-height: 80px;
+}
+.vp-sp-textarea:focus {
+    outline: none;
+    border-color: #2563eb;
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+    background: #fff;
+}
+.vp-sp-dep-list {
+    max-height: 180px;
+    overflow-y: auto;
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    padding: 6px;
+    background: #f9fafb;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+.vp-sp-dep-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 3px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+}
+.vp-sp-dep-label:hover { background: #f3f4f6; }
+.vp-sp-dep-label input[type="checkbox"] { margin: 0; cursor: pointer; }
+.vp-sp-dep-name {
+    flex: 1;
+    color: #1f2937;
+    word-break: break-word;
+}
+.vp-sp-dep-id {
+    font-family: ui-monospace, monospace;
+    font-size: 10px;
+    color: #9ca3af;
+}
+.vp-sp-empty {
+    color: #9ca3af;
+    font-style: italic;
+    font-size: 12px;
+}
+.vp-sp-btn-danger {
+    background: #fee2e2;
+    color: #b91c1c;
+    border-color: #fecaca;
+}
+.vp-sp-btn-danger:hover:not(:disabled) {
+    background: #fecaca;
+}
+/* Stage 3.5 card-level X delete button (top-right corner) */
+.vp-card-del {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 20px;
+    height: 20px;
+    border: none;
+    background: rgba(255, 255, 255, 0.85);
+    color: #9ca3af;
+    font-size: 14px;
+    line-height: 1;
+    border-radius: 3px;
+    cursor: pointer;
+    padding: 0;
+    display: none;
+    z-index: 3;
+    font-family: inherit;
+}
+.vp-card:hover .vp-card-del { display: block; }
+.vp-card-del:hover {
+    background: #fee2e2;
+    color: #dc2626;
+}
+/* Stage 3.5 — extra padding-right on name so the X button
+   doesn't overlap the task name. */
+.vp-card { padding-right: 28px; }
 </style>
 {% endblock %}
 
@@ -357,8 +479,13 @@ svg.connection.output_2 path {
                 · visual view (Phase 4 Stage 3 — canvas with depends_on wires)
             </p>
         </div>
-        <div class="text-xs text-gray-400">
-            auto-refresh: 30s
+        <div class="text-xs text-gray-400 flex items-center gap-3">
+            <button onclick="vpOpenAddTaskPanel()"
+                class="px-3 py-1 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700 font-medium"
+                title="Add a new task to this project. The task will be created in 'pending' state and can be edited or deleted before the project runs.">
+                ➕ Add task
+            </button>
+            <span>auto-refresh: 30s</span>
         </div>
     </div>
 
@@ -431,6 +558,12 @@ svg.connection.output_2 path {
    when the user clicks a card. The data is small enough to inline. #}
 <script id="vp-task-data" type="application/json">
 {
+    "project": {
+        "id": {{ project.id | tojson }},
+        "name": {{ project.name | tojson }},
+        "state": {{ project.state | tojson }}
+    },
+    "profiles": {{ profile_names | tojson }},
     "tasks": {
     {%- for t in tasks %}
         "{{ t.id }}": {
@@ -481,8 +614,18 @@ function _vpCardHtml(task) {
     const art = task.artifacts || {};
     const timing = task.timing || {};
     const deps = task.depends_on || [];
+    // Stage 3.5 (2026-07-26): only show the X delete button for
+    // pending/assigned tasks (same rule as PATCH/DELETE endpoints).
+    // Running/completed/terminal tasks can't be deleted while the
+    // wrapper or history holds them, so hide the button rather
+    // than show a confirm-then-400 flow.
+    const canDelete = task.status === 'pending' || task.status === 'assigned';
+    const delBtn = canDelete
+        ? `<button class="vp-card-del" onclick="vpCardDelete(event, '${_escHtml(task.id)}')" title="Delete task">×</button>`
+        : '';
     return `
 <div class="vp-card vp-card-status-${_escHtml(task.status)}" data-task-name="${_escHtml(task.id)}">
+    ${delBtn}
     <span class="vp-status vp-status-${_escHtml(task.status)}">${_escHtml(task.status)}</span>
     <div class="vp-name">${_escHtml(task.name)}</div>
     <div class="vp-role">${_escHtml(task.agent_role || '?')}</div>
@@ -680,7 +823,7 @@ function _vpBindClickHandlers() {
 }
 
 // ===== Side panel (Stage 2, kept) =====
-function _vpRenderActions(task) {
+function _vpRenderActions(task, EDITABLE) {
     const buttons = [];
     const status = task.status;
     if (status === 'failed' || status === 'interrupted' ||
@@ -705,6 +848,15 @@ function _vpRenderActions(task) {
             </button>`
         );
     }
+    // Phase 4 Stage 3.5 (2026-07-26): Edit button only for
+    // tasks in pending/assigned state.
+    if (EDITABLE) {
+        buttons.push(
+            `<button class="vp-sp-btn vp-sp-btn-primary" onclick="vpStartEdit('${task.id}')">
+                ✏️ Edit
+            </button>`
+        );
+    }
     buttons.push(
         `<button class="vp-sp-btn" onclick="vpClosePanel()">Close</button>`
     );
@@ -712,16 +864,42 @@ function _vpRenderActions(task) {
 }
 
 function vpOpenPanel(taskId) {
-    const task = _VP_DATA.tasks[taskId];
-    if (!task) {
-        console.error('task not found:', taskId);
-        return;
-    }
     const panel = document.getElementById('vp-side-panel');
     const title = document.getElementById('vp-sp-title');
     const body = document.getElementById('vp-sp-body');
     const footer = document.getElementById('vp-sp-footer');
 
+    // Phase 4 Stage 3.5 (2026-07-26): if taskId is the
+    // literal string '__NEW__', we're creating a new task.
+    // Show the edit form in "new" mode.
+    if (taskId === '__NEW__') {
+        title.textContent = '➕ Add task';
+        body.innerHTML = _vpRenderEditForm({
+            id: '',
+            name: '',
+            agent_role: '',
+            action: '',
+            params: {},
+            depends_on: [],
+        });
+        footer.innerHTML = `
+            <button class="vp-sp-btn vp-sp-btn-primary" onclick="vpSaveEdit('__NEW__', event)">
+                ➕ Create
+            </button>
+            <button class="vp-sp-btn" onclick="vpClosePanel()">Cancel</button>
+        `;
+        panel.classList.remove('hidden');
+        setTimeout(() => {
+            const first = panel.querySelector('input,textarea,select');
+            if (first) first.focus();
+        }, 50);
+        return;
+    }
+    const task = _VP_DATA.tasks[taskId];
+    if (!task) {
+        console.error('task not found:', taskId);
+        return;
+    }
     title.textContent = task.name;
 
     const tok = task.tokens || {};
@@ -730,8 +908,29 @@ function vpOpenPanel(taskId) {
     const result = task.result || null;
     const params = task.params || {};
     const deps = task.depends_on || [];
+    const EDITABLE = task.status === 'pending' || task.status === 'assigned';
 
-    body.innerHTML = `
+    if (_vpEditMode && EDITABLE) {
+        body.innerHTML = _vpRenderEditForm(task);
+        footer.innerHTML = `
+            <button class="vp-sp-btn vp-sp-btn-primary" onclick="vpSaveEdit('${task.id}', event)">
+                💾 Save
+            </button>
+            <button class="vp-sp-btn" onclick="vpCancelEdit('${task.id}')">Cancel</button>
+            <button class="vp-sp-btn vp-sp-btn-danger" onclick="vpDeleteTask('${task.id}', event)" style="margin-left: auto;">
+                🗑 Delete
+            </button>
+        `;
+    } else {
+        body.innerHTML = _vpRenderReadOnly(task, tok, art, timing, result, params, deps);
+        footer.innerHTML = _vpRenderActions(task, EDITABLE);
+    }
+    panel.classList.remove('hidden');
+    panel.querySelector('.vp-sp-close').focus();
+}
+
+function _vpRenderReadOnly(task, tok, art, timing, result, params, deps) {
+    return `
         <div class="vp-sp-row">
             <span class="vp-sp-label">status</span>
             <span class="vp-status vp-status-${_escHtml(task.status)}">${_escHtml(task.status)}</span>
@@ -793,10 +992,203 @@ function vpOpenPanel(taskId) {
         <pre class="vp-sp-pre vp-sp-error">${_escHtml(task.error)}</pre>
         ` : ''}
     `;
+}
 
-    footer.innerHTML = _vpRenderActions(task);
-    panel.classList.remove('hidden');
-    panel.querySelector('.vp-sp-close').focus();
+// Phase 4 Stage 3.5 (2026-07-26): editable form for
+// pending/assigned tasks. Renders the task's current values
+// as form fields. Save / Cancel / Delete buttons in footer.
+function _vpRenderEditForm(task) {
+    const paramsStr = task.params && Object.keys(task.params).length
+        ? JSON.stringify(task.params, null, 2)
+        : '{}';
+    const allTaskIds = Object.keys(_VP_DATA.tasks);
+    const depSet = new Set(task.depends_on || []);
+    const depCheckboxes = allTaskIds
+        .filter(tid => tid !== task.id)
+        .map(tid => {
+            const t = _VP_DATA.tasks[tid];
+            const checked = depSet.has(tid) ? 'checked' : '';
+            return `<label class="vp-sp-dep-label">
+                <input type="checkbox" class="vp-sp-deps" value="${_escHtml(tid)}" ${checked}>
+                <span class="vp-sp-dep-name">${_escHtml(t.name || tid)}</span>
+                <span class="vp-sp-dep-id">${_escHtml(tid)}</span>
+            </label>`;
+        }).join('');
+    return `
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">id</span>
+            <span class="vp-sp-mono">${_escHtml(task.id || '(new task — id assigned on save)')}</span>
+        </div>
+        <div class="vp-sp-edit-row">
+            <label class="vp-sp-edit-label">name</label>
+            <input id="vp-edit-name" type="text" class="vp-sp-input" value="${_escHtml(task.name || '')}" placeholder="task display name">
+        </div>
+        <div class="vp-sp-edit-row">
+            <label class="vp-sp-edit-label">agent_role</label>
+            <select id="vp-edit-agent_role" class="vp-sp-input">
+                <option value="">(default to first profile)</option>
+                ${(_VP_DATA.profiles || []).map(p =>
+                    `<option value="${_escHtml(p)}" ${p === task.agent_role ? 'selected' : ''}>${_escHtml(p)}</option>`
+                ).join('')}
+            </select>
+        </div>
+        <div class="vp-sp-edit-row">
+            <label class="vp-sp-edit-label">action *</label>
+            <input id="vp-edit-action" type="text" class="vp-sp-input" value="${_escHtml(task.action || '')}" placeholder="e.g. fetch_data, write_report" required>
+        </div>
+        <div class="vp-sp-edit-row">
+            <label class="vp-sp-edit-label">params (JSON object)</label>
+            <textarea id="vp-edit-params" class="vp-sp-textarea" rows="4" placeholder='{"symbol": "EURUSD"}'>${_escHtml(paramsStr)}</textarea>
+        </div>
+        <div class="vp-sp-edit-row">
+            <label class="vp-sp-edit-label">depends_on (${allTaskIds.length - (task.id ? 1 : 0)} other tasks)</label>
+            <div class="vp-sp-dep-list">${depCheckboxes || '<em class="vp-sp-empty">no other tasks in this project yet</em>'}</div>
+        </div>
+    `;
+}
+
+let _vpEditMode = false;
+
+function vpStartEdit(taskId) {
+    _vpEditMode = true;
+    vpOpenPanel(taskId);
+}
+
+function vpCancelEdit(taskId) {
+    _vpEditMode = false;
+    vpOpenPanel(taskId);
+}
+
+async function vpSaveEdit(taskId, ev) {
+    const name = document.getElementById('vp-edit-name')?.value?.trim() || '';
+    let agent_role = document.getElementById('vp-edit-agent_role')?.value || '';
+    const action = document.getElementById('vp-edit-action')?.value?.trim() || '';
+    const paramsStr = document.getElementById('vp-edit-params')?.value?.trim() || '{}';
+    const depCheckboxes = document.querySelectorAll('.vp-sp-deps:checked');
+    const depends_on = Array.from(depCheckboxes).map(cb => cb.value);
+    if (!action) {
+        alert('action is required');
+        return;
+    }
+    // Default empty agent_role to the first registered profile
+    // (TaskCreate requires non-empty agent_role, so the empty
+    // "default" option in the form must be resolved here. The
+    // chat apply endpoint does the same fallback server-side.)
+    // Use `let` (not `const`) above so we can reassign here.
+    if (!agent_role) {
+        if (_VP_DATA.profiles && _VP_DATA.profiles.length) {
+            agent_role = _VP_DATA.profiles[0];
+        } else {
+            alert('No agent profiles registered. Add one on the Agents page first.');
+            return;
+        }
+    }
+    let params;
+    try {
+        params = JSON.parse(paramsStr);
+        if (typeof params !== 'object' || params === null || Array.isArray(params)) {
+            throw new Error('params must be a JSON object');
+        }
+    } catch (e) {
+        alert('Invalid params JSON: ' + e.message);
+        return;
+    }
+    const btn = ev?.currentTarget || ev?.target;
+    const origLabel = taskId === '__NEW__' ? '➕ Create' : '💾 Save';
+    if (btn) { btn.disabled = true; btn.textContent = '... Saving'; }
+    try {
+        if (taskId === '__NEW__') {
+            const r = await _fetchWithTimeout('/api/tasks/', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    project_id: _VP_DATA.project.id,
+                    name: name,
+                    agent_role: agent_role,
+                    action: action,
+                    params: params,
+                    depends_on: depends_on,
+                }),
+            }, 15000);
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                alert('Create failed: ' + _errDetailToString(data.detail, r.status));
+                if (btn) { btn.disabled = false; btn.textContent = origLabel; }
+                return;
+            }
+            setTimeout(() => location.reload(), 600);
+        } else {
+            const r = await _fetchWithTimeout(`/api/tasks/${taskId}`, {
+                method: 'PATCH',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    name: name,
+                    agent_role: agent_role,
+                    action: action,
+                    params: params,
+                    depends_on: depends_on,
+                }),
+            }, 15000);
+            const data = await r.json().catch(() => ({}));
+            if (!r.ok) {
+                alert('Save failed: ' + _errDetailToString(data.detail, r.status));
+                if (btn) { btn.disabled = false; btn.textContent = origLabel; }
+                return;
+            }
+            setTimeout(() => location.reload(), 600);
+        }
+    } catch (e) {
+        const reason = e.name === 'AbortError' ? 'timed out' : e.message;
+        alert('Network error: ' + reason);
+        if (btn) { btn.disabled = false; btn.textContent = origLabel; }
+    }
+}
+
+async function vpDeleteTask(taskId, ev) {
+    const task = _VP_DATA.tasks[taskId];
+    if (!task) return;
+    if (!confirm(`Delete task "${task.name || taskId}"?\n\nThis will:\n- Remove the task from the project\n- Scrub its ID from any sibling tasks' depends_on\n\nThis cannot be undone.`)) return;
+    const btn = ev?.currentTarget || ev?.target;
+    if (btn) { btn.disabled = true; btn.textContent = '... Deleting'; }
+    try {
+        const r = await _fetchWithTimeout(`/api/tasks/${taskId}`, {method: 'DELETE'}, 10000);
+        if (r.status === 204) {
+            setTimeout(() => location.reload(), 500);
+        } else {
+            const data = await r.json().catch(() => ({}));
+            alert('Delete failed: ' + _errDetailToString(data.detail, r.status));
+            if (btn) { btn.disabled = false; btn.textContent = '🗑 Delete'; }
+        }
+    } catch (e) {
+        alert('Network error: ' + e.message);
+        if (btn) { btn.disabled = false; btn.textContent = '🗑 Delete'; }
+    }
+}
+
+function vpOpenAddTaskPanel() {
+    _vpEditMode = true;
+    vpOpenPanel('__NEW__');
+}
+
+// Stage 3.5 (2026-07-26): card-level X delete. Called by the
+// X button rendered in _vpCardHtml. Stops propagation so the
+// card click handler doesn't also fire (would open the side
+// panel first). Then delegates to vpDeleteTask (the same flow
+// the side-panel Delete button uses, including the confirm
+// prompt).
+async function vpCardDelete(ev, taskId) {
+    ev.stopPropagation();
+    ev.preventDefault();
+    const btn = ev.currentTarget;
+    if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; }
+    try {
+        await vpDeleteTask(taskId, ev);
+    } finally {
+        if (btn && document.body.contains(btn)) {
+            btn.disabled = false;
+            btn.style.opacity = '1';
+        }
+    }
 }
 
 function vpClosePanel() {
