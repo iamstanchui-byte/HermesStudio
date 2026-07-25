@@ -107,9 +107,21 @@
                     </a>
                     <button onclick="openReplanModal('{{ project.id }}')"
                         class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
-                        title="Re-trigger the LLM planner: set/update the project goal and configure iter-loop settings. Existing pending tasks are kept unless you also tick 'clear tasks'.">
+                        title="Re-trigger the LLM planner: set/update the project goal and configure iter-loop settings. Existing pending tasks are kept unless you also tick 'clear tasks'. After planning, the project stays in 'planned' state — click Run to start dispatch.">
                         ✨ Generate plan
                     </button>
+                    {# Phase 4+ (2026-07-25): explicit Run button. Only shown
+                       when state='planned' (or 'planning' for queued plans
+                       with cleared_tasks — user can pre-trigger Run to skip
+                       the wait). On click: state=planned -> ready, supervisor
+                       picks up on next tick. Idempotent on 'ready'/'running'. #}
+                    {% if project.state in ('planned', 'planning') %}
+                    <button onclick="runProject('{{ project.id }}')"
+                        class="px-3 py-1.5 text-xs font-bold rounded border-2 border-green-500 text-green-700 hover:bg-green-50"
+                        title="Start dispatch: transitions project from 'planned' to 'ready'. Supervisor's next tick (within ~5s) will pick up pending tasks. Requires at least one task — add manually or via Generate plan first.">
+                        ▶️ Run
+                    </button>
+                    {% endif %}
                 </div>
                 <div class="flex gap-1.5 flex-wrap justify-end">
                     {% if project.state == 'archived' %}
@@ -155,16 +167,21 @@
                         + Mark as template
                     </button>
                     {% endif %}
-                    {# Path B (#22): promote this project to a SKILL.md on a
-                       target profile. Useful for "I just did X, now
-                       agents should know how to do X." Available on
-                       all projects (any state) — a half-finished
-                       project can still teach a useful lesson. #}
+                    {# Phase 4+ (2026-07-25): HIDDEN for now per user
+                       direction. The "Promote to skill" feature is
+                       still available via API (POST /api/schedules/
+                       project/{id}/promote-to-skill) for programmatic
+                       use, but the UI button is hidden because:
+                         - the project page is being repositioned
+                         - skill promotion needs a separate UX pass
+                       Restore by uncommenting when ready. #}
+                    {% if false %}
                     <button onclick="promoteToSkill()"
                         class="px-3 py-1.5 text-xs font-medium rounded border border-indigo-300 text-indigo-700 hover:bg-indigo-50"
                         title="Render this project as a SKILL.md and register it to a target profile. The agent on that profile will see the skill in its available skills list within ~30s.">
                         ✨ Promote to skill
                     </button>
+                    {% endif %}
                     {# Stage 1 (2026-07-23): promote this project to a
                        reusable workflow package. Different from
                        "Mark as template" (which is a 1:1 schedule clone
@@ -193,13 +210,19 @@
 <!-- Workflow procedure (Path A, #22) — n8n-style "how to do this workflow"
      markdown. The agent reads this before executing each task. For
      recurring templates, this file is copied to the clone so the new
-     cycle has the same procedure without redefining it. -->
+     cycle has the same procedure without redefining it.
+     Phase 4+ (2026-07-25): the Auto-generate + Edit buttons are
+     HIDDEN per user direction. The procedure.md is still loaded
+     (read-only), but the LLM-driven auto-generation and inline edit
+     are deferred. Users who need to write procedure.md can still use
+     the file API (PUT /api/projects/{id}/files/procedure.md) directly. -->
 <div class="bg-white border rounded-lg p-4 mb-4 shadow-sm">
     <div class="flex items-center justify-between mb-2">
         <h2 class="text-base font-semibold text-gray-800">
             Workflow procedure
-            <span class="text-xs text-gray-500 font-normal">(read by the agent before each task)</span>
+            <span class="text-xs text-gray-500 font-normal">(read by the agent before each task · read-only for now)</span>
         </h2>
+        {% if false %}
         <div class="flex items-center gap-2">
             <button id="proc-autogen-btn" onclick="autoGenerateProcedure()" class="text-xs px-2 py-1 bg-purple-50 text-purple-700 rounded border border-purple-300 hover:bg-purple-100"
                 title="Ask the LLM to write procedure.md from this project's tasks + facts">
@@ -209,6 +232,7 @@
                 Edit
             </button>
         </div>
+        {% endif %}
     </div>
     <div id="proc-view" class="text-sm text-gray-700 prose-sm max-w-none">
         <div id="proc-content" class="text-xs text-gray-500 italic">Loading...</div>
@@ -454,7 +478,7 @@ they target different agent profiles. -->
         <h2 class="text-lg font-semibold text-gray-800">
             Tasks
             {% if total_count %}
-            <span class="text-sm text-gray-500 font-normal">({{ total_count }} total)</span>
+            <span id="task-count-badge" class="text-sm text-gray-500 font-normal">({{ total_count }} total)</span>
             {% endif %}
         </h2>
         <button id="collapse-all-btn" onclick="collapseAllResults()" class="px-2 py-1 text-xs bg-white border text-gray-700 rounded hover:bg-gray-50" title="Hide all expanded result panels. Without this, the 10s auto-refresh pauses because the polling script skips reloads while a result panel is open.">
@@ -815,7 +839,10 @@ async function loadProcedure() {
     try {
         const r = await _fetchWithTimeout(`/api/projects/${PROJECT_ID}/files/procedure.md`);
         if (r.status === 404) {
-            el.textContent = '(no procedure yet — click Edit to add one)';
+            // Phase 4+ (2026-07-25): Edit button is hidden. Procedure
+            // editing is via file API or future Auto-generate. Plain
+            // "no procedure yet" message.
+            el.textContent = '(no procedure yet)';
             el.classList.remove('italic', 'text-gray-500');
             el.classList.add('text-gray-400');
             return;
@@ -823,7 +850,7 @@ async function loadProcedure() {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const text = await r.text();
         if (!text.trim()) {
-            el.textContent = '(empty — click Edit to add one)';
+            el.textContent = '(empty)';
             el.classList.remove('italic', 'text-gray-500');
             el.classList.add('text-gray-400');
         } else {
@@ -1047,6 +1074,44 @@ async function deleteProject(projectId) {
     }
 }
 
+// ===== Run (Phase 4+, 2026-07-25) =====
+// Explicit trigger to start dispatch. State goes planned -> ready, then
+// supervisor picks up on next tick (within ~5s). The user reviews the
+// plan (visual view, or task list below) and clicks Run when ready.
+async function runProject(projectId) {
+    // Quick sanity-check the count from the visible task list. If the
+    // server says 0 we want a clear message before the round-trip.
+    const taskCountEl = document.getElementById('task-count-badge');
+    const visibleCount = taskCountEl ? parseInt(taskCountEl.textContent || '0', 10) : null;
+    let confirmMsg = 'Start dispatch for this project?\n\nThe supervisor will pick up pending tasks on its next tick (~5s).';
+    if (visibleCount === 0) {
+        if (!confirm('This project has 0 tasks. Run anyway?\n\nThe server will return 400 if you try. Click Cancel and add a task (or click Generate plan) first.')) return;
+        // We let the request go so the server-side error gives the
+        // canonical 400 message; this branch is just an early bail.
+    }
+    if (!confirm(confirmMsg)) return;
+    try {
+        const r = await fetch('/api/projects/' + projectId + '/run', {method: 'POST'});
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            // 400 from server (e.g. 0 tasks, terminal state) — show the
+            // message verbatim; it's already human-readable.
+            alert('Run failed: ' + (data.detail || r.status));
+            return;
+        }
+        if (data.noop) {
+            // Already ready/running — just reload to show updated state.
+            location.reload();
+            return;
+        }
+        // Successful transition planned -> ready. Reload so the user
+        // sees the new state + dispatch indicators.
+        location.reload();
+    } catch (err) {
+        alert('Network error: ' + err.message);
+    }
+}
+
 // Re-trigger the LLM planner. If the project has no goal yet, prompt for one.
 // ===== Generate plan modal =====
 
@@ -1151,6 +1216,10 @@ async function submitReplan(projectId) {
         status.textContent = `Replan queued. ${data.cleared_tasks} task(s) cleared. Reloading...`;
         status.className = 'text-sm text-green-600';
         setTimeout(() => location.reload(), 1500);
+        // Phase 4+ (2026-07-25): the message above is misleading now —
+        // replan leaves the project in 'planned', NOT auto-dispatching.
+        // Replace it with the new flow. The user sees the page reload
+        // 1.5s after submission, and the new Run button is visible.
     } catch (err) {
         status.textContent = 'Network error: ' + err.message;
         status.className = 'text-sm text-red-600';
@@ -1300,7 +1369,11 @@ async function deletePreset(agentId, profileName, btn) {
             <h2 class="text-lg font-semibold text-gray-800 mb-1">&#x2728; Generate plan</h2>
             <p class="text-sm text-gray-500 mb-4">
                 Set the goal and (optionally) configure iter-loop settings.
-                The supervisor will call the LLM planner on the next tick.
+                The supervisor calls the LLM planner on the next tick
+                (~5s). After planning, the project stays in <code>planned</code>
+                state — tasks are created but NOT yet dispatched. Review the
+                plan on this page (or in the visual view), then click
+                <strong>Run</strong> to start dispatch.
             </p>
 
             <div class="grid grid-cols-1 gap-3">

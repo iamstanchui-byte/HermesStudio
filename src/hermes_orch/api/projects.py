@@ -34,16 +34,20 @@ router = APIRouter()
 
 
 class ProjectCreate(BaseModel):
-    goal: str | None = None  # Optional: omit for manual mode (you add tasks yourself)
-    name: str | None = None
-    mode: str = "auto"  # auto = planner generates tasks from goal; manual = no goal, you add tasks
-    # Q3: system-level project handle. Defaults are project-driven (not yet
-    # used by the supervisor loop; populated when the user opts into
-    # iterative project mode).
-    coordinator_role: str | None = None  # e.g. "super" or "auto" (LLM picks)
-    accept_criteria: str | None = None  # plain-text "definition of done"
-    deliverable_path: str | None = None  # final artifact path (e.g. "report_v2.md")
-    max_iterations: int = 0  # 0 = no cap; otherwise max replan rounds
+    # Phase 4+ repositioning (2026-07-25): create is now SIMPLE. Just a
+    # name is required. Goal/iter-loop/etc. are setup INSIDE the
+    # project page, not at create time. New projects always start at
+    # state='planned' (blank, awaiting tasks or Run click) — there is
+    # no "auto-plan on create" anymore. The user adds tasks manually
+    # via the project page, or clicks "Generate plan" to have the
+    # LLM planner create them. Either way, the project stays at
+    # state='planned' until the user explicitly clicks Run.
+    name: str  # required: just a name
+    goal: str | None = None  # optional: stored, but not used until Generate plan
+    coordinator_role: str | None = None  # optional: iter-loop, set later
+    accept_criteria: str | None = None
+    deliverable_path: str | None = None
+    max_iterations: int = 0
 
 
 class Project(BaseModel):
@@ -168,20 +172,21 @@ def _serialize_plan_md(fm: dict[str, Any], body: str) -> str:
 async def create_project(body: ProjectCreate, request: Request) -> Project:
     """Create a new project. Initializes plan.md, status.md, decisions.md.
 
-    Two modes:
-    - auto (default): requires goal; supervisor calls LLM planner to generate
-      tasks, then transitions to 'ready'.
-    - manual: no goal needed; project starts in 'ready' state. You add tasks
-      one at a time via POST /api/tasks/ {project_id, agent_role, action, ...}.
-      Useful for: interactive workflows, testing, exploratory tinkering.
+    Phase 4+ repositioning (2026-07-25): the new flow is "create blank
+    project -> setup plan inside -> Run". The project always starts at
+    state='planned' (blank), regardless of whether a goal is provided.
+    The user then:
+      1. Adds tasks manually via the project page, OR
+      2. Clicks "Generate plan" (LLM creates tasks from goal), OR
+      3. Both — some manual, some planned.
+    ...and stays at state='planned' until they explicitly click Run.
+    This is the orch-as-coordinator principle: LLM is a planner, not
+    a control flow. Tasks don't auto-dispatch.
     """
     db = request.app.state.db
     project_id = _project_id()
     now = _now_iso()
-
-    # Determine initial state
-    is_manual = body.mode == "manual" or not (body.goal or "").strip()
-    initial_state = "ready" if is_manual else "planning"
+    initial_state = "planned"  # always; user clicks Run to dispatch
     initial_goal = body.goal or ""
 
     await db.insert(
@@ -191,7 +196,6 @@ async def create_project(body: ProjectCreate, request: Request) -> Project:
             "name": body.name,
             "goal": initial_goal,
             "state": initial_state,
-            # Q3 iteration tracking (all optional / empty for ad-hoc projects)
             "coordinator_role": body.coordinator_role or "",
             "accept_criteria": body.accept_criteria or "",
             "deliverable_path": body.deliverable_path or "",
@@ -207,13 +211,13 @@ async def create_project(body: ProjectCreate, request: Request) -> Project:
 
     # Initial plan.md
     plan_fm = {"project_id": project_id, "state": initial_state, "created_at": now, "tasks": []}
-    goal_section = f"## Goal\n\n{initial_goal}\n" if initial_goal else "## Goal\n\n_(manual mode — no goal; add tasks via the API or dashboard)_\n"
+    goal_section = f"## Goal\n\n{initial_goal}\n" if initial_goal else "## Goal\n\n_(no goal set — add one via Edit, or click Generate plan)_\n"
     plan_body = f"\n# Project: {body.name or project_id}\n\n{goal_section}"
     (pdir / "plan.md").write_text(_serialize_plan_md(plan_fm, plan_body), encoding="utf-8")
 
     # Initial status.md
     status_fm = {"state": initial_state, "last_updated": now}
-    status_body = "\n# Status\n\nJust created (manual mode — waiting for tasks).\n" if is_manual else "\n# Status\n\nJust created. Planning in progress.\n"
+    status_body = "\n# Status\n\nJust created (blank project — add tasks or click Generate plan, then click Run).\n"
     (pdir / "status.md").write_text(
         _serialize_plan_md(status_fm, status_body), encoding="utf-8"
     )
@@ -250,7 +254,7 @@ async def create_project(body: ProjectCreate, request: Request) -> Project:
         db, "project.created",
         actor="operator",
         project_id=project_id,
-        payload={"name": body.name, "goal": initial_goal, "mode": body.mode, "state": initial_state},
+        payload={"name": body.name, "goal": initial_goal, "state": initial_state},
     )
     return Project(
         id=project_id,
@@ -1062,8 +1066,13 @@ async def replan_project(
 ) -> dict:
     """Re-trigger the LLM planner for a project.
 
+    Phase 4+ behavior (2026-07-25): planner CREATES tasks but does NOT
+    auto-dispatch. After this call + supervisor's next tick, the project
+    is in state='planned' (not 'ready'). The user reviews the plan
+    (e.g. via /projects/{id}/visual) and clicks Run to actually start.
+
     Use cases:
-    - Project was created in manual mode (no goal). Now the user wants the
+    - Project was just created (no tasks yet). Now the user wants the
       planner to generate a plan: set goal + replan.
     - User wants to regenerate the plan (e.g. after editing the goal, or
       because the previous plan was poor).
@@ -1075,6 +1084,7 @@ async def replan_project(
       project (running/terminal tasks are left alone).
     - Set state='planning' so the supervisor's next tick calls
       _handle_planning, which calls the planner.
+    - After planning, supervisor sets state='planned' (NOT 'ready' anymore).
     - Audit log: project.replan_requested
     """
     db = request.app.state.db
@@ -1166,7 +1176,98 @@ async def replan_project(
         "goal": new_goal,
         "cleared_tasks": cleared,
         "cleared_reviews": cleared_reviews,
-        "message": "replan queued. The supervisor's next tick will call the LLM planner.",
+        "message": (
+            "replan queued. The supervisor's next tick will call the LLM planner. "
+            "After planning, the project will be in state='planned' (tasks created, "
+            "but NOT yet dispatched). Click Run on the project page to start dispatch."
+        ),
+    }
+
+
+@router.post("/{project_id}/run")
+async def run_project(project_id: str, request: Request) -> dict:
+    """Trigger the supervisor to dispatch tasks for a project.
+
+    Phase 4+ flow (2026-07-25): project starts at state='planned' (blank
+    or LLM-plan-generated). The user reviews the plan (e.g. via the
+    visual project page) and clicks Run. This endpoint sets state='ready'
+    so the supervisor's next tick picks it up and starts dispatching
+    pending tasks.
+
+    Pre-conditions:
+    - Project must exist and be in state='planned' (or 'ready' for idempotency).
+    - Project must have at least one task (otherwise there's nothing to run).
+
+    Idempotent: calling on state='ready' returns 200 with noop=true.
+    Errors: 404 if project not found; 400 if state is 'completed'/'cancelled'/
+    'archived'/'deleted' (terminal states); 400 if no tasks yet.
+    """
+    db = request.app.state.db
+    project = await db.fetchone(
+        "SELECT id, state, name, goal FROM projects WHERE id = ?", (project_id,),
+    )
+    if not project:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    cur_state = project["state"]
+    # Terminal states — refuse
+    if cur_state in ("completed", "cancelled", "archived", "deleted"):
+        raise HTTPException(
+            400,
+            f"Cannot Run project in state='{cur_state}' (terminal state). "
+            f"Archive/delete are one-way. Unarchive first if you want to re-run.",
+        )
+    # Idempotent: already running
+    if cur_state == "ready":
+        return {
+            "project_id": project_id,
+            "state": "ready",
+            "noop": True,
+            "message": "Project already in 'ready' — supervisor will dispatch on next tick.",
+        }
+    if cur_state == "running":
+        return {
+            "project_id": project_id,
+            "state": "running",
+            "noop": True,
+            "message": "Project is already running.",
+        }
+    if cur_state != "planned":
+        # 'planning' is in-flight (planner running) — refuse, user should
+        # wait or retry the plan first. 'interrupted' is a supervisor
+        # signal, also refuse.
+        raise HTTPException(
+            400,
+            f"Cannot Run project in state='{cur_state}'. "
+            f"Wait for planning to complete, or re-trigger via Generate plan.",
+        )
+    # Check there's at least one task
+    task_count = await db.fetchone(
+        "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?",
+        (project_id,),
+    )
+    if not task_count or task_count.get("n", 0) == 0:
+        raise HTTPException(
+            400,
+            f"Project {project_id} has no tasks yet. Add tasks manually "
+            f"or click Generate plan before clicking Run.",
+        )
+    # All checks pass — flip to ready
+    await db.execute(
+        "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
+        (_now_iso(), project_id),
+    )
+    await audit_log(
+        db, "project.run_requested",
+        actor="operator",
+        project_id=project_id,
+        payload={"previous_state": cur_state, "task_count": task_count["n"]},
+    )
+    return {
+        "project_id": project_id,
+        "state": "ready",
+        "noop": False,
+        "task_count": task_count["n"],
+        "message": "Run requested. Supervisor's next tick (within ~5s) will dispatch pending tasks.",
     }
 
 

@@ -480,11 +480,13 @@ class Supervisor:
             plan = await self.planner.plan(goal, available_roles, role_skills, role_capabilities)
         except Exception as e:
             log.warning(f"planner failed for {pid}: {e}")
-            # Reset state to 'ready' (manual mode default) so the supervisor
-            # doesn't loop forever retrying the same broken plan every
-            # tick. The user can fix the goal / retry via /replan.
+            # Phase 4+ (2026-07-25): reset to 'planned' (NOT 'ready') so
+            # the supervisor doesn't auto-dispatch a failed plan and so
+            # the user knows the plan was never created. They can fix
+            # the goal / retry via /replan, or just click Run after the
+            # next successful plan.
             await self.db.execute(
-                "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
+                "UPDATE projects SET state = 'planned', updated_at = ? WHERE id = ?",
                 (_now_iso(), pid),
             )
             await audit_log(
@@ -495,7 +497,7 @@ class Supervisor:
             )
             await self.notifier.send(
                 f"Planner failed for {pid}",
-                f"Goal: {goal[:200]}\nError: `{type(e).__name__}: {e}`\nState reset to 'ready'. Use 'Generate plan' on the project page to retry.",
+                f"Goal: {goal[:200]}\nError: `{type(e).__name__}: {e}`\nState reset to 'planned'. Use 'Generate plan' on the project page to retry, or add tasks manually.",
                 level="error",
             )
             return
@@ -529,9 +531,13 @@ class Supervisor:
                     (json.dumps(dep_ids), tid),
                 )
             # Transition project
+            # Phase 4+ (2026-07-25): after planning, state='planned'
+            # (NOT 'ready'). User reviews the plan and clicks Run to
+            # start dispatch. This is the orch-as-coordinator principle:
+            # LLM is a planner, not a control flow.
             now = _now_iso()
             await self.db.execute(
-                "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
+                "UPDATE projects SET state = 'planned', updated_at = ? WHERE id = ?",
                 (now, pid),
             )
             await audit_log(
@@ -540,6 +546,7 @@ class Supervisor:
                 project_id=pid,
                 payload={
                     "task_count": len(plan),
+                    "state_after": "planned",
                     # Report the actual planner used: if the LLM call
                     # failed and we fell back to mock, say so. Previously
                     # this always reported "llm" when self.planner.mock
@@ -576,7 +583,7 @@ class Supervisor:
                 pass
             log.info(
                 f"project {pid}: plan generated ({self._plan_source_label()}), "
-                f"{len(plan)} tasks -> state=ready"
+                f"{len(plan)} tasks -> state=planned (awaiting Run)"
             )
         except Exception as e:
             log.exception(f"failed to save plan for {pid}: {e}")
