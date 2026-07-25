@@ -690,6 +690,85 @@ async def interrupt_task(task_id: str, request: Request) -> Task:
     return _row_to_task(row)
 
 
+@router.post("/{task_id}/retry", response_model=Task)
+async def retry_task(task_id: str, request: Request) -> Task:
+    """Operator retries a failed/interrupted/cancelled/skipped task.
+
+    Resets the task to 'pending' so the supervisor's next tick picks it
+    up and re-dispatches it. The task ID is preserved (operators can
+    re-link logs and audit history to the same task). Increments
+    retry_count so the operator can see how many times this task has
+    been retried.
+
+    Phase 4 Stage 2 (2026-07-25): added so the visual project page
+    can offer a 'Retry' button on failed tasks. Previously operators
+    had to use the supervisor's loop-back mechanism (requires the
+    project to have feedback_to + max_iterations configured) or
+    manually re-run the whole workflow — neither is a good UX for
+    "I just want to try this one task again".
+
+    Idempotency: a second retry on the same task (now pending) is
+    a 400 — operator should wait for the supervisor to re-dispatch
+    it first.
+    """
+    db = request.app.state.db
+    task = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    if not task:
+        raise HTTPException(404, f"Task not found: {task_id}")
+    # Only failed/interrupted/cancelled/skipped can be retried. A
+    # pending/assigned/running task is already in flight — no point
+    # retrying. A completed task is "done" — operator should clone
+    # the workflow and re-run, not retry (avoids the "successful
+    # retry overwrites successful result" surprise).
+    RETRYABLE = ("failed", "interrupted", "cancelled", "skipped")
+    if task["status"] not in RETRYABLE:
+        raise HTTPException(
+            400,
+            f"Task not in retryable state: {task['status']!r}. "
+            f"Retry only works for: {sorted(RETRYABLE)}",
+        )
+
+    now = _now_iso()
+    # Reset terminal-state fields, increment retry_count, free profile
+    # (only if it was assigned — defensive; normally interrupted/cancelled
+    # already freed the profile but failed might not have).
+    await db.execute(
+        "UPDATE tasks SET "
+        "  status = 'pending', "
+        "  result = NULL, "
+        "  error = NULL, "
+        "  started_at = NULL, "
+        "  ended_at = NULL, "
+        "  last_liveness_at = NULL, "
+        "  retry_count = retry_count + 1, "
+        "  assigned_agent_id = NULL, "
+        "  assigned_profile_id = NULL, "
+        "  updated_at = ? "
+        "WHERE id = ?",
+        (now, task_id),
+    )
+    if task.get("assigned_profile_id"):
+        await db.execute(
+            "UPDATE agent_profiles SET status = 'idle', current_task_id = NULL, "
+            "updated_at = ? WHERE id = ? AND current_task_id = ?",
+            (now, task["assigned_profile_id"], task_id),
+        )
+    row = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    new_retry_count = (row["retry_count"] or 0) if row else 0
+    await audit_log(
+        db, "task.retried",
+        actor="operator",
+        project_id=task["project_id"],
+        task_id=task_id,
+        agent_id=task.get("assigned_agent_id"),
+        payload={
+            "prev_status": task["status"],
+            "retry_count": new_retry_count,
+        },
+    )
+    return _row_to_task(row)
+
+
 # ===== Failure propagation (§4.3) =====
 
 

@@ -154,9 +154,11 @@
     </div>
 
     <div class="vp-stage-banner">
-        <strong>Stage 1 minimum:</strong> read-only card view, no interactivity.
-        Stage 2 will add dblclick → side panel (edit params, retry, cancel).
-        Stage 3 will add drag-to-wire depends_on.
+        <strong>Stage 2 (side panel + retry/cancel):</strong> click any card
+        to open the side panel — view full task details, retry failed
+        tasks, cancel running/pending ones, view result/error.
+        Stage 3 will add drag-to-wire depends_on. Stage 4 will add live
+        polling + tab switcher.
         <a href="/projects/{{ project.id }}" class="underline">Switch to text view</a> for the full task list.
     </div>
 
@@ -193,7 +195,10 @@
             {% set tok = token_by_task.get(t.id, {}) %}
             {% set art = art_by_task.get(t.id, {}) %}
             {% set deps = t.get('depends_on', []) or [] %}
-        <div class="vp-card vp-card-status-{{ status }}">
+        <div class="vp-card vp-card-status-{{ status }}"
+             data-task-id="{{ t.id }}"
+             onclick="vpOpenPanel('{{ t.id }}')"
+             style="cursor: pointer;">
             <span class="vp-status vp-status-{{ status }}">{{ status }}</span>
             <div class="vp-name">{{ t.name }}</div>
             <div class="vp-role">{{ t.agent_role or '?' }}</div>
@@ -225,13 +230,7 @@
                 ⇠ deps: {{ deps|join(', ') }}
             </div>
             {% endif %}
-            {% if status == 'running' %}
-            <div class="vp-actions">in flight…</div>
-            {% elif status == 'failed' %}
-            <div class="vp-actions">click to retry (Stage 2)</div>
-            {% elif status == 'completed' %}
-            <div class="vp-actions">click to view result (Stage 2)</div>
-            {% endif %}
+            <div class="vp-actions">click for details</div>
         </div>
         {% endfor %}
     </div>
@@ -240,10 +239,390 @@
 
 </div>
 
+{# Side panel — Stage 2 (2026-07-25). Slides in from the right when
+   a card is clicked. Read-only details + action buttons (Retry, Cancel,
+   View result). Closes via X button, ESC key, or click outside. #}
+<div id="vp-side-panel" class="vp-side-panel hidden" onclick="if(event.target===this) vpClosePanel()">
+    <div class="vp-side-panel-inner" onclick="event.stopPropagation()">
+        <div class="vp-side-panel-header">
+            <span id="vp-sp-title">Task</span>
+            <button class="vp-sp-close" onclick="vpClosePanel()" title="Close (ESC)">×</button>
+        </div>
+        <div class="vp-side-panel-body" id="vp-sp-body">
+            {# Filled by JS from the embedded task data #}
+        </div>
+        <div class="vp-side-panel-footer" id="vp-sp-footer">
+            {# Filled by JS based on task status #}
+        </div>
+    </div>
+</div>
+
+{# Embedded task data for the side panel — avoids a fetch() round-trip
+   when the user clicks a card. The data is small enough to inline. #}
+<script id="vp-task-data" type="application/json">
+{
+    "tasks": {
+    {%- for t in tasks %}
+        "{{ t.id }}": {
+            "id": {{ t.id | tojson }},
+            "name": {{ t.name | tojson }},
+            "agent_role": {{ t.agent_role | tojson }},
+            "action": {{ t.action | tojson }},
+            "status": {{ t.status | tojson }},
+            "params": {{ t.params | tojson if t.params is mapping else '{}' }},
+            "depends_on": {{ t.depends_on | tojson if t.depends_on is iterable else '[]' }},
+            "output_path": {{ (t.output_path or '') | tojson }},
+            "result": {{ t.result | tojson if t.result is mapping else 'null' }},
+            "error": {{ t.error | tojson if t.error else 'null' }},
+            "retry_count": {{ t.retry_count or 0 }},
+            "max_retries": {{ t.max_retries or 0 }},
+            "started_at": {{ (t.started_at or '') | tojson }},
+            "ended_at": {{ (t.ended_at or '') | tojson }},
+            "timing": {{ t.timing | tojson }},
+            "tokens": {{ token_by_task.get(t.id, {}) | tojson }},
+            "artifacts": {{ art_by_task.get(t.id, {}) | tojson }}
+        }{% if not loop.last %},{% endif %}
+    {%- endfor %}
+    }
+}
+</script>
+
 <script>
-// Phase 4 Stage 1: 30s reload for live updates. Real WebSocket or
-// incremental re-render comes in Stage 4 (after we know the UX
-// pattern from Stage 2-3 is settled).
+// Phase 4 Stage 2 — side panel + retry/cancel buttons.
+//
+// Pattern: pre-loaded JSON dataset (above) avoids a fetch() round-trip
+// when opening the panel. Mutating actions (retry, cancel) DO use
+// fetch() because the server is the source of truth for status.
+
+const _VP_DATA = JSON.parse(document.getElementById('vp-task-data').textContent);
+const _VP_PROJECT_ID = {{ project.id | tojson }};
+
+function _escHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+function _vpRenderActions(task) {
+    // Returns HTML for the action buttons at the bottom of the side panel.
+    // Each button is shown only if the action is valid for the task's
+    // current status.
+    const buttons = [];
+    const status = task.status;
+    if (status === 'failed' || status === 'interrupted' ||
+        status === 'cancelled' || status === 'skipped') {
+        buttons.push(
+            `<button class="vp-sp-btn vp-sp-btn-primary" onclick="vpRetryTask('${task.id}')">
+                🔄 Retry
+            </button>`
+        );
+    }
+    if (status === 'pending' || status === 'assigned') {
+        buttons.push(
+            `<button class="vp-sp-btn vp-sp-btn-warn" onclick="vpCancelTask('${task.id}')">
+                ✕ Cancel
+            </button>`
+        );
+    }
+    if (status === 'running') {
+        buttons.push(
+            `<button class="vp-sp-btn vp-sp-btn-warn" onclick="vpInterruptTask('${task.id}')">
+                ⏸ Interrupt
+            </button>`
+        );
+    }
+    buttons.push(
+        `<button class="vp-sp-btn" onclick="vpClosePanel()">Close</button>`
+    );
+    return buttons.join('');
+}
+
+function vpOpenPanel(taskId) {
+    const task = _VP_DATA.tasks[taskId];
+    if (!task) {
+        console.error('task not found:', taskId);
+        return;
+    }
+    const panel = document.getElementById('vp-side-panel');
+    const title = document.getElementById('vp-sp-title');
+    const body = document.getElementById('vp-sp-body');
+    const footer = document.getElementById('vp-sp-footer');
+
+    title.textContent = task.name;
+
+    // Build body. Tokens + artifacts use the per-task queries from
+    // the page load (single fetch, not per-card).
+    const tok = task.tokens || {};
+    const art = task.artifacts || {};
+    const timing = task.timing || {};
+    const result = task.result || null;
+    const params = task.params || {};
+    const deps = task.depends_on || [];
+
+    body.innerHTML = `
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">status</span>
+            <span class="vp-status vp-status-${_escHtml(task.status)}">${_escHtml(task.status)}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">id</span>
+            <span class="vp-sp-mono">${_escHtml(task.id)}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">agent_role</span>
+            <span class="vp-sp-mono">${_escHtml(task.agent_role || '?')}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">action</span>
+            <span class="vp-sp-mono">${_escHtml(task.action || '?')}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">retry</span>
+            <span class="vp-sp-mono">${task.retry_count} / ${task.max_retries || '∞'}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">started</span>
+            <span class="vp-sp-mono">${_escHtml(task.started_at || '—')}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">ended</span>
+            <span class="vp-sp-mono">${_escHtml(task.ended_at || '—')}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">took</span>
+            <span class="vp-sp-mono">${timing.took_sec ? timing.took_sec + 's' : '—'}</span>
+        </div>
+
+        <h3 class="vp-sp-h3">params</h3>
+        <pre class="vp-sp-pre">${_escHtml(JSON.stringify(params, null, 2))}</pre>
+
+        ${deps.length ? `
+        <h3 class="vp-sp-h3">depends_on (${deps.length})</h3>
+        <div class="vp-sp-mono">${deps.map(_escHtml).join(', ')}</div>
+        ` : ''}
+
+        <h3 class="vp-sp-h3">tokens</h3>
+        <div class="vp-sp-mono">
+            total: ${(tok.total || 0).toLocaleString()}<br>
+            prompt: ${(tok.prompt || 0).toLocaleString()}<br>
+            completion: ${(tok.completion || 0).toLocaleString()}
+        </div>
+
+        <h3 class="vp-sp-h3">artifacts (${art.n || 0})</h3>
+        <div class="vp-sp-mono">${(art.total_bytes || 0).toLocaleString()} bytes total</div>
+
+        ${result ? `
+        <h3 class="vp-sp-h3">result</h3>
+        <pre class="vp-sp-pre vp-sp-result">${_escHtml(JSON.stringify(result, null, 2))}</pre>
+        ` : ''}
+
+        ${task.error ? `
+        <h3 class="vp-sp-h3">error</h3>
+        <pre class="vp-sp-pre vp-sp-error">${_escHtml(task.error)}</pre>
+        ` : ''}
+    `;
+
+    footer.innerHTML = _vpRenderActions(task);
+    panel.classList.remove('hidden');
+    // Focus close button for accessibility (and so ESC works on it)
+    panel.querySelector('.vp-sp-close').focus();
+}
+
+function vpClosePanel() {
+    document.getElementById('vp-side-panel').classList.add('hidden');
+}
+
+// ESC to close
+document.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Escape' && !document.getElementById('vp-side-panel').classList.contains('hidden')) {
+        vpClosePanel();
+    }
+});
+
+async function _vpCallAction(taskId, action) {
+    const panel = document.getElementById('vp-side-panel');
+    const body = document.getElementById('vp-sp-body');
+    const footer = document.getElementById('vp-sp-footer');
+    // Disable buttons while in flight
+    const btns = footer.querySelectorAll('button');
+    btns.forEach(b => b.disabled = true);
+
+    try {
+        const r = await fetch(`/api/tasks/${taskId}/${action}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+        });
+        const j = await r.json();
+        if (!r.ok) {
+            const errMsg = (j.detail || r.statusText || 'failed');
+            footer.innerHTML = `<span class="vp-sp-error">✕ ${_escHtml(errMsg)}</span> ` +
+                `<button class="vp-sp-btn" onclick="vpClosePanel()">Close</button>`;
+            return;
+        }
+        // Update the embedded data and re-render the panel
+        _VP_DATA.tasks[taskId] = j;
+        // Also update the card in the grid
+        _vpUpdateCard(taskId, j);
+        vpOpenPanel(taskId);
+        // Re-enable after render
+        setTimeout(() => {
+            footer.querySelectorAll('button').forEach(b => b.disabled = false);
+        }, 100);
+    } catch (e) {
+        footer.innerHTML = `<span class="vp-sp-error">✕ ${_escHtml(e.message || e)}</span> ` +
+            `<button class="vp-sp-btn" onclick="vpClosePanel()">Close</button>`;
+    }
+}
+
+function _vpUpdateCard(taskId, task) {
+    const card = document.querySelector(`.vp-card[data-task-id="${taskId}"]`);
+    if (!card) return;
+    // Update the status badge
+    const statusBadge = card.querySelector('.vp-status');
+    if (statusBadge) {
+        // Remove old vp-status-* class
+        statusBadge.className = 'vp-status vp-status-' + task.status;
+        statusBadge.textContent = task.status;
+    }
+    // Update the card's border-left class
+    card.className = 'vp-card vp-card-status-' + task.status;
+}
+
+function vpRetryTask(taskId) { _vpCallAction(taskId, 'retry'); }
+function vpCancelTask(taskId) { _vpCallAction(taskId, 'cancel'); }
+function vpInterruptTask(taskId) { _vpCallAction(taskId, 'interrupt'); }
+
+// Phase 4 Stage 1: 30s reload for live updates. Smarter incremental
+// re-render comes in Stage 4.
 setTimeout(function() { location.reload(); }, 30000);
 </script>
+
+<style>
+/* Side panel — Stage 2 additions */
+.vp-side-panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.4);
+    z-index: 100;
+    display: flex;
+    justify-content: flex-end;
+}
+.vp-side-panel.hidden { display: none; }
+.vp-side-panel-inner {
+    background: white;
+    width: 480px;
+    max-width: 100%;
+    height: 100%;
+    box-shadow: -4px 0 16px rgba(0, 0, 0, 0.2);
+    display: flex;
+    flex-direction: column;
+}
+.vp-side-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid #e5e7eb;
+    font-weight: 600;
+    font-size: 14px;
+}
+.vp-sp-close {
+    background: none;
+    border: none;
+    font-size: 24px;
+    color: #6b7280;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0 4px;
+}
+.vp-sp-close:hover { color: #111; }
+.vp-side-panel-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+    font-size: 13px;
+}
+.vp-side-panel-footer {
+    border-top: 1px solid #e5e7eb;
+    padding: 12px 16px;
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    background: #f9fafb;
+}
+.vp-sp-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 4px;
+}
+.vp-sp-label {
+    width: 90px;
+    font-size: 11px;
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    flex-shrink: 0;
+}
+.vp-sp-mono {
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    color: #1f2937;
+    word-break: break-all;
+}
+.vp-sp-h3 {
+    margin: 14px 0 4px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #6b7280;
+    font-weight: 600;
+    border-top: 1px solid #e5e7eb;
+    padding-top: 8px;
+}
+.vp-sp-h3:first-child { border-top: none; padding-top: 0; }
+.vp-sp-pre {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    padding: 8px;
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 240px;
+    overflow-y: auto;
+    margin: 0;
+}
+.vp-sp-result { border-left: 3px solid #10b981; }
+.vp-sp-error { border-left: 3px solid #ef4444; color: #991b1b; }
+.vp-sp-btn {
+    padding: 6px 12px;
+    border: 1px solid #d1d5db;
+    background: white;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    color: #1f2937;
+}
+.vp-sp-btn:hover:not(:disabled) { background: #f3f4f6; }
+.vp-sp-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.vp-sp-btn-primary {
+    background: #2563eb;
+    color: white;
+    border-color: #2563eb;
+}
+.vp-sp-btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+.vp-sp-btn-warn {
+    background: #dc2626;
+    color: white;
+    border-color: #dc2626;
+}
+.vp-sp-btn-warn:hover:not(:disabled) { background: #b91c1c; }
+</style>
 {% endblock %}
