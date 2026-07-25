@@ -19,6 +19,7 @@ State transitions handled by:
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -27,6 +28,99 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+
+
+# Pollution markers (LLM-fooling pattern #10, 2026-07-25)
+# LLM agents sometimes include parts of the prompt (context blocks,
+# user recent, workflow procedure, etc.) in their response. The
+# wrapper's _strip_prompt_echo catches some but not all. We do a
+# final strip on the server side so the result.summary is just
+# the LLM's actual work output.
+#
+# The markers are the 4 horizontal-rule "header" lines that the
+# wrapper / project memory injects into the agent's prompt:
+#   --- PROJECT CONTEXT ---
+#   --- USER RECENT (L3: recent.md, last 7 days) ---
+#   --- PROJECT STATE (L3: state.md) ---
+#   --- WORKFLOW PROCEDURE ---
+#   --- OUTPUT FORMAT ---
+#   --- STORAGE ---
+#   --- SKILL: <name> ---
+# Plus the wrapper's own transcript markers:
+#   [...] (single line, often meaning "stripped content")
+#   […session metadata stripped…]
+#   […transcript continued…]
+_POLLUTION_MARKER_PATTERN = re.compile(
+    r"^---\s*(?:"
+    r"PROJECT\s+CONTEXT|"
+    r"USER\s+RECENT[^|]*\|[^|]*\|[^|]*\|"
+    r"PROJECT\s+STATE[^|]*\|[^|]*\|"
+    r"WORKFLOW\s+PROCEDURE|"
+    r"OUTPUT\s+FORMAT|"
+    r"STORAGE|"
+    r"SKILL:\s*[^\s-][^-]*"
+    r")\s*---"
+    r"|^[\u2026\.\[\(].*?(stripped|continued|metadata|content omitted|truncated).*?[\u2026\.\]\)]"
+    r"|^\s*\[\u2026\]\s*$",
+    re.MULTILINE,
+)
+
+
+def _strip_pollution_markers(text: str) -> str:
+    """Strip known pollution markers from agent result text.
+
+    LLM agents sometimes include parts of the prompt context
+    (project context, user recent, etc.) in their response.
+    The wrapper does some stripping via _strip_prompt_echo but
+    not all cases are caught. This server-side pass is a
+    defense-in-depth: if the line is just a pollution header
+    or stripped-content marker (no actual content), drop it.
+
+    Strips:
+      - Header lines: '--- PROJECT CONTEXT ---' etc.
+      - Wrapper markers: '[…session metadata stripped…]', etc.
+      - Single line '[…]' placeholder (truncation marker)
+
+    Does NOT strip:
+      - Body content of any block (the LLM might have written
+        real text between markers — we keep it)
+      - Lines that look like headers but contain content after
+        the '---' on the same line (defensive: leave them)
+    """
+    if not text:
+        return text
+    out_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        # Drop single-line pollution markers
+        if not stripped:
+            out_lines.append(line)
+            continue
+        # Drop wrapper truncation placeholders
+        if stripped in ("[…]", "[…]", "[...]", "[truncated]"):
+            continue
+        if re.match(r"^\[[\.\u2026].*?(stripped|continued|metadata|truncated|omitted)", stripped):
+            continue
+        # Drop section header lines (the '--- XXX ---' style)
+        # Must be: '--- ' + header content + ' ---?' (end).
+        # Allow letters (any case), spaces, parens, dots, colons,
+        # digits, underscores, hyphens, slashes, pipes, commas.
+        # The key is that the line is JUST a header (no body
+        # content). Examples that should match:
+        #   --- PROJECT CONTEXT ---
+        #   --- USER RECENT (L3: recent.md, last 7 days) ---
+        #   --- PROJECT STATE (L3: state.md) ---
+        #   --- WORKFLOW PROCEDURE ---
+        #   --- OUTPUT FORMAT ---
+        #   --- STORAGE ---
+        #   --- SKILL: bus ---
+        if re.match(
+            r"^---\s+[A-Za-z][A-Za-z0-9\s\(\)\.:_/\-|,]+\s+---?\s*$",
+            stripped,
+        ):
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines).strip()
 
 from hermes_orch.core.audit import audit_log
 from hermes_orch.utils import now_iso as _now_iso
@@ -400,9 +494,18 @@ async def submit_result(task_id: str, body: TaskResult, request: Request) -> Tas
     # Store result as JSON
     import json
 
+    # LLM-fooling pattern #10 (2026-07-25): the LLM agent
+    # sometimes includes parts of the prompt (--- PROJECT
+    # CONTEXT ---, --- USER RECENT ---, etc.) in its response.
+    # The wrapper's _strip_prompt_echo doesn't catch all
+    # cases. Do a final server-side strip on the summary so
+    # the user sees just the LLM's actual work, not the
+    # prompt context echoed back.
+    clean_summary = _strip_pollution_markers(body.summary or "")
+
     result_json = json.dumps(
         {
-            "summary": body.summary,
+            "summary": clean_summary,
             "session_id": body.session_id,
             "error": body.error,
             "artifacts": body.artifacts,
