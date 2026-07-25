@@ -1868,10 +1868,17 @@ CRITICAL: agent_role field for create_task
 Output rules:
   - Plain markdown, 1-15 lines, terse.
   - If you have CONCRETE actions to propose (create tasks, run,
-    re-plan, etc.), end with EXACTLY ONE fenced JSON block:
+    re-plan, etc.), you MUST end with EXACTLY ONE fenced JSON
+    block:
     ```json
     {"suggestions": [{"type": "create_task", "name": "...", ...}]}
     ```
+    This includes implicit action requests: when the user says
+    "yes do it", "add it", "幫加上去", "ok run", "yes please",
+    "做啦", etc., they want the action EXECUTED. Always return
+    a JSON block — never just describe what should happen in
+    text. The user reads the markdown for context, then clicks
+    Apply on the JSON suggestions.
   - If the user just asks a question (no concrete action), no
     JSON block. Just answer.
   - Never suggest actions you don't have a type for. The
@@ -2069,37 +2076,68 @@ _SUGGESTION_RE = re.compile(
 def _extract_suggestions(llm_text: str) -> tuple[str, list[dict] | None]:
     """Split LLM response into (display_text, suggestions).
 
-    Suggestions are extracted from the LAST fenced JSON block
-    in the response. The JSON must have a 'suggestions' key
-    with a list value. Everything before the JSON block is
-    shown to the user as plain markdown.
+    Suggestions are extracted in this order:
+      1. LAST fenced ```json``` block in the response
+         (the standard case per the system prompt)
+      2. LAST inline JSON object matching {"suggestions": [...]}
+         (LLM-fooling pattern #9: LLM sometimes writes inline
+          JSON like '"type": "create_task", "name": "..."'
+          without the fence)
+      3. NOTHING: return (text, None). The UI shows a friendly
+         "Reformat" button so the user can ask the LLM to
+         try again with proper formatting.
 
     Returns (text_without_json_block, suggestions_list_or_None).
     """
     if not llm_text:
         return llm_text, None
+    # 1) Try fenced JSON block first
     matches = list(_SUGGESTION_RE.finditer(llm_text))
-    if not matches:
-        return llm_text.strip(), None
-    # Use the last JSON block (LLM may have written a code
-    # example earlier; we only want the action suggestions)
-    last = matches[-1]
-    raw_json = last.group(1).strip()
-    try:
-        parsed = json.loads(raw_json)
-    except (json.JSONDecodeError, TypeError):
-        return llm_text.strip(), None
-    suggestions = parsed.get("suggestions") if isinstance(parsed, dict) else None
-    if not isinstance(suggestions, list):
-        return llm_text.strip(), None
-    # Strip the JSON block from display text
-    display = (llm_text[: last.start()] + llm_text[last.end():]).strip()
-    # Validate each suggestion has a type
-    valid = []
-    for s in suggestions:
-        if isinstance(s, dict) and isinstance(s.get("type"), str):
-            valid.append(s)
-    return display, valid or None
+    if matches:
+        last = matches[-1]
+        raw_json = last.group(1).strip()
+        try:
+            parsed = json.loads(raw_json)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            suggestions = parsed.get("suggestions")
+            if isinstance(suggestions, list):
+                valid = [s for s in suggestions
+                         if isinstance(s, dict) and isinstance(s.get("type"), str)]
+                if valid:
+                    display = (llm_text[: last.start()] + llm_text[last.end():]).strip()
+                    return display, valid
+    # 2) Fallback: inline JSON object with "suggestions" key.
+    # Use a regex to find a {"suggestions": [...]} pattern.
+    # The LLM might write inline like:
+    #   type: "create_task", name: "foo", ...
+    # OR
+    #   {"type": "create_task", "name": "foo"}
+    # The regex looks for the brace-delimited object form.
+    inline_re = re.compile(
+        r'(\{\s*"suggestions"\s*:\s*\[.*?\]\s*\})',
+        re.DOTALL,
+    )
+    inline_matches = list(inline_re.finditer(llm_text))
+    if inline_matches:
+        last = inline_matches[-1]
+        raw_json = last.group(1)
+        try:
+            parsed = json.loads(raw_json)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            suggestions = parsed.get("suggestions")
+            if isinstance(suggestions, list):
+                valid = [s for s in suggestions
+                         if isinstance(s, dict) and isinstance(s.get("type"), str)]
+                if valid:
+                    # Don't strip from display (the inline form is
+                    # part of the prose; stripping it would leave
+                    # an awkward gap). Just return the text as-is.
+                    return llm_text.strip(), valid
+    return llm_text.strip(), None
 
 
 @router.post("/{project_id}/chat")

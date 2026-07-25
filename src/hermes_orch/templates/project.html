@@ -1686,6 +1686,11 @@ async function submitPromoteToWorkflow() {
 // _fetchWithTimeout + _errDetailToString are defined in base.html now
 // (moved from project.html in commit 3bbf5aa), so they're available here.
 
+// Persist the open/closed state in localStorage so the panel
+// re-opens after page reload (e.g. from the 30s auto-refresh
+// or from the post-apply reload). Key per-project so each
+// project's chat state is remembered independently.
+const _chatStateKey = 'chatOpen:' + PROJECT_ID;
 let _chatPanelOpen = false;
 
 function toggleChatPanel() {
@@ -1693,14 +1698,37 @@ function toggleChatPanel() {
     _chatPanelOpen = !_chatPanelOpen;
     if (_chatPanelOpen) {
         panel.classList.remove('hidden');
+        try { localStorage.setItem(_chatStateKey, '1'); } catch (e) {}
         if (document.getElementById('chat-messages').children.length <= 1) {
             loadChatHistory();
         }
         setTimeout(() => document.getElementById('chat-input').focus(), 50);
     } else {
         panel.classList.add('hidden');
+        try { localStorage.setItem(_chatStateKey, '0'); } catch (e) {}
     }
 }
+
+// On page load, restore the open state (default = open if no key).
+// This handles the auto-refresh case: chat was open, page reloaded,
+// panel re-opens without the user needing to click the button.
+(function _restoreChatState() {
+    let saved = '1';  // default open
+    try { saved = localStorage.getItem(_chatStateKey) || '1'; } catch (e) {}
+    if (saved === '1') {
+        const panel = document.getElementById('chat-panel');
+        if (panel) {
+            panel.classList.remove('hidden');
+            _chatPanelOpen = true;
+            // Load history only after a tick (don't block initial render)
+            setTimeout(() => {
+                if (document.getElementById('chat-messages').children.length <= 1) {
+                    loadChatHistory();
+                }
+            }, 200);
+        }
+    }
+})();
 
 async function loadChatHistory() {
     try {
@@ -1750,10 +1778,54 @@ function renderChatMessage(m) {
         if (m.suggestions && m.suggestions.length) {
             html += `<div class="mt-2 space-y-1">${m.suggestions.map((s, i) =>
                 renderSuggestion(s, i, m.id)).join('')}</div>`;
+        } else {
+            // LLM-fooling pattern #9: LLM sometimes describes the
+            // action in text without a JSON block. Show a Reformat
+            // button that asks the LLM to wrap the action in JSON
+            // (auto-triggers a follow-up chat with the same intent).
+            html += `<div class="mt-2">
+                <button onclick="reformatLastAssistant()"
+                    class="text-xs px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-300 rounded hover:bg-amber-200"
+                    title="Ask the assistant to reformat its last response as structured actions (one-click retry with stronger instruction)">
+                    ✨ Reformat as actions
+                </button>
+            </div>`;
         }
         div.innerHTML = html;
     }
     return div;
+}
+
+// Phase 4+ #25 v2 (2026-07-25): reformat fallback
+// LLM-fooling pattern #9: when the LLM describes an action
+// in plain text without a JSON block, the user clicks this
+// button to ask the LLM to retry with explicit instruction to
+// format as JSON. Uses the same last user message + history.
+async function reformatLastAssistant() {
+    const status = document.getElementById('chat-status');
+    status.textContent = 'Reformatting...';
+    status.className = 'text-xs text-gray-500 mt-1 h-4';
+    // Take the last user message and re-send with a reformat
+    // suffix. This is cheap (one more LLM call) but recovers
+    // the structured-suggestion UX the user wanted.
+    const lastUser = Array.from(document.querySelectorAll('#chat-messages > div'))
+        .reverse()
+        .find(d => d.querySelector('.bg-blue-50'));  // user bubble class
+    if (!lastUser) {
+        status.textContent = 'No prior message to reformat';
+        status.className = 'text-xs text-red-600 mt-1 h-4';
+        return;
+    }
+    const text = lastUser.querySelector('.whitespace-pre-wrap')?.textContent || '';
+    if (!text) return;
+    // Re-send with explicit reformat instruction. The user's
+    // original text is preserved so the LLM has the same intent.
+    const reformatted = text + '\n\n[Reformat: please re-state your response as a fenced ```json``` block with a "suggestions" array, even if you already described it in text above. The user wants to click Apply on a button, not copy-paste your text into the form.]';
+    const input = document.getElementById('chat-input');
+    const origVal = input.value;
+    input.value = reformatted;
+    await sendChatMessage();
+    input.value = origVal;  // restore (in case send failed)
 }
 
 function renderSuggestion(s, idx, messageId) {
