@@ -334,9 +334,17 @@ async def _load_profile_skills(db: Any, profile_id: str) -> list[dict[str, Any]]
     commit 5e69bdb). We only keep the newest row per file_path (created_at
     DESC), and we treat empty applied content as a deletion — those entries
     are filtered out so the dashboard shows what's actually on the host.
+
+    Performance: we don't SELECT desired_content (templates only show
+    name/status/size in the list; content is loaded on demand by
+    /api/agents/.../skills/<name>). With 86 skills × 10KB each, this
+    saves ~1MB of HTML per page render. 2026-07-25 fix after the
+    runaway-skill-upload loop made the page take 4.5s.
     """
     rows = await db.fetchall(
-        "SELECT * FROM profile_configs WHERE profile_id = ? "
+        "SELECT id, profile_id, file_path, status, error, created_at, applied_at, "
+        "LENGTH(desired_content) AS size_bytes "
+        "FROM profile_configs WHERE profile_id = ? "
         "AND file_path LIKE 'skills/%/SKILL.md' "
         "ORDER BY (CASE WHEN file_path LIKE 'skills/%/%/SKILL.md' THEN 1 ELSE 0 END), "
         "file_path ASC, created_at DESC",
@@ -348,8 +356,11 @@ async def _load_profile_skills(db: Any, profile_id: str) -> list[dict[str, Any]]
         if r["file_path"] in seen:
             continue
         seen.add(r["file_path"])
-        # Treat applied-with-empty-content as deleted; skip from list
-        if r["status"] == "applied" and (r["desired_content"] or "") == "":
+        # Treat applied-with-empty-content as deleted; skip from list.
+        # The empty-content check is cheap even without selecting the
+        # full text: size_bytes=0 means empty (an applied row with
+        # size 0 = a deletion marker).
+        if r["status"] == "applied" and r["size_bytes"] == 0:
             continue
         # Path is skills/<name>/SKILL.md — strip both ends
         name = r["file_path"][len("skills/"):-len("/SKILL.md")]
@@ -357,11 +368,11 @@ async def _load_profile_skills(db: Any, profile_id: str) -> list[dict[str, Any]]
             "name": name,
             "file_path": r["file_path"],
             "status": r["status"],
-            "size": len(r["desired_content"] or ""),
+            "size": r["size_bytes"],
             "created_at": r.get("created_at"),
             "applied_at": r.get("applied_at"),
             "error": r.get("error"),
-            "content": r["desired_content"] or "",
+            "content": "",  # not loaded in list; fetch via /skills/{name} on demand
         })
     return out
 

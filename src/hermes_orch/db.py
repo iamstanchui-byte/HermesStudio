@@ -136,6 +136,16 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_profile_configs_status ON profile_configs(status);
+-- Covering index for the list_skills / _load_profile_skills queries.
+-- Filters by (profile_id, file_path LIKE 'skills/%/SKILL.md') and orders
+-- by (file_path ASC, created_at DESC). Without this index, both
+-- endpoints do a full table scan and the dashboard's /agents page
+-- took 4.5s with 35k rows. With the index, both queries return in
+-- <20ms regardless of total table size. Added 2026-07-25 after the
+-- runaway-skill-upload loop caused profile_configs to balloon to
+-- 35k rows (see agent memory entry "agents page 5s reload").
+CREATE INDEX IF NOT EXISTS idx_profile_configs_profile_path_created
+    ON profile_configs(profile_id, file_path, created_at DESC);
 
 -- Project SOUL presets: per-project snapshot of agent identity (SOUL.md)
 -- content for each role the project plans to use. Lets the user switch

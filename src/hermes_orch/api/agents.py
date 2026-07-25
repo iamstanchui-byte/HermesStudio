@@ -1312,19 +1312,24 @@ async def list_skills(
     # asked for this ordering on 2026-07-24 because the previous
     # created_at DESC order was just insertion-order and made the
     # list hard to scan when there's a mix of flat and subfolder.
+    # CRITICAL: must ORDER BY created_at DESC so the wrapper's SHA cache
+    # (agent_cli.py:2446) hits the NEWEST row's sha256 — otherwise it
+    # sees an old row's sha and thinks the file changed, re-uploads, and
+    # we grow profile_configs unboundedly. 2026-07-25: discovered 35k
+    # duplicate rows in production because of this missing DESC.
     rows = await db.fetchall(
         "SELECT * FROM profile_configs WHERE profile_id = ? "
         "AND file_path LIKE 'skills/%/SKILL.md' "
         "ORDER BY (CASE WHEN file_path LIKE 'skills/%/%/SKILL.md' THEN 1 ELSE 0 END), "
-        "file_path ASC",
+        "file_path ASC, created_at DESC",
         (profile["id"],),
     )
     include_deleted = request.query_params.get("include_deleted") == "1"
-    # Flat-path support dropped 2026-07-19 (commit d5b7c9a), so we
-    # only ever have one record per (profile, skill_name). The
-    # newest one wins; ORDER BY in the SQL gives stable order
-    # (flat first, then subfolder, both alphabetical). The dedup
-    # loop preserves that order.
+    # Flat-path support dropped 2026-07-19 (commit d5b7c9a). The newest
+    # row per (profile, skill_name) wins — guaranteed by the
+    # `created_at DESC` tiebreak in the ORDER BY above. The dedup
+    # loop preserves the (flat-first, subfolder, alphabetical) order
+    # from the primary ORDER BY.
     seen: set[str] = set()
     out: list[SkillInfo] = []
     for r in rows:
