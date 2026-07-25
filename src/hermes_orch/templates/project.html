@@ -219,6 +219,128 @@
     </form>
 </div>
 
+{# Phase 2 Q6 — Iterations tab (2026-07-25). Read-only display of the
+   iteration history: current/max counters, loopback.fired events,
+   iteration_completed events, and state_archive snapshots. Hidden
+   when there's nothing to show (project has no iter-loop + no
+   feedback_to usage + no archive). #}
+{% set max_iter = project.max_iterations or 0 %}
+{% set cur_iter = project.current_iteration or 0 %}
+{% set has_iter_history = iter_event_count > 0 or decision_archives %}
+{% if has_iter_history or max_iter > 0 %}
+<div class="bg-white border rounded-lg p-4 mb-4 shadow-sm">
+    <div class="flex items-center justify-between mb-2">
+        <h2 class="text-base font-semibold text-gray-800">
+            Iterations
+            <span class="text-xs text-gray-500 font-normal">(read-only history)</span>
+        </h2>
+        <div class="text-sm">
+            {% if max_iter > 0 %}
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+                    {% if cur_iter >= max_iter %}
+                        bg-red-50 text-red-700 border border-red-200
+                    {% elif cur_iter > 0 %}
+                        bg-amber-50 text-amber-700 border border-amber-200
+                    {% else %}
+                        bg-gray-50 text-gray-600 border border-gray-200
+                    {% endif %}">
+                    iteration {{ cur_iter }} / {{ max_iter }}
+                    {% if cur_iter >= max_iter %}(at cap){% endif %}
+                </span>
+            {% else %}
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-50 text-gray-500 border border-gray-200"
+                    title="max_iterations is 0 — any step.feedback_to in the workflow is a no-op. Set this on run via the workflow detail page.">
+                    loop-back disabled (max_iter = 0)
+                </span>
+            {% endif %}
+        </div>
+    </div>
+    {% if not iter_event_count and not decision_archives %}
+        <p class="text-xs text-gray-500 italic">
+            No iteration events yet. Iterations fire when (a) the project
+            has a coordinator_role set + the coord agent writes
+            <code>decision.md</code>, or (b) any task fails AND another
+            step's <code>feedback_to</code> references it (visual
+            builder loop-back, requires max_iterations &gt; 0).
+        </p>
+    {% else %}
+        <div class="space-y-1 text-xs">
+            {% for ev in iteration_events %}
+            <div class="flex items-start gap-2 border-l-2 pl-2 py-0.5
+                {% if ev.event_type == 'loopback.cap_reached' %}
+                    border-red-300 bg-red-50
+                {% elif ev.event_type == 'loopback.fired' %}
+                    border-amber-300 bg-amber-50
+                {% else %}
+                    border-blue-300 bg-blue-50
+                {% endif %}
+                rounded-r">
+                <div class="font-mono text-[10px] text-gray-500 shrink-0 mt-0.5">
+                    {{ ev.created_at[:19] }}
+                </div>
+                <div class="flex-1 min-w-0">
+                    <div class="font-semibold">
+                        {% if ev.event_type == 'project.iteration_completed' %}
+                            {% set d = ev.payload_parsed %}
+                            iter <span class="font-mono">{{ d.get('current_iteration', '?') }}/{{ d.get('max_iterations', '?') }}</span>
+                            →
+                            {% if d.get('decision') == 'PASS' %}
+                                <span class="text-emerald-700">PASS</span>
+                            {% elif d.get('decision') == 'FAIL' %}
+                                <span class="text-red-700">FAIL</span>
+                            {% elif d.get('decision') == 'CAP_REACHED' %}
+                                <span class="text-red-700">CAP_REACHED</span>
+                            {% else %}
+                                {{ d.get('decision', '?') }}
+                            {% endif %}
+                            {% if d.get('at_cap') %}<span class="text-red-600 ml-1">(at cap)</span>{% endif %}
+                            {% if d.get('summary') %}
+                                <span class="text-gray-600 font-normal">— {{ d.get('summary')[:150] }}{% if d.get('summary')|length > 150 %}…{% endif %}</span>
+                            {% endif %}
+                        {% elif ev.event_type == 'loopback.fired' %}
+                            {% set d = ev.payload_parsed %}
+                            loop-back → <span class="font-mono">{{ d.get('target_step', '?') }}</span>
+                            (triggers: <span class="font-mono">{{ d.get('triggers', []) | join(', ') }}</span>,
+                            iter <span class="font-mono">{{ d.get('iteration', '?') }}</span>,
+                            reset <span class="font-mono">{{ d.get('reset_count', 0) }}</span> task{{ '' if d.get('reset_count', 0) == 1 else 's' }})
+                        {% elif ev.event_type == 'loopback.cap_reached' %}
+                            {% set d = ev.payload_parsed %}
+                            <span class="text-red-700">cap reached</span>
+                            at iter <span class="font-mono">{{ d.get('current_iteration', '?') }}/{{ d.get('max_iterations', '?') }}</span>
+                            — would re-dispatch: <span class="font-mono">{{ d.get('would_re_dispatch', []) | join(', ') }}</span>
+                            (failed: <span class="font-mono">{{ d.get('failed_step_names', []) | join(', ') }}</span>)
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% if decision_archives %}
+        <div class="mt-3 pt-3 border-t border-gray-200">
+            <p class="text-xs text-gray-500 font-semibold mb-1">
+                state.md history ({{ decision_archives|length }} snapshot{{ '' if decision_archives|length == 1 else 's' }})
+            </p>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-1 text-xs">
+                {% for a in decision_archives %}
+                <div class="flex items-center gap-2 bg-gray-50 rounded px-2 py-1">
+                    <span class="font-mono text-[10px] text-gray-500">{{ a.filename }}</span>
+                    <span class="text-gray-400">·</span>
+                    <span class="text-gray-500">{{ a.size }} B</span>
+                    <span class="text-gray-400">·</span>
+                    <span class="text-gray-400 text-[10px]">{{ a.mtime_iso[:19] }}</span>
+                </div>
+                {% endfor %}
+            </div>
+            <p class="text-[10px] text-gray-400 mt-1">
+                state.md is regenerated after each iteration_completed;
+                each regen archives the previous version here.
+            </p>
+        </div>
+        {% endif %}
+    {% endif %}
+</div>
+{% endif %}
+
 <!-- Create task (collapsed) -->
 <button onclick="toggleForm('new-task-form')" class="mb-3 text-sm text-blue-600 hover:underline">
     + Create task in this project

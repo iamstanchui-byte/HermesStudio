@@ -14,7 +14,7 @@ Live updates via 5s polling (vanilla JS setInterval + fetch).
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -956,6 +956,52 @@ async def project_page(
             "SELECT * FROM project_schedules WHERE id = ?",
             (project["source_schedule_id"],),
         )
+    # Phase 2 Q6 — Iterations tab (2026-07-25). Read-only timeline of
+    # iteration events. We pull 3 event types:
+    #   - project.iteration_completed  (iterative projects w/ coordinator)
+    #   - loopback.fired                (visual builder feedback_to)
+    #   - loopback.cap_reached          (loop-back hit max_iterations)
+    # These are 2 different concepts (coordinator-driven vs cascade-reset)
+    # but the user sees them as "iteration history" — a unified timeline
+    # of "the supervisor decided to retry something, and here's why".
+    iter_event_rows = await db.fetchall(
+        "SELECT id, event_type, actor, task_id, payload, created_at "
+        "FROM audit_log "
+        "WHERE project_id = ? "
+        "AND event_type IN ('project.iteration_completed', "
+        "                    'loopback.fired', "
+        "                    'loopback.cap_reached') "
+        "ORDER BY id ASC LIMIT 200",
+        (project_id,),
+    )
+    iteration_events = []
+    for r in iter_event_rows:
+        d = dict(r)
+        # Parse JSON payload for display
+        try:
+            d["payload_parsed"] = json.loads(d.get("payload") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            d["payload_parsed"] = {}
+        iteration_events.append(d)
+    # state_archive snapshots — visual timeline of every state.md regen
+    # (Phase 2 of 3-tier memory: L3 state.md is regenerated after each
+    # iteration_completed; each regen leaves a breadcrumb in state_archive/).
+    decision_archives = []
+    try:
+        archive_dir = projects_root_p / project_id / "state_archive"
+        if archive_dir.exists():
+            for p in sorted(archive_dir.iterdir()):
+                if p.is_file() and p.suffix == ".md":
+                    stat = p.stat()
+                    decision_archives.append({
+                        "filename": p.name,
+                        "size": stat.st_size,
+                        "mtime_iso": datetime.fromtimestamp(
+                            stat.st_mtime, tz=timezone.utc
+                        ).isoformat(),
+                    })
+    except Exception:
+        pass  # best-effort; missing dir = no archive yet
     return templates.TemplateResponse(
         request=request,
         name="project.html",
@@ -973,6 +1019,9 @@ async def project_page(
             "token_total": token_total,
             "template_schedule": dict(template_schedule) if template_schedule else None,
             "source_schedule": dict(source_schedule) if source_schedule else None,
+            "iteration_events": iteration_events,
+            "decision_archives": decision_archives,
+            "iter_event_count": len(iteration_events),
         },
     )
 
