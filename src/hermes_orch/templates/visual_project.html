@@ -1,71 +1,157 @@
 {% extends "base.html" %}
 
-{# Phase 4 Stage 1 (2026-07-25) — Visual Project Page.
-   Read-only card view of every task. Status colors + tokens + artifacts.
-   No interactivity in this stage (Stage 2 adds side panel, Stage 3 adds
-   drag-to-edit, Stage 4 adds live polling on top of the 30s reload). #}
+{# Phase 4 Stage 3 (2026-07-25) — Visual Project Page with canvas.
+
+   Stage 1: read-only card view (CSS grid)
+   Stage 2: side panel + retry/cancel/interrupt
+   Stage 3: drawflow canvas with wires showing depends_on relationships
+
+   Stage 3 minimum (this commit): render every task as a drawflow
+   card on a 2D canvas. Show depends_on as chain wires (blue). Cards
+   positioned by created_at order (Y = index * 140, X = 50). Side
+   panel still works. Click card to open panel. NO drag-to-edit yet
+   (that's Stage 3.5).
+
+   Pattern reused from visual_workflow.js: data-task-name attribute
+   on each card; pre-loaded JSON dataset; drawflow.addNode /
+   addConnection for initial render. The click handler walks
+   data-task-name to find the task in the JSON dataset.
+
+   drawflow 0.0.59 API notes (from visual_workflow.js experience):
+     - addNode(name, n_inputs, n_outputs, posx, posy, classoverride,
+       data, html) where inputs/outputs are NUMBERS (count), not class
+       names. drawflow auto-generates .input_1 / .output_1.
+     - Internal state at editor.drawflow[module][container].data[id]
+       — we don't traverse this; we use data-task-name as source
+       of truth (more stable across drawflow versions).
+     - addConnection(srcId, tgtId, output_class, input_class) where
+       classes must match what addNode generated.
+#}
 
 {% block head %}
+<script src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"
+        defer></script>
+<link href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css"
+      rel="stylesheet">
 <style>
-.vp-wrap { max-width: 1400px; margin: 0 auto; padding: 16px; }
-.vp-card {
-    border: 1px solid #d1d5db;
-    border-radius: 8px;
-    background: #fff;
-    padding: 12px;
-    min-height: 120px;
+/* Canvas + cards (Stage 3 additions) */
+.vp-canvas-wrap {
+    width: 100%;
+    height: calc(100vh - 200px);
+    min-height: 400px;
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
     position: relative;
-    transition: box-shadow 0.15s, transform 0.15s;
+    overflow: auto;
 }
-.vp-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.08); transform: translateY(-1px); }
+.vp-canvas-wrap > div:not(.vp-side-panel) {
+    /* drawflow injects its DOM as a direct child of the wrap; force
+       it to fill the wrap. EXCLUDE the side panel which is also a
+       direct child. */
+    width: 100% !important;
+    height: 100% !important;
+    position: relative !important;
+}
+/* drawflow's default `.drawflow-node` has `background: #0ff` (cyan)
+   and `border: 2px solid #000` (black). We override with !important
+   to get a clean white card. Without this override, every card
+   shows up as a teal block on the canvas. Pattern: drawflow loads
+   via <link> in <head>, so its CSS is applied AFTER our inline
+   <style> block — source-order tiebreak means we need !important.
+
+   We do NOT override width/height/padding on .drawflow-node.
+   Setting min-height: 110px !important breaks drawflow's connection
+   path math: it adds the card's height to the y-position of the
+   input handle (the y of the second card's input ends up at
+   card_y + card_height/2 + card_height, which is wrong). The
+   workflow builder (visual_workflow.js) uses the same pattern
+   and it works there because the cards have less padding (8px
+   vs my 10px) and the height is closer to the default.
+
+   Instead, the .vp-card (the INNER div) gets explicit width/height,
+   and we just override the .parent-node wrapper to match. */
+.drawflow .drawflow-node {
+    background: #fff !important;
+    border: 1px solid #d1d5db !important;
+    padding: 0 !important;
+    border-radius: 6px !important;
+    color: #1f2937 !important;
+    z-index: 2 !important;  /* keep card on top of selected highlight */
+}
+.drawflow-node.selected { background: #fff !important; }
+/* drawflow's default selected style is red background + 2px black
+   border. For our read-only Stage 3 view we want the selected card
+   to look the same as a non-selected one (no highlight), so the
+   user can click without visual confusion. Stage 3.5 will add a
+   custom highlight for the "edit this task" case. */
+.drawflow .parent-node {
+    width: 240px !important;
+    height: auto !important;
+}
+/* The .parent-node wrapper is a block-level element. Without
+   explicit width, it collapses to the content width (0 for the
+   children which are absolute). We force it to 240px. Height is
+   left to drawflow's math. */
+.vp-card {
+    width: 240px;
+    min-height: 110px;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    background: #fff;
+    padding: 10px 12px;
+    font-size: 12px;
+    position: relative;
+    cursor: pointer;
+    box-sizing: border-box;
+}
+.vp-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
 .vp-card .vp-status {
     display: inline-block;
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    padding: 2px 6px;
-    border-radius: 4px;
+    padding: 2px 5px;
+    border-radius: 3px;
     color: #fff;
 }
 .vp-card .vp-name {
     font-weight: 600;
-    font-size: 14px;
-    margin: 8px 0 4px;
-    word-break: break-all;
+    font-size: 13px;
+    margin: 6px 0 3px;
+    word-break: break-word;
 }
 .vp-card .vp-role {
-    font-size: 11px;
+    font-size: 10px;
     color: #6b7280;
     font-family: ui-monospace, monospace;
 }
 .vp-card .vp-metrics {
     display: flex;
-    gap: 8px;
-    margin-top: 8px;
+    gap: 4px;
+    margin-top: 6px;
     flex-wrap: wrap;
 }
 .vp-card .vp-metric {
-    font-size: 11px;
+    font-size: 9px;
     color: #4b5563;
     background: #f3f4f6;
-    padding: 2px 6px;
-    border-radius: 4px;
+    padding: 1px 4px;
+    border-radius: 3px;
     font-family: ui-monospace, monospace;
 }
-.vp-card .vp-deps {
-    margin-top: 8px;
-    font-size: 10px;
-    color: #9ca3af;
-    font-family: ui-monospace, monospace;
-}
-.vp-card .vp-actions {
-    margin-top: 8px;
-    font-size: 10px;
-    color: #9ca3af;
-    font-style: italic;
-}
-/* status colors */
+/* status border colors (4px left border) */
+.vp-card-status-pending    { border-left: 4px solid #9ca3af; }
+.vp-card-status-assigned   { border-left: 4px solid #3b82f6; }
+.vp-card-status-running    { border-left: 4px solid #f59e0b; }
+.vp-card-status-completed  { border-left: 4px solid #10b981; }
+.vp-card-status-failed     { border-left: 4px solid #ef4444; }
+.vp-card-status-cancelled  { border-left: 4px solid #6b7280; }
+.vp-card-status-interrupted{ border-left: 4px solid #dc2626; }
+.vp-card-status-skipped    { border-left: 4px solid #94a3b8; }
+.vp-card-status-unknown    { border-left: 4px solid #4b5563; }
+/* status badge colors */
 .vp-status-pending    { background: #9ca3af; }
 .vp-status-assigned   { background: #3b82f6; }
 .vp-status-running    { background: #f59e0b; }
@@ -75,20 +161,18 @@
 .vp-status-interrupted{ background: #dc2626; }
 .vp-status-skipped    { background: #94a3b8; }
 .vp-status-unknown    { background: #4b5563; }
-.vp-card-status-pending    { border-left: 4px solid #9ca3af; }
-.vp-card-status-assigned   { border-left: 4px solid #3b82f6; }
-.vp-card-status-running    { border-left: 4px solid #f59e0b; }
-.vp-card-status-completed  { border-left: 4px solid #10b981; }
-.vp-card-status-failed     { border-left: 4px solid #ef4444; }
-.vp-card-status-cancelled  { border-left: 4px solid #6b7280; }
-.vp-card-status-interrupted{ border-left: 4px solid #dc2626; }
-.vp-card-status-skipped    { border-left: 4px solid #94a3b8; }
-.vp-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 12px;
-    margin-top: 16px;
+/* Connection path styling: thicker, slightly darker chain wires
+   for better visibility on the canvas. */
+svg.connection path {
+    stroke: #6b7280 !important;
+    stroke-width: 2 !important;
 }
+svg.connection.output_2 path {
+    stroke: #dc2626 !important;
+    stroke-dasharray: 5 3;
+    stroke-width: 1.5;
+}
+/* Status bar (unchanged from Stage 1) */
 .vp-status-bar {
     display: flex;
     gap: 6px;
@@ -127,379 +211,7 @@
     color: #9ca3af;
     font-size: 14px;
 }
-</style>
-{% endblock %}
-
-{% block content %}
-<div class="vp-wrap">
-
-    <div class="flex items-center justify-between mb-2">
-        <div>
-            <h1 class="text-xl font-semibold text-gray-800">
-                {{ project.name }}
-                <a href="/projects/{{ project.id }}" class="text-sm font-normal text-blue-600 hover:underline ml-2">
-                    ← back to text view
-                </a>
-            </h1>
-            <p class="text-xs text-gray-500 mt-0.5">
-                <span class="font-mono">{{ project.id }}</span>
-                · state: <span class="font-mono">{{ project.state }}</span>
-                · {{ tasks|length }} task{{ '' if tasks|length == 1 else 's' }}
-                · visual view (Phase 4 Stage 1 — read-only)
-            </p>
-        </div>
-        <div class="text-xs text-gray-400">
-            auto-refresh: 30s
-        </div>
-    </div>
-
-    <div class="vp-stage-banner">
-        <strong>Stage 2 (side panel + retry/cancel):</strong> click any card
-        to open the side panel — view full task details, retry failed
-        tasks, cancel running/pending ones, view result/error.
-        Stage 3 will add drag-to-wire depends_on. Stage 4 will add live
-        polling + tab switcher.
-        <a href="/projects/{{ project.id }}" class="underline">Switch to text view</a> for the full task list.
-    </div>
-
-    {% if not tasks %}
-    <div class="vp-empty">
-        No tasks yet. Tasks are created by the planner when the project enters 'planning', or by the workflow runner for workflow-spawned projects. Refresh in a few seconds.
-    </div>
-    {% else %}
-
-    <div class="vp-status-bar">
-        <span class="text-xs text-gray-500 mr-2">Status:</span>
-        {% set status_order = ['pending', 'assigned', 'running', 'completed', 'failed', 'cancelled', 'interrupted', 'skipped'] %}
-        {% for s in status_order %}
-            {% if status_counts.get(s, 0) > 0 %}
-            <span class="vp-status-chip">
-                <span class="vp-status-chip-dot vp-status-{{ s }}"></span>
-                {{ s }} · {{ status_counts[s] }}
-            </span>
-            {% endif %}
-        {% endfor %}
-        {% for s in status_counts %}
-            {% if s not in status_order %}
-            <span class="vp-status-chip">
-                <span class="vp-status-chip-dot vp-status-unknown"></span>
-                {{ s }} · {{ status_counts[s] }}
-            </span>
-            {% endif %}
-        {% endfor %}
-    </div>
-
-    <div class="vp-grid">
-        {% for t in tasks %}
-            {% set status = t.get('status', 'unknown') %}
-            {% set tok = token_by_task.get(t.id, {}) %}
-            {% set art = art_by_task.get(t.id, {}) %}
-            {% set deps = t.get('depends_on', []) or [] %}
-        <div class="vp-card vp-card-status-{{ status }}"
-             data-task-id="{{ t.id }}"
-             onclick="vpOpenPanel('{{ t.id }}')"
-             style="cursor: pointer;">
-            <span class="vp-status vp-status-{{ status }}">{{ status }}</span>
-            <div class="vp-name">{{ t.name }}</div>
-            <div class="vp-role">{{ t.agent_role or '?' }}</div>
-            <div class="vp-metrics">
-                <span class="vp-metric" title="Tokens used (prompt + completion)">
-                    {% if tok.get('total') %}
-                        🪙 {{ "{:,}".format(tok['total']) }} tok
-                    {% else %}
-                        🪙 0 tok
-                    {% endif %}
-                </span>
-                <span class="vp-metric" title="Artifacts produced">
-                    {% if art.get('n') %}
-                        📄 {{ art['n'] }} art
-                    {% else %}
-                        📄 0 art
-                    {% endif %}
-                </span>
-                <span class="vp-metric" title="Execution time">
-                    {% if t.timing.took_sec %}
-                        ⏱ {{ t.timing.took_sec }}s
-                    {% else %}
-                        ⏱ —
-                    {% endif %}
-                </span>
-            </div>
-            {% if deps %}
-            <div class="vp-deps">
-                ⇠ deps: {{ deps|join(', ') }}
-            </div>
-            {% endif %}
-            <div class="vp-actions">click for details</div>
-        </div>
-        {% endfor %}
-    </div>
-
-    {% endif %}
-
-</div>
-
-{# Side panel — Stage 2 (2026-07-25). Slides in from the right when
-   a card is clicked. Read-only details + action buttons (Retry, Cancel,
-   View result). Closes via X button, ESC key, or click outside. #}
-<div id="vp-side-panel" class="vp-side-panel hidden" onclick="if(event.target===this) vpClosePanel()">
-    <div class="vp-side-panel-inner" onclick="event.stopPropagation()">
-        <div class="vp-side-panel-header">
-            <span id="vp-sp-title">Task</span>
-            <button class="vp-sp-close" onclick="vpClosePanel()" title="Close (ESC)">×</button>
-        </div>
-        <div class="vp-side-panel-body" id="vp-sp-body">
-            {# Filled by JS from the embedded task data #}
-        </div>
-        <div class="vp-side-panel-footer" id="vp-sp-footer">
-            {# Filled by JS based on task status #}
-        </div>
-    </div>
-</div>
-
-{# Embedded task data for the side panel — avoids a fetch() round-trip
-   when the user clicks a card. The data is small enough to inline. #}
-<script id="vp-task-data" type="application/json">
-{
-    "tasks": {
-    {%- for t in tasks %}
-        "{{ t.id }}": {
-            "id": {{ t.id | tojson }},
-            "name": {{ t.name | tojson }},
-            "agent_role": {{ t.agent_role | tojson }},
-            "action": {{ t.action | tojson }},
-            "status": {{ t.status | tojson }},
-            "params": {{ t.params | tojson if t.params is mapping else '{}' }},
-            "depends_on": {{ t.depends_on | tojson if t.depends_on is iterable else '[]' }},
-            "output_path": {{ (t.output_path or '') | tojson }},
-            "result": {{ t.result | tojson if t.result is mapping else 'null' }},
-            "error": {{ t.error | tojson if t.error else 'null' }},
-            "retry_count": {{ t.retry_count or 0 }},
-            "max_retries": {{ t.max_retries or 0 }},
-            "started_at": {{ (t.started_at or '') | tojson }},
-            "ended_at": {{ (t.ended_at or '') | tojson }},
-            "timing": {{ t.timing | tojson }},
-            "tokens": {{ token_by_task.get(t.id, {}) | tojson }},
-            "artifacts": {{ art_by_task.get(t.id, {}) | tojson }}
-        }{% if not loop.last %},{% endif %}
-    {%- endfor %}
-    }
-}
-</script>
-
-<script>
-// Phase 4 Stage 2 — side panel + retry/cancel buttons.
-//
-// Pattern: pre-loaded JSON dataset (above) avoids a fetch() round-trip
-// when opening the panel. Mutating actions (retry, cancel) DO use
-// fetch() because the server is the source of truth for status.
-
-const _VP_DATA = JSON.parse(document.getElementById('vp-task-data').textContent);
-const _VP_PROJECT_ID = {{ project.id | tojson }};
-
-function _escHtml(s) {
-    if (s == null) return '';
-    return String(s).replace(/[&<>"']/g, c => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[c]));
-}
-
-function _vpRenderActions(task) {
-    // Returns HTML for the action buttons at the bottom of the side panel.
-    // Each button is shown only if the action is valid for the task's
-    // current status.
-    const buttons = [];
-    const status = task.status;
-    if (status === 'failed' || status === 'interrupted' ||
-        status === 'cancelled' || status === 'skipped') {
-        buttons.push(
-            `<button class="vp-sp-btn vp-sp-btn-primary" onclick="vpRetryTask('${task.id}')">
-                🔄 Retry
-            </button>`
-        );
-    }
-    if (status === 'pending' || status === 'assigned') {
-        buttons.push(
-            `<button class="vp-sp-btn vp-sp-btn-warn" onclick="vpCancelTask('${task.id}')">
-                ✕ Cancel
-            </button>`
-        );
-    }
-    if (status === 'running') {
-        buttons.push(
-            `<button class="vp-sp-btn vp-sp-btn-warn" onclick="vpInterruptTask('${task.id}')">
-                ⏸ Interrupt
-            </button>`
-        );
-    }
-    buttons.push(
-        `<button class="vp-sp-btn" onclick="vpClosePanel()">Close</button>`
-    );
-    return buttons.join('');
-}
-
-function vpOpenPanel(taskId) {
-    const task = _VP_DATA.tasks[taskId];
-    if (!task) {
-        console.error('task not found:', taskId);
-        return;
-    }
-    const panel = document.getElementById('vp-side-panel');
-    const title = document.getElementById('vp-sp-title');
-    const body = document.getElementById('vp-sp-body');
-    const footer = document.getElementById('vp-sp-footer');
-
-    title.textContent = task.name;
-
-    // Build body. Tokens + artifacts use the per-task queries from
-    // the page load (single fetch, not per-card).
-    const tok = task.tokens || {};
-    const art = task.artifacts || {};
-    const timing = task.timing || {};
-    const result = task.result || null;
-    const params = task.params || {};
-    const deps = task.depends_on || [];
-
-    body.innerHTML = `
-        <div class="vp-sp-row">
-            <span class="vp-sp-label">status</span>
-            <span class="vp-status vp-status-${_escHtml(task.status)}">${_escHtml(task.status)}</span>
-        </div>
-        <div class="vp-sp-row">
-            <span class="vp-sp-label">id</span>
-            <span class="vp-sp-mono">${_escHtml(task.id)}</span>
-        </div>
-        <div class="vp-sp-row">
-            <span class="vp-sp-label">agent_role</span>
-            <span class="vp-sp-mono">${_escHtml(task.agent_role || '?')}</span>
-        </div>
-        <div class="vp-sp-row">
-            <span class="vp-sp-label">action</span>
-            <span class="vp-sp-mono">${_escHtml(task.action || '?')}</span>
-        </div>
-        <div class="vp-sp-row">
-            <span class="vp-sp-label">retry</span>
-            <span class="vp-sp-mono">${task.retry_count} / ${task.max_retries || '∞'}</span>
-        </div>
-        <div class="vp-sp-row">
-            <span class="vp-sp-label">started</span>
-            <span class="vp-sp-mono">${_escHtml(task.started_at || '—')}</span>
-        </div>
-        <div class="vp-sp-row">
-            <span class="vp-sp-label">ended</span>
-            <span class="vp-sp-mono">${_escHtml(task.ended_at || '—')}</span>
-        </div>
-        <div class="vp-sp-row">
-            <span class="vp-sp-label">took</span>
-            <span class="vp-sp-mono">${timing.took_sec ? timing.took_sec + 's' : '—'}</span>
-        </div>
-
-        <h3 class="vp-sp-h3">params</h3>
-        <pre class="vp-sp-pre">${_escHtml(JSON.stringify(params, null, 2))}</pre>
-
-        ${deps.length ? `
-        <h3 class="vp-sp-h3">depends_on (${deps.length})</h3>
-        <div class="vp-sp-mono">${deps.map(_escHtml).join(', ')}</div>
-        ` : ''}
-
-        <h3 class="vp-sp-h3">tokens</h3>
-        <div class="vp-sp-mono">
-            total: ${(tok.total || 0).toLocaleString()}<br>
-            prompt: ${(tok.prompt || 0).toLocaleString()}<br>
-            completion: ${(tok.completion || 0).toLocaleString()}
-        </div>
-
-        <h3 class="vp-sp-h3">artifacts (${art.n || 0})</h3>
-        <div class="vp-sp-mono">${(art.total_bytes || 0).toLocaleString()} bytes total</div>
-
-        ${result ? `
-        <h3 class="vp-sp-h3">result</h3>
-        <pre class="vp-sp-pre vp-sp-result">${_escHtml(JSON.stringify(result, null, 2))}</pre>
-        ` : ''}
-
-        ${task.error ? `
-        <h3 class="vp-sp-h3">error</h3>
-        <pre class="vp-sp-pre vp-sp-error">${_escHtml(task.error)}</pre>
-        ` : ''}
-    `;
-
-    footer.innerHTML = _vpRenderActions(task);
-    panel.classList.remove('hidden');
-    // Focus close button for accessibility (and so ESC works on it)
-    panel.querySelector('.vp-sp-close').focus();
-}
-
-function vpClosePanel() {
-    document.getElementById('vp-side-panel').classList.add('hidden');
-}
-
-// ESC to close
-document.addEventListener('keydown', function(ev) {
-    if (ev.key === 'Escape' && !document.getElementById('vp-side-panel').classList.contains('hidden')) {
-        vpClosePanel();
-    }
-});
-
-async function _vpCallAction(taskId, action) {
-    const panel = document.getElementById('vp-side-panel');
-    const body = document.getElementById('vp-sp-body');
-    const footer = document.getElementById('vp-sp-footer');
-    // Disable buttons while in flight
-    const btns = footer.querySelectorAll('button');
-    btns.forEach(b => b.disabled = true);
-
-    try {
-        const r = await fetch(`/api/tasks/${taskId}/${action}`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-        });
-        const j = await r.json();
-        if (!r.ok) {
-            const errMsg = (j.detail || r.statusText || 'failed');
-            footer.innerHTML = `<span class="vp-sp-error">✕ ${_escHtml(errMsg)}</span> ` +
-                `<button class="vp-sp-btn" onclick="vpClosePanel()">Close</button>`;
-            return;
-        }
-        // Update the embedded data and re-render the panel
-        _VP_DATA.tasks[taskId] = j;
-        // Also update the card in the grid
-        _vpUpdateCard(taskId, j);
-        vpOpenPanel(taskId);
-        // Re-enable after render
-        setTimeout(() => {
-            footer.querySelectorAll('button').forEach(b => b.disabled = false);
-        }, 100);
-    } catch (e) {
-        footer.innerHTML = `<span class="vp-sp-error">✕ ${_escHtml(e.message || e)}</span> ` +
-            `<button class="vp-sp-btn" onclick="vpClosePanel()">Close</button>`;
-    }
-}
-
-function _vpUpdateCard(taskId, task) {
-    const card = document.querySelector(`.vp-card[data-task-id="${taskId}"]`);
-    if (!card) return;
-    // Update the status badge
-    const statusBadge = card.querySelector('.vp-status');
-    if (statusBadge) {
-        // Remove old vp-status-* class
-        statusBadge.className = 'vp-status vp-status-' + task.status;
-        statusBadge.textContent = task.status;
-    }
-    // Update the card's border-left class
-    card.className = 'vp-card vp-card-status-' + task.status;
-}
-
-function vpRetryTask(taskId) { _vpCallAction(taskId, 'retry'); }
-function vpCancelTask(taskId) { _vpCallAction(taskId, 'cancel'); }
-function vpInterruptTask(taskId) { _vpCallAction(taskId, 'interrupt'); }
-
-// Phase 4 Stage 1: 30s reload for live updates. Smarter incremental
-// re-render comes in Stage 4.
-setTimeout(function() { location.reload(); }, 30000);
-</script>
-
-<style>
-/* Side panel — Stage 2 additions */
+/* Side panel (Stage 2, kept) */
 .vp-side-panel {
     position: fixed;
     top: 0;
@@ -625,4 +337,529 @@ setTimeout(function() { location.reload(); }, 30000);
 }
 .vp-sp-btn-warn:hover:not(:disabled) { background: #b91c1c; }
 </style>
+{% endblock %}
+
+{% block content %}
+<div class="vp-wrap">
+
+    <div class="flex items-center justify-between mb-2">
+        <div>
+            <h1 class="text-xl font-semibold text-gray-800">
+                {{ project.name }}
+                <a href="/projects/{{ project.id }}" class="text-sm font-normal text-blue-600 hover:underline ml-2">
+                    ← back to text view
+                </a>
+            </h1>
+            <p class="text-xs text-gray-500 mt-0.5">
+                <span class="font-mono">{{ project.id }}</span>
+                · state: <span class="font-mono">{{ project.state }}</span>
+                · {{ tasks|length }} task{{ '' if tasks|length == 1 else 's' }}
+                · visual view (Phase 4 Stage 3 — canvas with depends_on wires)
+            </p>
+        </div>
+        <div class="text-xs text-gray-400">
+            auto-refresh: 30s
+        </div>
+    </div>
+
+    <div class="vp-stage-banner">
+        <strong>Stage 3 (drawflow canvas):</strong> each task is a card on
+        a 2D canvas; <span class="font-mono">depends_on</span> shown as blue
+        chain wires. Click any card to open the side panel — view full
+        task details, retry failed tasks, cancel running/pending ones.
+        Stage 3.5 will add drag-to-edit depends_on. Stage 4 will add
+        live polling + tab switcher.
+        <a href="/projects/{{ project.id }}" class="underline">Switch to text view</a> for the full task list.
+    </div>
+
+    {% if not tasks %}
+    <div class="vp-empty">
+        No tasks yet. Tasks are created by the planner when the project enters 'planning', or by the workflow runner for workflow-spawned projects. Refresh in a few seconds.
+    </div>
+    {% else %}
+
+    <div class="vp-status-bar">
+        <span class="text-xs text-gray-500 mr-2">Status:</span>
+        {% set status_order = ['pending', 'assigned', 'running', 'completed', 'failed', 'cancelled', 'interrupted', 'skipped'] %}
+        {% for s in status_order %}
+            {% if status_counts.get(s, 0) > 0 %}
+            <span class="vp-status-chip">
+                <span class="vp-status-chip-dot vp-status-{{ s }}"></span>
+                {{ s }} · {{ status_counts[s] }}
+            </span>
+            {% endif %}
+        {% endfor %}
+        {% for s in status_counts %}
+            {% if s not in status_order %}
+            <span class="vp-status-chip">
+                <span class="vp-status-chip-dot vp-status-unknown"></span>
+                {{ s }} · {{ status_counts[s] }}
+            </span>
+            {% endif %}
+        {% endfor %}
+    </div>
+
+    <div id="vp-canvas" class="vp-canvas-wrap">
+        {# drawflow injects its DOM as a direct child of #vp-canvas.
+           Cards are positioned by JS (drawflow.addNode) based on
+           task index in created_at order. #}
+    </div>
+
+    {% endif %}
+
+</div>
+
+{# Side panel — Stage 2 (kept). Slides in from the right when a card
+   is clicked. Read-only details + action buttons (Retry, Cancel,
+   View result). Closes via X button, ESC key, or click outside. #}
+<div id="vp-side-panel" class="vp-side-panel hidden" onclick="if(event.target===this) vpClosePanel()">
+    <div class="vp-side-panel-inner" onclick="event.stopPropagation()">
+        <div class="vp-side-panel-header">
+            <span id="vp-sp-title">Task</span>
+            <button class="vp-sp-close" onclick="vpClosePanel()" title="Close (ESC)">×</button>
+        </div>
+        <div class="vp-side-panel-body" id="vp-sp-body">
+            {# Filled by JS from the embedded task data #}
+        </div>
+        <div class="vp-side-panel-footer" id="vp-sp-footer">
+            {# Filled by JS based on task status #}
+        </div>
+    </div>
+</div>
+
+{# Embedded task data for the side panel — avoids a fetch() round-trip
+   when the user clicks a card. The data is small enough to inline. #}
+<script id="vp-task-data" type="application/json">
+{
+    "tasks": {
+    {%- for t in tasks %}
+        "{{ t.id }}": {
+            "id": {{ t.id | tojson }},
+            "name": {{ t.name | tojson }},
+            "agent_role": {{ t.agent_role | tojson }},
+            "action": {{ t.action | tojson }},
+            "status": {{ t.status | tojson }},
+            "params": {{ t.params | tojson if t.params is mapping else '{}' }},
+            "depends_on": {{ t.depends_on | tojson if t.depends_on is iterable else '[]' }},
+            "output_path": {{ (t.output_path or '') | tojson }},
+            "result": {{ t.result | tojson if t.result is mapping else 'null' }},
+            "error": {{ t.error | tojson if t.error else 'null' }},
+            "retry_count": {{ t.retry_count or 0 }},
+            "max_retries": {{ t.max_retries or 0 }},
+            "started_at": {{ (t.started_at or '') | tojson }},
+            "ended_at": {{ (t.ended_at or '') | tojson }},
+            "timing": {{ t.timing | tojson }},
+            "tokens": {{ token_by_task.get(t.id, {}) | tojson }},
+            "artifacts": {{ art_by_task.get(t.id, {}) | tojson }}
+        }{% if not loop.last %},{% endif %}
+    {%- endfor %}
+    }
+}
+</script>
+
+<script>
+const _VP_DATA = JSON.parse(document.getElementById('vp-task-data').textContent);
+const _VP_PROJECT_ID = {{ project.id | tojson }};
+
+function _escHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+// ===== Stage 3: drawflow canvas init + render =====
+let _vpEditor = null;
+
+function _vpCardHtml(task) {
+    // Build the inner card HTML. task is one of the _VP_DATA.tasks
+    // entries. We tag the inner .vp-card div with data-task-name
+    // (mirroring the data-step-name pattern from visual_workflow.js)
+    // so the click handler can look up the task by id without
+    // knowing drawflow's internal module/container structure.
+    const tok = task.tokens || {};
+    const art = task.artifacts || {};
+    const timing = task.timing || {};
+    const deps = task.depends_on || [];
+    return `
+<div class="vp-card vp-card-status-${_escHtml(task.status)}" data-task-name="${_escHtml(task.id)}">
+    <span class="vp-status vp-status-${_escHtml(task.status)}">${_escHtml(task.status)}</span>
+    <div class="vp-name">${_escHtml(task.name)}</div>
+    <div class="vp-role">${_escHtml(task.agent_role || '?')}</div>
+    <div class="vp-metrics">
+        <span class="vp-metric" title="Tokens used">
+            ${(tok.total || 0).toLocaleString()} tok
+        </span>
+        <span class="vp-metric" title="Artifacts">
+            ${art.n || 0} art
+        </span>
+        <span class="vp-metric" title="Execution time">
+            ${timing.took_sec ? timing.took_sec + 's' : '—'}
+        </span>
+        ${deps.length ? `<span class="vp-metric" title="${deps.length} parent(s)">⇠ ${deps.length}</span>` : ''}
+    </div>
+</div>`;
+}
+
+function _vpInit() {
+    const wrap = document.getElementById('vp-canvas');
+    if (!wrap) return;
+    if (typeof Drawflow === 'undefined') {
+        wrap.innerHTML = '<div class="vp-empty" style="padding: 20px;">Drawflow CDN not loaded. Check your internet connection.</div>';
+        return;
+    }
+    try {
+        _vpEditor = new Drawflow(wrap);
+        _vpEditor.reroute = true;
+        _vpEditor.start();
+    } catch (e) {
+        console.error('vp: Drawflow init failed:', e);
+        wrap.innerHTML = `<div class="vp-empty" style="padding: 20px;">Drawflow init failed: ${_escHtml(e.message || e)}</div>`;
+        return;
+    }
+
+    // Add a node for each task. Position: 50px X, index * 140 Y.
+    // 140px gap = enough for 2-3 wires to connect without overlap.
+    const tasks = Object.values(_VP_DATA.tasks);
+    tasks.forEach((task, i) => {
+        try {
+            _vpEditor.addNode(
+                task.id,         // 1: name (use task id for clarity)
+                1,               // 2: n_inputs (1 input handle for depends_on)
+                1,               // 3: n_outputs (1 output handle for depends_on)
+                50,              // 4: posx
+                50 + i * 140,    // 5: posy
+                '',              // 6: classoverride (none)
+                { taskId: task.id },  // 7: data
+                _vpCardHtml(task)     // 8: html
+            );
+        } catch (e) {
+            console.warn(`vp: addNode(${task.id}) failed:`, e);
+        }
+    });
+
+    // drawflow auto-selects the most-recently-added node, which adds
+    // a teal 'selected' class to the .drawflow-node wrapper. We don't
+    // want that for the read-only Stage 3 view (looks like every
+    // card is highlighted), so strip the class from every node.
+    for (const el of wrap.querySelectorAll('.drawflow-node.selected')) {
+        el.classList.remove('selected');
+    }
+
+    // Wire depends_on: for each task B with deps [A, C], find
+    // node A and C, and connect A.output_1 -> B.input_1.
+    // Drawflow's addConnection expects numeric ids. We map
+    // task_id -> numeric_id by reading drawflow's internal state
+    // (data.taskId matches our taskId).
+    const idMap = {};  // taskId -> drawflow numeric id
+    for (const moduleName of Object.keys(_vpEditor.drawflow)) {
+        const module = _vpEditor.drawflow[moduleName];
+        if (!module || typeof module !== 'object') continue;
+        for (const containerName of Object.keys(module)) {
+            const container = module[containerName];
+            if (!container || !container.data) continue;
+            for (const numId of Object.keys(container.data)) {
+                const node = container.data[numId];
+                if (node && node.data && node.data.taskId) {
+                    idMap[node.data.taskId] = numId;
+                }
+            }
+        }
+    }
+
+    tasks.forEach((task) => {
+        const deps = task.depends_on || [];
+        const targetNum = idMap[task.id];
+        if (!targetNum) return;
+        deps.forEach((depId) => {
+            const sourceNum = idMap[depId];
+            if (!sourceNum) return;  // parent might be from a different project or deleted
+            try {
+                _vpEditor.addConnection(sourceNum, targetNum, 'output_1', 'input_1');
+            } catch (e) {
+                // drawflow silently skips duplicate connections
+                console.warn(`vp: addConnection(${depId}->${task.id}) failed:`, e.message);
+            }
+        });
+    });
+
+    // Recompute all connection paths via rAF. drawflow 0.0.59
+    // computes the connection d-attr at addConnection time, but
+    // since addNode was mutating the DOM right before, the
+    // getBoundingClientRect calls inside addConnection may have
+    // returned stale (zero) values, leaving the path with an
+    // empty or 0-length d. Recompute once the DOM has settled.
+    // Same pattern as visual_workflow.js:602.
+    requestAnimationFrame(_vpRecomputePaths);
+}
+
+// Re-compute every <svg.connection> path d-attr from the CURRENT
+// input/output handle positions. drawflow's updateConnectionNodes
+// only updates the source side of paths where the dragged node is
+// the source — not the target side. We walk all SVGs ourselves and
+// set the d using drawflow's createCurvature.
+function _vpRecomputePaths() {
+    if (!_vpEditor || !_vpEditor.precanvas || !_vpEditor.container) return;
+    const pre = _vpEditor.precanvas;
+    const preRect = pre.getBoundingClientRect();
+    const curvature = (typeof _vpEditor.curvature === 'number') ? _vpEditor.curvature : 0.5;
+    const svgs = _vpEditor.container.querySelectorAll('svg.connection');
+    svgs.forEach(svg => {
+        const classes = (svg.getAttribute('class') || '').split(/\s+/);
+        let sourceId = null, targetId = null, outputClass = null, inputClass = null;
+        for (const cls of classes) {
+            if (cls.startsWith('node_in_')) {
+                // cls is "node_in_<id>" where id is the DOM id
+                // (e.g. "node-2") or just the numeric id ("2") —
+                // drawflow 0.0.59 emits different formats in
+                // different setups. Strip the prefix and use as
+                // the id directly (don't prepend "node-" — the
+                // class already includes it if needed).
+                targetId = cls.slice('node_in_'.length);
+            } else if (cls.startsWith('node_out_')) {
+                sourceId = cls.slice('node_out_'.length);
+            } else if (cls.startsWith('output_')) {
+                outputClass = cls;
+            } else if (cls.startsWith('input_')) {
+                inputClass = cls;
+            }
+        }
+        if (!sourceId || !targetId || !outputClass || !inputClass) return;
+        // The DOM id is "#node-<id>" where <id> matches the
+        // value we extracted. If the extracted id already starts
+        // with "node-" (e.g. "node-2"), don't double-prepend.
+        const sId = sourceId.startsWith('node-') ? sourceId : 'node-' + sourceId;
+        const tId = targetId.startsWith('node-') ? targetId : 'node-' + targetId;
+        const sourceEl = _vpEditor.container.querySelector('#' + sId + ' .' + outputClass);
+        const targetEl = _vpEditor.container.querySelector('#' + tId + ' .' + inputClass);
+        if (!sourceEl || !targetEl) return;
+        const sr = sourceEl.getBoundingClientRect();
+        const tr = targetEl.getBoundingClientRect();
+        // srcX = center of the source handle, in precanvas-relative coords
+        const srcX = sourceEl.offsetWidth / 2 + sr.x - preRect.x;
+        const srcY = sourceEl.offsetHeight / 2 + sr.y - preRect.y;
+        const tgtX = targetEl.offsetWidth / 2 + tr.x - preRect.x;
+        const tgtY = targetEl.offsetHeight / 2 + tr.y - preRect.y;
+        try {
+            const d = _vpEditor.createCurvature(srcX, srcY, tgtX, tgtY, curvature, 'openclose');
+            const path = svg.querySelector('path.main-path');
+            if (path) path.setAttributeNS(null, 'd', d);
+        } catch (e) {
+            // ignore per-connection errors
+        }
+    });
+}
+
+// Wire the click handler for cards. Bound on the canvas wrap so it
+// survives re-renders. Distinguishes click from drag (drawflow's
+// own click fires after drag-end) by tracking mousedown position
+// and only opening the panel if movement < 8px.
+let _vpMouseDown = null;
+function _vpBindClickHandlers() {
+    const wrap = document.getElementById('vp-canvas');
+    if (!wrap || wrap._vpClickBound) return;
+    wrap._vpClickBound = true;
+    wrap.addEventListener('mousedown', (ev) => {
+        const cardEl = ev.target.closest('[data-task-name]');
+        _vpMouseDown = cardEl ? { x: ev.clientX, y: ev.clientY, id: cardEl.dataset.taskName } : null;
+    });
+    wrap.addEventListener('click', (ev) => {
+        if (!_vpMouseDown) return;
+        const dx = Math.abs(ev.clientX - _vpMouseDown.x);
+        const dy = Math.abs(ev.clientY - _vpMouseDown.y);
+        if (dx > 8 || dy > 8) {
+            _vpMouseDown = null;
+            return;  // it was a drag, not a click
+        }
+        const cardEl = ev.target.closest('[data-task-name]');
+        if (cardEl && cardEl.dataset.taskName === _vpMouseDown.id) {
+            vpOpenPanel(cardEl.dataset.taskName);
+        }
+        _vpMouseDown = null;
+    });
+}
+
+// ===== Side panel (Stage 2, kept) =====
+function _vpRenderActions(task) {
+    const buttons = [];
+    const status = task.status;
+    if (status === 'failed' || status === 'interrupted' ||
+        status === 'cancelled' || status === 'skipped') {
+        buttons.push(
+            `<button class="vp-sp-btn vp-sp-btn-primary" onclick="vpRetryTask('${task.id}')">
+                🔄 Retry
+            </button>`
+        );
+    }
+    if (status === 'pending' || status === 'assigned') {
+        buttons.push(
+            `<button class="vp-sp-btn vp-sp-btn-warn" onclick="vpCancelTask('${task.id}')">
+                ✕ Cancel
+            </button>`
+        );
+    }
+    if (status === 'running') {
+        buttons.push(
+            `<button class="vp-sp-btn vp-sp-btn-warn" onclick="vpInterruptTask('${task.id}')">
+                ⏸ Interrupt
+            </button>`
+        );
+    }
+    buttons.push(
+        `<button class="vp-sp-btn" onclick="vpClosePanel()">Close</button>`
+    );
+    return buttons.join('');
+}
+
+function vpOpenPanel(taskId) {
+    const task = _VP_DATA.tasks[taskId];
+    if (!task) {
+        console.error('task not found:', taskId);
+        return;
+    }
+    const panel = document.getElementById('vp-side-panel');
+    const title = document.getElementById('vp-sp-title');
+    const body = document.getElementById('vp-sp-body');
+    const footer = document.getElementById('vp-sp-footer');
+
+    title.textContent = task.name;
+
+    const tok = task.tokens || {};
+    const art = task.artifacts || {};
+    const timing = task.timing || {};
+    const result = task.result || null;
+    const params = task.params || {};
+    const deps = task.depends_on || [];
+
+    body.innerHTML = `
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">status</span>
+            <span class="vp-status vp-status-${_escHtml(task.status)}">${_escHtml(task.status)}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">id</span>
+            <span class="vp-sp-mono">${_escHtml(task.id)}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">agent_role</span>
+            <span class="vp-sp-mono">${_escHtml(task.agent_role || '?')}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">action</span>
+            <span class="vp-sp-mono">${_escHtml(task.action || '?')}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">retry</span>
+            <span class="vp-sp-mono">${task.retry_count} / ${task.max_retries || '∞'}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">started</span>
+            <span class="vp-sp-mono">${_escHtml(task.started_at || '—')}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">ended</span>
+            <span class="vp-sp-mono">${_escHtml(task.ended_at || '—')}</span>
+        </div>
+        <div class="vp-sp-row">
+            <span class="vp-sp-label">took</span>
+            <span class="vp-sp-mono">${timing.took_sec ? timing.took_sec + 's' : '—'}</span>
+        </div>
+
+        <h3 class="vp-sp-h3">params</h3>
+        <pre class="vp-sp-pre">${_escHtml(JSON.stringify(params, null, 2))}</pre>
+
+        ${deps.length ? `
+        <h3 class="vp-sp-h3">depends_on (${deps.length})</h3>
+        <div class="vp-sp-mono">${deps.map(_escHtml).join(', ')}</div>
+        ` : ''}
+
+        <h3 class="vp-sp-h3">tokens</h3>
+        <div class="vp-sp-mono">
+            total: ${(tok.total || 0).toLocaleString()}<br>
+            prompt: ${(tok.prompt || 0).toLocaleString()}<br>
+            completion: ${(tok.completion || 0).toLocaleString()}
+        </div>
+
+        <h3 class="vp-sp-h3">artifacts (${art.n || 0})</h3>
+        <div class="vp-sp-mono">${(art.total_bytes || 0).toLocaleString()} bytes total</div>
+
+        ${result ? `
+        <h3 class="vp-sp-h3">result</h3>
+        <pre class="vp-sp-pre vp-sp-result">${_escHtml(JSON.stringify(result, null, 2))}</pre>
+        ` : ''}
+
+        ${task.error ? `
+        <h3 class="vp-sp-h3">error</h3>
+        <pre class="vp-sp-pre vp-sp-error">${_escHtml(task.error)}</pre>
+        ` : ''}
+    `;
+
+    footer.innerHTML = _vpRenderActions(task);
+    panel.classList.remove('hidden');
+    panel.querySelector('.vp-sp-close').focus();
+}
+
+function vpClosePanel() {
+    document.getElementById('vp-side-panel').classList.add('hidden');
+}
+
+document.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Escape' && !document.getElementById('vp-side-panel').classList.contains('hidden')) {
+        vpClosePanel();
+    }
+});
+
+async function _vpCallAction(taskId, action) {
+    const footer = document.getElementById('vp-sp-footer');
+    const btns = footer.querySelectorAll('button');
+    btns.forEach(b => b.disabled = true);
+
+    try {
+        const r = await fetch(`/api/tasks/${taskId}/${action}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+        });
+        const j = await r.json();
+        if (!r.ok) {
+            const errMsg = (j.detail || r.statusText || 'failed');
+            footer.innerHTML = `<span class="vp-sp-error">✕ ${_escHtml(errMsg)}</span> ` +
+                `<button class="vp-sp-btn" onclick="vpClosePanel()">Close</button>`;
+            return;
+        }
+        _VP_DATA.tasks[taskId] = j;
+        vpOpenPanel(taskId);
+        setTimeout(() => {
+            footer.querySelectorAll('button').forEach(b => b.disabled = false);
+        }, 100);
+    } catch (e) {
+        footer.innerHTML = `<span class="vp-sp-error">✕ ${_escHtml(e.message || e)}</span> ` +
+            `<button class="vp-sp-btn" onclick="vpClosePanel()">Close</button>`;
+    }
+}
+
+function vpRetryTask(taskId) { _vpCallAction(taskId, 'retry'); }
+function vpCancelTask(taskId) { _vpCallAction(taskId, 'cancel'); }
+function vpInterruptTask(taskId) { _vpCallAction(taskId, 'interrupt'); }
+
+// Init on DOMContentLoaded. drawflow is loaded via defer script,
+// so by the time DOMContentLoaded fires, Drawflow should be defined.
+// If not (slow CDN), poll briefly with a 100ms retry.
+function _vpBootstrap() {
+    if (typeof Drawflow === 'undefined') {
+        setTimeout(_vpBootstrap, 100);
+        return;
+    }
+    _vpInit();
+    _vpBindClickHandlers();
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _vpBootstrap);
+} else {
+    _vpBootstrap();
+}
+
+// Stage 4 will replace this with incremental re-render.
+setTimeout(function() { location.reload(); }, 30000);
+</script>
 {% endblock %}
