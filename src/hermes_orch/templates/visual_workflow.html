@@ -255,6 +255,10 @@
             v{{ workflow.version }} ·
             {{ workflow.step_count if workflow.step_count is defined else '?' }} step(s) ·
             Phase 1 skeleton
+            <span class="text-gray-400 ml-2">
+                · <span class="font-semibold text-gray-600">blue</span> wires = chain (depends_on)
+                · <span class="font-semibold" style="color: #dc2626;">red dashed</span> wire = loop-back (feedback_to)
+            </span>
         </p>
     </div>
     <div class="flex gap-2">
@@ -346,9 +350,22 @@
             <input type="text" id="vf-edit-skill">
             <label>output_path (optional)</label>
             <input type="text" id="vf-edit-output-path">
-            <label>feedback_to (Phase 0 loop-back, optional)</label>
+            <label>
+                Loop-back: re-run me if these steps fail
+                <span class="text-xs text-gray-400 font-normal"
+                    title="When any of these steps fail, this step is automatically re-dispatched, and all downstream steps (via depends_on) are reset to pending. Useful for upstream retries when downstream validation catches a stale data problem.">
+                    (?)
+                </span>
+            </label>
             <input type="text" id="vf-edit-feedback-to"
-                placeholder="audit-step, deliver-step">
+                placeholder="e.g. verify-step, audit-step">
+            <p class="text-xs text-gray-500 mt-1">
+                Wire from another step's
+                <span class="inline-block w-3 h-3 align-middle rounded-full"
+                    style="background: #dc2626; border: 1px dashed #dc2626;"></span>
+                <span class="font-mono text-[10px]">red handle</span>
+                to draw a loop-back. Empty = no re-run on failure.
+            </p>
             <label>params_template (JSON)</label>
             <textarea id="vf-edit-params"
                 class="font-mono text-xs"></textarea>
