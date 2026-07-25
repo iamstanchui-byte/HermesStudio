@@ -270,14 +270,18 @@
             _recomputeAllConnectionPaths();
         });
 
-        // Click handler: open the side panel on card click;
-        // close the side panel on click of the wrap's blank area
-        // (the user asked for an obvious way to "go back out").
-        // We track mousedown so a drag (movement > 5px) does NOT
-        // open the side panel — drawflow's default behavior is to
-        // fire click after drag-end, which is misleading to users
-        // who intended to reorder. Phase 1.1 (drag-to-reorder) will
-        // override this and actually move the card in _stepTemplate.
+        // Click + double-click handlers:
+        //   - Single click on card: just select (drawflow already does
+        //     this; we don't open the side panel, to avoid accidental
+        //     opens when the user is dragging).
+        //   - Double click on card: open the side panel.
+        //   - Click on wrap's blank area: close the side panel (which
+        //     reverts the form per closeSidePanel's contract).
+        // We track mousedown so a drag (movement > 8px) does NOT
+        // trigger dblclick — drawflow's default behavior is to fire
+        // click after drag-end, and dblclick can fire on a drag-end
+        // if the user clicks twice in quick succession. Skipping on
+        // movement > threshold makes drag-to-reorder unambiguous.
         if (!wrap._vfClickBound) {
             wrap.addEventListener('mousedown', (ev) => {
                 const nodeEl = ev.target.closest('.drawflow-node');
@@ -286,35 +290,44 @@
                     : null;
             });
             wrap.addEventListener('click', (ev) => {
-                // .drawflow-node is the drawflow wrapper, but our
-                // data-step-name is on the inner .vf-node div. Use
-                // closest('[data-step-name]') to find the actual
-                // step name regardless of which descendant the user
-                // clicked on. Fall back to .drawflow-node for
-                // blank-area detection.
+                // Click on the wrap's blank area (not a card) →
+                // close the side panel if it's open. Reverts the
+                // form via closeSidePanel.
+                //
+                // IMPORTANT: ignore clicks whose target is inside
+                // the side panel (or any other non-canvas element).
+                // Otherwise the click event that fires on the
+                // Apply/Cancel button bubbles up to the wrap, sees
+                // that the target is NOT a card, and closes the
+                // panel right after applyEdit re-opened it.
+                const sp = _sidePanel();
+                if (sp && sp.contains(ev.target)) return;
+                // Also ignore clicks on the Add Step palette (lives
+                // outside the canvas wrap but the click still
+                // bubbles through the document).
+                if (ev.target.closest('.vf-palette-chip')) return;
                 const stepEl = ev.target.closest('[data-step-name]');
-                const nodeEl = ev.target.closest('.drawflow-node');
-                if (stepEl && nodeEl) {
-                    // Was this a drag (movement > 8px)? If so, the
-                    // user intended to reposition the card, not
-                    // view its details. Skip opening the side panel.
-                    if (_mouseDownPos) {
-                        const dx = ev.clientX - _mouseDownPos.x;
-                        const dy = ev.clientY - _mouseDownPos.y;
-                        if (Math.sqrt(dx * dx + dy * dy) > _DRAG_THRESHOLD_PX) {
-                            return;
-                        }
-                    }
-                    window.visualBuilder.openSidePanel(nodeEl.id);
-                } else {
-                    // Click on the wrap's blank area (not a card) →
-                    // close the side panel if it's open. Don't open
-                    // on background click — only on explicit card click.
-                    const sp = _sidePanel();
+                if (!stepEl) {
                     if (sp.classList.contains('open')) {
                         closeSidePanel();
                     }
                 }
+            });
+            wrap.addEventListener('dblclick', (ev) => {
+                const stepEl = ev.target.closest('[data-step-name]');
+                const nodeEl = ev.target.closest('.drawflow-node');
+                if (!stepEl || !nodeEl) return;
+                // Was this a drag (movement > 8px)? If so, the user
+                // intended to reposition the card, not view its
+                // details. Skip opening the side panel.
+                if (_mouseDownPos) {
+                    const dx = ev.clientX - _mouseDownPos.x;
+                    const dy = ev.clientY - _mouseDownPos.y;
+                    if (Math.sqrt(dx * dx + dy * dy) > _DRAG_THRESHOLD_PX) {
+                        return;
+                    }
+                }
+                window.visualBuilder.openSidePanel(nodeEl.id);
             });
             wrap._vfClickBound = true;
         }
@@ -668,6 +681,24 @@
             console.warn('visual_workflow: no step for node', nodeId);
             return;
         }
+        _refreshEditFormFromTemplate(step);
+        _sidePanel().classList.add('open');
+    }
+
+    // Phase 1.4 polish (2026-07-25): pull the form-input population
+    // out of openSidePanel so closeSidePanel can call it too. Cancel /
+    // ESC / blank-canvas click should REVERT the form to the current
+    // step_template state, not just close the panel — otherwise
+    // typed-but-not-applied values linger in the inputs and surface
+    // the next time the user re-opens the same card. This makes Apply
+    // the only way to commit, and Cancel/ESC the only ways to revert
+    // (per the user's UX request).
+    function _refreshEditFormFromTemplate(step) {
+        if (!step) {
+            const sel = _selectedNodeId ? _findStepByNodeId(_selectedNodeId) : null;
+            if (!sel) return;
+            step = sel;
+        }
         document.getElementById('vf-edit-name').value = step.name || '';
         document.getElementById('vf-edit-role').value = step.agent_role || '';
         document.getElementById('vf-edit-action').value = step.action || '';
@@ -686,10 +717,16 @@
             errEl.textContent = '';
             errEl.classList.add('hidden');
         }
-        _sidePanel().classList.add('open');
     }
 
     function closeSidePanel() {
+        // Revert: restore the form inputs to the current step_template
+        // state so any typed-but-not-applied values are dropped. Only
+        // Apply should commit; Cancel / ESC / blank-canvas click
+        // should be pure revert.
+        if (_selectedNodeId) {
+            _refreshEditFormFromTemplate();
+        }
         _selectedNodeId = null;
         _sidePanel().classList.remove('open');
     }

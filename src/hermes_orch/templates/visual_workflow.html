@@ -31,8 +31,10 @@
         border-radius: 0.5rem;
         position: relative;
     }
-    /* Drawflow injects this into the wrap; we just size it. */
-    .vf-canvas-wrap > div {
+    /* Drawflow injects this into the wrap; we just size it.
+       Exclude the side panel — it lives inside the wrap too,
+       but it has its own size (360px wide on the right). */
+    .vf-canvas-wrap > div:not(.vf-side-panel) {
         width: 100% !important;
         height: 100% !important;
     }
@@ -237,9 +239,11 @@
        panel below is a sibling (position: absolute), so it floats
        over the canvas (z-index: 10) without affecting layout. #}
 
-    {# Side panel — Phase 1.3 (now editable). Click a card to open,
-       edit fields, click "Apply" to commit the changes to the
-       in-memory step_template. Then click "Save" to persist to DB. #}
+    {# Side panel — Phase 1.3 (now editable). Double-click a card to
+       open, edit fields, click "Apply" to commit the changes to the
+       in-memory step_template. "Cancel" / Esc / click outside revert
+       the form to the current step_template state. Then click "Save"
+       to persist to DB. #}
     <div class="vf-side-panel" id="vf-side-panel">
         <div class="flex items-center justify-between mb-2">
             <h3>Step details</h3>
@@ -247,8 +251,9 @@
                 class="text-gray-400 hover:text-gray-700 text-sm">×</button>
         </div>
         <p class="text-xs text-gray-500 mb-3" id="vf-side-panel-hint">
-            Click a card to view + edit its details. Click
-            <strong>Apply</strong> to commit changes; then <strong>Save</strong>
+            <strong>Double-click</strong> a card to view + edit its details.
+            <strong>Apply</strong> commits changes; <strong>Cancel</strong>,
+            <kbd>Esc</kbd> or click outside revert. Then <strong>Save</strong>
             to persist to the database.
         </p>
         <div id="vf-side-panel-body">
