@@ -1853,8 +1853,17 @@ project page. They can ask you to:
      happen next, given the project's goal)
 
 You will see a JSON snapshot of the project (goal, state, tasks
-with status/result, recent audit events) before each user
-message. Use it to ground every response.
+with status/result, recent audit events, available_profiles) before
+each user message. Use it to ground every response.
+
+CRITICAL: agent_role field for create_task
+  The `available_profiles` list in the snapshot shows the EXACT
+  profile names you can use. The system REJECTS any other
+  name with a 400. NEVER invent names like 'google-drive-uploader',
+  'script-runner', 'data-analyst', etc. — use one of:
+  {available_profiles_inline}
+  If the task genuinely fits no profile, leave agent_role empty
+  and the system defaults to the first one.
 
 Output rules:
   - Plain markdown, 1-15 lines, terse.
@@ -2024,6 +2033,18 @@ async def _build_chat_context(project_id: str, db) -> dict:
             "summary": {k: str(v)[:200] for k, v in payload.items()},
             "created_at": a["created_at"][:19] if a["created_at"] else None,
         })
+    # Available agent profiles — included in the chat context so
+    # the LLM uses a REAL profile name for agent_role in
+    # create_task suggestions. Without this, the LLM invents
+    # plausible-looking names like 'google-drive-uploader' or
+    # 'script-runner' that don't exist; apply then 400s.
+    # (LLM-fooling pattern #7 — see memory catalog.)
+    profiles = await db.fetchall(
+        "SELECT name, agent_id FROM agent_profiles ORDER BY agent_id, name"
+    )
+    available_profiles = [
+        {"name": p["name"], "agent_id": p["agent_id"]} for p in profiles
+    ]
     return {
         "project": {
             "id": proj["id"],
@@ -2035,6 +2056,7 @@ async def _build_chat_context(project_id: str, db) -> dict:
         },
         "tasks": task_list,
         "audit_tail": audit_list,
+        "available_profiles": available_profiles,
     }
 
 
@@ -2129,8 +2151,22 @@ async def chat_with_project(
         "created_at": now,
     })
     # Build LLM messages
+    # Fill the {available_profiles_inline} placeholder in the
+    # system prompt with the comma-separated profile names from
+    # the project context. This stops the LLM from inventing
+    # names like 'google-drive-uploader' or 'script-runner' (the
+    # apply endpoint validates and 400s on unknown names, so
+    # the LLM MUST use a real name).
+    profile_names = [p["name"] for p in ctx.get("available_profiles", [])]
+    if profile_names:
+        inline = ", ".join(f"`{n}`" for n in profile_names)
+    else:
+        inline = "(no profiles registered — leave agent_role empty)"
+    system_prompt = _CHAT_SYSTEM_PROMPT.replace(
+        "{available_profiles_inline}", inline
+    )
     llm_messages = [
-        {"role": "system", "content": _CHAT_SYSTEM_PROMPT + "\n\nProject snapshot:\n" + json.dumps(ctx, ensure_ascii=False, indent=2)},
+        {"role": "system", "content": system_prompt + "\n\nProject snapshot:\n" + json.dumps(ctx, ensure_ascii=False, indent=2)},
     ]
     for h in history:
         role = h.get("role")
