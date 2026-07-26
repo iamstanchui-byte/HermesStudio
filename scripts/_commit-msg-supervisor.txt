@@ -1,0 +1,56 @@
+fix(supervisor): dispatch single tasks (were stuck pending forever)
+
+User reported (2026-07-27): "我看見single task 的agent 不能指派".
+
+Root cause: the supervisor's main loop filtered projects by
+`state IN ('planning','ready','running')`. The virtual
+`__single_tasks__` project is created with state='completed'
+(by db.ensure_single_tasks_project) so it was skipped by the
+project loop. Net result: single tasks were created with
+status='pending' and stayed that way forever — no supervisor
+tick dispatched them.
+
+The deeper issue: _assign_task also rejected empty agent_role
+with a hard return, so even if the task had been seen, the
+dispatch would have failed with "no agent has this role".
+
+Fix (two parts):
+
+  1. core/supervisor.py — new `_drive_single_tasks` method
+     (called after the project loop in the same tick):
+       - Queries pending single tasks in the virtual
+         __single_tasks__ project (ORDER BY created_at, LIMIT 20)
+       - Calls _assign_task on each (which now handles empty
+         agent_role by picking any verified agent's first
+         profile, deterministic by agent_id)
+       - Promotes assigned → running immediately (single tasks
+         have no project lifecycle, so the wrapper picks them
+         up via the standard running-state poll)
+       - Audits task.started for each promotion
+     Plus: modified _assign_task to accept single tasks with
+     empty agent_role — the user's "code-gen flow" / "ad-hoc
+     summarize" doesn't pin a role, so we pick any verified
+     agent's first profile.
+
+  2. tests/test_single_tasks.py — 2 new tests:
+       - test_supervisor_dispatches_single_task: create, wait
+         up to 15s, assert status moves to assigned/running
+       - test_supervisor_dispatches_single_task_with_empty_role:
+         same, but the API call leaves agent_role empty
+         (default behavior) and the assertion checks
+         assigned_profile_id is non-None
+     Total: 11/11 single_tasks tests pass, 63/64 overall
+     (1 skip = LLM variance on the optimize-tasks test).
+
+Pattern catalog #116 — single tasks need a separate dispatch loop:
+  Single tasks live in a virtual project whose state is
+  'completed' (terminal), so the project loop's state filter
+  excludes them. They also have no depends_on and no project
+  lifecycle, so _handle_execution is wrong for them. A small
+  dedicated loop is the cleanest fix. The dispatch is otherwise
+  identical to project tasks — same _assign_task, same
+  audit trail, same wrapper pickup via status='running'.
+
+Verified end-to-end: created a single task via API, supervisor
+picked it up and assigned to profile 2a6c730c (linux-a-01
+super-b) within ~6s, promoted to running.

@@ -188,6 +188,58 @@ def test_list_filters_by_status():
     _delete_task(t2["id"])
 
 
+def test_supervisor_dispatches_single_task():
+    """The supervisor's _drive_single_tasks loop should pick up a
+    newly-created single task, assign it to an available agent, and
+    promote it to 'running' so the wrapper can pick it up. The
+    supervisor polls every ~5s, so we wait up to 15s.
+    """
+    s, t = _http("POST", "/api/single-tasks", {
+        "name": "supervisor dispatch test",
+        "goal": "verify supervisor dispatches single tasks",
+    })
+    assert s == 201
+    assert t["status"] == "pending"
+    # Wait up to 15s for the supervisor to pick it up
+    deadline = time.time() + 15
+    final_status = "pending"
+    while time.time() < deadline:
+        s, cur = _http("GET", f"/api/single-tasks/{t['id']}")
+        final_status = cur["status"]
+        if final_status in ("assigned", "running", "completed", "failed"):
+            break
+        time.sleep(2)
+    # The supervisor should have moved it from pending to assigned/running
+    # (the exact state depends on whether the supervisor's auto-promote
+    # fired before the wrapper claimed it; both are valid).
+    assert final_status in ("assigned", "running"), (
+        f"supervisor didn't dispatch single task in 15s; final status={final_status}"
+    )
+    _delete_task(t["id"])
+
+
+def test_supervisor_dispatches_single_task_with_empty_role():
+    """A single task created with no agent_role (the default) should
+    still be dispatched — _assign_task now picks any available
+    verified profile for single tasks with empty role."""
+    s, t = _http("POST", "/api/single-tasks", {
+        "name": "empty role dispatch test",
+        "goal": "verify empty-role single tasks get dispatched",
+    })
+    assert s == 201
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        s, cur = _http("GET", f"/api/single-tasks/{t['id']}")
+        if cur["status"] in ("assigned", "running"):
+            # Confirm an agent was actually picked (not None)
+            assert cur.get("assigned_profile_id") is not None
+            break
+        time.sleep(2)
+    else:
+        pytest.fail(f"empty-role single task wasn't dispatched; final={cur['status']}")
+    _delete_task(t["id"])
+
+
 # ===== Helpers =====
 
 

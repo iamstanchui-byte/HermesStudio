@@ -420,6 +420,15 @@ class Supervisor:
                     level="error",
                 )
 
+        # Single tasks (Object Layer commit 3, 2026-07-27): dispatched
+        # separately because they live in the virtual __single_tasks__
+        # project (state=completed) and the projects loop above filters
+        # by state IN (planning,ready,running). The dispatch flow is
+        # simpler: find pending single tasks, assign via _assign_task
+        # (which now handles empty agent_role), then promote assigned
+        # to running so the wrapper can pick them up.
+        await self._drive_single_tasks()
+
     async def _drive_project(self, proj: dict[str, Any]) -> None:
         pid = proj["id"]
         state = proj["state"]
@@ -431,6 +440,79 @@ class Supervisor:
         if state in ("ready", "running"):
             await self._handle_execution(proj)
             return
+
+    # ===== single tasks (Object Layer commit 3, 2026-07-27) =====
+
+    async def _drive_single_tasks(self) -> None:
+        """Dispatch pending single tasks.
+
+        Single tasks live in the virtual __single_tasks__ project,
+        which is in state='completed' (so the project loop skips it).
+        We scan for pending single tasks here, assign them to any
+        available agent (since the user typically doesn't pin a role
+        for a one-off task), and promote them to running so the
+        wrapper can pick them up.
+
+        Unlike project tasks, single tasks:
+          - have no depends_on (always 0 dependencies)
+          - have no upstream project context (just the task's own
+            goal + source in params)
+          - are dispatched the moment they're pending (no project
+            state machine to wait for)
+        """
+        from hermes_orch.db import SINGLE_TASKS_PROJECT_ID
+        # Fetch all pending single tasks, oldest first (FIFO so a
+        # backlog of ad-hoc tasks processes in submission order).
+        pending = await self.db.fetchall(
+            "SELECT * FROM tasks WHERE project_id = ? "
+            "AND is_single_task = 1 AND status = 'pending' "
+            "ORDER BY created_at ASC LIMIT 20",
+            (SINGLE_TASKS_PROJECT_ID,),
+        )
+        if not pending:
+            return
+        n_assigned = 0
+        n_running = 0
+        for t in pending:
+            try:
+                ok = await self._assign_task(t)
+                if ok:
+                    n_assigned += 1
+            except Exception as e:
+                log.exception(f"single-task assign {t['id']} failed: {e}")
+        # Promote just-assigned tasks to running (the wrapper polls
+        # for status='running' to claim work). For project tasks this
+        # is normally deferred (the wrapper claims via /start), but
+        # single tasks have no project lifecycle so we just kick
+        # them off.
+        rows = await self.db.fetchall(
+            "SELECT id FROM tasks WHERE project_id = ? "
+            "AND is_single_task = 1 AND status = 'assigned'",
+            (SINGLE_TASKS_PROJECT_ID,),
+        )
+        now = _now_iso()
+        for r in rows:
+            try:
+                await self.db.execute(
+                    "UPDATE tasks SET status = 'running', last_liveness_at = ?, "
+                    "started_at = COALESCE(started_at, ?), updated_at = ? "
+                    "WHERE id = ? AND status = 'assigned'",
+                    (now, now, now, r["id"]),
+                )
+                await audit_log(
+                    self.db, "task.started",
+                    actor="supervisor",
+                    project_id=SINGLE_TASKS_PROJECT_ID,
+                    task_id=r["id"],
+                )
+                n_running += 1
+            except Exception as e:
+                log.exception(f"single-task promote {r['id']} failed: {e}")
+        if n_assigned or n_running:
+            log.info(
+                "single tasks: assigned %d, promoted %d (out of %d pending)",
+                n_assigned, n_running, len(pending),
+            )
 
     # ===== planning -> ready =====
 
@@ -1335,6 +1417,7 @@ class Supervisor:
         """
         tid = task["id"]
         role = task["agent_role"]
+        is_single = bool(task.get("is_single_task"))
         # Re-read to avoid races
         cur = await self.db.fetchone(
             "SELECT id, status, project_id, agent_role, required_capability "
@@ -1363,14 +1446,36 @@ class Supervisor:
                     cur["procedure_md"] = proc_text
             except Exception as e:
                 log.warning("failed to load procedure.md for task %s: %s", tid, e)
-        # Find an idle profile for this role (prefer verified agents)
-        prof = await self.db.fetchone(
-            "SELECT ap.id, ap.agent_id, ap.capabilities FROM agent_profiles ap "
-            "JOIN agents a ON a.id = ap.agent_id "
-            "WHERE ap.name = ? AND a.status = 'verified' "
-            "ORDER BY ap.agent_id LIMIT 1",
-            (role,),
-        )
+        # Find an idle profile for this role (prefer verified agents).
+        # Single tasks (is_single_task=1) often have an empty agent_role
+        # because the user didn't specify one — they want ANY available
+        # agent. For those, pick the first verified agent's first
+        # profile (deterministic order by agent_id).
+        prof = None
+        if is_single and not role:
+            prof = await self.db.fetchone(
+                "SELECT ap.id, ap.agent_id, ap.capabilities, ap.name AS role "
+                "FROM agent_profiles ap "
+                "JOIN agents a ON a.id = ap.agent_id "
+                "WHERE a.status = 'verified' "
+                "ORDER BY a.id, ap.id LIMIT 1",
+            )
+            if prof:
+                # Mark the role so the rest of the dispatch flow works
+                # consistently (audit + log say "single-task-pick: role X").
+                role = prof["role"]
+                log.info(
+                    "single task %s: no role specified, picked %r from %s",
+                    tid, role, prof["agent_id"],
+                )
+        if not prof:
+            prof = await self.db.fetchone(
+                "SELECT ap.id, ap.agent_id, ap.capabilities FROM agent_profiles ap "
+                "JOIN agents a ON a.id = ap.agent_id "
+                "WHERE ap.name = ? AND a.status = 'verified' "
+                "ORDER BY ap.agent_id LIMIT 1",
+                (role,),
+            )
         if not prof:
             # Fall back to any profile (even un-verified) so demo still flows
             prof = await self.db.fetchone(
