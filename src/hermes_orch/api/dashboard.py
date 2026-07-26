@@ -883,9 +883,11 @@ async def project_page(
         # before/after: what the OLD execution produced vs the new one.
         # User feedback (2026-07-26): "可以像之前一樣可以看到output 嗎?"
         # — without result, the history is just metadata, not useful.
+        # We also pull `project_id` so _annotate_artifact_exists can
+        # resolve file paths to <projects_root>/<project_id>/<name>.
         archived_rows = await db.fetchall(
-            "SELECT id, name, agent_role, action, status, result, error, "
-            "updated_at, created_at "
+            "SELECT id, project_id, name, agent_role, action, status, "
+            "result, error, updated_at, created_at "
             "FROM tasks WHERE project_id = ? AND archived = 1 "
             "ORDER BY updated_at DESC, created_at DESC",
             (project_id,),
@@ -894,6 +896,17 @@ async def project_page(
         # template can use `t.result.summary` / `.session_id` / `.artifacts`
         for t in archived_rows:
             _parse_json_fields(t, "result")
+        # Annotate each artifact with on-disk existence so the template
+        # can render links vs "deleted" badges. The same helper the
+        # live task list uses (see _annotate_artifact_exists for why
+        # this matters — without it, links to ephemeral control files
+        # like decision.md / status.md / plan.md 404 because the
+        # supervisor read + unlinked them after each iter loop).
+        from pathlib import Path
+        cfg = request.app.state.config
+        projects_root_p = Path(cfg["projects"]["storage_root"]).resolve()
+        for t in archived_rows:
+            _annotate_artifact_exists(t, projects_root_p)
 
     # Paginated task rows (project-scoped SQL, not "load all then filter").
     # Filter archived=0 by default (the active plan). The "show archived"
