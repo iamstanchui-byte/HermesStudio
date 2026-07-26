@@ -494,8 +494,9 @@ svg.connection.output_2 path {
         a 2D canvas; <span class="font-mono">depends_on</span> shown as blue
         chain wires. Click any card to open the side panel — view full
         task details, retry failed tasks, cancel running/pending ones,
-        <strong>reset &amp; cascade</strong> to re-run a task and all
-        downstream tasks, or edit/delete the task structure.
+        <strong>clone chain</strong> to re-run a task and all downstream
+        tasks as fresh new tasks (old ones are archived for comparison),
+        or edit/delete the task structure.
         Stage 3.5 is the editable plan builder. Stage 4 will add
         live polling + tab switcher.
         <a href="/projects/{{ project.id }}" class="underline">Switch to text view</a> for the full task list.
@@ -859,26 +860,32 @@ function _vpRenderActions(task, EDITABLE) {
             </button>`
         );
     }
-    // Phase 4 Stage 3.5+ (2026-07-26): Reset & cascade button.
-    // Shows for tasks in a resettable state (any terminal or
-    // completed). Resets this task + every task that depends on
-    // it (transitively) back to pending, so the supervisor will
-    // re-dispatch the whole chain. The operator uses this when
-    // an upstream task's output was wrong and they want to
-    // refresh everything that consumed it.
-    // Skip for pending/assigned (nothing to reset) and running
-    // (would race with the wrapper — operator should interrupt
-    // first).
-    const RESETTABLE = ['failed', 'interrupted', 'cancelled',
+    // Phase 4+ clone-chain (2026-07-26): "Clone chain" button.
+    // Shows for tasks in a cloneable state (any terminal or
+    // completed). Clones this task + every task that depends on
+    // it (transitively) as FRESH new tasks (new IDs, status=pending).
+    // The OLD tasks are preserved untouched in the DB but marked
+    // archived=1 so they're hidden from the project view.
+    // Skip for pending/assigned (nothing to clone from) and
+    // running (would race with the wrapper — operator should
+    // interrupt first).
+    //
+    // Replaces the earlier "Reset & cascade" button, which
+    // destroyed history. Clone is the proper "re-run with a
+    // fresh start" semantic — task (structure) and task result
+    // (execution) stay separate, and the user can edit the new
+    // chain after.
+    const CLONEABLE = ['failed', 'interrupted', 'cancelled',
                         'skipped', 'completed'];
-    if (RESETTABLE.includes(status)) {
-        const downstreamNote = status === 'completed'
-            ? 'Re-run this task plus all tasks that depend on it (downstream).'
-            : 'Re-run this task plus all downstream tasks. The current ' +
-              'results/error output will be discarded.';
+    if (CLONEABLE.includes(status)) {
+        const downstreamNote = 'Create fresh new tasks with the same params, ' +
+            'starting from this one. The old tasks are kept as ' +
+            'archive (hidden from the default view) so you can ' +
+            'compare before/after. The new chain starts pending and ' +
+            'you can edit/add/delete tasks on it before the project runs.';
         buttons.push(
-            `<button class="vp-sp-btn vp-sp-btn-primary" onclick="vpResetCascade('${task.id}', event)" title="${downstreamNote}">
-                ⤵ Reset & cascade
+            `<button class="vp-sp-btn vp-sp-btn-primary" onclick="vpCloneCascade('${task.id}', event)" title="${downstreamNote}">
+                🧬 Clone chain
             </button>`
         );
     }
@@ -1258,16 +1265,24 @@ function vpRetryTask(taskId) { _vpCallAction(taskId, 'retry'); }
 function vpCancelTask(taskId) { _vpCallAction(taskId, 'cancel'); }
 function vpInterruptTask(taskId) { _vpCallAction(taskId, 'interrupt'); }
 
-// Phase 4 Stage 3.5+ (2026-07-26): Reset & cascade handler.
-// Different from vpRetryTask because:
-//  1. The endpoint is /reset-and-cascade (not /retry) and may
-//     reset many tasks (the response only echoes the source).
-//  2. We confirm the operator understands the cascade scope
-//     BEFORE firing the request — it's a multi-task mutation
-//     that erases all downstream results.
-//  3. We update the local _VP_DATA so the UI reflects the
-//     cascade immediately (don't wait for reload).
-async function vpResetCascade(taskId, ev) {
+// Phase 4+ (2026-07-26): Clone chain handler.
+// Replaces the earlier vpResetCascade (which destroyed history).
+// This handler creates N fresh new tasks (one for the source +
+// one for each downstream task). The OLD tasks stay in the DB
+// (marked archived=1) so the operator can compare before/after
+// via the audit log + the (future) "show archived" toggle.
+//
+// Different from the old reset handler because:
+//  1. The endpoint is /clone-and-cascade (not /reset-and-cascade)
+//     and returns a map of new_task_ids (the response is the
+//     list of new IDs, not a single task).
+//  2. We confirm the operator understands the scope BEFORE firing
+//     — it's a multi-task mutation (creates N new tasks, archives
+//     N old).
+//  3. We reload the page after success so the canvas shows the
+//     fresh new chain. The OLD tasks are filtered out by the
+//     archived=0 clause in the project query.
+async function vpCloneCascade(taskId, ev) {
     const task = _VP_DATA.tasks[taskId];
     if (!task) {
         alert('Task not found: ' + taskId);
@@ -1278,54 +1293,45 @@ async function vpResetCascade(taskId, ev) {
     // into the confirm dialog so the operator sees the scope.
     const downstreamIds = _vpDownstreamIds(taskId);
     const n = downstreamIds.length;
+    const total = n + 1;  // source + downstream
     const msg = n === 0
-        ? `Reset task "${task.name || taskId}"?\n\nThis will clear its current result/error and re-dispatch it. No other tasks are affected.`
-        : `Reset task "${task.name || taskId}"?\n\nThis will also reset ${n} downstream task${n === 1 ? '' : 's'} that depend on it:\n${downstreamIds.slice(0, 5).map(id => '  - ' + (_VP_DATA.tasks[id]?.name || id)).join('\n')}${n > 5 ? '\n  ... and ' + (n - 5) + ' more' : ''}\n\nAll their current results/errors will be discarded and the project will be re-dispatched from "${task.name || taskId}".`;
+        ? `Clone task "${task.name || taskId}" as a fresh new task?\n\nThe new task will be pending and ready to run. The old task is preserved (archived) so you can compare before/after afterwards.`
+        : `Clone task "${task.name || taskId}" and ${n} downstream task${n === 1 ? '' : 's'} as fresh new tasks?\n\nNew tasks:\n  - ${task.name || taskId} (source)\n${downstreamIds.slice(0, 5).map(id => '  - ' + (_VP_DATA.tasks[id]?.name || id)).join('\n')}${n > 5 ? '\n  ... and ' + (n - 5) + ' more' : ''}\n\nAll ${total} new tasks start as pending. The old ${total} tasks are preserved as archive (hidden from the default view) so you can compare before/after. You can edit the new chain afterwards (add/remove tasks).`;
     if (!confirm(msg)) return;
 
     // Capture btn ref BEFORE await (LLM-fooling pattern #7:
     // event.target becomes undefined after the first await
     // in browser-strict mode).
     const btn = ev?.currentTarget || ev?.target;
-    if (btn) { btn.disabled = true; btn.textContent = '... Resetting'; }
+    if (btn) { btn.disabled = true; btn.textContent = '... Cloning'; }
     try {
         const r = await _fetchWithTimeout(
-            `/api/tasks/${taskId}/reset-and-cascade`,
+            `/api/tasks/${taskId}/clone-and-cascade`,
             {method: 'POST', headers: {'Content-Type': 'application/json'}},
             15000
         );
         const data = await r.json().catch(() => ({}));
         if (!r.ok) {
-            alert('Reset failed: ' + _errDetailToString(data.detail, r.status));
-            if (btn) { btn.disabled = false; btn.textContent = '⤵ Reset & cascade'; }
+            alert('Clone failed: ' + _errDetailToString(data.detail, r.status));
+            if (btn) { btn.disabled = false; btn.textContent = '🧬 Clone chain'; }
             return;
         }
-        // Update local state for source + all downstream so the
-        // canvas reflects the change immediately (no flash of
-        // old colors before reload). The reload at the end
-        // re-syncs the rest.
-        _VP_DATA.tasks[taskId] = data;
-        for (const did of downstreamIds) {
-            if (_VP_DATA.tasks[did]) {
-                _VP_DATA.tasks[did].status = 'pending';
-                _VP_DATA.tasks[did].result = null;
-                _VP_DATA.tasks[did].error = null;
-            }
-        }
-        // Reload after a short delay so the operator sees the
-        // updated cards render. Same pattern as Save / Create
-        // / Delete.
+        // Server response: {new_task_ids, old_task_ids, id_map, project_id, ...}
+        // The new tasks have fresh IDs (data.new_task_ids); the old
+        // ones (taskId + downstreamIds) are archived. Just reload —
+        // the server's archived=0 filter will hide the old ones and
+        // the new chain will render with the depends_on graph.
         setTimeout(() => location.reload(), 600);
     } catch (e) {
         const reason = e.name === 'AbortError' ? 'timed out' : e.message;
         alert('Network error: ' + reason);
-        if (btn) { btn.disabled = false; btn.textContent = '⤵ Reset & cascade'; }
+        if (btn) { btn.disabled = false; btn.textContent = '🧬 Clone chain'; }
     }
 }
 
 // Walk the depends_on graph in REVERSE (every task that
 // transitively depends on `sourceId`). Mirrors the server-side
-// BFS in /reset-and-cascade so the confirm dialog shows the
+// BFS in /clone-and-cascade so the confirm dialog shows the
 // exact scope. Cycle-safe via visited set.
 function _vpDownstreamIds(sourceId) {
     const allTasks = _VP_DATA.tasks || {};

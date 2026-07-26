@@ -873,103 +873,108 @@ async def retry_task(task_id: str, request: Request) -> Task:
     return _row_to_task(row)
 
 
-# ===== reset-and-cascade (re-run from a task downstream) — Phase 4 Stage 3.5+ (2026-07-26) =====
+# ===== clone-and-cascade (re-run a chain as new tasks) — Phase 4+ (2026-07-26) =====
+#
+# Replaces the earlier "reset-and-cascade" endpoint, which destroyed
+# history by clearing result/error/timestamps. User feedback
+# (2026-07-26): "正常設計 task & task result 是分開的, 但現在是組合
+# 一起了, 如果是測試, 最快當然是 clone". The clone semantic:
+#   - Source task + every downstream task gets a NEW sibling task
+#     (new ID, fresh status=pending, all result/error/started_at
+#     /ended_at are NULL by default).
+#   - The OLD tasks are NOT touched (preserved with their results,
+#     audit log, and on-disk artifacts).
+#   - The OLD tasks are marked `archived=1` so the project views
+#     filter them out by default. The user can still see them via
+#     "show archived" (TODO: add the toggle) or via the audit log.
+#   - depends_on is rebuilt in the new graph: each new task's
+#     depends_on = [new_id if old_id in cascade_set else old_id for
+#     old_id in old.depends_on]. So a NEW child of an OLD parent
+#     (parent not in cascade) keeps the OLD parent ID; a NEW child
+#     of a NEW parent points to the NEW parent ID.
+#   - Project is woken from completed/paused/cancelled to ready
+#     (same as /create and the old /reset-and-cascade).
+#
+# Why this design is better than reset-and-cascade:
+#   1. PRESERVES HISTORY: old tasks stay in the DB with their full
+#      audit trail. The operator can compare "before vs after" by
+#      looking at archived tasks.
+#   2. PROPER PLAN/RESULT SEPARATION: the user pointed out that
+#      "task (structure) & task result (execution) should be
+#      separate". clone-and-cascade effectively makes each new
+#      task a fresh execution of an existing plan. The plan row
+#      is the new task; the result is whatever the new task
+#      produces. Old plans + old results stay linked via
+#      audit log + archive.
+#   3. POST-CLONE EDIT: the user said "之後我可以再加減 task". The
+#      new chain is a normal plan, so they can PATCH/POST/DELETE
+#      on the new tasks as if it were a fresh plan.
 
 
-class ResetCascadeBody(BaseModel):
-    """Body for POST /api/tasks/{id}/reset-and-cascade. All fields optional."""
-    # If true (default), also reset every task that depends (transitively)
-    # on this task. If false, only reset this task. Downstream tasks
-    # are detected by walking the depends_on graph in reverse (every
-    # task that has this task in its depends_on, recursively).
+class CloneCascadeBody(BaseModel):
+    """Body for POST /api/tasks/{id}/clone-and-cascade. All fields optional."""
+    # If true (default), also clone every task that depends
+    # (transitively) on this task. If false, only clone this
+    # single task. Downstream tasks are detected by walking the
+    # depends_on graph in reverse (every task that has this task
+    # in its depends_on, recursively).
     include_downstream: bool = True
 
 
-# Statuses from which a task can be "reset" (i.e. cleared and re-dispatched).
-# Running tasks are NOT included because resetting a running task would
-# race with the wrapper — operator should interrupt first. Pending/assigned
-# tasks are NOT included because they haven't produced a result to reset
-# — operator should just edit (PATCH) or wait. Completed is allowed because
-# the operator may want to "re-run to verify reproducibility".
-_RESETTABLE_STATUSES = ("failed", "interrupted", "cancelled", "skipped", "completed")
+# Statuses from which a task can be "cloned" (i.e. a new fresh
+# task is created alongside). Same constraints as the old
+# _RESETTABLE_STATUSES: not running (would race with the wrapper),
+# not pending/assigned (nothing to clone from — operator should
+# just edit a pending task or wait).
+_CLONEABLE_STATUSES = ("failed", "interrupted", "cancelled", "skipped", "completed")
 
 
-@router.post("/{task_id}/reset-and-cascade", response_model=Task)
-async def reset_and_cascade(
-    task_id: str, request: Request, body: ResetCascadeBody | None = None
-) -> Task:
-    """Reset a task (and optionally all downstream tasks) to pending.
+@router.post("/{task_id}/clone-and-cascade")
+async def clone_and_cascade(
+    task_id: str, request: Request, body: CloneCascadeBody | None = None
+) -> dict[str, Any]:
+    """Clone a task (and optionally all downstream tasks) as fresh pending tasks.
 
-    The "cascade" walks the depends_on graph in REVERSE: every task that
-    lists this task in its depends_on (directly or transitively) is
-    included. This is the "re-run this task and everything that depends
-    on it" semantic — exactly what the operator wants when an upstream
-    task's output was wrong and they need to refresh the chain.
+    The original tasks are preserved untouched (in DB + audit log +
+    on-disk artifacts) but marked `archived=1` so the project views
+    filter them out by default.
 
-    Why this exists (2026-07-26):
-      The visual project page exposes tasks as a real plan builder
-      (Stage 3.5: add / edit / delete). Operators asked for a
-      "re-run this task" button on the side panel. The existing
-      /retry endpoint resets a single task but leaves downstream
-      tasks in their terminal state (e.g. failed B downstream of
-      completed A still has B's stale result). The operator then
-      has to manually retry each downstream task. This endpoint
-      does it in one shot.
-
-    Behavior:
-      - Source task must be in _RESETTABLE_STATUSES (any terminal or
-        completed state). Refuses with 400 if the task is running
-        (operator should interrupt first) or pending/assigned
-        (nothing to reset).
-      - BFS walks depends_on in reverse, collecting affected tasks.
-        Self-loops and cycles are defended against with a visited set.
-        Cycle detection only catches true cycles (A→B→A) — forward
-        refs (B depends on A which is created later) are fine.
-      - All affected tasks go to 'pending', with result/error/
-        started_at/ended_at/last_liveness_at cleared, profile freed.
-      - If the project is in a terminal state (completed/paused/
-        cancelled), wake it up to 'ready' so the supervisor will
-        pick up the newly-pending tasks. Same pattern as /create.
-      - Audit log: one 'task.reset_cascade' event on the source
-        task with the full list of affected task IDs and their
-        previous statuses.
-
-    Idempotency: a second call on an already-pending source task
-    returns 400. The source's status is checked first; if the
-    source is not in a resettable state, the whole call is
-    rejected (no partial resets).
+    Returns: {
+        "new_task_ids": [str, ...],     # IDs of the newly created tasks
+        "old_task_ids": [str, ...],     # IDs of the archived source tasks
+        "id_map": {old_id: new_id, ...},# mapping for the depends_on rebuild
+        "project_id": str,
+        "include_downstream": bool,
+    }
     """
+    if body is None:
+        body = CloneCascadeBody()
     db = request.app.state.db
     task = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
     if not task:
         raise HTTPException(404, f"Task not found: {task_id}")
-    if task["status"] not in _RESETTABLE_STATUSES:
+    if task["status"] not in _CLONEABLE_STATUSES:
         raise HTTPException(
             400,
-            f"Task not in resettable state: {task['status']!r}. "
-            f"Resettable states: {sorted(_RESETTABLE_STATUSES)}. "
+            f"Task not in cloneable state: {task['status']!r}. "
+            f"Cloneable states: {sorted(_CLONEABLE_STATUSES)}. "
             f"If the task is running, interrupt it first. "
             f"If pending/assigned, just edit it (PATCH) or wait.",
         )
     project_id = task["project_id"]
 
-    # ---- BFS: find all downstream tasks (tasks that depend on
-    # `task_id`, transitively) ----
-    affected_ids: list[str] = [task_id]
-    prev_statuses: dict[str, str] = {task_id: task["status"]}
-    # Body is optional (default to ResetCascadeBody() with all defaults)
-    if body is None:
-        body = ResetCascadeBody()
+    # ---- BFS: find all downstream tasks ----
+    cascade_ids: list[str] = [task_id]
     if body.include_downstream:
-        # Load all tasks in this project in one query (small N — visual
-        # projects are typically <50 tasks; if they grow, switch to
-        # iterative SQL with parent_id index).
+        # Load all NON-ARCHIVED tasks in this project (we don't want
+        # archived tasks to appear in the BFS — they shouldn't be
+        # dependents of anything new).
         all_rows = await db.fetchall(
-            "SELECT id, status, depends_on FROM tasks WHERE project_id = ?",
+            "SELECT id, depends_on FROM tasks "
+            "WHERE project_id = ? AND archived = 0",
             (project_id,),
         )
-        # Parse depends_on JSON for each row
-        all_tasks: dict[str, dict[str, Any]] = {}
+        all_tasks: dict[str, list[str]] = {}
         for r in all_rows:
             deps_raw = r.get("depends_on")
             if isinstance(deps_raw, str):
@@ -981,59 +986,120 @@ async def reset_and_cascade(
                 deps = deps_raw
             else:
                 deps = []
-            all_tasks[r["id"]] = {"status": r["status"], "depends_on": deps}
+            all_tasks[r["id"]] = deps
 
-        # BFS forward (reverse-direction traversal: from source, find
-        # tasks whose depends_on includes us, then their children, ...)
+        # BFS in reverse (every task that lists us in its depends_on,
+        # then their children, etc.)
         visited: set[str] = {task_id}
         frontier: list[str] = [task_id]
         while frontier:
             next_frontier: list[str] = []
             for tid in frontier:
-                for other_id, other in all_tasks.items():
+                for other_id, deps in all_tasks.items():
                     if other_id in visited:
                         continue
-                    if tid in (other.get("depends_on") or []):
+                    if tid in deps:
                         visited.add(other_id)
-                        affected_ids.append(other_id)
-                        prev_statuses[other_id] = other["status"]
+                        cascade_ids.append(other_id)
                         next_frontier.append(other_id)
             frontier = next_frontier
 
-    # ---- Reset all affected tasks in one batched UPDATE per task ----
-    now = _now_iso()
-    for tid in affected_ids:
-        # Fetch assigned_profile_id BEFORE the update so we can free
-        # the profile. (After UPDATE we wouldn't know if the task
-        # was previously assigned or always idle.)
-        row = await db.fetchone(
-            "SELECT assigned_profile_id FROM tasks WHERE id = ?", (tid,),
-        )
-        prev_profile_id = row["assigned_profile_id"] if row else None
+    # ---- Load the source task rows we need to clone (full row,
+    # including params/depends_on/etc.) ----
+    # Build a placeholder string for the IN clause. SQLite supports
+    # up to 999 placeholders by default; we typically have <50.
+    placeholders = ",".join("?" for _ in cascade_ids)
+    source_rows = await db.fetchall(
+        f"SELECT * FROM tasks WHERE id IN ({placeholders})",
+        tuple(cascade_ids),
+    )
+    sources_by_id: dict[str, dict[str, Any]] = {r["id"]: dict(r) for r in source_rows}
 
-        await db.execute(
-            "UPDATE tasks SET "
-            "  status = 'pending', "
-            "  result = NULL, "
-            "  error = NULL, "
-            "  started_at = NULL, "
-            "  ended_at = NULL, "
-            "  last_liveness_at = NULL, "
-            "  assigned_agent_id = NULL, "
-            "  assigned_profile_id = NULL, "
-            "  updated_at = ? "
-            "WHERE id = ?",
-            (now, tid),
+    # ---- Create the new tasks in dependency order (parents first,
+    # so the new depends_on can reference the just-created new IDs
+    # for in-cascade parents). cascade_ids is already in BFS order
+    # which is parent-first; we can iterate it directly. ----
+    now = _now_iso()
+    new_id_map: dict[str, str] = {}  # old_id -> new_id
+    new_ids_in_order: list[str] = []
+    for old_id in cascade_ids:
+        src = sources_by_id.get(old_id)
+        if src is None:
+            # Should not happen, but defensive: skip if missing
+            continue
+        new_id = _task_id()
+        new_id_map[old_id] = new_id
+        new_ids_in_order.append(new_id)
+
+        # Rebuild depends_on: any old_id IN the cascade set becomes
+        # its new sibling; anything else (an external dep) stays
+        # as-is. Empty if src had no deps.
+        old_deps_raw = src.get("depends_on")
+        if isinstance(old_deps_raw, str):
+            try:
+                old_deps = json.loads(old_deps_raw)
+            except Exception:
+                old_deps = []
+        elif isinstance(old_deps_raw, list):
+            old_deps = old_deps_raw
+        else:
+            old_deps = []
+        new_deps = [new_id_map.get(d, d) for d in old_deps]
+        # Dedup (defensive)
+        seen: set[str] = set()
+        deduped_deps: list[str] = []
+        for d in new_deps:
+            if d != new_id and d not in seen:
+                seen.add(d)
+                deduped_deps.append(d)
+
+        # Pull params (JSON) and re-encode. If the source's params
+        # are NULL (default), we keep them NULL in the clone.
+        params_raw = src.get("params")
+        if params_raw is None or params_raw == "":
+            clone_params: Any = None
+        elif isinstance(params_raw, str):
+            try:
+                clone_params = json.loads(params_raw)
+            except Exception:
+                clone_params = None
+        else:
+            clone_params = params_raw
+
+        # Required capability (also JSON, single string or null)
+        clone_req_cap = src.get("required_capability") or None
+
+        await db.insert(
+            "tasks",
+            {
+                "id": new_id,
+                "project_id": project_id,
+                "name": src.get("name"),
+                "agent_role": src.get("agent_role"),
+                "depends_on": deduped_deps,
+                "on_parent_failure": src.get("on_parent_failure", "skip"),
+                "status": "pending",
+                "priority": src.get("priority", "normal"),
+                "action": src.get("action"),
+                "params": clone_params,
+                "max_retries": src.get("max_retries", 2),
+                "timeout_seconds": src.get("timeout_seconds", 1800),
+                "output_path": src.get("output_path"),
+                "required_capability": clone_req_cap,
+                "feedback_to": "[]",
+                "procedure_md": src.get("procedure_md", "") or "",
+                "archived": 0,
+            },
         )
-        if prev_profile_id:
-            # Defensive: only free the profile if it's still claimed
-            # by THIS task (avoid the "two tasks freed the same profile"
-            # race when many tasks reset at once).
-            await db.execute(
-                "UPDATE agent_profiles SET status = 'idle', current_task_id = NULL, "
-                "updated_at = ? WHERE id = ? AND current_task_id = ?",
-                (now, prev_profile_id, tid),
-            )
+
+    # ---- Mark the OLD tasks as archived ----
+    if cascade_ids:
+        archive_placeholders = ",".join("?" for _ in cascade_ids)
+        await db.execute(
+            f"UPDATE tasks SET archived = 1, updated_at = ? "
+            f"WHERE id IN ({archive_placeholders})",
+            (now, *cascade_ids),
+        )
 
     # ---- Wake the project if it was in a terminal state ----
     proj = await db.fetchone(
@@ -1050,32 +1116,41 @@ async def reset_and_cascade(
             project_id=project_id,
             payload={
                 "previous_state": proj["state"],
-                "trigger": "task.reset_cascade",
+                "trigger": "task.clone_and_cascade",
                 "source_task_id": task_id,
-                "affected_count": len(affected_ids),
+                "new_count": len(new_ids_in_order),
             },
         )
 
-    # ---- Audit log: one event on the source task, with the full
-    # list of affected task IDs and their previous statuses. ----
+    # ---- Audit log: one event on the SOURCE task, with the
+    # mapping so the operator can trace old -> new. The new tasks
+    # get their own task.created events via the db.insert path
+    # (well, they don't, because db.insert doesn't auto-audit;
+    # we add a single task.cloned_cascade event that lists them). ----
     await audit_log(
-        db, "task.reset_cascade",
+        db, "task.cloned_cascade",
         actor="operator",
         project_id=project_id,
         task_id=task_id,
         agent_id=task.get("assigned_agent_id"),
         payload={
             "include_downstream": body.include_downstream,
-            "affected_task_ids": affected_ids,
-            "affected_count": len(affected_ids),
-            "prev_statuses": prev_statuses,
+            "old_task_ids": cascade_ids,
+            "new_task_ids": new_ids_in_order,
+            "id_map": new_id_map,
+            "archived_count": len(cascade_ids),
+            "created_count": len(new_ids_in_order),
             "project_woken": proj is not None and proj["state"] in ("completed", "paused", "cancelled"),
         },
     )
 
-    # Return the source task (the operator clicked on this one)
-    row = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
-    return _row_to_task(row)
+    return {
+        "new_task_ids": new_ids_in_order,
+        "old_task_ids": cascade_ids,
+        "id_map": new_id_map,
+        "project_id": project_id,
+        "include_downstream": body.include_downstream,
+    }
 
 
 # ===== PATCH (edit task structure) — Phase 4 Stage 3.5 (2026-07-26) =====

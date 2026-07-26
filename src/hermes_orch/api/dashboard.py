@@ -854,15 +854,20 @@ async def project_page(
     if offset < 0:
         offset = 0
 
-    # Total count for pagination
+    # Total count for pagination (matches the archived=0 filter below)
     total_count_row = await db.fetchone(
-        "SELECT COUNT(*) as n FROM tasks WHERE project_id = ?", (project_id,)
+        "SELECT COUNT(*) as n FROM tasks WHERE project_id = ? AND archived = 0",
+        (project_id,),
     )
     total_count = total_count_row["n"] if total_count_row else 0
 
-    # Paginated task rows (project-scoped SQL, not "load all then filter")
+    # Paginated task rows (project-scoped SQL, not "load all then filter").
+    # Filter archived=0 by default (the active plan). The "show archived"
+    # toggle is TODO; for now operators can see archived history via the
+    # audit_log table or the /api/tasks endpoint with the include_archived
+    # flag.
     task_rows = await db.fetchall(
-        "SELECT * FROM tasks WHERE project_id = ? "
+        "SELECT * FROM tasks WHERE project_id = ? AND archived = 0 "
         "ORDER BY created_at DESC LIMIT ? OFFSET ?",
         (project_id, limit, offset),
     )
@@ -1047,9 +1052,13 @@ async def project_visual_page(
     if not project:
         raise HTTPException(404, f"Project not found: {project_id}")
 
-    # All tasks (no pagination — visual page shows all)
+    # All tasks (no pagination — visual page shows all).
+    # Filter archived=0 so the canvas only shows the active plan.
+    # Archived tasks (from prior clone-and-cascade calls) are hidden
+    # but their results are still in the DB + audit log.
     task_rows = await db.fetchall(
-        "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC",
+        "SELECT * FROM tasks WHERE project_id = ? AND archived = 0 "
+        "ORDER BY created_at ASC",
         (project_id,),
     )
     tasks = [

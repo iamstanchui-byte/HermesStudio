@@ -87,6 +87,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- The supervisor reads this on every tick to decide whether to
     -- cascade-reset this task when one of its referenced steps fails.
     feedback_to TEXT NOT NULL DEFAULT '[]',
+    -- archived: Phase 4+ clone-chain (2026-07-26). When 1, this task
+    -- is hidden from the project's default view because a "clone
+    -- chain" has replaced it with a fresh task. Old result/history
+    -- is preserved in this row + audit_log + artifacts. 0 = active
+    -- (default for all new tasks).
+    archived INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -133,6 +139,12 @@ CREATE TABLE IF NOT EXISTS profile_configs (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+-- Covering index for the "show active tasks" filter
+-- (project_id, archived=0, status). The default project views
+-- always filter archived=0; this index lets the query stay
+-- fast even when many projects accumulate archived history
+-- over time. Phase 4+ clone-chain (2026-07-26).
+CREATE INDEX IF NOT EXISTS idx_tasks_project_archived ON tasks(project_id, archived);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_profile_configs_status ON profile_configs(status);
@@ -417,6 +429,12 @@ MIGRATIONS = [
     # "no loop-back" (safe default; old workflows behave exactly as before).
     # workflow-run populates this from step.feedback_to at creation time.
     "ALTER TABLE tasks ADD COLUMN feedback_to TEXT NOT NULL DEFAULT '[]'",
+    # Phase 4+ clone-chain (2026-07-26): when a task is replaced by
+    # a clone, the old task is marked archived=1 instead of deleted.
+    # Preserves history but hides from default view. See the
+    # /api/tasks/{id}/clone-and-cascade endpoint and the `archived`
+    # column comment above.
+    "ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
 ]
 
 
