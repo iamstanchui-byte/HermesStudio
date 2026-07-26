@@ -705,6 +705,22 @@ function _vpInit() {
         wrap.innerHTML = '<div class="vp-empty" style="padding: 20px;">Drawflow CDN not loaded. Check your internet connection.</div>';
         return;
     }
+    // Re-render-safe init: the background poller calls _vpInit
+    // on every data change, and drawflow 0.0.59's
+    // `new Drawflow(wrap).start()` does NOT remove any old
+    // `.drawflow` divs from `wrap` — it just appends a new one.
+    // Without a clean reset, after 3 polls the user sees 3
+    // `.drawflow` divs side by side, each with 3 cards, for 9
+    // visible cards (verified by Playwright in commit
+    // 72bf999's regression). `removeNodeId` is also unreliable
+    // for clearing the DOM. The simplest correct reset is to
+    // wipe the wrap and null the editor — then the standard
+    // create+start+add path runs as if it were the first call.
+    // The click handler binding (in _vpBindClickHandlers) is on
+    // `wrap` itself, which is the static container, so it
+    // survives the innerHTML wipe.
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+    _vpEditor = null;
     try {
         _vpEditor = new Drawflow(wrap);
         _vpEditor.reroute = true;
@@ -1475,15 +1491,18 @@ let _vpStaleCount = 0;
 let _vpEditDirty = false;
 
 function _vpComputeHash(tasks) {
-    // Compact, stable hash: id|status|updated_at joined. Status
-    // changes (running→completed) bump the hash. updated_at catches
-    // other mutations (e.g. retry_count bump). We don't hash
-    // result/error/tokens content — re-rendering the canvas just
-    // because a wrapper ticked up the token counter would be too
-    // aggressive. The side panel will pick up rich data on its own
-    // when the user re-opens it.
+    // Compact, stable hash. The fields we hash are the ones
+    // actually rendered on the canvas cards (status, name,
+    // agent_role, depends_on count). We deliberately do NOT
+    // include updated_at — the embedded data doesn't carry it
+    // (it would mismatch the API response and force a re-render
+    // every poll), and updated_at bumps on heartbeat writes
+    // that don't visually change anything. We also don't hash
+    // tokens/artifacts/timing — those show in the side panel
+    // (which re-reads on open), and would force a re-render
+    // every time the wrapper ticks.
     return tasks
-        .map(t => `${t.id}:${t.status}:${t.updated_at || ''}`)
+        .map(t => `${t.id}:${t.status}:${t.name || ''}:${t.agent_role || ''}:${(t.depends_on || []).length}`)
         .join('|');
 }
 
@@ -1515,8 +1534,16 @@ async function _vpPollOnce() {
         return;
     }
     try {
+        // Use `exclude_archived_tasks=true` (NOT `include_archived`,
+        // which only filters at the PROJECT level — see api/tasks.py
+        // docstring for the distinction). Without this filter, the
+        // canvas would re-render with the project's archived "before"
+        // tasks (e.g. the old A/B/C from a prior clone-and-cascade)
+        // showing up as faded/completed ghosts next to the active
+        // pending tasks. The server's visual_project route already
+        // filters at the task level; the poller just has to match.
         const r = await fetch(
-            `/api/tasks/?project_id=${encodeURIComponent(_VP_DATA.project.id)}&include_archived=false`,
+            `/api/tasks/?project_id=${encodeURIComponent(_VP_DATA.project.id)}&exclude_archived_tasks=true`,
             { headers: { 'Accept': 'application/json' } }
         );
         if (!r.ok) return;  // silent: next tick will retry

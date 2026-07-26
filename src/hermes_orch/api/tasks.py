@@ -322,13 +322,30 @@ async def list_tasks(
     agent_id: str | None = None,
     role: str | None = None,
     include_archived: bool = False,
+    exclude_archived_tasks: bool = False,
 ) -> dict:
     """List tasks (filterable).
 
-    By default, tasks whose project is in 'archived' or 'deleted' state
-    are hidden (joined filter on projects table). Pass
-    `include_archived=true` to see them (e.g. for a "Show archived
-    projects" toggle on the task page).
+    Two independent "archived" filters — easy to confuse, so be
+    explicit about which is which:
+
+      `include_archived` (project-level): when False (default), tasks
+        whose PROJECT is in 'archived'/'deleted' state are hidden
+        (joined filter on projects table). Set True to see them (e.g.
+        the Tasks page's "show archived projects" toggle).
+
+      `exclude_archived_tasks` (task-level): when True, tasks whose
+        individual `archived=1` column is set are hidden. The
+        `tasks.archived` flag is set by clone-and-cascade (and
+        apply-workflow's archived step, if any) to hide old tasks
+        after the operator creates a fresh replacement chain. The
+        default view of a project (text + visual) excludes these.
+        The visual view's background poller relies on this filter —
+        without it, archived "before" tasks re-appear in the canvas
+        after the first poll tick.
+
+    Both can be combined: e.g. `?include_archived=true&exclude_archived_tasks=true`
+    shows tasks for archived projects but only the active ones.
     """
     db = request.app.state.db
     where = []
@@ -350,6 +367,9 @@ async def list_tasks(
     join_projects = not include_archived
     if join_projects:
         where.append("p.state NOT IN ('archived', 'deleted')")
+    # Task-level archive filter (independent of project-level above).
+    if exclude_archived_tasks:
+        where.append("t.archived = 0")
     sql = "SELECT t.* FROM tasks t"
     if join_projects:
         sql += " JOIN projects p ON t.project_id = p.id"
