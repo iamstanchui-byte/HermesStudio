@@ -267,6 +267,11 @@
             title="Phase 1.5: auto-arrange cards top-to-bottom in execution order (so depends_on only references earlier steps). Use this if Save fails with a forward-ref error.">
             Topo sort
         </button>
+        <button onclick="window.visualBuilder.resetLayout()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            title="Phase 2.5 (2026-07-26): clear all saved card positions and re-stack the canvas in the default top-to-bottom order. step_template is NOT changed. Click Save to persist the cleared layout, otherwise refresh will restore the old positions.">
+            Reset layout
+        </button>
         <button onclick="window.visualBuilder.toggleJsonForm()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
             title="Q4 (c): show/hide the raw JSON text form (hidden by default for semi-tech users)">
@@ -314,7 +319,8 @@
      id="vf-canvas"
      data-workflow-id="{{ workflow.id }}"
      data-step-template='{{ workflow.step_template | tojson }}'
-     data-variables='{{ workflow.variables | tojson }}'>
+     data-variables='{{ workflow.variables | tojson }}'
+     data-visual-layout='{{ workflow.visual_layout | tojson }}'>
     {# Drawflow injects its DOM directly into this wrap. The side
        panel below is a sibling (position: absolute), so it floats
        over the canvas (z-index: 10) without affecting layout. #}

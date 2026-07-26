@@ -287,6 +287,7 @@ CREATE TABLE IF NOT EXISTS workflow_packages (
     description TEXT NOT NULL,
     step_template TEXT NOT NULL,      -- JSON array (string-encoded)
     variables TEXT NOT NULL,          -- JSON array (string-encoded)
+    visual_layout TEXT NOT NULL DEFAULT '{}',  -- JSON {step_name: {x, y}} card positions; visual editor only
     source_project_id TEXT,           -- FK to projects.id (NULL if hand-authored)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -435,6 +436,12 @@ MIGRATIONS = [
     # /api/tasks/{id}/clone-and-cascade endpoint and the `archived`
     # column comment above.
     "ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+    # Visual workflow builder Phase 2.5 (2026-07-26): persist the
+    # visual card positions so refresh doesn't re-stack everything
+    # top-to-bottom. Stored as JSON {step_name: {x, y}}; visual
+    # editor only — never read by the runner. Default '{}' = no
+    # saved positions, fall back to vertical stack on render.
+    "ALTER TABLE workflow_packages ADD COLUMN visual_layout TEXT NOT NULL DEFAULT '{}'",
 ]
 
 

@@ -30,6 +30,13 @@
     let _workflowId = null;      // workflow id from the page data attribute
     let _stepTemplate = [];      // canonical list of step dicts
     let _variables = [];         // canonical list of variable dicts
+    // Phase 2.5 (2026-07-26): {step_name: {x, y}} — persisted card
+    // positions. Read from the DB on init, updated in-memory on every
+    // drag (nodeMoved listener), sent back on Save. Visual-only;
+    // the runner never reads this. Missing entries fall back to the
+    // default vertical stack (50, 50 + i*120). Orphan entries (e.g.
+    // a renamed step) are harmless — we just ignore them on render.
+    let _visualLayout = {};
     let _selectedNodeId = null;  // drawflow node id (e.g. "node-3") of the focused card
     // Track mousedown position so we can distinguish a pure click
     // (no movement → open the side panel) from a drag (movement > 5px
@@ -206,7 +213,12 @@
             // connections for the dragged node). Bind the listener
             // ONLY here (not in every _render) so we don't stack
             // up duplicates.
+            // Phase 2.5 (2026-07-26): also persist the new (x, y)
+            // into _visualLayout so the position survives reload.
+            // The user still has to click Save to push it to the
+            // server; this is the in-memory mirror.
             _editor.on('nodeMoved', () => {
+                _captureAllNodePositions();
                 _reorderStepTemplateByPosition();
                 requestAnimationFrame(_recomputeAllConnectionPaths);
             });
@@ -252,10 +264,12 @@
         _editor.clear();
         _clearConnections(_editor);
 
-        // Lay out steps top-to-bottom in their declared order.
-        // Drawflow positions are in pixels; we start at (50, 50) and
-        // stack vertically with 120px between cards.
-        const x = 50, y = 50, dy = 120;
+        // Lay out steps. Phase 2.5: if a saved position exists for this
+        // step in _visualLayout, use it; otherwise fall back to the
+        // default vertical stack (50, 50 + i*120). This is the difference
+        // between "refresh resets everything" and "cards stay where I
+        // left them" — the whole point of persisting visual_layout.
+        const defaultX = 50, defaultY = 50, defaultDy = 120;
         try {
             _stepTemplate.forEach((step, i) => {
                 const html = _stepToCardHtml(step);
@@ -264,6 +278,9 @@
                     role: step.agent_role,
                     action: step.action,
                 };
+                const saved = _visualLayout[step.name];
+                const posX = (saved && typeof saved.x === 'number') ? saved.x : defaultX;
+                const posY = (saved && typeof saved.y === 'number') ? saved.y : (defaultY + i * defaultDy);
                 // drawflow 0.0.59 addNode signature:
                 //   addNode(name, n_inputs, n_outputs, posx, posy, classoverride, data, html)
                 // The inputs/outputs args are NUMBERS (count of
@@ -281,8 +298,8 @@
                     step.name,         // 1: name
                     1,                 // 2: number of inputs
                     2,                 // 3: number of outputs (1 normal + 1 loop-back)
-                    x,                 // 4: posx
-                    y + i * dy,        // 5: posy
+                    posX,              // 4: posx (saved or default)
+                    posY,              // 5: posy (saved or default)
                     'vf-node',         // 6: classoverride
                     data,              // 7: data (attached to node)
                     html,              // 8: html content
@@ -576,6 +593,40 @@
         }
     }
 
+    // Phase 2.5 (2026-07-26): snapshot every visible card's current
+    // (x, y) into _visualLayout, keyed by step name. Called from
+    // nodeMoved (after every drag) so the in-memory state always
+    // mirrors the canvas. The next Save pushes it to the server.
+    //
+    // We iterate drawflow's internal node map (via getNodesFromName or
+    // module scan) and read pos_x / pos_y off each node. Steps that
+    // exist in _stepTemplate but not on canvas (race during re-render)
+    // are skipped — their last-known position is kept.
+    function _captureAllNodePositions() {
+        if (!_editor || !_stepTemplate || _stepTemplate.length === 0) return;
+        const stepNames = new Set(_stepTemplate.map((s) => s.name));
+        const layout = _visualLayout && typeof _visualLayout === 'object' ? _visualLayout : {};
+        // Walk every module in drawflow (we use only module 'Home' —
+        // the visual editor is single-module; multi-module is a future
+        // feature). For each node whose data.name matches a step,
+        // capture its current (x, y).
+        const modules = _editor.drawflow ? Object.keys(_editor.drawflow.drawflow) : [];
+        for (const modName of modules) {
+            const mod = _editor.drawflow.drawflow[modName];
+            if (!mod || !mod.data) continue;
+            for (const nodeId of Object.keys(mod.data)) {
+                const node = mod.data[nodeId];
+                if (!node || !node.data) continue;
+                const stepName = node.data.name;
+                if (!stepName || !stepNames.has(stepName)) continue;
+                if (typeof node.pos_x === 'number' && typeof node.pos_y === 'number') {
+                    layout[stepName] = { x: Math.round(node.pos_x), y: Math.round(node.pos_y) };
+                }
+            }
+        }
+        _visualLayout = layout;
+    }
+
     // Phase 1.2 + drag: re-compute all connection SVG path d-attrs
     // using the CURRENT handle positions. This fixes drawflow 0.0.59's
     // stale-path bug:
@@ -839,6 +890,18 @@
         } catch (e) {
             console.error('visual_workflow: bad variables JSON', e);
             _variables = [];
+        }
+        // Phase 2.5: load saved card positions. Default {} means
+        // every step falls back to the vertical-stack layout. Any
+        // orphan (renamed/deleted step) entries are kept — harmless.
+        try {
+            _visualLayout = JSON.parse(wrap.dataset.visualLayout || '{}');
+        } catch (e) {
+            console.error('visual_workflow: bad visual_layout JSON', e);
+            _visualLayout = {};
+        }
+        if (!_visualLayout || typeof _visualLayout !== 'object') {
+            _visualLayout = {};
         }
         _render();
         _bindGlobalShortcuts();
@@ -1262,10 +1325,26 @@
             );
             variables = _variables;
         }
+        // Phase 2.5 (2026-07-26): if the JSON form was used, the user
+        // bypassed the canvas — _visualLayout may still be valid (we
+        // didn't touch it) but it's safest to skip the position field
+        // so the server doesn't overwrite the saved positions with
+        // whatever was last in the in-memory mirror. The next drag
+        // (or a future Save through the canvas) will repopulate it.
+        // If the user used the canvas path, capture the live positions
+        // one more time so the most recent drag is included.
+        let visualLayoutToSend;
+        if (_jsonForm().classList.contains('open')) {
+            visualLayoutToSend = _visualLayout;
+        } else {
+            _captureAllNodePositions();
+            visualLayoutToSend = _visualLayout;
+        }
         const url = `/api/workflows/${encodeURIComponent(_workflowId)}`;
         const body = {
             step_template: stepTemplate,
             variables: variables,
+            visual_layout: visualLayoutToSend,
         };
         try {
             const r = await _fetchWithTimeout(url, {
@@ -1352,6 +1431,15 @@
         // Apply the new order to _stepTemplate
         const reordered = order.map((n) => byName.get(n));
         _stepTemplate = reordered;
+        // Phase 2.5 (2026-07-26): clear the saved visual_layout
+        // before re-render. The old positions are now meaningless
+        // (they pointed to the pre-reorder layout) and the
+        // default-render path is exactly the "stacked
+        // top-to-bottom in execution order" arrangement the user
+        // expects from a "Topo sort" click. The user can still
+        // re-drag after this and the next drag will repopulate
+        // _visualLayout via the nodeMoved listener.
+        _visualLayout = {};
         // Re-render so visual Y positions match the new order.
         // _render uses a simple Y = 50 + i*120 layout, so cards
         // end up stacked top-to-bottom in execution order.
@@ -1375,6 +1463,26 @@
                 changed ? 'success' : 'info'
             );
         },
+        resetLayout: () => {
+            // Phase 2.5 (2026-07-26): clear all saved card positions
+            // and re-render the canvas using the default vertical
+            // stack (50, 50 + i*120). Does NOT change step_template
+            // order — that's what distinguishes this from Topo sort.
+            // The change is in-memory only; the user must click Save
+            // to clear visual_layout on the server. Otherwise the
+            // next page load will restore the old positions.
+            if (!confirm(
+                'Reset all card positions to the default vertical layout?\n\n'
+                + 'This only affects the visual arrangement — step_template '
+                + 'is untouched. Click Save to persist the new layout.'
+            )) return;
+            _visualLayout = {};
+            _render();
+            _showBanner(
+                'Layout reset to default stack. Click Save to persist.',
+                'info'
+            );
+        },
     };
     // Debug hook: expose internals for Playwright headless tests.
     // NOT used by the UI. Safe to ship to production.
@@ -1382,6 +1490,7 @@
         getEditor: () => _editor,
         getStepTemplate: () => _stepTemplate,
         getSelectedNodeId: () => _selectedNodeId,
+        getVisualLayout: () => _visualLayout,
     };
 
     // Auto-init when the DOM is ready (this script is loaded with

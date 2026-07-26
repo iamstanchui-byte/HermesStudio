@@ -96,6 +96,11 @@ class WorkflowSummary(BaseModel):
 class WorkflowDetail(WorkflowSummary):
     step_template: list[dict]
     variables: list[dict]
+    # Phase 2.5 (2026-07-26): visual editor card positions. Dict
+    # of {step_name: {x: int, y: int}}. Visual-only — never read by
+    # the runner. Empty dict on workflows that have never been opened
+    # in the visual editor, or after the operator clicks "Reset layout".
+    visual_layout: dict = {}
 
 
 # --- LLM synthesis ---
@@ -793,9 +798,50 @@ def _row_to_workflow_detail(row) -> dict:
         vs = json.loads(row["variables"] or "[]")
     except Exception:
         vs = []
+    # Phase 2.5 (2026-07-26): visual_layout is a {step_name: {x,y}} dict.
+    # If the column doesn't exist yet (pre-migration DB), KeyError falls
+    # back to {} — same default as the column DEFAULT. Older rows may
+    # also have a NULL value if the migration ran with an older schema.
+    try:
+        vl_raw = row["visual_layout"]
+    except (KeyError, IndexError):
+        vl = {}
+    else:
+        try:
+            vl = json.loads(vl_raw) if vl_raw else {}
+        except Exception:
+            vl = {}
+    if not isinstance(vl, dict):
+        vl = {}
     summary["step_template"] = st
     summary["variables"] = vs
+    summary["visual_layout"] = vl
     return summary
+
+
+# Phase 2.5 (2026-07-26): validate the visual_layout field. Separate
+# from _validate_workflow_package so the LLM-synth validator stays
+# clean (the LLM never produces visual_layout, only the visual editor
+# sends it via PATCH). Schema: {step_name: {x: number, y: number}}.
+# Orphan step names (referring to deleted/renamed steps) are allowed
+# — they're harmless and the visual editor just ignores them on render.
+def _validate_visual_layout(vl) -> tuple[bool, str | None]:
+    if vl is None:
+        return True, None
+    if not isinstance(vl, dict):
+        return False, "visual_layout must be a dict"
+    for name, pos in vl.items():
+        if not isinstance(name, str) or not name:
+            return False, f"visual_layout key {name!r} must be a non-empty string"
+        if not isinstance(pos, dict):
+            return False, f"visual_layout[{name!r}] must be a dict"
+        x = pos.get("x")
+        y = pos.get("y")
+        # bool is a subclass of int in Python — reject True/False explicitly
+        if not isinstance(x, (int, float)) or isinstance(x, bool) \
+                or not isinstance(y, (int, float)) or isinstance(y, bool):
+            return False, f"visual_layout[{name!r}] must have numeric x and y"
+    return True, None
 
 
 # --- API endpoints ---
@@ -965,6 +1011,10 @@ class WorkflowPatchBody(BaseModel):
     step_template: list[dict] | None = None
     variables: list[dict] | None = None
     version: str | None = None
+    # Phase 2.5 (2026-07-26): optional — only sent by the visual editor.
+    # Visual-only, validated by _validate_visual_layout (separate from
+    # _validate_workflow_package so the LLM-synth validator stays clean).
+    visual_layout: dict | None = None
 
 
 @router.patch("/{workflow_id}")
@@ -996,6 +1046,27 @@ async def update_workflow(
         new_vars = body.variables
     else:
         new_vars = json.loads(row["variables"] or "[]")
+    # Phase 2.5 (2026-07-26): visual_layout. None means "don't touch"
+    # (so non-visual PATCHes don't accidentally wipe positions). Validated
+    # separately from the workflow package — the LLM-synth validator
+    # doesn't see it, only the visual editor sends it.
+    if body.visual_layout is not None:
+        ok_vl, err_vl = _validate_visual_layout(body.visual_layout)
+        if not ok_vl:
+            raise HTTPException(422, f"visual_layout invalid: {err_vl}")
+        new_visual_layout = body.visual_layout
+    else:
+        # Keep existing value from the row
+        try:
+            existing_vl_raw = row["visual_layout"]
+        except (KeyError, IndexError):
+            existing_vl_raw = "{}"
+        try:
+            new_visual_layout = json.loads(existing_vl_raw) if existing_vl_raw else {}
+        except Exception:
+            new_visual_layout = {}
+        if not isinstance(new_visual_layout, dict):
+            new_visual_layout = {}
 
     # Name uniqueness if changing
     if body.name is not None and body.name != row["name"]:
@@ -1021,11 +1092,12 @@ async def update_workflow(
     now = _now_iso()
     await db.execute(
         "UPDATE workflow_packages SET name=?, description=?, version=?, "
-        "step_template=?, variables=?, updated_at=? WHERE id=?",
+        "step_template=?, variables=?, visual_layout=?, updated_at=? WHERE id=?",
         (
             new_name, new_desc, new_version,
             json.dumps(new_step, ensure_ascii=False),
             json.dumps(new_vars, ensure_ascii=False),
+            json.dumps(new_visual_layout, ensure_ascii=False),
             now, workflow_id,
         ),
     )

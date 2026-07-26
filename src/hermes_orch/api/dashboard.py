@@ -1455,6 +1455,15 @@ async def workflow_visual_page(workflow_id: str, request: Request) -> HTMLRespon
     d["variables_pretty"] = _json.dumps(
         d["variables"], indent=2, ensure_ascii=False
     )
+    # Phase 2.5 (2026-07-26): visual_layout is the {step_name: {x,y}}
+    # dict used by the visual editor to remember card positions across
+    # page reloads. Default to {} if column missing (pre-migration DBs).
+    try:
+        d["visual_layout"] = _json.loads(d.get("visual_layout") or "{}")
+    except Exception:
+        d["visual_layout"] = {}
+    if not isinstance(d["visual_layout"], dict):
+        d["visual_layout"] = {}
     d["step_count"] = len(d["step_template"]) if isinstance(d["step_template"], list) else 0
     return templates.TemplateResponse(
         request=request,
