@@ -57,12 +57,11 @@
 {% endif %}
 
 <div class="mt-6 bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900">
-    <p class="font-medium mb-1">Stage 2b will add:</p>
+    <p class="font-medium mb-1">Other ways to use this workflow</p>
     <ul class="list-disc list-inside space-y-1 text-xs">
-        <li>"Run with variables" button — form with one input per variable in the list above.</li>
-        <li>Variable substitution into step_template's <code>{{ '{{var}}' }}</code> placeholders.</li>
-        <li>Spawn a fresh project 1:1 from the template, with substituted values baked in.</li>
-        <li>Audit event links the new run back to this workflow package.</li>
+        <li>"📥 Apply to a project" — import this workflow's steps into an EXISTING project as new tasks (additive — existing tasks are kept). Open the project page and click "📥 Apply workflow" in the toolbar.</li>
+        <li>"🔁 Promote" — go the other way: synthesize a new workflow from a completed project (project → workflow).</li>
+        <li>"🎨 Visual editor" — open the drawflow canvas to edit step order, depends_on, feedback_to, and add/remove steps visually.</li>
     </ul>
 </div>
 
