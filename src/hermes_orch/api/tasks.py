@@ -873,6 +873,211 @@ async def retry_task(task_id: str, request: Request) -> Task:
     return _row_to_task(row)
 
 
+# ===== reset-and-cascade (re-run from a task downstream) — Phase 4 Stage 3.5+ (2026-07-26) =====
+
+
+class ResetCascadeBody(BaseModel):
+    """Body for POST /api/tasks/{id}/reset-and-cascade. All fields optional."""
+    # If true (default), also reset every task that depends (transitively)
+    # on this task. If false, only reset this task. Downstream tasks
+    # are detected by walking the depends_on graph in reverse (every
+    # task that has this task in its depends_on, recursively).
+    include_downstream: bool = True
+
+
+# Statuses from which a task can be "reset" (i.e. cleared and re-dispatched).
+# Running tasks are NOT included because resetting a running task would
+# race with the wrapper — operator should interrupt first. Pending/assigned
+# tasks are NOT included because they haven't produced a result to reset
+# — operator should just edit (PATCH) or wait. Completed is allowed because
+# the operator may want to "re-run to verify reproducibility".
+_RESETTABLE_STATUSES = ("failed", "interrupted", "cancelled", "skipped", "completed")
+
+
+@router.post("/{task_id}/reset-and-cascade", response_model=Task)
+async def reset_and_cascade(
+    task_id: str, request: Request, body: ResetCascadeBody | None = None
+) -> Task:
+    """Reset a task (and optionally all downstream tasks) to pending.
+
+    The "cascade" walks the depends_on graph in REVERSE: every task that
+    lists this task in its depends_on (directly or transitively) is
+    included. This is the "re-run this task and everything that depends
+    on it" semantic — exactly what the operator wants when an upstream
+    task's output was wrong and they need to refresh the chain.
+
+    Why this exists (2026-07-26):
+      The visual project page exposes tasks as a real plan builder
+      (Stage 3.5: add / edit / delete). Operators asked for a
+      "re-run this task" button on the side panel. The existing
+      /retry endpoint resets a single task but leaves downstream
+      tasks in their terminal state (e.g. failed B downstream of
+      completed A still has B's stale result). The operator then
+      has to manually retry each downstream task. This endpoint
+      does it in one shot.
+
+    Behavior:
+      - Source task must be in _RESETTABLE_STATUSES (any terminal or
+        completed state). Refuses with 400 if the task is running
+        (operator should interrupt first) or pending/assigned
+        (nothing to reset).
+      - BFS walks depends_on in reverse, collecting affected tasks.
+        Self-loops and cycles are defended against with a visited set.
+        Cycle detection only catches true cycles (A→B→A) — forward
+        refs (B depends on A which is created later) are fine.
+      - All affected tasks go to 'pending', with result/error/
+        started_at/ended_at/last_liveness_at cleared, profile freed.
+      - If the project is in a terminal state (completed/paused/
+        cancelled), wake it up to 'ready' so the supervisor will
+        pick up the newly-pending tasks. Same pattern as /create.
+      - Audit log: one 'task.reset_cascade' event on the source
+        task with the full list of affected task IDs and their
+        previous statuses.
+
+    Idempotency: a second call on an already-pending source task
+    returns 400. The source's status is checked first; if the
+    source is not in a resettable state, the whole call is
+    rejected (no partial resets).
+    """
+    db = request.app.state.db
+    task = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    if not task:
+        raise HTTPException(404, f"Task not found: {task_id}")
+    if task["status"] not in _RESETTABLE_STATUSES:
+        raise HTTPException(
+            400,
+            f"Task not in resettable state: {task['status']!r}. "
+            f"Resettable states: {sorted(_RESETTABLE_STATUSES)}. "
+            f"If the task is running, interrupt it first. "
+            f"If pending/assigned, just edit it (PATCH) or wait.",
+        )
+    project_id = task["project_id"]
+
+    # ---- BFS: find all downstream tasks (tasks that depend on
+    # `task_id`, transitively) ----
+    affected_ids: list[str] = [task_id]
+    prev_statuses: dict[str, str] = {task_id: task["status"]}
+    # Body is optional (default to ResetCascadeBody() with all defaults)
+    if body is None:
+        body = ResetCascadeBody()
+    if body.include_downstream:
+        # Load all tasks in this project in one query (small N — visual
+        # projects are typically <50 tasks; if they grow, switch to
+        # iterative SQL with parent_id index).
+        all_rows = await db.fetchall(
+            "SELECT id, status, depends_on FROM tasks WHERE project_id = ?",
+            (project_id,),
+        )
+        # Parse depends_on JSON for each row
+        all_tasks: dict[str, dict[str, Any]] = {}
+        for r in all_rows:
+            deps_raw = r.get("depends_on")
+            if isinstance(deps_raw, str):
+                try:
+                    deps = json.loads(deps_raw)
+                except Exception:
+                    deps = []
+            elif isinstance(deps_raw, list):
+                deps = deps_raw
+            else:
+                deps = []
+            all_tasks[r["id"]] = {"status": r["status"], "depends_on": deps}
+
+        # BFS forward (reverse-direction traversal: from source, find
+        # tasks whose depends_on includes us, then their children, ...)
+        visited: set[str] = {task_id}
+        frontier: list[str] = [task_id]
+        while frontier:
+            next_frontier: list[str] = []
+            for tid in frontier:
+                for other_id, other in all_tasks.items():
+                    if other_id in visited:
+                        continue
+                    if tid in (other.get("depends_on") or []):
+                        visited.add(other_id)
+                        affected_ids.append(other_id)
+                        prev_statuses[other_id] = other["status"]
+                        next_frontier.append(other_id)
+            frontier = next_frontier
+
+    # ---- Reset all affected tasks in one batched UPDATE per task ----
+    now = _now_iso()
+    for tid in affected_ids:
+        # Fetch assigned_profile_id BEFORE the update so we can free
+        # the profile. (After UPDATE we wouldn't know if the task
+        # was previously assigned or always idle.)
+        row = await db.fetchone(
+            "SELECT assigned_profile_id FROM tasks WHERE id = ?", (tid,),
+        )
+        prev_profile_id = row["assigned_profile_id"] if row else None
+
+        await db.execute(
+            "UPDATE tasks SET "
+            "  status = 'pending', "
+            "  result = NULL, "
+            "  error = NULL, "
+            "  started_at = NULL, "
+            "  ended_at = NULL, "
+            "  last_liveness_at = NULL, "
+            "  assigned_agent_id = NULL, "
+            "  assigned_profile_id = NULL, "
+            "  updated_at = ? "
+            "WHERE id = ?",
+            (now, tid),
+        )
+        if prev_profile_id:
+            # Defensive: only free the profile if it's still claimed
+            # by THIS task (avoid the "two tasks freed the same profile"
+            # race when many tasks reset at once).
+            await db.execute(
+                "UPDATE agent_profiles SET status = 'idle', current_task_id = NULL, "
+                "updated_at = ? WHERE id = ? AND current_task_id = ?",
+                (now, prev_profile_id, tid),
+            )
+
+    # ---- Wake the project if it was in a terminal state ----
+    proj = await db.fetchone(
+        "SELECT state FROM projects WHERE id = ?", (project_id,),
+    )
+    if proj and proj["state"] in ("completed", "paused", "cancelled"):
+        await db.execute(
+            "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
+            (now, project_id),
+        )
+        await audit_log(
+            db, "project.woken",
+            actor="operator",
+            project_id=project_id,
+            payload={
+                "previous_state": proj["state"],
+                "trigger": "task.reset_cascade",
+                "source_task_id": task_id,
+                "affected_count": len(affected_ids),
+            },
+        )
+
+    # ---- Audit log: one event on the source task, with the full
+    # list of affected task IDs and their previous statuses. ----
+    await audit_log(
+        db, "task.reset_cascade",
+        actor="operator",
+        project_id=project_id,
+        task_id=task_id,
+        agent_id=task.get("assigned_agent_id"),
+        payload={
+            "include_downstream": body.include_downstream,
+            "affected_task_ids": affected_ids,
+            "affected_count": len(affected_ids),
+            "prev_statuses": prev_statuses,
+            "project_woken": proj is not None and proj["state"] in ("completed", "paused", "cancelled"),
+        },
+    )
+
+    # Return the source task (the operator clicked on this one)
+    row = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    return _row_to_task(row)
+
+
 # ===== PATCH (edit task structure) — Phase 4 Stage 3.5 (2026-07-26) =====
 #
 # The visual project page now lets the operator add/edit/delete
