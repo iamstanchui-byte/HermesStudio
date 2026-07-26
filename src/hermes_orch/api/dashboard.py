@@ -861,6 +861,31 @@ async def project_page(
     )
     total_count = total_count_row["n"] if total_count_row else 0
 
+    # Archived task history (created by prior Clone chain actions).
+    # We always query the count so the toggle can render in the page
+    # header; we only load the full rows when ?show_archived=1 is on
+    # (to keep the default view fast). Older versions of the same chain
+    # are kept (archived=1) so the operator can compare before/after.
+    from pathlib import Path
+    show_archived = request.query_params.get("show_archived") == "1"
+    archived_count_row = await db.fetchone(
+        "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND archived = 1",
+        (project_id,),
+    )
+    archived_count = archived_count_row["n"] if archived_count_row else 0
+    archived_rows: list[dict] = []
+    if show_archived and archived_count > 0:
+        # NOTE: tasks table has no `archived_at` column (the audit log
+        # records task.archived events with the timestamp). We use
+        # `updated_at` here as a proxy for "when this task was archived"
+        # — that's when the Clone chain set archived=1 on it.
+        archived_rows = await db.fetchall(
+            "SELECT id, name, agent_role, action, status, updated_at, created_at "
+            "FROM tasks WHERE project_id = ? AND archived = 1 "
+            "ORDER BY updated_at DESC, created_at DESC",
+            (project_id,),
+        )
+
     # Paginated task rows (project-scoped SQL, not "load all then filter").
     # Filter archived=0 by default (the active plan). The "show archived"
     # toggle is TODO; for now operators can see archived history via the
@@ -1027,6 +1052,9 @@ async def project_page(
             "iteration_events": iteration_events,
             "decision_archives": decision_archives,
             "iter_event_count": len(iteration_events),
+            "archived_tasks": archived_rows,
+            "archived_count": archived_count,
+            "show_archived": show_archived,
         },
     )
 
@@ -1061,6 +1089,32 @@ async def project_visual_page(
         "ORDER BY created_at ASC",
         (project_id,),
     )
+    # Archived tasks (the old tasks from prior clone-and-cascade
+    # calls; rendered grayed-out with an "ARCHIVED" badge so the
+    # operator can compare before/after). The default view hides
+    # them. We always query the count so the toggle can render in
+    # the page header; we only load the full rows when the toggle
+    # is on (to keep the default view fast).
+    from pathlib import Path
+    show_archived = request.query_params.get("show_archived") == "1"
+    archived_count_row = await db.fetchone(
+        "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND archived = 1",
+        (project_id,),
+    )
+    archived_count = archived_count_row["n"] if archived_count_row else 0
+    archived_rows: list[dict] = []
+    if show_archived and archived_count > 0:
+        archived_rows = await db.fetchall(
+            "SELECT * FROM tasks WHERE project_id = ? AND archived = 1 "
+            "ORDER BY created_at ASC",
+            (project_id,),
+        )
+        # Annotate artifacts with on-disk existence (needs projects_root_p)
+        cfg = request.app.state.config
+        projects_root_p = Path(cfg["projects"]["storage_root"]).resolve()
+        for r in archived_rows:
+            r["timing"] = _compute_task_timing(r)
+            _annotate_artifact_exists(r, projects_root_p)
     tasks = [
         _parse_json_fields(dict(r), "depends_on", "params", "result")
         for r in task_rows
@@ -1095,7 +1149,8 @@ async def project_visual_page(
     )
     art_by_task = {r["task_id"]: dict(r) for r in art_rows}
 
-    # Status counts for the filter bar
+    # Status counts for the filter bar (active tasks only;
+    # archived tasks are shown separately when ?show_archived=1)
     status_counts: dict[str, int] = {}
     for t in tasks:
         s = t.get("status") or "unknown"
@@ -1119,6 +1174,9 @@ async def project_visual_page(
             **_base_context(request, "projects"),
             "project": project,
             "tasks": tasks,
+            "archived_tasks": archived_rows,
+            "archived_count": archived_count,
+            "show_archived": show_archived,
             "token_by_task": token_by_task,
             "art_by_task": art_by_task,
             "status_counts": status_counts,

@@ -409,6 +409,80 @@
     </div>
 </form>
 
+{# Task history: old versions of tasks in this project, kept (archived=1)
+   after Clone chain actions. Hidden by default to keep the page clean.
+   A simple table is enough — operators can compare before/after
+   without needing a full drawflow canvas. The audit log keeps the
+   full id_map of which old ID maps to which new ID.
+   User feedback (2026-07-26): this section was previously in the
+   visual view's show_archived toggle, but that page returned
+   "internal server error". The text view is the simpler home for
+   this and matches the operator's read-only intent (compare, don't
+   interact). #}
+{% if archived_count > 0 %}
+<div class="mb-4 bg-white border rounded-lg p-4 shadow-sm">
+    <div class="flex items-center justify-between mb-2">
+        <div>
+            <h2 class="text-sm font-semibold text-gray-700">
+                📜 Task history
+            </h2>
+            <p class="text-xs text-gray-500 mt-0.5">
+                Older versions of tasks. Created by prior <strong>Clone chain</strong>
+                actions. The audit log keeps the full id_map of which old ID
+                maps to which new ID.
+            </p>
+        </div>
+        <a href="/projects/{{ project.id }}{% if show_archived %}{% else %}?show_archived=1{% endif %}"
+            class="px-3 py-1 text-xs rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+            title="{% if show_archived %}Hide archived tasks{% else %}Show archived tasks (older versions of the same chain, useful for before/after comparison){% endif %}">
+            {% if show_archived %}👁️‍🗨️ Hide ({{ archived_count }}){% else %}👁️ Show ({{ archived_count }}){% endif %}
+        </a>
+    </div>
+    {% if show_archived and archived_tasks %}
+    <div class="bg-white border border-gray-200 rounded overflow-x-auto">
+        <table class="w-full text-xs">
+            <thead class="bg-gray-50 text-gray-600 text-left">
+                <tr>
+                    <th class="px-3 py-2 font-medium">Name</th>
+                    <th class="px-3 py-2 font-medium">Role</th>
+                    <th class="px-3 py-2 font-medium">Action</th>
+                    <th class="px-3 py-2 font-medium">Status (when archived)</th>
+                    <th class="px-3 py-2 font-medium">Archived at</th>
+                    <th class="px-3 py-2 font-medium">Old ID</th>
+                </tr>
+            </thead>
+            <tbody>
+                {%- for t in archived_tasks %}
+                <tr class="border-t border-gray-100 text-gray-500">
+                    <td class="px-3 py-2 font-medium text-gray-700">{{ t.name or '—' }}</td>
+                    <td class="px-3 py-2 font-mono">{{ t.agent_role or '?' }}</td>
+                    <td class="px-3 py-2 font-mono">{{ t.action or '?' }}</td>
+                    <td class="px-3 py-2">
+                        <span class="px-1.5 py-0.5 rounded text-[10px]
+                            {% if t.status == 'completed' %}bg-green-100 text-green-800
+                            {% elif t.status == 'failed' %}bg-red-100 text-red-800
+                            {% elif t.status == 'running' %}bg-yellow-100 text-yellow-800
+                            {% else %}bg-gray-100 text-gray-700{% endif %}">
+                            {{ t.status or '?' }}
+                        </span>
+                    </td>
+                    <td class="px-3 py-2 whitespace-nowrap text-gray-400">
+                        {{ (t.archived_at or t.created_at)[:19] if (t.archived_at or t.created_at) else '—' }}
+                    </td>
+                    <td class="px-3 py-2 font-mono text-[10px] text-gray-400">
+                        {{ t.id[:16] }}{% if t.id|length > 16 %}…{% endif %}
+                    </td>
+                </tr>
+                {%- endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% elif show_archived %}
+    <p class="text-xs text-gray-500 italic">No archived tasks (toggle is on but count is 0 — race condition, refresh).</p>
+    {% endif %}
+</div>
+{% endif %}
+
 <!-- SOUL presets: per-project agent identity snapshots. Click "Apply" to
 load the preset's content into that profile's SOUL.md (via the wrapper
 apply-config flow). Multiple projects can run in parallel as long as
