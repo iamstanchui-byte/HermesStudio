@@ -1311,30 +1311,48 @@ class WorkflowApplyBody(BaseModel):
 async def apply_workflow_to_project(
     project_id: str, body: WorkflowApplyBody, request: Request
 ) -> dict:
-    """Apply a workflow's step_template to this project as its task list.
+    """Import a workflow's step_template into this project as NEW tasks.
 
-    Pipeline (mirrors the relevant parts of /api/workflows/{id}/run):
-      1. Load the target project (404 if missing/deleted).
-      2. Load the workflow (by id or name) + parse its step_template
-         and variables declaration.
+    Mental model: "apply workflow" = import a workflow OBJECT into
+    the project. The workflow's steps are added to the project's
+    existing task list. Existing tasks are NOT touched — they stay
+    in the live Tasks list, and the workflow's steps join them.
+    If you want to replace an existing task chain, use Clone chain
+    (POST /api/tasks/{id}/clone-and-cascade) — that one is surgical.
+
+    User feedback (2026-07-26): "我一直都說是import workflow 的
+    object 入project". The previous version archived all current
+    tasks then inserted the workflow's steps (a destructive replace).
+    This version is additive — both old and new tasks coexist, and
+    the user can manually clean up duplicates via the Tasks section
+    (e.g. with Delete on a row, or Clone chain to supersede).
+
+    Pipeline:
+      1. Load project (404 if missing/deleted).
+      2. Load workflow (by id or name) + parse step_template +
+         variables declaration.
       3. Validate user-provided variables + substitute {{var}} in
-         the step_template (reusing the helpers from api/workflows.py
-         so the substitution semantics stay identical to /run).
-      4. Archive all current non-archived tasks (preserve history in
-         the Task history section). Don't touch already-archived
-         tasks from prior runs.
+         the step_template (reuses helpers from api/workflows.py so
+         substitution semantics stay identical to /run).
+      4. Count current non-archived tasks (so the response can tell
+         the user "you had N, now you have N+M"). DON'T archive.
       5. Set the project to state='planned' (pause dispatch). User
-         feedback (2026-07-26): 'apply workflow 後會自動run, 應該要按
-         run 才start' — we must NOT auto-dispatch the new pending
-         tasks. From 'planned' the supervisor's _drive_project
-         does nothing (only 'planning' and 'ready'/'running' are
-         handled). The user reviews the new task list and clicks
-         Run. This matches the /replan flow (planning → planned,
-         user clicks Run).
-      6. Insert the substituted steps as new pending tasks with
-         depends_on wired (name → id map).
+         feedback (2026-07-26): "apply workflow 後會自動run, 應該
+         要按run 才start". The supervisor's _drive_project only
+         handles 'planning' + 'ready'/'running', so from 'planned'
+         the new pending tasks wait. User reviews + clicks Run.
+      6. Insert the substituted steps as new pending tasks. depends_on
+         is resolved in two passes:
+         a. First try the step_name → step_name map (the workflow
+            references its own steps).
+         b. Then try matching against EXISTING tasks in the project
+            (by name). This lets a workflow integrate with the
+            project's current tasks (e.g. "verify-and-summarize"
+            depends on a project task with the same name).
+         If both miss, log task.depends_on_unresolved and treat as
+         no dependency (loud, not silent).
       7. Audit: project.applied_workflow (top-level) + task.created
-         per task (same shape as the /run endpoint).
+         per task (same shape as /run endpoint).
     """
     # Late import: avoid circular import (workflows.py imports from
     # projects.py for _project_id/_projects_root/_serialize_plan_md).
@@ -1390,36 +1408,27 @@ async def apply_workflow_to_project(
             "nothing to apply",
         )
 
-    # 4. Archive all current non-archived tasks (preserve history).
-    # We keep already-archived tasks untouched so prior workflow
-    # applications show up in the Task history section correctly.
     now = _now_iso()
-    archive_cur = await db.execute(
-        "UPDATE tasks SET archived = 1, updated_at = ? "
-        "WHERE project_id = ? AND archived = 0",
-        (now, project_id),
+
+    # 4. Count current non-archived tasks (so the response + UI can
+    # show "you had N, now you have N+M" — additive semantics). We
+    # don't archive, so the user's existing tasks stay live.
+    pre_count_row = await db.fetchone(
+        "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND archived = 0",
+        (project_id,),
     )
-    archived_count = (
-        archive_cur.rowcount if hasattr(archive_cur, "rowcount") else 0
-    )
+    pre_count = pre_count_row["n"] if pre_count_row else 0
 
     # 5. Set state to 'planned' (NOT 'ready') regardless of prior state.
-    # User feedback (2026-07-26): 'apply workflow 後會自動run, 應該要按
-    # run 才start'. We must NOT auto-dispatch the new pending tasks.
-    # - For terminal states (completed/failed/cancelled/interrupted/
-    #   archived), the supervisor was ignoring this project anyway,
-    #   so we MUST flip state — but to 'planned', not 'ready'.
-    # - For non-terminal states (ready/running/planning), the
-    #   supervisor was actively dispatching. Flipping to 'planned'
-    #   PAUSES dispatch (supervisor's _drive_project only handles
-    #   planning + ready/running, not planned). This means: the new
-    #   pending tasks wait, and the user reviews + clicks Run.
-    # - For 'planned' (already), no-op.
-    # Net effect: apply = plan, Run = dispatch. Same model as
-    # /api/projects/{id}/replan which sets state='planning' and the
-    # user clicks Run on completion.
+    # User feedback (2026-07-26): "apply workflow 後會自動run, 應該要按
+    # run 才start". Same model as /replan (planning → planned, user
+    # clicks Run). For all prior states, we transition: terminal
+    # states (completed/failed/cancelled/interrupted/archived) need
+    # to flip because the supervisor was ignoring them; non-terminal
+    # states (ready/running/planning) need to flip to PAUSE dispatch
+    # so the new pending tasks don't auto-run. 'planned' state is
+    # the supervisor's "do nothing" state — user reviews + clicks Run.
     PLANNED = "planned"
-    TERMINAL_STATES = ("completed", "failed", "cancelled", "interrupted", "archived")
     woken = False
     new_state = proj["state"]
     if proj["state"] != PLANNED:
@@ -1439,28 +1448,55 @@ async def apply_workflow_to_project(
             },
         )
 
-    # 6. Insert new tasks (same wiring pattern as /api/workflows/{id}/run
-    # — first pass: insert all, build step_name → task_id map. Second
-    # pass: nothing — depends_on was already resolved to task IDs in
-    # pass 1 because the step template lists steps in execution order
-    # so earlier steps' IDs are known when later steps are inserted).
+    # 6. Resolve depends_on in two passes. The workflow's step
+    # template references other steps by NAME. We map:
+    #   a. Workflow-internal: name -> new task id (if both the
+    #      dep and the step being inserted are in THIS apply)
+    #   b. Project-external: name -> existing project task id
+    #      (so a workflow step can depend on a project task with
+    #      the same name — e.g. "verify-and-summarize" depends on
+    #      an existing "fetch-data" task)
+    # Anything not in either map is logged as unresolved (loud,
+    # not silent — the audit log will show the gap).
+    # Load existing project tasks once, by name.
+    existing_task_rows = await db.fetchall(
+        "SELECT id, name FROM tasks WHERE project_id = ? AND archived = 0",
+        (project_id,),
+    )
+    existing_name_to_tid: dict[str, str] = {r["name"]: r["id"] for r in existing_task_rows}
+
+    # First pass: collect step names + their pending tids (in order
+    # so earlier steps' tids are available to later steps).
     name_to_tid: dict[str, str] = {}
     task_rows: list[dict] = []
     for i, step in enumerate(substituted):
         sname = step.get("name") or f"step-{i+1}"
         tid = "t-" + secrets.token_hex(4)
         name_to_tid[sname] = tid
-        # Resolve depends_on (step names) to task IDs
+
+    # Second pass: build task rows with resolved depends_on.
+    for i, step in enumerate(substituted):
+        sname = step.get("name") or f"step-{i+1}"
+        tid = name_to_tid[sname]
         dep_step_names = step.get("depends_on") or []
-        dep_tids = [name_to_tid[d] for d in dep_step_names if d in name_to_tid]
-        # If a step references an unknown step name, log it and treat
-        # as no dependency. Same behavior as /run — be loud, not silent.
-        if dep_step_names and not dep_tids:
+        dep_tids: list[str] = []
+        unresolved: list[str] = []
+        for d in dep_step_names:
+            if d in name_to_tid:
+                # Same-workflow dependency
+                dep_tids.append(name_to_tid[d])
+            elif d in existing_name_to_tid:
+                # Project-external dependency (workflow integrates
+                # with an existing project task)
+                dep_tids.append(existing_name_to_tid[d])
+            else:
+                unresolved.append(d)
+        if unresolved:
             await audit_log(
                 db, "task.depends_on_unresolved",
                 actor="workflow-applier", project_id=project_id, task_id=tid,
                 payload={"step_name": sname,
-                         "unresolved_deps": dep_step_names},
+                         "unresolved_deps": unresolved},
             )
         # Carry skill name reference (Stage 1.5) and feedback_to
         # (Phase 0 of visual workflow builder). See run_workflow
@@ -1519,7 +1555,7 @@ async def apply_workflow_to_project(
             "workflow_name": wf["name"],
             "variables_provided": list(vars_typed.keys()),
             "task_count": len(task_rows),
-            "archived_count": archived_count,
+            "pre_count": pre_count,
             "previous_state": proj["state"],
             "new_state": new_state,
             "woken": woken,
@@ -1531,16 +1567,15 @@ async def apply_workflow_to_project(
         "workflow_id": wf["id"],
         "workflow_name": wf["name"],
         "task_count": len(task_rows),
-        "archived_count": archived_count,
+        "pre_count": pre_count,
         "variables_applied": vars_typed,
         "previous_state": proj["state"],
         "new_state": new_state,
         "woken": woken,
         "tasks": [{"id": t["id"], "name": t["name"]} for t in task_rows],
         "message": (
-            f"Applied workflow {wf['name']!r} ({len(task_rows)} new tasks, "
-            f"{archived_count} archived). "
-            + ("Set state " + repr(proj["state"]) + " → planned. " if woken else "State already planned. ")
+            f"Applied workflow '{wf['name']}' ({len(task_rows)} new tasks added to {pre_count} existing). "
+            + (f"State: {proj['state']} → planned. " if woken else "State already planned. ")
             + "Click ▶️ Run on the project page to dispatch."
         ),
     }

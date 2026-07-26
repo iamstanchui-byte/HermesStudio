@@ -1657,15 +1657,13 @@ async function deletePreset(agentId, profileName, btn) {
             <h2 class="text-lg font-semibold text-gray-800 mb-1">📥 Apply workflow</h2>
             <p class="text-sm text-gray-500 mb-4">
                 Pick a workflow package and fill in its variables. The
-                workflow's <code>step_template</code> becomes this
-                project's task list. <strong>Current tasks are archived</strong>
-                (they show up in the Task history section below — not
-                deleted, just hidden from the live Tasks list) and
-                replaced with the workflow's steps. The project state
-                is set to <code>planned</code> so the supervisor pauses
-                dispatch — <strong>click ▶️ Run on the project page to
-                start</strong>. A confirmation dialog summarizes the
-                blast radius before submit.
+                workflow's <code>step_template</code> is <strong>imported</strong>
+                as new tasks into this project — your existing tasks
+                are kept untouched. The project state is set to
+                <code>planned</code> so the supervisor pauses dispatch
+                — <strong>click ▶️ Run on the project page to start</strong>.
+                A confirmation dialog summarizes the change before
+                submit.
             </p>
 
             <label class="block text-sm font-medium text-gray-700 mb-1">
@@ -1924,17 +1922,22 @@ async function submitApplyWorkflow() {
     // count comes from a hidden input rendered into the page at
     // load time (avoids a separate /api/projects/{id} fetch). The
     // step count comes from the workflow's step_template (already
-    // loaded into _applyWorkflowSelected). User feedback (2026-07-26):
-    // 'apply workflow ... 會remove 原有的task' — the user wasn't sure
-    // if existing tasks were preserved. This dialog spells it out.
+    // loaded into _applyWorkflowSelected).
+    // Mental model: "Apply workflow" = IMPORT a workflow object
+    // into the project. The workflow's steps become NEW tasks; the
+    // project's existing tasks are kept untouched. User feedback
+    // (2026-07-26): "我一直都說是import workflow 的object 入project"
+    // — the earlier archive-all-then-insert was wrong.
     const stepCount = (_applyWorkflowSelected.step_template || []).length;
     const curEl = document.getElementById('current-task-count');
     const curCount = curEl ? parseInt(curEl.value || '0', 10) : 0;
+    const totalAfter = curCount + stepCount;
     const confirmMsg =
-        `Apply workflow "${_applyWorkflowSelected.name}"?\n\n` +
-        `• ${curCount} existing task${curCount === 1 ? '' : 's'} will be archived ` +
-        `(visible in Task history, not deleted)\n` +
-        `• ${stepCount} new pending task${stepCount === 1 ? '' : 's'} from the workflow\n` +
+        `Import workflow "${_applyWorkflowSelected.name}" into this project?\n\n` +
+        `• ${stepCount} new pending task${stepCount === 1 ? '' : 's'} will be added\n` +
+        `• ${curCount} existing task${curCount === 1 ? '' : 's'} will be kept ` +
+        `(not archived, not deleted)\n` +
+        `• After: ${totalAfter} active task${totalAfter === 1 ? '' : 's'} in the project\n` +
         `• Project state → planned (you must click ▶️ Run to dispatch)\n\n` +
         `Continue?`;
     if (!confirm(confirmMsg)) {
@@ -1981,7 +1984,7 @@ async function submitApplyWorkflow() {
             btn.disabled = false;
             return;
         }
-        status.textContent = `Applied: ${j.task_count} new task${j.task_count === 1 ? '' : 's'} (${j.archived_count} archived) · state: ${j.new_state}. Click ▶️ Run to dispatch. Reloading...`;
+        status.textContent = `Imported: ${j.task_count} new task${j.task_count === 1 ? '' : 's'} added (${j.pre_count} existing kept) · state: ${j.new_state}. Click ▶️ Run to dispatch. Reloading...`;
         status.className = 'text-sm text-green-600 ml-2';
         setTimeout(() => location.reload(), 1500);
     } catch (e) {
