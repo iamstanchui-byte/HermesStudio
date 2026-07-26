@@ -1,0 +1,76 @@
+feat(agent contracts): 5 planning-time LLM hooks (plan real, others stub)
+
+Per the product positioning doc (2026-07-26), the Agent Layer's
+5 standardized contracts — plan / route / judge / repair / audit
+— are design-time hooks only. The LLM returns DRAFT suggestions
+that the operator reviews and adjusts. The runtime (depends_on,
+dispatch, retry, status machine) stays fully deterministic; the
+LLM is never in the hot path.
+
+This commit ships:
+
+  1. core/llm_caller.py — unified LLM call helper (httpx + MiniMax
+     OpenAI-compatible). Replaces the ad-hoc call logic that was
+     duplicated across core/planner.py, api/workflows.py, and
+     api/schedules.py. Handles:
+       - MiniMax / OpenAI-compatible chat completions
+       - JSON output via response_format={"type":"json_object"}
+       - Defense-in-depth JSON parsing (strip <think>, strip code
+         fences, find first '{', raise on failure)
+       - Mock mode (no api_key) returns a stub object
+       - Best-effort token_usage recording
+
+  2. core/contracts/ — 5 contract classes (one per hook):
+       plan.py   — IMPLEMENTED. Drafts a workflow package from a
+                   project + available skills + operator hints.
+                   Prompt + schema designed to subsume the existing
+                   promote-to-workflow LLM call (api/workflows.py).
+                   Refactor of that endpoint to use this contract
+                   is a follow-up; this commit only adds the new
+                   contract + draft endpoint, doesn't break the
+                   old one.
+       route.py  — STUB. Suggest which skill + agent_role for a task.
+       judge.py  — STUB. Score a task's result vs its goal.
+       repair.py — STUB. Suggest a retry/repair strategy.
+       audit.py  — STUB. 6-dimension audit assessment.
+     Each contract: name + description + Pydantic input/output
+     models + system prompt + draft() that validates input,
+     calls LLM via LLMCaller, validates output.
+
+  3. api/contracts.py — router:
+       GET  /api/contracts                  — registry + schemas
+       GET  /api/contracts/{name}           — one contract + schemas
+       POST /api/contracts/{name}/draft     — invoke (validates input
+                                                + output; returns
+                                                structured JSON)
+     Stubs return 503 in real-LLM mode (no api_key → mock mode
+     still works for testing the schemas).
+
+  4. main.py: register the contracts router.
+
+  5. tests/test_contracts.py — 8 tests, all pass:
+       - registry lists all 5 names
+       - plan is implemented, others are stubs
+       - GET /{name} returns the schemas
+       - 404 for unknown contract
+       - POST /draft validates input
+       - POST /draft works in mock mode (skipped if real mode)
+       - stub contracts return 503 in real mode
+       - draft 404 for unknown contract
+     Total: 48/48 tests pass (no regressions).
+
+Pattern catalog #114 — Agent contract as planning-time hook:
+  The LLM is a DRAFT generator, never a runtime decision. The
+  runtime applies the (operator-approved) draft deterministically.
+  This is the doc's "AI workflow, not chat" distinction made
+  enforceable: contract output IS data, not a directive the
+  runtime can interpret freely.
+
+What this commit does NOT touch (deferred):
+  - Refactor api/workflows.py's promote-to-workflow to actually
+    USE the plan contract (separate commit; behavior change)
+  - Wire route/judge/repair/audit to the UI (separate commit each;
+    they need operator-facing flows first)
+  - The 4 contract stubs are intentionally inert: they validate
+    schemas and the LLM call path works, but no real LLM prompt
+    tuning has been done.
