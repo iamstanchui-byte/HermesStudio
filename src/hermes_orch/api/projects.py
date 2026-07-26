@@ -1271,6 +1271,266 @@ async def run_project(project_id: str, request: Request) -> dict:
     }
 
 
+# ===== Apply workflow to existing project (2026-07-26) =====
+#
+# Reverse of "Promote to workflow": instead of extracting a workflow
+# from a project, push a workflow INTO a project as its task list.
+# The user has a workflow package (e.g. "monthly-claim-report") and
+# wants to use it as the plan for THIS project. Fills variables
+# (e.g. report_month=May2026) and the project's task list becomes
+# the workflow's steps with placeholders substituted.
+#
+# Semantics (mirrors clone-and-cascade's "preserve history" pattern):
+#   - All current non-archived tasks are ARCHIVED (not deleted) so
+#     the operator can still see "what was here before" via the
+#     Task history section on the project page.
+#   - New tasks are inserted as pending with depends_on wired from
+#     the workflow's step names.
+#   - Project state is woken from any terminal state back to ready
+#     (so the supervisor's next tick picks up the new tasks).
+#
+# Why not just call /api/workflows/{id}/run? That endpoint creates
+# a NEW project. Apply-to-existing is the operator's edit-the-plan
+# flow: same project, fresh task list.
+#
+# Body: { workflow_id: str, variables: { name: value, ... } }
+class WorkflowApplyBody(BaseModel):
+    """Body for POST /api/projects/{id}/apply-workflow.
+
+    `variables` is a dict mapping workflow variable names to values.
+    Required variables (per the workflow's declared variables) MUST
+    be present. Type coercion (string → int/bool) is handled by
+    the same _validate_run_variables helper that /api/workflows/{id}/run
+    uses, so the client can send values in their natural form.
+    """
+    workflow_id: str
+    variables: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/{project_id}/apply-workflow")
+async def apply_workflow_to_project(
+    project_id: str, body: WorkflowApplyBody, request: Request
+) -> dict:
+    """Apply a workflow's step_template to this project as its task list.
+
+    Pipeline (mirrors the relevant parts of /api/workflows/{id}/run):
+      1. Load the target project (404 if missing/deleted).
+      2. Load the workflow (by id or name) + parse its step_template
+         and variables declaration.
+      3. Validate user-provided variables + substitute {{var}} in
+         the step_template (reusing the helpers from api/workflows.py
+         so the substitution semantics stay identical to /run).
+      4. Archive all current non-archived tasks (preserve history in
+         the Task history section). Don't touch already-archived
+         tasks from prior runs.
+      5. Wake the project from any terminal state (completed/failed/
+         cancelled/interrupted/archived) back to ready so the
+         supervisor's next tick dispatches the new tasks. If the
+         project is already non-terminal, leave state alone.
+      6. Insert the substituted steps as new pending tasks with
+         depends_on wired (name → id map).
+      7. Audit: project.applied_workflow (top-level) + task.created
+         per task (same shape as the /run endpoint).
+    """
+    # Late import: avoid circular import (workflows.py imports from
+    # projects.py for _project_id/_projects_root/_serialize_plan_md).
+    from hermes_orch.api.workflows import (
+        _validate_run_variables,
+        _substitute_variables,
+    )
+
+    db = request.app.state.db
+
+    # 1. Load project
+    proj = await db.fetchone(
+        "SELECT id, state, name FROM projects WHERE id = ?", (project_id,)
+    )
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    if proj["state"] == "deleted":
+        raise HTTPException(400, "Cannot apply workflow to a deleted project. Restore it first.")
+
+    # 2. Load workflow
+    wf = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (body.workflow_id,)
+    )
+    if not wf:
+        wf = await db.fetchone(
+            "SELECT * FROM workflow_packages WHERE name = ?", (body.workflow_id,)
+        )
+    if not wf:
+        raise HTTPException(404, f"workflow {body.workflow_id!r} not found")
+
+    try:
+        step_template = json.loads(wf["step_template"] or "[]")
+    except Exception:
+        step_template = []
+    try:
+        variables_declared = json.loads(wf["variables"] or "[]")
+    except Exception:
+        variables_declared = []
+
+    # 3. Validate + substitute (re-using the run endpoint's helpers)
+    ok, err, vars_typed = _validate_run_variables(
+        variables_declared, body.variables
+    )
+    if not ok:
+        raise HTTPException(400, f"variable validation failed: {err}")
+
+    substituted = _substitute_variables(step_template, vars_typed)
+
+    if not substituted:
+        raise HTTPException(
+            400,
+            f"workflow {wf['name']!r} has no steps in step_template — "
+            "nothing to apply",
+        )
+
+    # 4. Archive all current non-archived tasks (preserve history).
+    # We keep already-archived tasks untouched so prior workflow
+    # applications show up in the Task history section correctly.
+    now = _now_iso()
+    archive_cur = await db.execute(
+        "UPDATE tasks SET archived = 1, updated_at = ? "
+        "WHERE project_id = ? AND archived = 0",
+        (now, project_id),
+    )
+    archived_count = (
+        archive_cur.rowcount if hasattr(archive_cur, "rowcount") else 0
+    )
+
+    # 5. Wake the project from any terminal state. Non-terminal
+    # states (ready/running/planning/planned) stay as-is — the
+    # supervisor will pick up the new tasks on the next tick
+    # regardless. A terminal state would mean the supervisor
+    # ignores new pending tasks, so we MUST flip to ready.
+    TERMINAL_STATES = ("completed", "failed", "cancelled", "interrupted", "archived")
+    woken = False
+    new_state = proj["state"]
+    if proj["state"] in TERMINAL_STATES:
+        await db.execute(
+            "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
+            (now, project_id),
+        )
+        woken = True
+        new_state = "ready"
+        await audit_log(
+            db, "project.woken", actor="operator", project_id=project_id,
+            payload={
+                "previous_state": proj["state"],
+                "trigger": "apply_workflow",
+                "workflow_id": wf["id"],
+                "workflow_name": wf["name"],
+            },
+        )
+
+    # 6. Insert new tasks (same wiring pattern as /api/workflows/{id}/run
+    # — first pass: insert all, build step_name → task_id map. Second
+    # pass: nothing — depends_on was already resolved to task IDs in
+    # pass 1 because the step template lists steps in execution order
+    # so earlier steps' IDs are known when later steps are inserted).
+    name_to_tid: dict[str, str] = {}
+    task_rows: list[dict] = []
+    for i, step in enumerate(substituted):
+        sname = step.get("name") or f"step-{i+1}"
+        tid = "t-" + secrets.token_hex(4)
+        name_to_tid[sname] = tid
+        # Resolve depends_on (step names) to task IDs
+        dep_step_names = step.get("depends_on") or []
+        dep_tids = [name_to_tid[d] for d in dep_step_names if d in name_to_tid]
+        # If a step references an unknown step name, log it and treat
+        # as no dependency. Same behavior as /run — be loud, not silent.
+        if dep_step_names and not dep_tids:
+            await audit_log(
+                db, "task.depends_on_unresolved",
+                actor="workflow-applier", project_id=project_id, task_id=tid,
+                payload={"step_name": sname,
+                         "unresolved_deps": dep_step_names},
+            )
+        # Carry skill name reference (Stage 1.5) and feedback_to
+        # (Phase 0 of visual workflow builder). See run_workflow
+        # for the same pattern.
+        params = step.get("params_template") or {}
+        skill_name = step.get("skill")
+        if skill_name:
+            params = dict(params)
+            params["_workflow_skill"] = skill_name
+        raw_fb = step.get("feedback_to") or []
+        if isinstance(raw_fb, list):
+            feedback_to = [f for f in raw_fb if f != sname]
+        else:
+            feedback_to = []
+        task_rows.append({
+            "id": tid,
+            "project_id": project_id,
+            "name": sname,
+            "agent_role": step.get("agent_role") or "",
+            "depends_on": json.dumps(dep_tids),
+            "on_parent_failure": "skip",
+            "status": "pending",
+            "priority": "normal",
+            "action": step.get("action") or "do_task",
+            "params": json.dumps(params),
+            "retry_count": 0,
+            "max_retries": 2,
+            "timeout_seconds": 1800,
+            "output_path": step.get("output_path") or "",
+            "required_capability": None,
+            "feedback_to": json.dumps(feedback_to),
+        })
+    for t in task_rows:
+        try:
+            await db.insert("tasks", t)
+        except Exception as e:
+            raise HTTPException(
+                500, f"failed to insert task {t['name']!r}: {e}"
+            )
+    # task.created audit per task
+    for t in task_rows:
+        await audit_log(
+            db, "task.created",
+            actor="workflow-applier", project_id=project_id, task_id=t["id"],
+            payload={"agent_role": t["agent_role"],
+                     "action": t["action"],
+                     "name": t["name"],
+                     "source": "apply_workflow"},
+        )
+
+    # 7. Top-level audit
+    await audit_log(
+        db, "project.applied_workflow", actor="operator", project_id=project_id,
+        payload={
+            "workflow_id": wf["id"],
+            "workflow_name": wf["name"],
+            "variables_provided": list(vars_typed.keys()),
+            "task_count": len(task_rows),
+            "archived_count": archived_count,
+            "previous_state": proj["state"],
+            "new_state": new_state,
+            "woken": woken,
+        },
+    )
+
+    return {
+        "project_id": project_id,
+        "workflow_id": wf["id"],
+        "workflow_name": wf["name"],
+        "task_count": len(task_rows),
+        "archived_count": archived_count,
+        "variables_applied": vars_typed,
+        "previous_state": proj["state"],
+        "new_state": new_state,
+        "woken": woken,
+        "tasks": [{"id": t["id"], "name": t["name"]} for t in task_rows],
+        "message": (
+            f"Applied workflow {wf['name']!r} ({len(task_rows)} new tasks, "
+            f"{archived_count} archived). "
+            + ("Woke project from " + repr(proj["state"]) + " → ready. " if woken else "")
+            + "Supervisor will dispatch pending tasks on next tick."
+        ),
+    }
+
+
 @router.delete("/{project_id}", status_code=204)
 async def delete_project(project_id: str, request: Request):
     """Hard-delete a project: removes folder + cascades DB records (tasks, artifacts)."""
