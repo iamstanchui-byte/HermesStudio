@@ -221,6 +221,10 @@
             <input type="hidden" id="replan-max-iter" value="{{ project.max_iterations or 0 }}">
             <input type="hidden" id="replan-criteria" value="{{ project.accept_criteria or '' }}">
             <input type="hidden" id="replan-deliverable" value="{{ project.deliverable_path or '' }}">
+            {# Apply-workflow modal reads this for the blast-radius
+               confirm() dialog. Cached at page render so we don't
+               have to fetch /api/projects/{id} just to get a count. #}
+            <input type="hidden" id="current-task-count" value="{{ total_count or 0 }}">
         </div>
     </div>
 </div>
@@ -1655,11 +1659,13 @@ async function deletePreset(agentId, profileName, btn) {
                 Pick a workflow package and fill in its variables. The
                 workflow's <code>step_template</code> becomes this
                 project's task list. <strong>Current tasks are archived</strong>
-                (they show up in the Task history section below) and
-                replaced with the workflow's steps. If the project is in
-                a terminal state (completed/failed/cancelled), it will be
-                woken back to <code>ready</code> so the supervisor can
-                dispatch the new tasks.
+                (they show up in the Task history section below — not
+                deleted, just hidden from the live Tasks list) and
+                replaced with the workflow's steps. The project state
+                is set to <code>planned</code> so the supervisor pauses
+                dispatch — <strong>click ▶️ Run on the project page to
+                start</strong>. A confirmation dialog summarizes the
+                blast radius before submit.
             </p>
 
             <label class="block text-sm font-medium text-gray-700 mb-1">
@@ -1914,6 +1920,27 @@ async function submitApplyWorkflow() {
     const btn = document.getElementById('apply-workflow-submit-btn');
     const status = document.getElementById('apply-workflow-status');
     if (!_applyWorkflowSelected) { status.textContent = 'No workflow selected'; return; }
+    // Confirmation dialog with the blast radius. The current task
+    // count comes from a hidden input rendered into the page at
+    // load time (avoids a separate /api/projects/{id} fetch). The
+    // step count comes from the workflow's step_template (already
+    // loaded into _applyWorkflowSelected). User feedback (2026-07-26):
+    // 'apply workflow ... 會remove 原有的task' — the user wasn't sure
+    // if existing tasks were preserved. This dialog spells it out.
+    const stepCount = (_applyWorkflowSelected.step_template || []).length;
+    const curEl = document.getElementById('current-task-count');
+    const curCount = curEl ? parseInt(curEl.value || '0', 10) : 0;
+    const confirmMsg =
+        `Apply workflow "${_applyWorkflowSelected.name}"?\n\n` +
+        `• ${curCount} existing task${curCount === 1 ? '' : 's'} will be archived ` +
+        `(visible in Task history, not deleted)\n` +
+        `• ${stepCount} new pending task${stepCount === 1 ? '' : 's'} from the workflow\n` +
+        `• Project state → planned (you must click ▶️ Run to dispatch)\n\n` +
+        `Continue?`;
+    if (!confirm(confirmMsg)) {
+        // user cancelled — keep the modal open so they can edit + retry
+        return;
+    }
     btn.disabled = true;
     status.textContent = 'Applying...';
     status.className = 'text-sm text-gray-500 ml-2';
@@ -1954,7 +1981,7 @@ async function submitApplyWorkflow() {
             btn.disabled = false;
             return;
         }
-        status.textContent = `Applied: ${j.task_count} new task${j.task_count === 1 ? '' : 's'} (${j.archived_count} archived)${j.woken ? ` · woke from ${j.previous_state} → ${j.new_state}` : ''}. Reloading...`;
+        status.textContent = `Applied: ${j.task_count} new task${j.task_count === 1 ? '' : 's'} (${j.archived_count} archived) · state: ${j.new_state}. Click ▶️ Run to dispatch. Reloading...`;
         status.className = 'text-sm text-green-600 ml-2';
         setTimeout(() => location.reload(), 1500);
     } catch (e) {

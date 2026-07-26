@@ -1323,10 +1323,14 @@ async def apply_workflow_to_project(
       4. Archive all current non-archived tasks (preserve history in
          the Task history section). Don't touch already-archived
          tasks from prior runs.
-      5. Wake the project from any terminal state (completed/failed/
-         cancelled/interrupted/archived) back to ready so the
-         supervisor's next tick dispatches the new tasks. If the
-         project is already non-terminal, leave state alone.
+      5. Set the project to state='planned' (pause dispatch). User
+         feedback (2026-07-26): 'apply workflow 後會自動run, 應該要按
+         run 才start' — we must NOT auto-dispatch the new pending
+         tasks. From 'planned' the supervisor's _drive_project
+         does nothing (only 'planning' and 'ready'/'running' are
+         handled). The user reviews the new task list and clicks
+         Run. This matches the /replan flow (planning → planned,
+         user clicks Run).
       6. Insert the substituted steps as new pending tasks with
          depends_on wired (name → id map).
       7. Audit: project.applied_workflow (top-level) + task.created
@@ -1399,21 +1403,32 @@ async def apply_workflow_to_project(
         archive_cur.rowcount if hasattr(archive_cur, "rowcount") else 0
     )
 
-    # 5. Wake the project from any terminal state. Non-terminal
-    # states (ready/running/planning/planned) stay as-is — the
-    # supervisor will pick up the new tasks on the next tick
-    # regardless. A terminal state would mean the supervisor
-    # ignores new pending tasks, so we MUST flip to ready.
+    # 5. Set state to 'planned' (NOT 'ready') regardless of prior state.
+    # User feedback (2026-07-26): 'apply workflow 後會自動run, 應該要按
+    # run 才start'. We must NOT auto-dispatch the new pending tasks.
+    # - For terminal states (completed/failed/cancelled/interrupted/
+    #   archived), the supervisor was ignoring this project anyway,
+    #   so we MUST flip state — but to 'planned', not 'ready'.
+    # - For non-terminal states (ready/running/planning), the
+    #   supervisor was actively dispatching. Flipping to 'planned'
+    #   PAUSES dispatch (supervisor's _drive_project only handles
+    #   planning + ready/running, not planned). This means: the new
+    #   pending tasks wait, and the user reviews + clicks Run.
+    # - For 'planned' (already), no-op.
+    # Net effect: apply = plan, Run = dispatch. Same model as
+    # /api/projects/{id}/replan which sets state='planning' and the
+    # user clicks Run on completion.
+    PLANNED = "planned"
     TERMINAL_STATES = ("completed", "failed", "cancelled", "interrupted", "archived")
     woken = False
     new_state = proj["state"]
-    if proj["state"] in TERMINAL_STATES:
+    if proj["state"] != PLANNED:
         await db.execute(
-            "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
-            (now, project_id),
+            "UPDATE projects SET state = ?, updated_at = ? WHERE id = ?",
+            (PLANNED, now, project_id),
         )
         woken = True
-        new_state = "ready"
+        new_state = PLANNED
         await audit_log(
             db, "project.woken", actor="operator", project_id=project_id,
             payload={
@@ -1525,8 +1540,8 @@ async def apply_workflow_to_project(
         "message": (
             f"Applied workflow {wf['name']!r} ({len(task_rows)} new tasks, "
             f"{archived_count} archived). "
-            + ("Woke project from " + repr(proj["state"]) + " → ready. " if woken else "")
-            + "Supervisor will dispatch pending tasks on next tick."
+            + ("Set state " + repr(proj["state"]) + " → planned. " if woken else "State already planned. ")
+            + "Click ▶️ Run on the project page to dispatch."
         ),
     }
 
