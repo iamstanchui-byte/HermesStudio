@@ -439,6 +439,11 @@
         </a>
     </div>
     {% if show_archived and archived_tasks %}
+    <div class="flex items-center justify-end mb-2">
+        <button id="hist-collapse-all-btn" onclick="collapseHistResults()"
+            class="px-3 py-1 text-xs rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+            title="Close all open archived result panels at once">Collapse all</button>
+    </div>
     <div class="bg-white border border-gray-200 rounded overflow-x-auto">
         <table class="w-full text-xs">
             <thead class="bg-gray-50 text-gray-600 text-left">
@@ -516,7 +521,18 @@
                             <span class="text-gray-700">{{ t.result.artifacts|length }}</span>
                             <ul class="list-disc ml-6 mt-1">
                             {%- for a in t.result.artifacts %}
-                                <li class="font-mono text-gray-700">{{ a.name or a.path }}</li>
+                                <li>
+                                {%- if a.exists %}
+                                <a href="/api/projects/{{ t.project_id }}/files/{{ a.name or a.path }}" target="_blank"
+                                    class="font-mono text-blue-600 hover:underline">{{ a.name or a.path }}</a>
+                                <span class="text-gray-500">({{ a.storage_kind|default('?') }}{% if a.size_bytes %}, {{ a.size_bytes }} bytes{% endif %})</span>
+                                {%- else %}
+                                <span class="font-mono text-gray-500"
+                                    title="{% if a.is_ephemeral %}Ephemeral control file: read + unlinked by supervisor (decision / status / plan signal){% else %}File no longer on disk (may have been cleaned up){% endif %}{% if a.size_bytes %}&#10;original size: {{ a.size_bytes }} bytes{% endif %}">{{ a.name or a.path }}</span>
+                                <span class="px-1.5 py-0.5 text-xs rounded bg-gray-200 text-gray-600">deleted</span>
+                                {%- if a.size_bytes %}<span class="text-gray-400 text-xs">({{ a.size_bytes }} bytes)</span>{%- endif %}
+                                {%- endif %}
+                                </li>
                             {%- endfor %}
                             </ul>
                         </div>
@@ -870,6 +886,26 @@ function copyArchivedResult(taskId) {
         }).catch(() => fallbackCopy(text, btn));
     } else {
         fallbackCopy(text, btn);
+    }
+}
+// Close all open archived result panels at once. Mirrors the live
+// task's collapseAllResults() but operates on the 'hist-row-' prefix
+// and HIST_STORAGE_KEY. User feedback (2026-07-26): asked for a
+// "Collapse all" button so opening N results then closing them
+// doesn't take N clicks.
+function collapseHistResults() {
+    const s = getHistOpen();
+    let count = 0;
+    s.forEach(taskId => {
+        const el = document.getElementById('hist-row-' + taskId);
+        if (el) { el.classList.add('hidden'); count++; }
+    });
+    saveHistOpen(new Set());
+    const btn = document.getElementById('hist-collapse-all-btn');
+    if (btn) {
+        const orig = btn.textContent;
+        btn.textContent = count > 0 ? 'Collapsed ' + count : 'Nothing open';
+        setTimeout(function () { btn.textContent = orig; }, 1200);
     }
 }
 // Restore open state on page load (works for both refresh + 10s
@@ -1821,13 +1857,18 @@ async function submitPromoteToWorkflow() {
     💬
 </button>
 <div id="chat-panel" class="hidden fixed inset-y-0 right-0 z-50 w-96 max-w-full bg-white shadow-2xl border-l border-gray-200 flex flex-col">
-    <div class="flex items-center justify-between p-3 border-b border-gray-200 bg-gray-50">
-        <div>
+    <div class="flex items-center justify-between p-3 border-b border-gray-200 bg-gray-50 shrink-0">
+        <div class="min-w-0 flex-1">
             <div class="font-semibold text-gray-800">💬 Orchestrator assistant</div>
-            <div class="text-xs text-gray-500">Analyzes state, plans, suggests. LLM-driven, applies only when you click.</div>
+            <div id="chat-subtitle" class="text-xs text-gray-500">Analyzes state, plans, suggests. LLM-driven, applies only when you click.</div>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-1 shrink-0">
             <button onclick="clearChat()" class="text-xs text-gray-500 hover:text-red-600 px-2 py-1" title="Clear chat history">Clear</button>
+            <button onclick="toggleChatPanel()"
+                class="text-gray-500 hover:text-gray-800 px-2 py-1 text-base leading-none"
+                title="Close chat panel">
+                ✕
+            </button>
         </div>
     </div>
     <div id="chat-messages" class="flex-1 overflow-y-auto p-3 space-y-2 text-sm">
@@ -1835,22 +1876,22 @@ async function submitPromoteToWorkflow() {
             Ask the assistant to analyze the project, suggest tasks, identify which tasks are script-able, or recommend next steps.
         </div>
     </div>
-    <div class="border-t border-gray-200 p-3">
-        <div class="flex items-end gap-2">
+    <div id="chat-input-area" class="border-t border-gray-200 p-3 shrink-0">
+        <div id="chat-status" class="text-xs text-gray-500 h-4 mb-1"></div>
+        <div class="flex items-stretch gap-2">
             <textarea id="chat-input" rows="3"
                 class="flex-1 border rounded px-2 py-1 text-sm resize-none"
                 placeholder="Ask something... (Enter to send, Shift+Enter for newline)"
                 onkeydown="if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendChatMessage(); }"
                 oninput="document.getElementById('chat-send-btn').disabled = !this.value.trim();"></textarea>
-            <button id="chat-send-btn" onclick="sendChatMessage()" disabled
-                class="px-3 py-1 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                title="Send (Enter)">Send</button>
-        </div>
-        <div class="flex items-center justify-between mt-1">
-            <div id="chat-status" class="text-xs text-gray-500 h-4"></div>
-            <button onclick="toggleChatPanel()"
-                class="text-xs text-gray-500 hover:text-gray-800 px-2 py-1"
-                title="Close panel">Close ✕</button>
+            <div class="flex flex-col gap-1 w-20">
+                <button id="chat-send-btn" onclick="sendChatMessage()" disabled
+                    class="flex-1 px-3 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Send (Enter)">Send</button>
+                <button onclick="toggleChatPanel()"
+                    class="text-xs text-gray-500 hover:text-gray-800 px-2 py-1"
+                    title="Close panel">Close ✕</button>
+            </div>
         </div>
     </div>
 </div>
