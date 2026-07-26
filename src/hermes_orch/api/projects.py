@@ -1280,14 +1280,17 @@ async def run_project(project_id: str, request: Request) -> dict:
 # (e.g. report_month=May2026) and the project's task list becomes
 # the workflow's steps with placeholders substituted.
 #
-# Semantics (mirrors clone-and-cascade's "preserve history" pattern):
-#   - All current non-archived tasks are ARCHIVED (not deleted) so
-#     the operator can still see "what was here before" via the
-#     Task history section on the project page.
+# Semantics (additive import — import the workflow's OBJECT into
+# the project, do NOT replace its task list):
+#   - All current non-archived tasks are LEFT ALONE. The workflow's
+#     steps JOIN them. Both old and new tasks coexist in the live
+#     Tasks list. If you want a destructive replace, use Clone chain
+#     (POST /api/tasks/{id}/clone-and-cascade) — that one is surgical.
 #   - New tasks are inserted as pending with depends_on wired from
-#     the workflow's step names.
-#   - Project state is woken from any terminal state back to ready
-#     (so the supervisor's next tick picks up the new tasks).
+#     the workflow's step names (with 2-pass resolution: workflow-
+#     internal first, then existing project task names by name).
+#   - Project state is set to 'planned' regardless of prior state
+#     (so the supervisor does NOT auto-dispatch — user clicks Run).
 #
 # Why not just call /api/workflows/{id}/run? That endpoint creates
 # a NEW project. Apply-to-existing is the operator's edit-the-plan
