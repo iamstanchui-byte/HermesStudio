@@ -33,6 +33,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await db.connect()
     app.state.db = db
 
+    # Object Layer foundation (2026-07-26): ensure the virtual
+    # __single_tasks__ project row exists so single-task creation
+    # never races a lookup. Idempotent — no-op after the first run.
+    from hermes_orch.db import ensure_single_tasks_project
+    await ensure_single_tasks_project(db)
+
     # Start the brain: notifier + planner + supervisor (background task)
     notifier = Notifier(cfg)
     planner = Planner(cfg, db=db)  # db needed for token-usage recording
@@ -124,6 +130,7 @@ def create_app() -> FastAPI:
     from hermes_orch.api.artifacts import router as artifacts_router
     from hermes_orch.api.auth import router as auth_router
     from hermes_orch.api.dashboard import router as dashboard_router
+    from hermes_orch.api.objects import router as objects_router
     from hermes_orch.api.projects import router as projects_router
     from hermes_orch.api.schedules import router as schedules_router
     from hermes_orch.api.settings import router as settings_router
@@ -133,6 +140,7 @@ def create_app() -> FastAPI:
     app.include_router(agents_router, prefix="/api/agents", tags=["agents"])
     app.include_router(artifacts_router, prefix="/api/artifacts", tags=["artifacts"])
     app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
+    app.include_router(objects_router, prefix="/api/objects", tags=["objects"])
     app.include_router(projects_router, prefix="/api/projects", tags=["projects"])
     app.include_router(schedules_router, prefix="/api/schedules", tags=["schedules"])
     app.include_router(settings_router, prefix="/api/settings", tags=["settings"])

@@ -1,0 +1,16 @@
+fix(visual view): stop showing archived tasks after first poll
+
+User reported (2026-07-26): 'proj-8fece23e Visual view 打開後等一會會 show 到archive 的task'. Root cause: /api/tasks/ did NOT filter task-level archived rows, so the poller fetched every task (including archived) and re-rendered them on each tick.
+
+Two distinct bugs in the same fix:
+
+1. /api/tasks/?include_archived=false is misleadingly named — it only filters at the PROJECT level (joined filter on projects.state), not at the task level. Added a separate `exclude_archived_tasks` query param that adds a `t.archived = 0` WHERE clause for the actual fix. Updated the docstring to spell out the difference.
+
+2. /api/objects/skills/{profile_id}/{name} and the poller's _vpInit() both had a drawflow re-render bug: every poll call would create a NEW .drawflow div inside the wrap without removing the old one. After 3 polls, the user saw 3 columns of cards (3x duplication). drawflow 0.0.59's `new Drawflow(wrap).start()` does NOT remove old .drawflow children — it just appends. removeNodeId also doesn't fully clean the DOM. The simplest reliable fix is to clear the wrap's children (preserves click handlers because they're on the static wrap, not the drawflow divs) and null the editor before recreating.
+
+visual_project.html: the poller now uses ?exclude_archived_tasks=true (the new param), and _vpInit() clears the wrap + nulls the editor before recreating on each re-render.
+
+Verified with Playwright (scripts/_test-stage4-no-dup.py):
+  - t=0:  3 drawflow nodes
+  - t=13 (4 polls):  3 drawflow nodes (no duplication)
+  - All 3 cards have unique task ids

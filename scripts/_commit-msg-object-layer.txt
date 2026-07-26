@@ -1,0 +1,76 @@
+feat(object layer): schema foundation for Skill/Tool/Resource
+
+Foundation commit for the Object Layer (per the product positioning
+doc, 2026-07-26). The runtime stays the same; this commit adds the
+read API + schema groundwork that the LLM planner + UI registry +
+future code-gen flow will build on.
+
+The 5 object types per the doc:
+  - Skill: file-based content (already in profile_configs) + new
+    optional SKILL.schema.yaml sidecar for input/output contract
+  - Tool: NEW tool_definitions + profile_tools junction tables
+  - Resource: PROMOTED from existing agent_profiles.storage_refs
+    (no schema change, just a first-class read API)
+  - Policy: deferred (no separate table for now; deterministic
+    + llm_required live on the Skill sidecar)
+  - AgentProfile: unchanged (already first-class)
+
+What ships:
+
+  1. DB schema (idempotent migrations):
+     - tool_definitions (id, name UNIQUE, version, kind, description,
+       capabilities JSON, mcp_server_name)
+     - profile_tools (profile_id, tool_id, mcp_status, last_checked_at)
+     - tasks.is_single_task (column + index) — gating flag for the
+       future single-tasks page
+     - virtual __single_tasks__ project row, auto-inserted on
+       startup by ensure_single_tasks_project() (idempotent)
+
+  2. Skill sidecar loader (core/skill_loader.py):
+     - Parses SKILL.schema.yaml (YAML) from profile_configs on demand
+     - LEFT JOINs SKILL.md + SKILL.schema.yaml per skill name
+     - Fallback schema: {llm_required: true, deterministic: false,
+       requires_capabilities: []} for skills without a sidecar
+     - Per (profile, name) get() uses {name:path} catch-all to handle
+       names containing '/' (e.g. 'apple/apple-notes')
+     - Bug fix: SUBSTR offset was 8 instead of 7 (off-by-one, dropped
+       the last char of every name). 2026-07-26.
+
+  3. Object Layer read API (api/objects.py):
+     - GET    /api/objects/skills                         (with sidecar)
+     - GET    /api/objects/skills?profile_id=X
+     - GET    /api/objects/skills?deterministic_only=true
+     - GET    /api/objects/skills?requires_capability=X
+     - GET    /api/objects/skills/{profile_id}/{name:path}
+     - GET    /api/objects/tools                          (with availability)
+     - GET    /api/objects/tools/{id}
+     - GET    /api/objects/tools/{id}/availability
+     - POST   /api/objects/tools/{id}/check-mcp           (the one write)
+     - GET    /api/objects/resources                      (cross-profile)
+     - GET    /api/objects/registry                       (aggregate view)
+     All endpoints are read-only except check-mcp; mutating endpoints
+     will live in their owning routers (agents for skills/tools, profile
+     metadata for resources).
+
+  4. main.py: register the new objects router + ensure the virtual
+     __single_tasks__ project on startup.
+
+  5. tests/test_object_layer.py: 9 tests covering virtual project,
+     sidecar fallback, sidecar round-trip (insert + read), tools list,
+     resources aggregation, 404 handling, check-mcp success/invalid.
+     40/40 tests pass (no regressions).
+
+  6. Example sidecar (scripts/_seed-example-sidecar.py): one idempotent
+     script that attaches a 'deterministic: true' sidecar to the
+     'apple/apple-notes' skill on profile 034e6614-... so the example
+     shows up in /api/objects/registry?deterministic_only=true.
+
+  7. scripts/_restart-server.py: uvicorn --reload doesn't pick up
+     all changes reliably (especially new modules + schema changes),
+     so this kills the old server + waits for the new one to be
+     healthy. Used during dev.
+
+Per the doc: LLM is design-time assistant only, runtime stays
+deterministic. This commit doesn't change runtime — it just exposes
+the registry that the future plan/route/judge/audit hooks will
+read from during design.

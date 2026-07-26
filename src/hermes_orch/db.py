@@ -442,6 +442,61 @@ MIGRATIONS = [
     # editor only — never read by the runner. Default '{}' = no
     # saved positions, fall back to vertical stack on render.
     "ALTER TABLE workflow_packages ADD COLUMN visual_layout TEXT NOT NULL DEFAULT '{}'",
+    # ===== Object Layer foundation (2026-07-26) =====
+    # See src/hermes_orch/api/objects.py for the read API.
+    #
+    # tool_definitions: GLOBAL catalog of tools that any agent profile
+    # MAY register (the same MT5 / TradingView / browser tool can be
+    # registered by multiple profiles). Stored once, referenced from
+    # profile_tools (junction). For Phase 1 (skill/tool/resource
+    # foundation) the orch only USES this for capability declaration
+    # + MCP health check; actual tool execution goes through MCP
+    # servers, not through the orch. See user-stated 2026-07-26:
+    # "tool 是否能用orch server 操制不了, 其本上要用mcp 連上這些tools".
+    # name is the canonical tool id (e.g. "mt5", "tradingview",
+    # "browser"); version tracks the on-host install.
+    "CREATE TABLE IF NOT EXISTS tool_definitions ("
+    "  id TEXT PRIMARY KEY,"
+    "  name TEXT NOT NULL UNIQUE,"
+    "  version TEXT NOT NULL DEFAULT '1.0.0',"
+    "  kind TEXT NOT NULL DEFAULT 'external_app',"  # external_app | mcp_server | script | api | cli
+    "  description TEXT NOT NULL DEFAULT '',"
+    "  capabilities TEXT NOT NULL DEFAULT '[]',"  # JSON array of capability names
+    "  mcp_server_name TEXT NOT NULL DEFAULT '',"  # optional: MCP server name if wrapped
+    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+    "  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_tool_defs_name ON tool_definitions(name)",
+    #
+    # profile_tools: junction table — which profiles have which tools,
+    # plus per-profile MCP health status. PK is (profile_id, tool_id)
+    # so a profile can register each tool at most once. mcp_status is
+    # set by /api/objects/tools/{id}/check-mcp; 'unknown' = never
+    # checked. last_checked_at drives dashboard staleness badge.
+    "CREATE TABLE IF NOT EXISTS profile_tools ("
+    "  profile_id TEXT NOT NULL,"
+    "  tool_id TEXT NOT NULL,"
+    "  mcp_status TEXT NOT NULL DEFAULT 'unknown',"  # unknown | up | down | error
+    "  last_checked_at TIMESTAMP,"
+    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+    "  PRIMARY KEY (profile_id, tool_id),"
+    "  FOREIGN KEY (profile_id) REFERENCES agent_profiles(id) ON DELETE CASCADE,"
+    "  FOREIGN KEY (tool_id) REFERENCES tool_definitions(id) ON DELETE CASCADE"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_profile_tools_profile ON profile_tools(profile_id)",
+    "CREATE INDEX IF NOT EXISTS idx_profile_tools_tool ON profile_tools(tool_id)",
+    "CREATE INDEX IF NOT EXISTS idx_profile_tools_status ON profile_tools(mcp_status)",
+    #
+    # tasks.is_single_task: 1 = single task (no project context),
+    # lives in the virtual __single_tasks__ project. 0 = regular
+    # project task (default). Lets the UI filter single tasks out of
+    # the project task list and into a separate "Single tasks" page,
+    # while keeping all task history / audit / artifact rows in the
+    # same tables. See src/hermes_orch/api/objects.py and
+    # project_visual_page (which now hides single tasks from the
+    # project canvas).
+    "ALTER TABLE tasks ADD COLUMN is_single_task INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_is_single ON tasks(is_single_task)",
 ]
 
 
@@ -535,3 +590,55 @@ def _jsonify(v: Any) -> Any:
     if isinstance(v, (list, dict)):
         return json.dumps(v)
     return v
+
+
+# ===== Single-tasks virtual project (Object Layer foundation, 2026-07-26) =====
+#
+# Single tasks (code-gen, ad-hoc summarize, etc.) live in a virtual project
+# `__single_tasks__` so we can reuse the existing tasks / artifacts /
+# audit_log tables without changing their schema (tasks.project_id stays
+# NOT NULL). The project's row is created on first need (lazy, idempotent)
+# and its state stays 'completed' forever — the supervisor ignores it.
+#
+# Why a virtual project instead of making tasks.project_id NULL:
+# - SQLite ALTER TABLE can't drop NOT NULL without a table rebuild, which
+#   would block large DBs (we have 30k+ task rows) and risk data loss
+# - The projects table already has the columns we need (id, name, state,
+#   created_at), so adding a single row is free
+# - is_single_task column (indexed) gives us fast filtering; the
+#   project_id value just identifies which bucket the single task lives in
+SINGLE_TASKS_PROJECT_ID = "__single_tasks__"
+SINGLE_TASKS_PROJECT_NAME = "Single tasks (virtual container)"
+
+
+async def ensure_single_tasks_project(db: Database) -> None:
+    """Idempotently create the virtual single-tasks project if missing.
+
+    Called from the FastAPI lifespan on startup, so the first single
+    task creation doesn't race the lookup. Safe to call multiple times.
+    """
+    existing = await db.fetchone(
+        "SELECT id FROM projects WHERE id = ?", (SINGLE_TASKS_PROJECT_ID,)
+    )
+    if existing:
+        return
+    now = _now_iso()
+    # Use raw execute to avoid the timestamp-auto-fill path's assumptions
+    # (created_at/updated_at on projects are TIMESTAMP columns, not the
+    # _now_iso() ISO format that fetchone() returns on read).
+    await db.execute(
+        "INSERT OR IGNORE INTO projects "
+        "(id, name, goal, state, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'completed', ?, ?)",
+        (
+            SINGLE_TASKS_PROJECT_ID,
+            SINGLE_TASKS_PROJECT_NAME,
+            "Virtual container for one-off tasks (code-gen, ad-hoc "
+            "summarization, etc.) that don't belong to any project.",
+            now,
+            now,
+        ),
+    )
+    # INSERT OR IGNORE is silent on duplicate, so log only on actual insert.
+    # (We don't have rowcount here, but the existence check above means
+    # this insert only runs on first startup — fine to be quiet.)
