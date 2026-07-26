@@ -879,12 +879,21 @@ async def project_page(
         # records task.archived events with the timestamp). We use
         # `updated_at` here as a proxy for "when this task was archived"
         # — that's when the Clone chain set archived=1 on it.
+        # We also pull `result` + `error` so the operator can compare
+        # before/after: what the OLD execution produced vs the new one.
+        # User feedback (2026-07-26): "可以像之前一樣可以看到output 嗎?"
+        # — without result, the history is just metadata, not useful.
         archived_rows = await db.fetchall(
-            "SELECT id, name, agent_role, action, status, updated_at, created_at "
+            "SELECT id, name, agent_role, action, status, result, error, "
+            "updated_at, created_at "
             "FROM tasks WHERE project_id = ? AND archived = 1 "
             "ORDER BY updated_at DESC, created_at DESC",
             (project_id,),
         )
+        # result is stored as a JSON-encoded TEXT column; parse so the
+        # template can use `t.result.summary` / `.session_id` / `.artifacts`
+        for t in archived_rows:
+            _parse_json_fields(t, "result")
 
     # Paginated task rows (project-scoped SQL, not "load all then filter").
     # Filter archived=0 by default (the active plan). The "show archived"

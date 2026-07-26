@@ -449,10 +449,13 @@
                     <th class="px-3 py-2 font-medium">Status (when archived)</th>
                     <th class="px-3 py-2 font-medium">Archived at</th>
                     <th class="px-3 py-2 font-medium">Old ID</th>
+                    <th class="px-3 py-2 font-medium w-20">Result</th>
                 </tr>
             </thead>
             <tbody>
                 {%- for t in archived_tasks %}
+                {%- set has_result = t.result and (t.result.summary or t.result.session_id or t.result.error or t.result.artifacts) %}
+                {%- set has_error = t.error %}
                 <tr class="border-t border-gray-100 text-gray-500">
                     <td class="px-3 py-2 font-medium text-gray-700">{{ t.name or '—' }}</td>
                     <td class="px-3 py-2 font-mono">{{ t.agent_role or '?' }}</td>
@@ -472,7 +475,56 @@
                     <td class="px-3 py-2 font-mono text-[10px] text-gray-400">
                         {{ t.id[:16] }}{% if t.id|length > 16 %}…{% endif %}
                     </td>
+                    <td class="px-3 py-2 whitespace-nowrap">
+                        {%- if has_result %}
+                        <button onclick="toggleArchivedResult('{{ t.id }}')" class="text-blue-600 hover:underline">View</button>
+                        {%- elif has_error %}
+                        <button onclick="toggleArchivedResult('{{ t.id }}')" class="text-red-600 hover:underline">Error</button>
+                        {%- else %}
+                        <span class="text-gray-300">—</span>
+                        {%- endif %}
+                    </td>
                 </tr>
+                {%- if has_result or has_error %}
+                <tr id="hist-row-{{ t.id }}" class="hidden border-t border-gray-100 bg-gray-50">
+                    <td colspan="7" class="px-3 py-2">
+                        {%- if has_error %}
+                        <div class="mb-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2">
+                            <span class="font-semibold">Error:</span> {{ t.error }}
+                        </div>
+                        {%- endif %}
+                        {%- if has_result %}
+                        {%- if t.result.summary %}
+                        <div class="flex items-center justify-between mb-1">
+                            <div>
+                                <span class="text-gray-500 text-xs">Summary:</span>
+                                <span class="text-gray-400 text-xs">({{ t.result.summary|length }} chars)</span>
+                            </div>
+                            <button onclick="copyArchivedResult('{{ t.id }}')" class="text-blue-600 hover:underline text-xs">Copy</button>
+                        </div>
+                        <pre id="hist-full-{{ t.id }}" class="whitespace-pre-wrap break-words text-xs bg-white border rounded p-2 mt-1 max-h-96 overflow-auto">{{ t.result.summary }}</pre>
+                        {%- endif %}
+                        {%- if t.result.session_id %}
+                        <div class="mt-2 text-xs">
+                            <span class="text-gray-500">Session:</span>
+                            <span class="font-mono text-gray-700">{{ t.result.session_id }}</span>
+                        </div>
+                        {%- endif %}
+                        {%- if t.result.artifacts %}
+                        <div class="mt-2 text-xs">
+                            <span class="text-gray-500">📎 Artifacts:</span>
+                            <span class="text-gray-700">{{ t.result.artifacts|length }}</span>
+                            <ul class="list-disc ml-6 mt-1">
+                            {%- for a in t.result.artifacts %}
+                                <li class="font-mono text-gray-700">{{ a.name or a.path }}</li>
+                            {%- endfor %}
+                            </ul>
+                        </div>
+                        {%- endif %}
+                        {%- endif %}
+                    </td>
+                </tr>
+                {%- endif %}
                 {%- endfor %}
             </tbody>
         </table>
@@ -783,6 +835,49 @@ function fallbackCopy(text, btn) {
         setTimeout(() => { btn.textContent = orig; }, 1500);
     }
 }
+
+// Archived task result: same affordance as live tasks but with a
+// `hist-` prefix to avoid colliding with the live result panel's
+// `presult-` / `full-` IDs. We keep a SEPARATE localStorage key so
+// opening a result in this view doesn't accidentally open the live
+// task's panel (different DOM, different concern). User feedback
+// (2026-07-26): "可以像之前一樣可以看到output 嗎?" — without result
+// content the history is just metadata, not useful for before/after.
+const HIST_STORAGE_KEY = 'hermes.hist_open_results.v1';
+function getHistOpen() {
+    try { return new Set(JSON.parse(localStorage.getItem(HIST_STORAGE_KEY) || '[]')); }
+    catch { return new Set(); }
+}
+function saveHistOpen(s) {
+    localStorage.setItem(HIST_STORAGE_KEY, JSON.stringify([...s]));
+}
+function toggleArchivedResult(taskId) {
+    const row = document.getElementById('hist-row-' + taskId);
+    if (!row) return;
+    row.classList.toggle('hidden');
+    const s = getHistOpen();
+    if (row.classList.contains('hidden')) s.delete(taskId); else s.add(taskId);
+    saveHistOpen(s);
+}
+function copyArchivedResult(taskId) {
+    const pre = document.getElementById('hist-full-' + taskId);
+    if (!pre) return;
+    const text = pre.textContent || '';
+    const btn = document.querySelector(`button[onclick="copyArchivedResult('${taskId}')"]`);
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => {
+            if (btn) { const o = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = o; }, 1500); }
+        }).catch(() => fallbackCopy(text, btn));
+    } else {
+        fallbackCopy(text, btn);
+    }
+}
+// Restore open state on page load (works for both refresh + 10s
+// auto-poll because the hidden row's id is stable).
+getHistOpen().forEach(taskId => {
+    const el = document.getElementById('hist-row-' + taskId);
+    if (el) el.classList.remove('hidden');
+});
 
 const PROJECT_ID = "{{ project.id }}";
 const PROJECT_NAME = {{ (project.name or project.id) | tojson }};
