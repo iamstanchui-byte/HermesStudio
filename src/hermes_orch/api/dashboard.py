@@ -602,8 +602,15 @@ async def tasks_page(
     limit: int = 50,
     offset: int = 0,
     include_archived: bool = False,
+    search: str = "",
+    kind: str = "all",  # all | project | single
 ) -> HTMLResponse:
-    """Tasks page (filterable by status, date range, limit, paginated).
+    """Tasks page (filterable by status, date range, limit, kind, search).
+
+    Unified view per the 2026-07-27 merge decision: project tasks
+    and single tasks live on the same page. The `kind` filter
+    defaults to "all"; "single" shows only single tasks (the
+    `is_single_task=1` flag), "project" hides them.
 
     By default hides tasks from archived/deleted projects. Pass
     include_archived=true (via ?include_archived=1 in URL) to see them.
@@ -614,6 +621,10 @@ async def tasks_page(
     if status:
         where.append("t.status = ?")
         params.append(status)
+    if kind == "project":
+        where.append("t.is_single_task = 0")
+    elif kind == "single":
+        where.append("t.is_single_task = 1")
     if not include_archived:
         # JOIN projects and hide tasks whose project is archived/deleted
         where.append("p.state NOT IN ('archived', 'deleted')")
@@ -631,6 +642,24 @@ async def tasks_page(
         cutoff = (now_aware() - timedelta(days=days)).isoformat()
         where.append("t.created_at >= ?")
         params.append(cutoff)
+    if search:
+        # Search across task id, name, action, agent_role, and project
+        # name. SQLite LIKE is case-insensitive for ASCII by default;
+        # the LOWER() wrapper makes it case-insensitive for everything
+        # (PRAGMA case_sensitive_like = 0 is also set elsewhere, but
+        # LOWER is portable). We split on whitespace and AND each
+        # token so "write output" matches both "write_output" and
+        # "output.json". Cheap because the table is small.
+        tokens = [t for t in search.split() if t]
+        for tok in tokens:
+            where.append(
+                "(LOWER(t.id) LIKE ? OR LOWER(IFNULL(t.name, '')) LIKE ? "
+                "OR LOWER(IFNULL(t.action, '')) LIKE ? "
+                "OR LOWER(IFNULL(t.agent_role, '')) LIKE ? "
+                "OR LOWER(IFNULL(p.name, '')) LIKE ?)"
+            )
+            like = f"%{tok.lower()}%"
+            params.extend([like, like, like, like, like])
     # Always JOIN projects — column refs use t.alias and the JOIN
     # is cheap (indexed FK). The `p.state NOT IN (...)` filter below
     # is only added when include_archived=False, so the same SQL
@@ -646,8 +675,6 @@ async def tasks_page(
 
     # Page rows
     sql = f"SELECT t.* FROM tasks t{join_sql}{where_sql} ORDER BY t.created_at DESC LIMIT ? OFFSET ?"
-    page_params = tuple(params) + (limit, offset)
-    raw_rows = await db.fetchall(sql, page_params)
     page_params = tuple(params) + (limit, offset)
     raw_rows = await db.fetchall(sql, page_params)
     tasks = []
@@ -666,6 +693,11 @@ async def tasks_page(
     for t in tasks:
         t["project_name"] = project_map.get(t["project_id"], t["project_id"])
         t["timing"] = _compute_task_timing(t)
+        # Per the 2026-07-27 merge: annotate single tasks so the
+        # template can render a "Single" badge and link to the
+        # single-task detail URL (the project link would 404
+        # because the virtual project has no /projects/{id} page).
+        t["is_single_task"] = bool(t.get("is_single_task"))
     # Annotate each artifact with on-disk existence so the template
     # can show "deleted" badges for ephemeral control files
     # (decision.md, status.md, plan.md, etc.) that the supervisor
@@ -695,6 +727,8 @@ async def tasks_page(
             "filter_limit": limit,
             "filter_offset": offset,
             "filter_include_archived": include_archived,
+            "filter_search": search,
+            "filter_kind": kind,
             "total_count": total,
         },
     )

@@ -1,21 +1,20 @@
 """Single task HTML pages (Commit 3 of Object Layer, 2026-07-27).
 
-Renders the /single-tasks list page + detail page. The data
-fetching is via the API endpoints in api/single_tasks.py; this
-module is HTML-only.
+Renders the /single-tasks/{id} DETAIL page only — the LIST page
+has been merged into /tasks (per the unified-tasks decision, 2026-07-27).
 
-Why a separate module (vs adding to dashboard.py)?
-  - dashboard.py is already 1500+ lines and growing
-  - api/single_tasks.py is the API; pages are a thin presentation
-    layer that could be regenerated / replaced without touching
-    the API
-  - Easier to add per-page tests (template renders, links) without
-    loading all of dashboard.py's imports
+The /single-tasks URL now redirects to /tasks (preserves any
+existing bookmarks or external links). The detail page stays
+because external systems may have linked to a specific single task
+URL; the page itself is unchanged from the original commit 3.
+
+The data fetching for the detail page is via the API endpoints in
+api/single_tasks.py; this module is HTML-only.
 """
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from hermes_orch.db import SINGLE_TASKS_PROJECT_ID
 
@@ -23,32 +22,25 @@ router = APIRouter()
 
 
 @router.get("/single-tasks", response_class=HTMLResponse)
-async def single_tasks_list_page(request: Request) -> HTMLResponse:
-    """List all single tasks (newest first). Shows status, kind,
-    goal, result/error. The "+ Create single task" button opens an
-    inline form (no separate page needed for the simple case)."""
-    from hermes_orch.api.single_tasks import _row_to_single_task_out
-    db = request.app.state.db
-    rows = await db.fetchall(
-        "SELECT * FROM tasks WHERE project_id = ? AND is_single_task = 1 "
-        "ORDER BY created_at DESC LIMIT 200",
-        (SINGLE_TASKS_PROJECT_ID,),
-    )
-    tasks = [_row_to_single_task_out(r) for r in rows]
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
-        request, "single_tasks.html",
-        {
-            "tasks": tasks,
-            "active_page": "single-tasks",
-            **_base_context(request, "single-tasks"),
-        },
-    )
+async def single_tasks_list_page(request: Request) -> RedirectResponse:
+    """Redirect to the unified /tasks page (the list view lives there now).
+
+    The /tasks page shows single tasks mixed in with project tasks,
+    with a "Single" badge in the Type column. This redirect keeps
+    the /single-tasks URL alive for any bookmarked links.
+    """
+    return RedirectResponse(url="/tasks", status_code=307)
 
 
 @router.get("/single-tasks/{task_id}", response_class=HTMLResponse)
 async def single_task_detail_page(task_id: str, request: Request) -> HTMLResponse:
-    """Single task detail page (goal, status, timing, result, error)."""
+    """Single task detail page (goal, status, timing, result, error).
+
+    Kept as a separate URL even after the merge — external systems
+    (chatbox code-gen, audit log links) may have referenced the
+    detail URL. The page itself is unchanged from the original
+    commit 3.
+    """
     from hermes_orch.api.single_tasks import _row_to_single_task_out
     db = request.app.state.db
     row = await db.fetchone(
@@ -63,8 +55,8 @@ async def single_task_detail_page(task_id: str, request: Request) -> HTMLRespons
         request, "single_task_detail.html",
         {
             "task": task,
-            "active_page": "single-tasks",
-            **_base_context(request, "single-tasks"),
+            "active_page": "tasks",
+            **_base_context(request, "tasks"),
         },
     )
 

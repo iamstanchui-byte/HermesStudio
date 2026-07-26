@@ -10,89 +10,266 @@
     </div>
 </div>
 
-{% set q = "" %}
-{% if filter_status %}{% set q = q + "status=" + filter_status + "&" %}{% endif %}
-{% if filter_days %}{% set q = q + "days=" + (filter_days|string) + "&" %}{% endif %}
-{% if filter_limit %}{% set q = q + "limit=" + (filter_limit|string) + "&" %}{% endif %}
+{# Base query string with all filters that should be preserved when
+   changing one of them. kind / status / days / limit / search.
+   We DON'T put filter_kind here because the kind row is the one
+   being changed; the same for the others. Instead each row's links
+   use a partial q that excludes the filter being toggled. #}
+{% set q_base = "kind=" + (filter_kind or 'all') + "&status=" + (filter_status or '') + "&days=" + (filter_days|string) + "&limit=" + (filter_limit|string) + "&search=" + (filter_search or '') %}
+
 {% if total_count > filter_limit %}
 <div class="mb-3 flex items-center justify-end gap-2 text-sm">
     <span class="text-gray-500">Page {{ (filter_offset // filter_limit) + 1 }} of {{ ((total_count + filter_limit - 1) // filter_limit) }}</span>
     {% if filter_offset > 0 %}
-    <a href="/tasks?{{ q }}offset={{ filter_offset - filter_limit }}" class="px-3 py-1 bg-white border rounded text-gray-700 hover:bg-gray-50">&larr; Prev</a>
+    <a href="/tasks?{{ q_base }}&offset={{ filter_offset - filter_limit }}" class="px-3 py-1 bg-white border rounded text-gray-700 hover:bg-gray-50">&larr; Prev</a>
     {% endif %}
     {% if filter_offset + filter_limit < total_count %}
-    <a href="/tasks?{{ q }}offset={{ filter_offset + filter_limit }}" class="px-3 py-1 bg-white border rounded text-gray-700 hover:bg-gray-50">Next &rarr;</a>
+    <a href="/tasks?{{ q_base }}&offset={{ filter_offset + filter_limit }}" class="px-3 py-1 bg-white border rounded text-gray-700 hover:bg-gray-50">Next &rarr;</a>
     {% endif %}
 </div>
 {% endif %}
 
-<!-- Create new task (collapsed) -->
+<!-- Create new task (collapsed). Per the 2026-07-27 merge this
+     form covers BOTH project tasks AND single tasks via the
+     "Project container" dropdown — pick a project for a project
+     task, or "(Single — no project)" for an ad-hoc task. The
+     fields shown below change based on the selection via JS. -->
 <button onclick="toggleForm('new-task-form')" class="mb-3 text-sm text-blue-600 hover:underline">
     + Create new task
 </button>
 
-<form id="new-task-form" class="hidden bg-white border rounded-lg p-4 mb-4 shadow-sm">
+<form id="new-task-form" class="hidden bg-white border rounded-lg p-4 mb-4 shadow-sm" onsubmit="event.preventDefault(); submitNewTask();">
     <h3 class="text-lg font-semibold mb-3 text-gray-800">Create new task</h3>
     <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
         <div>
-            <label class="block text-xs font-medium text-gray-700">Project</label>
-            <select name="project_id" required class="mt-1 block w-full border rounded px-2 py-1 text-sm">
+            <label class="block text-xs font-medium text-gray-700">Project container</label>
+            <select id="nt-project" name="project_id" class="mt-1 block w-full border rounded px-2 py-1 text-sm" onchange="onProjectChange()">
+                <option value="">(Single — no project)</option>
                 {% for p in projects %}
+                {# Hide the virtual __single_tasks__ project — selecting
+                   it would create a regular project task in the virtual
+                   project (which is state=completed, supervisor would
+                   ignore it). For single tasks, leave the dropdown empty. #}
+                {% if p.id != '__single_tasks__' %}
                 <option value="{{ p.id }}">{{ p.name or p.id }}</option>
+                {% endif %}
                 {% endfor %}
             </select>
+            <p class="text-xs text-gray-500 mt-1" id="nt-mode-hint">
+                <span class="text-emerald-700 font-medium">Single task mode</span> — ad-hoc work, no DAG, no project context.
+            </p>
         </div>
         <div>
             <label class="block text-xs font-medium text-gray-700">Agent role</label>
-            <select name="agent_role" required class="mt-1 block w-full border rounded px-2 py-1 text-sm">
+            <select id="nt-agent-role" name="agent_role" class="mt-1 block w-full border rounded px-2 py-1 text-sm">
                 {% if all_profiles %}
-                {% for p in all_profiles %}
-                <option value="{{ p.name }}">{{ p.agent_id }} / {{ p.name }}</option>
-                {% endfor %}
+                    <option value="">(any — supervisor picks)</option>
+                    {% for p in all_profiles %}
+                    <option value="{{ p.name }}"{% if loop.first %} selected{% endif %}>{{ p.agent_id }} / {{ p.name }}</option>
+                    {% endfor %}
                 {% else %}
-                <option value="" disabled>No agents registered yet</option>
+                    <option value="" disabled>No agents registered yet</option>
                 {% endif %}
             </select>
         </div>
+    </div>
+
+    <!-- Single-task-only fields (shown when project_id == '') -->
+    <div id="nt-single-fields" class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div class="md:col-span-2">
+            <label class="block text-xs font-medium text-gray-700">Name</label>
+            <input id="nt-name" name="name" type="text" maxlength="200"
+                class="mt-1 block w-full border rounded px-2 py-1 text-sm"
+                placeholder="e.g. summarize today's news">
+        </div>
+        <div class="md:col-span-2">
+            <label class="block text-xs font-medium text-gray-700">Goal</label>
+            <textarea id="nt-goal" name="goal" rows="2" maxlength="2000"
+                class="mt-1 block w-full border rounded px-2 py-1 text-sm"
+                placeholder="What should this task accomplish?"></textarea>
+        </div>
+        <div>
+            <label class="block text-xs font-medium text-gray-700">Required capability</label>
+            <input id="nt-capability" name="required_capability" type="text"
+                class="mt-1 block w-full border rounded px-2 py-1 text-sm"
+                placeholder="(optional) e.g. summarize, translate">
+        </div>
+        <div>
+            <label class="block text-xs font-medium text-gray-700">Output path</label>
+            <input id="nt-output" name="output_path" type="text"
+                class="mt-1 block w-full border rounded px-2 py-1 text-sm"
+                placeholder="(optional) e.g. ./report.md">
+        </div>
+        <div class="md:col-span-2">
+            <label class="block text-xs font-medium text-gray-700">Source (free-form, JSON)</label>
+            <textarea id="nt-source" name="source" rows="2"
+                class="mt-1 block w-full border rounded px-2 py-1 text-sm font-mono text-xs"
+                placeholder='{"kind": "ad_hoc", "note": "..."}'></textarea>
+            <p class="text-xs text-gray-500 mt-1">
+                Tag the task (e.g. <code>{"kind": "code_gen", "source_task_id": "..."}</code>).
+            </p>
+        </div>
+    </div>
+
+    <!-- Project-task-only fields (shown when project_id is set) -->
+    <div id="nt-project-fields" class="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3 hidden">
         <div>
             <label class="block text-xs font-medium text-gray-700">Action</label>
-            <input name="action" type="text" required class="mt-1 block w-full border rounded px-2 py-1 text-sm" placeholder="e.g. run_backtest">
+            <input id="nt-action" name="action" type="text"
+                class="mt-1 block w-full border rounded px-2 py-1 text-sm"
+                placeholder="e.g. run_backtest">
         </div>
         <div>
             <label class="block text-xs font-medium text-gray-700">Params (JSON, optional)</label>
-            <input name="params" type="text" class="mt-1 block w-full border rounded px-2 py-1 text-sm" placeholder='{"symbol": "EURUSD"}'>
+            <input id="nt-params" name="params" type="text"
+                class="mt-1 block w-full border rounded px-2 py-1 text-sm"
+                placeholder='{"symbol": "EURUSD"}'>
         </div>
     </div>
+
     <div class="mt-3 flex items-center gap-2">
         <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Create</button>
         <span id="form-status" class="text-sm text-gray-500"></span>
     </div>
 </form>
 
-<!-- Filter bar: status + days + limit -->
+<script>
+// Per the 2026-07-27 unified-tasks merge: the form adapts based on
+// the Project container selection. Single-task mode shows the
+// simplified fields (name/goal/capability/output/source); project
+// mode shows the structured fields (action/params).
+function onProjectChange() {
+    const pid = document.getElementById('nt-project').value;
+    const singleFields = document.getElementById('nt-single-fields');
+    const projectFields = document.getElementById('nt-project-fields');
+    const hint = document.getElementById('nt-mode-hint');
+    if (pid) {
+        singleFields.classList.add('hidden');
+        projectFields.classList.remove('hidden');
+        hint.innerHTML = '<span class="text-blue-700 font-medium">Project task mode</span> — added to the project\'s task DAG.';
+    } else {
+        singleFields.classList.remove('hidden');
+        projectFields.classList.add('hidden');
+        hint.innerHTML = '<span class="text-emerald-700 font-medium">Single task mode</span> — ad-hoc work, no DAG, no project context.';
+    }
+}
+onProjectChange();
+
+async function submitNewTask() {
+    const btn = document.querySelector('#new-task-form button[type="submit"]');
+    const status = document.getElementById('form-status');
+    btn.disabled = true; status.textContent = 'Creating...';
+    const pid = document.getElementById('nt-project').value;
+    const agentRole = document.getElementById('nt-agent-role').value.trim();
+    let body, url;
+    if (pid) {
+        // Project task mode — POST /api/tasks
+        url = '/api/tasks';
+        body = {
+            project_id: pid,
+            agent_role: agentRole,
+            action: document.getElementById('nt-action').value.trim(),
+        };
+        const paramsRaw = document.getElementById('nt-params').value.trim();
+        if (paramsRaw) {
+            try { body.params = JSON.parse(paramsRaw); }
+            catch (e) { status.textContent = 'Params must be valid JSON: ' + e.message; btn.disabled = false; return; }
+        }
+    } else {
+        // Single task mode — POST /api/single-tasks
+        url = '/api/single-tasks';
+        let source = {};
+        const srcRaw = document.getElementById('nt-source').value.trim();
+        if (srcRaw) {
+            try { source = JSON.parse(srcRaw); }
+            catch (e) { status.textContent = 'Source must be valid JSON: ' + e.message; btn.disabled = false; return; }
+        }
+        const name = document.getElementById('nt-name').value.trim();
+        if (!name) { status.textContent = 'Name is required for single tasks'; btn.disabled = false; return; }
+        body = {
+            name: name,
+            goal: document.getElementById('nt-goal').value.trim(),
+            agent_role: agentRole,
+            required_capability: document.getElementById('nt-capability').value.trim(),
+            output_path: document.getElementById('nt-output').value.trim(),
+            source: source,
+        };
+    }
+    try {
+        const r = await _fetchWithTimeout(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        }, 15000);
+        const d = await r.json();
+        if (!r.ok) {
+            status.textContent = _errDetailToString(d.detail, r.status);
+            btn.disabled = false;
+            return;
+        }
+        status.textContent = 'Created — redirecting...';
+        // For project tasks, go to the project page; for single, go
+        // to the single task detail page.
+        if (pid) {
+            location.href = '/projects/' + pid;
+        } else {
+            location.href = '/single-tasks/' + d.id;
+        }
+    } catch (e) {
+        status.textContent = 'Network error: ' + e.message;
+        btn.disabled = false;
+    }
+}
+</script>
+
+<!-- Filter bar: kind + status + days + limit + search -->
 <div class="mb-3 flex flex-wrap items-center gap-3 text-sm">
     <div class="flex items-center gap-1">
+        <span class="text-gray-500">Kind:</span>
+        {% set q_no_kind = "status=" + (filter_status or '') + "&days=" + (filter_days|string) + "&limit=" + (filter_limit|string) + "&search=" + (filter_search or '') %}
+        <a href="/tasks?kind=all&{{ q_no_kind }}" class="px-2 py-1 rounded {% if filter_kind == 'all' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">All</a>
+        <a href="/tasks?kind=project&{{ q_no_kind }}" class="px-2 py-1 rounded {% if filter_kind == 'project' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Project</a>
+        <a href="/tasks?kind=single&{{ q_no_kind }}" class="px-2 py-1 rounded {% if filter_kind == 'single' %}bg-emerald-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Single</a>
+    </div>
+    <div class="flex items-center gap-1">
         <span class="text-gray-500">Status:</span>
-        <a href="/tasks?days={{ filter_days }}&limit={{ filter_limit }}" class="px-2 py-1 rounded {% if not filter_status %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">All</a>
-        <a href="/tasks?status=pending&days={{ filter_days }}&limit={{ filter_limit }}" class="px-2 py-1 rounded {% if filter_status == 'pending' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Pending</a>
-        <a href="/tasks?status=running&days={{ filter_days }}&limit={{ filter_limit }}" class="px-2 py-1 rounded {% if filter_status == 'running' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Running</a>
-        <a href="/tasks?status=completed&days={{ filter_days }}&limit={{ filter_limit }}" class="px-2 py-1 rounded {% if filter_status == 'completed' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Completed</a>
-        <a href="/tasks?status=failed&days={{ filter_days }}&limit={{ filter_limit }}" class="px-2 py-1 rounded {% if filter_status == 'failed' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Failed</a>
-        <a href="/tasks?status=skipped&days={{ filter_days }}&limit={{ filter_limit }}" class="px-2 py-1 rounded {% if filter_status == 'skipped' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Skipped</a>
+        {% set q_no_status = "kind=" + (filter_kind or 'all') + "&days=" + (filter_days|string) + "&limit=" + (filter_limit|string) + "&search=" + (filter_search or '') %}
+        <a href="/tasks?{{ q_no_status }}&status=" class="px-2 py-1 rounded {% if not filter_status %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">All</a>
+        <a href="/tasks?{{ q_no_status }}&status=pending" class="px-2 py-1 rounded {% if filter_status == 'pending' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Pending</a>
+        <a href="/tasks?{{ q_no_status }}&status=running" class="px-2 py-1 rounded {% if filter_status == 'running' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Running</a>
+        <a href="/tasks?{{ q_no_status }}&status=completed" class="px-2 py-1 rounded {% if filter_status == 'completed' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Completed</a>
+        <a href="/tasks?{{ q_no_status }}&status=failed" class="px-2 py-1 rounded {% if filter_status == 'failed' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Failed</a>
+        <a href="/tasks?{{ q_no_status }}&status=skipped" class="px-2 py-1 rounded {% if filter_status == 'skipped' %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">Skipped</a>
     </div>
     <div class="flex items-center gap-1">
         <span class="text-gray-500">Range:</span>
-        <a href="/tasks?status={{ filter_status or '' }}&days=1&limit={{ filter_limit }}" class="px-2 py-1 rounded {% if filter_days == 1 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">24h</a>
-        <a href="/tasks?status={{ filter_status or '' }}&days=7&limit={{ filter_limit }}" class="px-2 py-1 rounded {% if filter_days == 7 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">7d</a>
-        <a href="/tasks?status={{ filter_status or '' }}&days=30&limit={{ filter_limit }}" class="px-2 py-1 rounded {% if filter_days == 30 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">30d</a>
-        <a href="/tasks?status={{ filter_status or '' }}&days=9999&limit={{ filter_limit }}" class="px-2 py-1 rounded {% if filter_days == 9999 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">All</a>
+        <a href="/tasks?kind={{ filter_kind }}&status={{ filter_status or '' }}&days=1&limit={{ filter_limit }}&search={{ filter_search or '' }}" class="px-2 py-1 rounded {% if filter_days == 1 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">24h</a>
+        <a href="/tasks?kind={{ filter_kind }}&status={{ filter_status or '' }}&days=7&limit={{ filter_limit }}&search={{ filter_search or '' }}" class="px-2 py-1 rounded {% if filter_days == 7 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">7d</a>
+        <a href="/tasks?kind={{ filter_kind }}&status={{ filter_status or '' }}&days=30&limit={{ filter_limit }}&search={{ filter_search or '' }}" class="px-2 py-1 rounded {% if filter_days == 30 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">30d</a>
+        <a href="/tasks?kind={{ filter_kind }}&status={{ filter_status or '' }}&days=9999&limit={{ filter_limit }}&search={{ filter_search or '' }}" class="px-2 py-1 rounded {% if filter_days == 9999 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">All</a>
     </div>
     <div class="flex items-center gap-1">
         <span class="text-gray-500">Limit:</span>
-        <a href="/tasks?status={{ filter_status or '' }}&days={{ filter_days }}&limit=20" class="px-2 py-1 rounded {% if filter_limit == 20 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">20</a>
-        <a href="/tasks?status={{ filter_status or '' }}&days={{ filter_days }}&limit=50" class="px-2 py-1 rounded {% if filter_limit == 50 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">50</a>
-        <a href="/tasks?status={{ filter_status or '' }}&days={{ filter_days }}&limit=100" class="px-2 py-1 rounded {% if filter_limit == 100 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">100</a>
+        <a href="/tasks?kind={{ filter_kind }}&status={{ filter_status or '' }}&days={{ filter_days }}&limit=20&search={{ filter_search or '' }}" class="px-2 py-1 rounded {% if filter_limit == 20 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">20</a>
+        <a href="/tasks?kind={{ filter_kind }}&status={{ filter_status or '' }}&days={{ filter_days }}&limit=50&search={{ filter_search or '' }}" class="px-2 py-1 rounded {% if filter_limit == 50 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">50</a>
+        <a href="/tasks?kind={{ filter_kind }}&status={{ filter_status or '' }}&days={{ filter_days }}&limit=100&search={{ filter_search or '' }}" class="px-2 py-1 rounded {% if filter_limit == 100 %}bg-blue-600 text-white{% else %}bg-white border text-gray-700 hover:bg-gray-50{% endif %}">100</a>
     </div>
+    <form method="get" class="flex items-center gap-1 ml-auto">
+        {# Preserve all other filters in hidden inputs so the search
+           submit doesn't reset them. #}
+        <input type="hidden" name="kind" value="{{ filter_kind }}">
+        <input type="hidden" name="status" value="{{ filter_status or '' }}">
+        <input type="hidden" name="days" value="{{ filter_days }}">
+        <input type="hidden" name="limit" value="{{ filter_limit }}">
+        <span class="text-gray-500">Search:</span>
+        <input type="text" name="search" value="{{ filter_search or '' }}"
+            placeholder="id / action / project / role..."
+            class="px-2 py-1 border rounded text-xs w-56">
+        <button type="submit" class="px-2 py-1 bg-blue-600 text-white rounded text-xs hover:bg-blue-700">Go</button>
+        {% if filter_search %}
+        <a href="/tasks?kind={{ filter_kind }}&status={{ filter_status or '' }}&days={{ filter_days }}&limit={{ filter_limit }}" class="px-2 py-1 bg-white border text-gray-700 rounded text-xs hover:bg-gray-50">Clear</a>
+        {% endif %}
+    </form>
     <div class="flex items-center gap-1 ml-auto">
         <button id="collapse-all-btn" onclick="collapseAllResults()" class="px-2 py-1 rounded bg-white border text-gray-700 hover:bg-gray-50" title="Hide all expanded result panels. Without this, the 10s auto-refresh pauses because the polling script skips reloads while a result panel is open.">
             Collapse all
@@ -114,11 +291,23 @@
     <div class="bg-white border rounded-lg p-4 shadow-sm">
         <div class="flex items-center justify-between">
             <div class="flex items-center gap-3">
+                {% if task.is_single_task %}
+                <span class="px-1.5 py-0.5 bg-emerald-100 text-emerald-700 text-[10px] rounded font-medium uppercase tracking-wide"
+                    title="Single task — ad-hoc work, not in a project DAG">Single</span>
+                <a href="/single-tasks/{{ task.id }}" class="font-mono text-sm text-blue-600 hover:underline">{{ task.id }}</a>
+                {% else %}
                 <a href="/projects/{{ task.project_id }}" class="font-mono text-sm text-blue-600 hover:underline">{{ task.id }}</a>
+                {% endif %}
                 <span class="font-medium text-gray-800">{{ task.name or '(unnamed)' }}</span>
+                {% if task.is_single_task %}
+                <span class="px-2 py-0.5 bg-gray-100 text-gray-500 text-xs rounded" title="No project context">
+                    —
+                </span>
+                {% else %}
                 <a href="/projects/{{ task.project_id }}" class="px-2 py-0.5 bg-gray-100 text-gray-700 text-xs rounded hover:bg-gray-200" title="{{ task.project_id }}">
                     {{ task.project_name }}
                 </a>
+                {% endif %}
             </div>
             <div class="flex items-center gap-2">
                 <span class="px-2 py-0.5 text-xs font-medium rounded-full border

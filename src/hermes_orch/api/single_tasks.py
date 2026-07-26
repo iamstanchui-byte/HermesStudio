@@ -33,6 +33,14 @@ class SingleTaskCreate(BaseModel):
     """Body for POST /api/single-tasks."""
     name: str = Field(..., min_length=1, max_length=200)
     goal: str = Field("", max_length=2000)
+    # Which agent role to dispatch to (e.g. "win-agent01", "super-b").
+    # Empty string = "any available agent picks it up" (the
+    # supervisor's _assign_task picks the first verified profile
+    # in that case — same as before this field was added).
+    # Per the user-stated model (2026-07-27): semi-tech users
+    # should be able to pick which agent does the work, not just
+    # trust the system.
+    agent_role: str = ""
     # Required capability. Empty string = "any profile can pick this up".
     required_capability: str = ""
     # Where this task came from. Free-form so the code-gen flow
@@ -58,8 +66,12 @@ class SingleTaskOut(BaseModel):
     name: str
     goal: str
     status: str
+    # The role the user asked for. Empty = "any agent" (the
+    # supervisor picks at dispatch time).
+    agent_role: str
     required_capability: str
     assigned_profile_id: str | None
+    assigned_agent_id: str | None
     source: dict[str, Any]
     output_path: str
     result: dict[str, Any] | None
@@ -120,8 +132,10 @@ def _row_to_single_task_out(row: dict[str, Any]) -> SingleTaskOut:
         name=row.get("name") or "",
         goal=goal,
         status=row.get("status") or "pending",
+        agent_role=row.get("agent_role") or "",
         required_capability=row.get("required_capability") or "",
         assigned_profile_id=row.get("assigned_profile_id"),
+        assigned_agent_id=row.get("assigned_agent_id"),
         source=source,
         output_path=row.get("output_path") or "",
         result=result,
@@ -180,7 +194,7 @@ async def create_single_task(body: SingleTaskCreate, request: Request) -> Single
         "id": tid,
         "project_id": SINGLE_TASKS_PROJECT_ID,
         "name": body.name,
-        "agent_role": "",  # supervisor picks; could be set if we know
+        "agent_role": body.agent_role,  # empty = supervisor picks
         "depends_on": "[]",
         "on_parent_failure": "skip",
         "status": "pending",

@@ -34,6 +34,23 @@
                     placeholder="What should this task accomplish?"></textarea>
             </div>
             <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">Agent role</label>
+                <select id="ct-agent-role"
+                    class="w-full border rounded px-2 py-1">
+                    {% if all_profiles %}
+                        <option value="">(any — supervisor picks)</option>
+                        {% for p in all_profiles %}
+                        <option value="{{ p.name }}"{% if loop.first %} selected{% endif %}>{{ p.agent_id }} / {{ p.name }}</option>
+                        {% endfor %}
+                    {% else %}
+                        <option value="" disabled selected>No verified agent profiles yet — register one on the Agents page first</option>
+                    {% endif %}
+                </select>
+                <p class="text-xs text-gray-500 mt-1">
+                    Which agent profile runs this task. Defaults to the first one; pick a specific one to pin.
+                </p>
+            </div>
+            <div>
                 <label class="block text-xs font-medium text-gray-700 mb-1">Required capability</label>
                 <input id="ct-capability" type="text"
                     class="w-full border rounded px-2 py-1"
@@ -161,6 +178,7 @@ async function submitCreate() {
     const body = {
         name: document.getElementById('ct-name').value.trim(),
         goal: document.getElementById('ct-goal').value.trim(),
+        agent_role: document.getElementById('ct-agent-role').value.trim(),
         required_capability: document.getElementById('ct-capability').value.trim(),
         output_path: document.getElementById('ct-output').value.trim(),
         source: source,
