@@ -33,6 +33,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await db.connect()
     app.state.db = db
 
+    # Shared Jinja2 templates. dashboard.py's page routes already
+    # import a module-level instance; expose the same one on
+    # app.state so other routers (single_tasks_pages, etc.) can
+    # render without re-creating it.
+    from hermes_orch.api.dashboard import templates as _jinja_templates
+    app.state.templates = _jinja_templates
+
     # Object Layer foundation (2026-07-26): ensure the virtual
     # __single_tasks__ project row exists so single-task creation
     # never races a lookup. Idempotent — no-op after the first run.
@@ -132,9 +139,12 @@ def create_app() -> FastAPI:
     from hermes_orch.api.contracts import router as contracts_router
     from hermes_orch.api.dashboard import router as dashboard_router
     from hermes_orch.api.objects import router as objects_router
+    from hermes_orch.api.optimize import router as optimize_router
     from hermes_orch.api.projects import router as projects_router
     from hermes_orch.api.schedules import router as schedules_router
     from hermes_orch.api.settings import router as settings_router
+    from hermes_orch.api.single_tasks import router as single_tasks_router
+    from hermes_orch.api.single_tasks_pages import router as single_tasks_pages_router
     from hermes_orch.api.tasks import router as tasks_router
     from hermes_orch.api.workflows import router as workflows_router
 
@@ -143,12 +153,15 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
     app.include_router(contracts_router, prefix="/api/contracts", tags=["contracts"])
     app.include_router(objects_router, prefix="/api/objects", tags=["objects"])
+    app.include_router(optimize_router, prefix="/api/contracts/optimize-tasks", tags=["optimize"])
+    app.include_router(single_tasks_router, prefix="/api/single-tasks", tags=["single-tasks"])
     app.include_router(projects_router, prefix="/api/projects", tags=["projects"])
     app.include_router(schedules_router, prefix="/api/schedules", tags=["schedules"])
     app.include_router(settings_router, prefix="/api/settings", tags=["settings"])
     app.include_router(tasks_router, prefix="/api/tasks", tags=["tasks"])
     app.include_router(workflows_router, tags=["workflows"])
     app.include_router(dashboard_router, tags=["dashboard"])
+    app.include_router(single_tasks_pages_router, tags=["pages"])
 
     return app
 

@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}{{ task.name or task.id }} - Single task{% endblock %}
+{% block content %}
+
+<div class="flex items-center justify-between mb-4">
+    <div>
+        <a href="/single-tasks" class="text-sm text-blue-600 hover:underline">← All single tasks</a>
+        <h1 class="text-2xl font-bold text-gray-800 mt-2">{{ task.name or '(unnamed)' }}</h1>
+        <p class="text-sm text-gray-500 mt-1 font-mono">{{ task.id }}</p>
+    </div>
+    <div>
+        <span class="px-3 py-1 rounded text-sm
+            {% if task.status == 'pending' %}bg-gray-100 text-gray-700
+            {% elif task.status == 'assigned' or task.status == 'running' %}bg-blue-100 text-blue-700
+            {% elif task.status == 'completed' %}bg-green-100 text-green-700
+            {% elif task.status in ('failed', 'cancelled') %}bg-red-100 text-red-700
+            {% else %}bg-gray-100 text-gray-700{% endif %}">
+            {{ task.status }}
+        </span>
+    </div>
+</div>
+
+{% if task.source %}
+<div class="bg-blue-50 border border-blue-200 rounded p-3 mb-4 text-sm">
+    <strong>Kind:</strong> <code>{{ (task.source or {}).get('kind', '—') }}</code>
+    {% if task.source.get('source_task_id') %}
+    · Source task:
+    <a href="/projects/{{ task.source.get('source_project_id', '') }}/visual?focus_task={{ task.source.source_task_id }}"
+       class="text-blue-600 hover:underline font-mono">
+        {{ task.source.source_task_id }}
+    </a>
+    {% endif %}
+    {% if task.source.get('suggested_skill_name') %}
+    · Will register skill: <code class="text-emerald-700">{{ task.source.suggested_skill_name }}</code>
+    {% endif %}
+</div>
+{% endif %}
+
+<div class="grid grid-cols-2 gap-4">
+    <div class="bg-white border rounded p-4 text-sm">
+        <h2 class="text-sm font-semibold text-gray-700 mb-2">Goal</h2>
+        <p class="text-gray-800">{{ task.goal or '(no goal)' }}</p>
+        {% if task.required_capability %}
+        <p class="text-xs text-gray-500 mt-2">Capability: <code>{{ task.required_capability }}</code></p>
+        {% endif %}
+        {% if task.output_path %}
+        <p class="text-xs text-gray-500 mt-1">Output: <code>{{ task.output_path }}</code></p>
+        {% endif %}
+    </div>
+
+    <div class="bg-white border rounded p-4 text-sm">
+        <h2 class="text-sm font-semibold text-gray-700 mb-2">Timing</h2>
+        <p class="text-xs text-gray-600">Created: <code>{{ task.created_at or '—' }}</code></p>
+        <p class="text-xs text-gray-600 mt-1">Started: <code>{{ task.started_at or '—' }}</code></p>
+        <p class="text-xs text-gray-600 mt-1">Ended:   <code>{{ task.ended_at or '—' }}</code></p>
+        {% if task.started_at and task.ended_at %}
+        {% set dur = (task.ended_at|string)[:19] %}
+        <p class="text-xs text-gray-600 mt-1">Took: <code>see started → ended</code></p>
+        {% endif %}
+    </div>
+</div>
+
+{% if task.error %}
+<div class="mt-4 bg-red-50 border border-red-200 rounded p-4">
+    <h2 class="text-sm font-semibold text-red-800 mb-2">Error</h2>
+    <pre class="text-xs text-red-900 whitespace-pre-wrap">{{ task.error }}</pre>
+</div>
+{% endif %}
+
+{% if task.result %}
+<div class="mt-4 bg-white border rounded p-4">
+    <h2 class="text-sm font-semibold text-gray-700 mb-2">Result</h2>
+    <pre class="text-xs text-gray-800 whitespace-pre-wrap bg-gray-50 p-3 rounded">{{ task.result | tojson(indent=2) }}</pre>
+</div>
+{% endif %}
+
+<div class="mt-4 flex gap-2">
+    <a href="/single-tasks" class="px-3 py-1.5 bg-gray-200 text-gray-700 rounded text-sm hover:bg-gray-300">
+        ← Back
+    </a>
+    {% if task.status == 'pending' %}
+    <button onclick="runTask('{{ task.id }}')"
+        class="px-3 py-1.5 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700 font-medium">
+        ▶ Run
+    </button>
+    {% endif %}
+</div>
+
+<script>
+async function runTask(taskId) {
+    if (!confirm('Run this single task now? The supervisor will pick it up on the next tick.')) return;
+    try {
+        const r = await _fetchWithTimeout('/api/tasks/' + taskId + '/start', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+        }, 10000);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            alert('Failed: ' + _errDetailToString(d.detail, r.status));
+            return;
+        }
+        location.reload();
+    } catch (e) {
+        alert('Network error: ' + e.message);
+    }
+}
+</script>
+
+{% endblock %}

@@ -1,0 +1,90 @@
+feat(commit 3): single task section + code-gen flow
+
+Per the user-stated model (2026-07-26): "用orch server chatbox LLM
+分析流程, project 中哪些task 是可以用script 去做, 不用LLM 浪費token,
+如果user confirm 可行, 就叫agent 寫code, 將這個code 也register
+做object, 之後可以係task 上掛上".
+
+This commit ships the LLM-analysis half + the "spawn single task
+to write the script" half. The agent's "register the new Skill"
+half is out of scope (the agent that picks up the single task
+will follow the standard task contract — if it produces a
+SKILL.md body, the wrapper flow will register it; the explicit
+single-task -> Skill auto-registration can come later).
+
+What ships:
+
+  1. api/single_tasks.py — the Single Tasks API:
+       POST /api/single-tasks             (create, forces is_single_task=1)
+       GET  /api/single-tasks             (list, newest first; ?status= filter)
+       GET  /api/single-tasks/{id}        (404 for non-single or missing)
+     Single tasks live in the virtual __single_tasks__ project.
+     Same status machine as project tasks (pending → assigned →
+     running → completed/failed). Reuses /api/tasks/{id}/{start,
+     result, retry} endpoints.
+
+  2. api/optimize.py — the LLM analyze endpoint:
+       POST /api/contracts/optimize-tasks  (analyze a project, return
+                                            suggestions for deterministic
+                                            script candidates)
+     Each suggestion: {task_id, task_name, rationale,
+     suggested_skill_name, confidence}. LLM is called via the
+     shared LLMCaller. Output is validated against Pydantic
+     OptimizeSuggestions; failures surface as 502.
+     Mock mode (no api_key) returns a stub suggestion for the
+     first task so the UI has something to render.
+
+  3. api/single_tasks_pages.py + templates/single_tasks.html +
+     templates/single_task_detail.html:
+       GET /single-tasks           — list page with "+ Create" form
+       GET /single-tasks/{id}      — detail page with status, goal,
+                                     result, error
+     The nav has a new "Single tasks" link (emerald accent so it
+     stands out from the blue project nav).
+
+  4. templates/project.html — 🧠 Optimize button in the chatbox:
+       - Click → POST /api/contracts/optimize-tasks with the
+         project_id
+       - Renders suggestions as emerald cards in the chat panel
+         (rationale + confidence + "Generate" button)
+       - Click "Generate" → POST /api/single-tasks with
+         source={kind: "code_gen", source_task_id, source_project_id,
+         suggested_skill_name}. The single task is then picked up by
+         the supervisor and dispatched to an agent.
+
+  5. main.py: register the new routers + expose shared Jinja
+     templates on app.state so other routers can render.
+
+  6. tests/test_single_tasks.py — 9 tests (virtual project exists,
+     create / list / get, source field round-trip, 404 for project
+     tasks, status filter).
+     tests/test_optimize.py — 5 tests (200 with suggestions,
+     404 for missing project, empty project handling, generated_at
+     timestamp, 422 for missing project_id).
+     Total: 60 passed, 2 skipped (LLM variance, skipped on real-mode
+     non-conforming LLM output).
+
+  7. scripts/_smoke-single-tasks.py + scripts/_smoke-optimize.py:
+     end-to-end smoke tests for the two new APIs.
+     scripts/_e2e-single-tasks.py: Playwright e2e for the UI
+     (list page, create form, detail page navigation).
+
+Pattern catalog #115 — code-gen as a single task:
+  The LLM analyze step is a pure read (POST + structured output).
+  The user's "Generate" action is a separate POST that creates a
+  single task with source={kind: "code_gen", ...}. The single
+  task is then dispatched to an agent like any other task. This
+  decouples "LLM suggests" from "agent writes" — the LLM is the
+  planner, the agent is the implementer. If the LLM suggests
+  something and the agent can't write it, the single task fails
+  and the user can either fix the suggestion or write the
+  script themselves.
+
+What this commit does NOT touch (deferred):
+  - Automatic Skill registration on single-task completion (the
+    agent's wrapper can do this as a regular SKILL.md upload;
+    we don't need a special path for "code_gen" tasks).
+  - Task history filter toggle on /tasks (single tasks already
+    show up in /single-tasks; the history page is unchanged).
+  - 4 stub contracts (route/judge/repair/audit) still need LLM
+    tuning + UI before they're useful in real flows.

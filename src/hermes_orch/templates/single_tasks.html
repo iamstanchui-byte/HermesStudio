@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}Single tasks - Hermes Orchestrator{% endblock %}
+{% block content %}
+
+<div class="flex items-center justify-between mb-4">
+    <div>
+        <h1 class="text-2xl font-bold text-gray-800">Single tasks</h1>
+        <p class="text-sm text-gray-500 mt-1">
+            One-off tasks not tied to any project. Use for ad-hoc summarize,
+            code-gen, or any work that doesn't need a project context.
+        </p>
+    </div>
+    <button onclick="showCreateForm()"
+        class="px-3 py-1.5 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700 font-medium">
+        + Create single task
+    </button>
+</div>
+
+<!-- Create form (hidden by default, toggled by showCreateForm) -->
+<div id="create-form" class="hidden mb-4 bg-white border rounded-lg p-4 shadow-sm">
+    <h2 class="text-lg font-semibold text-gray-800 mb-3">New single task</h2>
+    <form id="create-single-task-form" onsubmit="event.preventDefault(); submitCreate();">
+        <div class="grid grid-cols-2 gap-3 text-sm">
+            <div class="col-span-2">
+                <label class="block text-xs font-medium text-gray-700 mb-1">Name *</label>
+                <input id="ct-name" type="text" required maxlength="200"
+                    class="w-full border rounded px-2 py-1"
+                    placeholder="e.g. summarize today's news">
+            </div>
+            <div class="col-span-2">
+                <label class="block text-xs font-medium text-gray-700 mb-1">Goal</label>
+                <textarea id="ct-goal" rows="2" maxlength="2000"
+                    class="w-full border rounded px-2 py-1"
+                    placeholder="What should this task accomplish?"></textarea>
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">Required capability</label>
+                <input id="ct-capability" type="text"
+                    class="w-full border rounded px-2 py-1"
+                    placeholder="(optional) e.g. summarize, translate">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">Output path</label>
+                <input id="ct-output" type="text"
+                    class="w-full border rounded px-2 py-1"
+                    placeholder="(optional) e.g. ./report.md">
+            </div>
+            <div class="col-span-2">
+                <label class="block text-xs font-medium text-gray-700 mb-1">Source (free-form, JSON)</label>
+                <textarea id="ct-source" rows="2"
+                    class="w-full border rounded px-2 py-1 font-mono text-xs"
+                    placeholder='{"kind": "ad_hoc", "note": "..."}'></textarea>
+                <p class="text-xs text-gray-500 mt-1">
+                    Used to tag the task (e.g. <code>{"kind": "code_gen", "source_task_id": "..."}</code>).
+                    Leave blank for ad-hoc tasks.
+                </p>
+            </div>
+        </div>
+        <div class="mt-3 flex gap-2">
+            <button type="submit" id="ct-submit"
+                class="px-3 py-1.5 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700 font-medium">
+                Create + Run
+            </button>
+            <button type="button" onclick="hideCreateForm()"
+                class="px-3 py-1.5 bg-gray-200 text-gray-700 rounded text-sm hover:bg-gray-300">
+                Cancel
+            </button>
+        </div>
+        <div id="ct-error" class="hidden mt-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded p-2"></div>
+    </form>
+</div>
+
+<!-- List of existing single tasks -->
+{% if tasks %}
+<div class="bg-white border rounded-lg shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+        <thead class="bg-gray-50 border-b">
+            <tr>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Name</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Status</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Kind</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Goal</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Created</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Result</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for t in tasks %}
+            <tr class="border-b last:border-0 hover:bg-gray-50">
+                <td class="px-3 py-2">
+                    <a href="/single-tasks/{{ t.id }}" class="text-blue-600 hover:underline font-mono">
+                        {{ t.name or t.id }}
+                    </a>
+                </td>
+                <td class="px-3 py-2">
+                    <span class="px-2 py-0.5 rounded text-xs
+                        {% if t.status == 'pending' %}bg-gray-100 text-gray-700
+                        {% elif t.status == 'assigned' or t.status == 'running' %}bg-blue-100 text-blue-700
+                        {% elif t.status == 'completed' %}bg-green-100 text-green-700
+                        {% elif t.status == 'failed' or t.status == 'cancelled' %}bg-red-100 text-red-700
+                        {% else %}bg-gray-100 text-gray-700{% endif %}">
+                        {{ t.status }}
+                    </span>
+                </td>
+                <td class="px-3 py-2 text-xs text-gray-600">
+                    {{ (t.source or {}).get('kind', '—') }}
+                </td>
+                <td class="px-3 py-2 text-gray-700 max-w-md truncate" title="{{ t.goal or '' }}">
+                    {{ t.goal or '(no goal)' }}
+                </td>
+                <td class="px-3 py-2 text-xs text-gray-500">
+                    {{ (t.created_at or '')[:19] }}
+                </td>
+                <td class="px-3 py-2 text-xs text-gray-600">
+                    {% if t.has_error %}
+                    <span class="text-red-700">error</span>
+                    {% elif t.has_result %}
+                    <span class="text-green-700">ok</span>
+                    {% else %}—{% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="bg-white border rounded-lg p-8 text-center text-gray-500">
+    <p class="text-sm">No single tasks yet.</p>
+    <p class="text-xs mt-2">
+        Click <strong>+ Create single task</strong> above to start one.
+        For example: "summarize this URL", "extract table from this PDF",
+        or trigger a code-gen flow from a project's chatbox.
+    </p>
+</div>
+{% endif %}
+
+<script>
+function showCreateForm() {
+    document.getElementById('create-form').classList.remove('hidden');
+    document.getElementById('ct-name').focus();
+}
+function hideCreateForm() {
+    document.getElementById('create-form').classList.add('hidden');
+    document.getElementById('ct-error').classList.add('hidden');
+}
+function _showError(msg) {
+    const el = document.getElementById('ct-error');
+    el.textContent = msg;
+    el.classList.remove('hidden');
+}
+async function submitCreate() {
+    const btn = document.getElementById('ct-submit');
+    btn.disabled = true; btn.textContent = '... Creating';
+    _showError('');  // clear
+    let source = {};
+    const srcRaw = document.getElementById('ct-source').value.trim();
+    if (srcRaw) {
+        try { source = JSON.parse(srcRaw); }
+        catch (e) { _showError('Source must be valid JSON: ' + e.message); btn.disabled = false; btn.textContent = 'Create + Run'; return; }
+    }
+    const body = {
+        name: document.getElementById('ct-name').value.trim(),
+        goal: document.getElementById('ct-goal').value.trim(),
+        required_capability: document.getElementById('ct-capability').value.trim(),
+        output_path: document.getElementById('ct-output').value.trim(),
+        source: source,
+    };
+    try {
+        const r = await _fetchWithTimeout('/api/single-tasks', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+        }, 15000);
+        const d = await r.json();
+        if (!r.ok) {
+            _showError(_errDetailToString(d.detail, r.status));
+            btn.disabled = false; btn.textContent = 'Create + Run';
+            return;
+        }
+        // Reload to show the new task
+        location.href = '/single-tasks/' + d.id;
+    } catch (e) {
+        _showError('Network error: ' + e.message);
+        btn.disabled = false; btn.textContent = 'Create + Run';
+    }
+}
+</script>
+
+{% endblock %}

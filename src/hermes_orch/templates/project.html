@@ -2040,6 +2040,16 @@ async function submitApplyWorkflow() {
                 <button id="chat-send-btn" onclick="sendChatMessage()" disabled
                     class="flex-1 px-3 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
                     title="Send (Enter)">Send</button>
+                {# Object Layer commit 3 (2026-07-27): code-gen flow entry.
+                   LLM analyzes the project and suggests which tasks are
+                   good candidates for being replaced by a deterministic
+                   script. Each suggestion is a click-to-create single
+                   task that will be dispatched to an agent. #}
+                <button id="chat-optimize-btn" onclick="runOptimizeTasks()"
+                    class="flex-1 px-3 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="🧠 Analyze & optimize: ask the LLM which tasks could be replaced by deterministic scripts">
+                    🧠 Optimize
+                </button>
                 <button onclick="toggleChatPanel()"
                     class="text-xs text-gray-500 hover:text-gray-800 px-2 py-1"
                     title="Close panel">Close ✕</button>
@@ -2261,9 +2271,115 @@ function renderSuggestion(s, idx, messageId) {
     </div>`;
 }
 
+// Object Layer commit 3 (2026-07-27): 🧠 Optimize button handler.
+// Calls POST /api/contracts/optimize-tasks with the project id, then
+// renders the suggestions inline in the chat panel as a list of
+// "create single task" buttons. The user can click one to spawn a
+// single task that will be dispatched to an agent (which writes the
+// script and registers it as a new Skill in the Object Layer).
+async function runOptimizeTasks() {
+    const btn = document.getElementById('chat-optimize-btn');
+    btn.disabled = true; btn.textContent = '... Analyzing';
+    const statusEl = document.getElementById('chat-status');
+    if (statusEl) statusEl.textContent = 'Analyzing project tasks...';
+    try {
+        const r = await _fetchWithTimeout('/api/contracts/optimize-tasks', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({project_id: PROJECT_ID}),
+        }, 60000);
+        const d = await r.json();
+        if (!r.ok) {
+            const errMsg = _errDetailToString(d.detail, r.status);
+            appendChatElement(renderChatMessage({role: 'assistant', content: '❌ Optimize failed: ' + errMsg}));
+            return;
+        }
+        // Render suggestions
+        if (!d.suggestions || d.suggestions.length === 0) {
+            appendChatElement(renderChatMessage({role: 'assistant',
+                content: `No deterministic candidates found. Analyzed ${d.task_count_analyzed} task(s). ${d.overall_notes || ''}`}));
+            return;
+        }
+        // Append a special "optimize" message with suggestion cards
+        const card = document.createElement('div');
+        card.className = 'bg-emerald-50 border border-emerald-200 rounded p-3 text-sm space-y-2';
+        let html = `<div class="font-semibold text-emerald-800">🧠 ${d.suggestions.length} deterministic candidate${d.suggestions.length === 1 ? '' : 's'}</div>`;
+        if (d.overall_notes) {
+            html += `<div class="text-xs text-emerald-700">${escapeHtml(d.overall_notes)}</div>`;
+        }
+        for (const s of d.suggestions) {
+            const sid = encodeURIComponent(s.task_id);
+            const skillName = encodeURIComponent(s.suggested_skill_name || ('auto-skill-' + s.task_id));
+            const conf = Math.round((s.confidence || 0) * 100);
+            html += `<div class="bg-white border border-emerald-200 rounded p-2 text-xs space-y-1">
+                <div class="font-medium text-gray-800">${escapeHtml(s.task_name)} <span class="text-emerald-600">(${conf}%)</span></div>
+                <div class="text-gray-600">${escapeHtml(s.rationale || '')}</div>
+                <div class="flex items-center justify-between gap-2">
+                    <span class="font-mono text-gray-500">→ ${escapeHtml(s.suggested_skill_name || '')}</span>
+                    <button onclick="createCodeGenTask('${sid}', '${skillName}', this)"
+                        class="px-2 py-0.5 bg-emerald-600 text-white rounded text-xs hover:bg-emerald-700 font-medium">
+                        Generate
+                    </button>
+                </div>
+            </div>`;
+        }
+        card.innerHTML = html;
+        appendChatElement(card);
+    } catch (e) {
+        appendChatElement(renderChatMessage({role: 'assistant', content: '❌ Network error: ' + e.message}));
+    } finally {
+        btn.disabled = false; btn.textContent = '🧠 Optimize';
+        if (statusEl) statusEl.textContent = '';
+    }
+}
+
+// Spawn a single task for code-gen based on a suggestion
+async function createCodeGenTask(sourceTaskId, suggestedSkillName, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = '... Creating'; }
+    try {
+        const r = await _fetchWithTimeout('/api/single-tasks', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                name: `Generate script: ${decodeURIComponent(suggestedSkillName)}`,
+                goal: `Write a deterministic script that replaces the project task ${sourceTaskId}. Save the script to a Skill in the Object Layer so future runs can use it.`,
+                required_capability: 'code_gen',
+                source: {
+                    kind: 'code_gen',
+                    source_task_id: sourceTaskId,
+                    source_project_id: PROJECT_ID,
+                    suggested_skill_name: decodeURIComponent(suggestedSkillName),
+                },
+            }),
+        }, 15000);
+        const d = await r.json();
+        if (!r.ok) {
+            alert('Failed: ' + _errDetailToString(d.detail, r.status));
+            if (btn) { btn.disabled = false; btn.textContent = 'Generate'; }
+            return;
+        }
+        if (btn) { btn.textContent = '✓ Created'; }
+        // Render as a markdown-ish assistant message (renderChatMessage
+        // doesn't support inline HTML, so use plain text + a link line)
+        appendChatElement(renderChatMessage({role: 'assistant',
+            content: `✅ Single task created. The supervisor will pick it up on the next tick. View at /single-tasks/${d.id} — the agent will write the script and (per the spec) register it as a Skill in the Object Layer.`}));
+    } catch (e) {
+        alert('Network error: ' + e.message);
+        if (btn) { btn.disabled = false; btn.textContent = 'Generate'; }
+    }
+}
+
+function appendChatElement(el) {
+    const wrap = document.getElementById('chat-messages');
+    if (!wrap) return;
+    // Remove the empty-state placeholder if present
+    const placeholder = wrap.querySelector('.italic.py-8');
+    if (placeholder) placeholder.remove();
+    wrap.appendChild(el);
+    wrap.scrollTop = wrap.scrollHeight;
+}
+
 async function sendChatMessage() {
-    const input = document.getElementById('chat-input');
-    const text = input.value.trim();
     if (!text) return;
     const sendBtn = document.getElementById('chat-send-btn');
     const status = document.getElementById('chat-status');
