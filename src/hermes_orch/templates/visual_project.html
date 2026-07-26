@@ -205,6 +205,39 @@ svg.connection.output_2 path {
     font-size: 12px;
     margin-bottom: 12px;
 }
+/* Stage 4: stale-updates banner. Shown when polling detects new
+   data but the user is interacting (side panel open or edit form
+   has unsaved input). User decides when to lose their state. */
+.vp-stale-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    margin-bottom: 12px;
+    background: #fef3c7;
+    border: 1px solid #fbbf24;
+    border-radius: 6px;
+    font-size: 13px;
+    color: #78350f;
+}
+.vp-stale-icon { font-size: 16px; }
+.vp-stale-text { flex: 1; }
+.vp-stale-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: 4px;
+    border: 1px solid #d97706;
+    background: #fff;
+    color: #92400e;
+    cursor: pointer;
+}
+.vp-stale-btn:hover { background: #fde68a; }
+.vp-stale-btn-dismiss {
+    border-color: #d1d5db;
+    color: #6b7280;
+}
+.vp-stale-btn-dismiss:hover { background: #f3f4f6; }
 .vp-empty {
     text-align: center;
     padding: 60px 20px;
@@ -497,9 +530,27 @@ svg.connection.output_2 path {
         <strong>clone chain</strong> to re-run a task and all downstream
         tasks as fresh new tasks (old ones are archived for comparison),
         or edit/delete the task structure.
-        Stage 3.5 is the editable plan builder. Stage 4 will add
-        live polling + tab switcher.
+        Stage 3.5 is the editable plan builder. Stage 4 ships the
+        background poller (no auto-reload) — task status changes
+        from the wrapper are picked up live; if you're mid-edit, a
+        banner tells you N updates are pending so you can decide
+        when to refresh.
         <a href="/projects/{{ project.id }}" class="underline">Switch to text view</a> for the full task list.
+    </div>
+
+    {# Stage 4: stale-updates banner. Shown when background polling
+       detects new data but can't auto-re-render because the user is
+       interacting (side panel open or edit form has unsaved input).
+       The user can click "Refresh now" to force a full reload, or
+       "Dismiss" to hide the banner (poll will resume re-rendering
+       once they close the panel / finish editing). #}
+    <div id="vp-stale-banner" class="vp-stale-banner" style="display: none;" role="status">
+        <span class="vp-stale-icon">🔔</span>
+        <span class="vp-stale-text">
+            <span class="vp-stale-count">0</span> update(s) pending
+        </span>
+        <button type="button" class="vp-stale-btn" onclick="vpForceRefresh()">Refresh now</button>
+        <button type="button" class="vp-stale-btn vp-stale-btn-dismiss" onclick="vpHideStaleBanner()">Dismiss</button>
     </div>
 
     {% if not tasks %}
@@ -901,6 +952,13 @@ function vpOpenPanel(taskId) {
     const body = document.getElementById('vp-sp-body');
     const footer = document.getElementById('vp-sp-footer');
 
+    // Stage 4: a fresh panel render means the edit form fields
+    // are pristine (from server). Clear the dirty flag so polling
+    // can resume auto-rendering. If the user then types, the
+    // input/change listener flips it back to true.
+    _vpEditDirty = false;
+    _vpHideStaleBanner();
+
     // Phase 4 Stage 3.5 (2026-07-26): if taskId is the
     // literal string '__NEW__', we're creating a new task.
     // Show the edit form in "new" mode.
@@ -1225,6 +1283,12 @@ async function vpCardDelete(ev, taskId) {
 
 function vpClosePanel() {
     document.getElementById('vp-side-panel').classList.add('hidden');
+    // Stage 4: panel closed → no more interaction state. Clear
+    // the dirty flag and stale counter. The next poll tick will
+    // pick up any updates and re-render in place.
+    _vpEditDirty = false;
+    _vpStaleCount = 0;
+    _vpHideStaleBanner();
 }
 
 document.addEventListener('keydown', function(ev) {
@@ -1366,6 +1430,7 @@ function _vpBootstrap() {
     }
     _vpInit();
     _vpBindClickHandlers();
+    _vpStartPolling();
 }
 
 if (document.readyState === 'loading') {
@@ -1374,7 +1439,160 @@ if (document.readyState === 'loading') {
     _vpBootstrap();
 }
 
-// Stage 4 will replace this with incremental re-render.
-setTimeout(function() { location.reload(); }, 30000);
+// ===== Stage 4: background poller (replaces brute-force reload) =====
+//
+// Previous behavior: every 30s, hard-reload the page via
+// `location.reload()`. Lost any unsaved edit form input, lost
+// scroll position, lost the open side panel, and made the page
+// flash every half minute.
+//
+// New behavior: every 3s, fetch /api/tasks/ and compute a compact
+// content hash. If unchanged → no-op. If changed AND the user is
+// NOT actively interacting → re-render the canvas in place (preserving
+// scroll position). If changed AND the user IS interacting (side
+// panel open OR edit form has unsaved input) → show a banner with
+// a "Refresh now" button. The user explicitly opts into losing
+// their state.
+//
+// State to preserve across re-renders:
+//   - scrollY (saved before, restored after)
+//   - open side panel task id (re-open if still in new data)
+//   - edit form draft (NEVER re-render the form mid-edit — we just
+//     show the banner and let the user finish)
+//
+// Why a 3s interval: cheap enough that the user sees updates within
+// a few seconds, but not so cheap that we hammer the API. At 3s and
+// a 50-task project, that's ~16 req/min — well within a localhost
+// server's capacity.
+
+// Last successful content hash. null = "never computed yet".
+let _vpLastDataHash = null;
+// How many ticks have we seen new data while unable to re-render?
+// Drives the "(N) update(s) pending" count in the banner.
+let _vpStaleCount = 0;
+// True when the user has typed in the edit form. Set on input
+// event, cleared on save success or panel close / fresh open.
+let _vpEditDirty = false;
+
+function _vpComputeHash(tasks) {
+    // Compact, stable hash: id|status|updated_at joined. Status
+    // changes (running→completed) bump the hash. updated_at catches
+    // other mutations (e.g. retry_count bump). We don't hash
+    // result/error/tokens content — re-rendering the canvas just
+    // because a wrapper ticked up the token counter would be too
+    // aggressive. The side panel will pick up rich data on its own
+    // when the user re-opens it.
+    return tasks
+        .map(t => `${t.id}:${t.status}:${t.updated_at || ''}`)
+        .join('|');
+}
+
+function _vpIndexById(tasks) {
+    // Convert API array -> {id: task} dict (matches _VP_DATA.tasks
+    // shape). We can't use Object.fromEntries because we need to
+    // defend against duplicate id collisions (shouldn't happen but
+    // be safe).
+    const out = {};
+    for (const t of tasks) {
+        if (t && t.id) out[t.id] = t;
+    }
+    return out;
+}
+
+async function _vpPollOnce() {
+    if (!_VP_DATA || !_VP_DATA.project || !_VP_DATA.project.id) return;
+    // Skip when the user is mid-interaction: edit form dirty OR
+    // side panel is open. Both can lose state if we re-render
+    // underneath them. The side panel is technically read-only
+    // most of the time, but re-rendering would reset its scroll
+    // position, so the cleaner rule is "don't disrupt anything
+    // the user can see".
+    const panel = document.getElementById('vp-side-panel');
+    const panelOpen = panel && !panel.classList.contains('hidden');
+    if (_vpEditDirty || panelOpen) {
+        _vpStaleCount++;
+        _vpShowStaleBanner();
+        return;
+    }
+    try {
+        const r = await fetch(
+            `/api/tasks/?project_id=${encodeURIComponent(_VP_DATA.project.id)}&include_archived=false`,
+            { headers: { 'Accept': 'application/json' } }
+        );
+        if (!r.ok) return;  // silent: next tick will retry
+        const d = await r.json();
+        const tasks = d.tasks || d || [];
+        const h = _vpComputeHash(tasks);
+        if (h === _vpLastDataHash) return;  // no change
+        _vpLastDataHash = h;
+        // Preserve scroll position across re-render
+        const scrollY = window.scrollY;
+        // Update data + re-render
+        _VP_DATA.tasks = _vpIndexById(tasks);
+        _vpInit();
+        window.scrollTo(0, scrollY);
+        // If a side panel was open and the task it pointed at still
+        // exists, re-open it. (Unlikely if we got past the panelOpen
+        // guard, but cheap to check.)
+        _vpStaleCount = 0;
+        _vpHideStaleBanner();
+    } catch (e) {
+        // Silent: network blip, retry next tick
+    }
+}
+
+function _vpStartPolling() {
+    // Compute initial hash from the embedded data so the first
+    // poll doesn't re-render for the same data we just rendered
+    // server-side.
+    if (_VP_DATA && _VP_DATA.tasks) {
+        const tasks = Object.values(_VP_DATA.tasks);
+        _vpLastDataHash = _vpComputeHash(tasks);
+    }
+    setInterval(_vpPollOnce, 3000);
+}
+
+function _vpShowStaleBanner() {
+    const b = document.getElementById('vp-stale-banner');
+    if (!b) return;
+    b.style.display = 'flex';
+    const c = b.querySelector('.vp-stale-count');
+    if (c) c.textContent = String(_vpStaleCount);
+}
+
+function _vpHideStaleBanner() {
+    const b = document.getElementById('vp-stale-banner');
+    if (!b) return;
+    b.style.display = 'none';
+    _vpStaleCount = 0;
+}
+
+// User clicks "Refresh now" — full page reload. They explicitly
+// chose to lose any in-progress state. This is the ONLY way the
+// page ever reloads now (along with explicit user actions like
+// Save / Delete / Clone-chain which already reload).
+function vpForceRefresh() {
+    location.reload();
+}
+
+// Hook the side panel's input/textarea/select so we know when the
+// user is mid-edit. Bound once after first open (the panel element
+// is static — only its innerHTML changes).
+function _vpBindEditDirtyTracking() {
+    const panel = document.getElementById('vp-side-panel');
+    if (!panel || panel._vpDirtyBound) return;
+    panel._vpDirtyBound = true;
+    panel.addEventListener('input', (ev) => {
+        if (ev.target && ev.target.matches('input, textarea, select')) {
+            _vpEditDirty = true;
+        }
+    });
+    panel.addEventListener('change', (ev) => {
+        if (ev.target && ev.target.matches('input, textarea, select')) {
+            _vpEditDirty = true;
+        }
+    });
+}
+_vpBindEditDirtyTracking();
 </script>
 {% endblock %}
