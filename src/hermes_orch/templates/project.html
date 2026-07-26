@@ -110,18 +110,21 @@
                         title="Re-trigger the LLM planner: set/update the project goal and configure iter-loop settings. Existing pending tasks are kept unless you also tick 'clear tasks'. After planning, the project stays in 'planned' state — click Run to start dispatch.">
                         ✨ Generate plan
                     </button>
-                    {# Phase 4+ (2026-07-25): explicit Run button. Only shown
-                       when state='planned' (or 'planning' for queued plans
-                       with cleared_tasks — user can pre-trigger Run to skip
-                       the wait). On click: state=planned -> ready, supervisor
-                       picks up on next tick. Idempotent on 'ready'/'running'. #}
-                    {% if project.state in ('planned', 'planning') %}
+                    {# Phase 4+ (2026-07-25): explicit Run button. Originally
+                       only shown when state='planned' (or 'planning') so
+                       the user has to opt-in to dispatch. User feedback
+                       (2026-07-26): "Run button 要長在, 現在時出見時不見"
+                       — the button flashing in/out by state is confusing.
+                       Now always visible. The server's /run endpoint is
+                       idempotent: noop on ready/running, error on
+                       terminal states, dispatch on planned/planning. The
+                       tooltip + the JS runProject() confirm flow explain
+                       what each state will do. #}
                     <button onclick="runProject('{{ project.id }}')"
                         class="px-3 py-1.5 text-xs font-bold rounded border-2 border-green-500 text-green-700 hover:bg-green-50"
-                        title="Start dispatch: transitions project from 'planned' to 'ready'. Supervisor's next tick (within ~5s) will pick up pending tasks. Requires at least one task — add manually or via Generate plan first.">
+                        title="Start dispatch: transitions project from 'planned' to 'ready'. Supervisor's next tick (within ~5s) will pick up pending tasks. Idempotent on ready/running (no-op); errors out on terminal states (completed/failed/cancelled). Requires at least one task.">
                         ▶️ Run
                     </button>
-                    {% endif %}
                 </div>
                 <div class="flex gap-1.5 flex-wrap justify-end">
                     {% if project.state == 'archived' %}
@@ -205,47 +208,6 @@
             <input type="hidden" id="replan-deliverable" value="{{ project.deliverable_path or '' }}">
         </div>
     </div>
-</div>
-
-<!-- Workflow procedure (Path A, #22) — n8n-style "how to do this workflow"
-     markdown. The agent reads this before executing each task. For
-     recurring templates, this file is copied to the clone so the new
-     cycle has the same procedure without redefining it.
-     Phase 4+ (2026-07-25): the Auto-generate + Edit buttons are
-     HIDDEN per user direction. The procedure.md is still loaded
-     (read-only), but the LLM-driven auto-generation and inline edit
-     are deferred. Users who need to write procedure.md can still use
-     the file API (PUT /api/projects/{id}/files/procedure.md) directly. -->
-<div class="bg-white border rounded-lg p-4 mb-4 shadow-sm">
-    <div class="flex items-center justify-between mb-2">
-        <h2 class="text-base font-semibold text-gray-800">
-            Workflow procedure
-            <span class="text-xs text-gray-500 font-normal">(read by the agent before each task · read-only for now)</span>
-        </h2>
-        {% if false %}
-        <div class="flex items-center gap-2">
-            <button id="proc-autogen-btn" onclick="autoGenerateProcedure()" class="text-xs px-2 py-1 bg-purple-50 text-purple-700 rounded border border-purple-300 hover:bg-purple-100"
-                title="Ask the LLM to write procedure.md from this project's tasks + facts">
-                ✨ Auto-generate
-            </button>
-            <button id="proc-edit-btn" onclick="toggleProcEdit()" class="text-xs px-2 py-1 bg-gray-50 text-gray-700 rounded border border-gray-300 hover:bg-gray-100">
-                Edit
-            </button>
-        </div>
-        {% endif %}
-    </div>
-    <div id="proc-view" class="text-sm text-gray-700 prose-sm max-w-none">
-        <div id="proc-content" class="text-xs text-gray-500 italic">Loading...</div>
-    </div>
-    <form id="proc-edit-form" class="hidden mt-2" onsubmit="saveProcedure(event)">
-        <textarea id="proc-textarea" class="block w-full border rounded px-3 py-2 text-sm font-mono" rows="10"
-            placeholder="# Procedure (markdown)&#10;&#10;## Step 1: fetch data&#10;...&#10;&#10;## Step 2: compose report&#10;..."></textarea>
-        <div class="mt-2 flex items-center gap-2">
-            <button type="submit" class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Save procedure</button>
-            <button type="button" onclick="toggleProcEdit()" class="px-3 py-1.5 bg-gray-200 text-gray-700 rounded text-sm hover:bg-gray-300">Cancel</button>
-            <span id="proc-msg" class="text-xs"></span>
-        </div>
-    </form>
 </div>
 
 {# Phase 2 Q6 — Iterations tab (2026-07-25). Read-only display of the
@@ -408,148 +370,6 @@
         <span id="form-status" class="text-sm text-gray-500"></span>
     </div>
 </form>
-
-{# Task history: old versions of tasks in this project, kept (archived=1)
-   after Clone chain actions. Hidden by default to keep the page clean.
-   A simple table is enough — operators can compare before/after
-   without needing a full drawflow canvas. The audit log keeps the
-   full id_map of which old ID maps to which new ID.
-   User feedback (2026-07-26): this section was previously in the
-   visual view's show_archived toggle, but that page returned
-   "internal server error". The text view is the simpler home for
-   this and matches the operator's read-only intent (compare, don't
-   interact). #}
-{% if archived_count > 0 %}
-<div class="mb-4 bg-white border rounded-lg p-4 shadow-sm">
-    <div class="flex items-center justify-between mb-2">
-        <div>
-            <h2 class="text-sm font-semibold text-gray-700">
-                📜 Task history
-            </h2>
-            <p class="text-xs text-gray-500 mt-0.5">
-                Older versions of tasks. Created by prior <strong>Clone chain</strong>
-                actions. The audit log keeps the full id_map of which old ID
-                maps to which new ID.
-            </p>
-        </div>
-        <a href="/projects/{{ project.id }}{% if show_archived %}{% else %}?show_archived=1{% endif %}"
-            class="px-3 py-1 text-xs rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
-            title="{% if show_archived %}Hide archived tasks{% else %}Show archived tasks (older versions of the same chain, useful for before/after comparison){% endif %}">
-            {% if show_archived %}👁️‍🗨️ Hide ({{ archived_count }}){% else %}👁️ Show ({{ archived_count }}){% endif %}
-        </a>
-    </div>
-    {% if show_archived and archived_tasks %}
-    <div class="flex items-center justify-end mb-2">
-        <button id="hist-collapse-all-btn" onclick="collapseHistResults()"
-            class="px-3 py-1 text-xs rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
-            title="Close all open archived result panels at once">Collapse all</button>
-    </div>
-    <div class="bg-white border border-gray-200 rounded overflow-x-auto">
-        <table class="w-full text-xs">
-            <thead class="bg-gray-50 text-gray-600 text-left">
-                <tr>
-                    <th class="px-3 py-2 font-medium">Name</th>
-                    <th class="px-3 py-2 font-medium">Role</th>
-                    <th class="px-3 py-2 font-medium">Action</th>
-                    <th class="px-3 py-2 font-medium">Status (when archived)</th>
-                    <th class="px-3 py-2 font-medium">Archived at</th>
-                    <th class="px-3 py-2 font-medium">Old ID</th>
-                    <th class="px-3 py-2 font-medium w-20">Result</th>
-                </tr>
-            </thead>
-            <tbody>
-                {%- for t in archived_tasks %}
-                {%- set has_result = t.result and (t.result.summary or t.result.session_id or t.result.error or t.result.artifacts) %}
-                {%- set has_error = t.error %}
-                <tr class="border-t border-gray-100 text-gray-500">
-                    <td class="px-3 py-2 font-medium text-gray-700">{{ t.name or '—' }}</td>
-                    <td class="px-3 py-2 font-mono">{{ t.agent_role or '?' }}</td>
-                    <td class="px-3 py-2 font-mono">{{ t.action or '?' }}</td>
-                    <td class="px-3 py-2">
-                        <span class="px-1.5 py-0.5 rounded text-[10px]
-                            {% if t.status == 'completed' %}bg-green-100 text-green-800
-                            {% elif t.status == 'failed' %}bg-red-100 text-red-800
-                            {% elif t.status == 'running' %}bg-yellow-100 text-yellow-800
-                            {% else %}bg-gray-100 text-gray-700{% endif %}">
-                            {{ t.status or '?' }}
-                        </span>
-                    </td>
-                    <td class="px-3 py-2 whitespace-nowrap text-gray-400">
-                        {{ (t.archived_at or t.created_at)[:19] if (t.archived_at or t.created_at) else '—' }}
-                    </td>
-                    <td class="px-3 py-2 font-mono text-[10px] text-gray-400">
-                        {{ t.id[:16] }}{% if t.id|length > 16 %}…{% endif %}
-                    </td>
-                    <td class="px-3 py-2 whitespace-nowrap">
-                        {%- if has_result %}
-                        <button onclick="toggleArchivedResult('{{ t.id }}')" class="text-blue-600 hover:underline">View</button>
-                        {%- elif has_error %}
-                        <button onclick="toggleArchivedResult('{{ t.id }}')" class="text-red-600 hover:underline">Error</button>
-                        {%- else %}
-                        <span class="text-gray-300">—</span>
-                        {%- endif %}
-                    </td>
-                </tr>
-                {%- if has_result or has_error %}
-                <tr id="hist-row-{{ t.id }}" class="hidden border-t border-gray-100 bg-gray-50">
-                    <td colspan="7" class="px-3 py-2">
-                        {%- if has_error %}
-                        <div class="mb-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2">
-                            <span class="font-semibold">Error:</span> {{ t.error }}
-                        </div>
-                        {%- endif %}
-                        {%- if has_result %}
-                        {%- if t.result.summary %}
-                        <div class="flex items-center justify-between mb-1">
-                            <div>
-                                <span class="text-gray-500 text-xs">Summary:</span>
-                                <span class="text-gray-400 text-xs">({{ t.result.summary|length }} chars)</span>
-                            </div>
-                            <button onclick="copyArchivedResult('{{ t.id }}')" class="text-blue-600 hover:underline text-xs">Copy</button>
-                        </div>
-                        <pre id="hist-full-{{ t.id }}" class="whitespace-pre-wrap break-words text-xs bg-white border rounded p-2 mt-1 max-h-96 overflow-auto">{{ t.result.summary }}</pre>
-                        {%- endif %}
-                        {%- if t.result.session_id %}
-                        <div class="mt-2 text-xs">
-                            <span class="text-gray-500">Session:</span>
-                            <span class="font-mono text-gray-700">{{ t.result.session_id }}</span>
-                        </div>
-                        {%- endif %}
-                        {%- if t.result.artifacts %}
-                        <div class="mt-2 text-xs">
-                            <span class="text-gray-500">📎 Artifacts:</span>
-                            <span class="text-gray-700">{{ t.result.artifacts|length }}</span>
-                            <ul class="list-disc ml-6 mt-1">
-                            {%- for a in t.result.artifacts %}
-                                <li>
-                                {%- if a.exists %}
-                                <a href="/api/projects/{{ t.project_id }}/files/{{ a.name or a.path }}" target="_blank"
-                                    class="font-mono text-blue-600 hover:underline">{{ a.name or a.path }}</a>
-                                <span class="text-gray-500">({{ a.storage_kind|default('?') }}{% if a.size_bytes %}, {{ a.size_bytes }} bytes{% endif %})</span>
-                                {%- else %}
-                                <span class="font-mono text-gray-500"
-                                    title="{% if a.is_ephemeral %}Ephemeral control file: read + unlinked by supervisor (decision / status / plan signal){% else %}File no longer on disk (may have been cleaned up){% endif %}{% if a.size_bytes %}&#10;original size: {{ a.size_bytes }} bytes{% endif %}">{{ a.name or a.path }}</span>
-                                <span class="px-1.5 py-0.5 text-xs rounded bg-gray-200 text-gray-600">deleted</span>
-                                {%- if a.size_bytes %}<span class="text-gray-400 text-xs">({{ a.size_bytes }} bytes)</span>{%- endif %}
-                                {%- endif %}
-                                </li>
-                            {%- endfor %}
-                            </ul>
-                        </div>
-                        {%- endif %}
-                        {%- endif %}
-                    </td>
-                </tr>
-                {%- endif %}
-                {%- endfor %}
-            </tbody>
-        </table>
-    </div>
-    {% elif show_archived %}
-    <p class="text-xs text-gray-500 italic">No archived tasks (toggle is on but count is 0 — race condition, refresh).</p>
-    {% endif %}
-</div>
-{% endif %}
 
 <!-- SOUL presets: per-project agent identity snapshots. Click "Apply" to
 load the preset's content into that profile's SOUL.md (via the wrapper
@@ -750,10 +570,148 @@ they target different agent profiles. -->
     </div>
 </div>
 
+{# Task history: old versions of tasks in this project, kept (archived=1)
+   after Clone chain actions. Hidden by default to keep the page clean.
+   A simple table is enough — operators can compare before/after
+   without needing a full drawflow canvas. The audit log keeps the
+   full id_map of which old ID maps to which new ID.
+   User feedback (2026-07-26): moved here from above the Tasks section
+   so the live Tasks list reads first, with the history (older versions
+   of the same chain) right below it. This matches the operator's mental
+   model: "current plan, then history of changes". #}
+{% if archived_count > 0 %}
+<div class="mb-4 bg-white border rounded-lg p-4 shadow-sm">
+    <div class="flex items-center justify-between mb-2">
+        <div>
+            <h2 class="text-sm font-semibold text-gray-700">
+                📜 Task history
+            </h2>
+            <p class="text-xs text-gray-500 mt-0.5">
+                Older versions of tasks. Created by prior <strong>Clone chain</strong>
+                actions. The audit log keeps the full id_map of which old ID
+                maps to which new ID.
+            </p>
+        </div>
+        <a href="/projects/{{ project.id }}{% if show_archived %}{% else %}?show_archived=1{% endif %}"
+            class="px-3 py-1 text-xs rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+            title="{% if show_archived %}Hide archived tasks{% else %}Show archived tasks (older versions of the same chain, useful for before/after comparison){% endif %}">
+            {% if show_archived %}👁️‍🗨️ Hide ({{ archived_count }}){% else %}👁️ Show ({{ archived_count }}){% endif %}
+        </a>
+    </div>
+    {% if show_archived and archived_tasks %}
+    <div class="flex items-center justify-end mb-2">
+        <button id="hist-collapse-all-btn" onclick="collapseHistResults()"
+            class="px-3 py-1 text-xs rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+            title="Close all open archived result panels at once">Collapse all</button>
+    </div>
+    <div class="bg-white border border-gray-200 rounded overflow-x-auto">
+        <table class="w-full text-xs">
+            <thead class="bg-gray-50 text-gray-600 text-left">
+                <tr>
+                    <th class="px-3 py-2 font-medium">Name</th>
+                    <th class="px-3 py-2 font-medium">Role</th>
+                    <th class="px-3 py-2 font-medium">Action</th>
+                    <th class="px-3 py-2 font-medium">Status (when archived)</th>
+                    <th class="px-3 py-2 font-medium">Archived at</th>
+                    <th class="px-3 py-2 font-medium">Old ID</th>
+                    <th class="px-3 py-2 font-medium w-20">Result</th>
+                </tr>
+            </thead>
+            <tbody>
+                {%- for t in archived_tasks %}
+                {%- set has_result = t.result and (t.result.summary or t.result.session_id or t.result.error or t.result.artifacts) %}
+                {%- set has_error = t.error %}
+                <tr class="border-t border-gray-100 text-gray-500">
+                    <td class="px-3 py-2 font-medium text-gray-700">{{ t.name or '—' }}</td>
+                    <td class="px-3 py-2 font-mono">{{ t.agent_role or '?' }}</td>
+                    <td class="px-3 py-2 font-mono">{{ t.action or '?' }}</td>
+                    <td class="px-3 py-2">
+                        <span class="px-1.5 py-0.5 rounded text-[10px]
+                            {% if t.status == 'completed' %}bg-green-100 text-green-800
+                            {% elif t.status == 'failed' %}bg-red-100 text-red-800
+                            {% elif t.status == 'running' %}bg-yellow-100 text-yellow-800
+                            {% else %}bg-gray-100 text-gray-700{% endif %}">
+                            {{ t.status or '?' }}
+                        </span>
+                    </td>
+                    <td class="px-3 py-2 whitespace-nowrap text-gray-400">
+                        {{ (t.archived_at or t.created_at)[:19] if (t.archived_at or t.created_at) else '—' }}
+                    </td>
+                    <td class="px-3 py-2 font-mono text-[10px] text-gray-400">
+                        {{ t.id[:16] }}{% if t.id|length > 16 %}…{% endif %}
+                    </td>
+                    <td class="px-3 py-2 whitespace-nowrap">
+                        {%- if has_result %}
+                        <button onclick="toggleArchivedResult('{{ t.id }}')" class="text-blue-600 hover:underline">View</button>
+                        {%- elif has_error %}
+                        <button onclick="toggleArchivedResult('{{ t.id }}')" class="text-red-600 hover:underline">Error</button>
+                        {%- else %}
+                        <span class="text-gray-300">—</span>
+                        {%- endif %}
+                    </td>
+                </tr>
+                {%- if has_result or has_error %}
+                <tr id="hist-row-{{ t.id }}" class="hidden border-t border-gray-100 bg-gray-50">
+                    <td colspan="7" class="px-3 py-2">
+                        {%- if has_error %}
+                        <div class="mb-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2">
+                            <span class="font-semibold">Error:</span> {{ t.error }}
+                        </div>
+                        {%- endif %}
+                        {%- if has_result %}
+                        {%- if t.result.summary %}
+                        <div class="flex items-center justify-between mb-1">
+                            <div>
+                                <span class="text-gray-500 text-xs">Summary:</span>
+                                <span class="text-gray-400 text-xs">({{ t.result.summary|length }} chars)</span>
+                            </div>
+                            <button onclick="copyArchivedResult('{{ t.id }}')" class="text-blue-600 hover:underline text-xs">Copy</button>
+                        </div>
+                        <pre id="hist-full-{{ t.id }}" class="whitespace-pre-wrap break-words text-xs bg-white border rounded p-2 mt-1 max-h-96 overflow-auto">{{ t.result.summary }}</pre>
+                        {%- endif %}
+                        {%- if t.result.session_id %}
+                        <div class="mt-2 text-xs">
+                            <span class="text-gray-500">Session:</span>
+                            <span class="font-mono text-gray-700">{{ t.result.session_id }}</span>
+                        </div>
+                        {%- endif %}
+                        {%- if t.result.artifacts %}
+                        <div class="mt-2 text-xs">
+                            <span class="text-gray-500">📎 Artifacts:</span>
+                            <span class="text-gray-700">{{ t.result.artifacts|length }}</span>
+                            <ul class="list-disc ml-6 mt-1">
+                            {%- for a in t.result.artifacts %}
+                                <li>
+                                {%- if a.exists %}
+                                <a href="/api/projects/{{ t.project_id }}/files/{{ a.name or a.path }}" target="_blank"
+                                    class="font-mono text-blue-600 hover:underline">{{ a.name or a.path }}</a>
+                                <span class="text-gray-500">({{ a.storage_kind|default('?') }}{% if a.size_bytes %}, {{ a.size_bytes }} bytes{% endif %})</span>
+                                {%- else %}
+                                <span class="font-mono text-gray-500"
+                                    title="{% if a.is_ephemeral %}Ephemeral control file: read + unlinked by supervisor (decision / status / plan signal){% else %}File no longer on disk (may have been cleaned up){% endif %}{% if a.size_bytes %}&#10;original size: {{ a.size_bytes }} bytes{% endif %}">{{ a.name or a.path }}</span>
+                                <span class="px-1.5 py-0.5 text-xs rounded bg-gray-200 text-gray-600">deleted</span>
+                                {%- if a.size_bytes %}<span class="text-gray-400 text-xs">({{ a.size_bytes }} bytes)</span>{%- endif %}
+                                {%- endif %}
+                                </li>
+                            {%- endfor %}
+                            </ul>
+                        </div>
+                        {%- endif %}
+                        {%- endif %}
+                    </td>
+                </tr>
+                {%- endif %}
+                {%- endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% elif show_archived %}
+    <p class="text-xs text-gray-500 italic">No archived tasks (toggle is on but count is 0 — race condition, refresh).</p>
+    {% endif %}
+</div>
+{% endif %}
+
 <script>
-// loadProcedure() is invoked AFTER PROJECT_ID is declared (further
-// down) to avoid a temporal-dead-zone ReferenceError on the const.
-// We don't call it here.
 function toggleForm(id) {
     document.getElementById(id).classList.toggle('hidden');
 }
@@ -918,9 +876,6 @@ getHistOpen().forEach(taskId => {
 const PROJECT_ID = "{{ project.id }}";
 const PROJECT_NAME = {{ (project.name or project.id) | tojson }};
 
-// PROJECT_ID is in scope from here down. Safe to call loadProcedure.
-loadProcedure();
-
 document.getElementById('new-task-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const form = e.target;
@@ -1027,125 +982,6 @@ async function unmarkTemplate(projectId, name) {
         location.reload();
     } catch (e) {
         alert("Unmark template failed: " + e.message);
-    }
-}
-
-// ===== Workflow procedure (Path A, #22) =====
-// procedure.md lives at <project_folder>/procedure.md. The supervisor
-// denormalizes it into each task's procedure_md column at assignment
-// time; the wrapper reads that and prepends it to the agent's prompt.
-// Here we just GET/PUT the raw file via the existing file API.
-// (PROJECT_ID is declared earlier in the same script block — don't
-// redeclare or the page errors out silently.)
-// _fetchWithTimeout and _errDetailToString are defined in base.html so
-// every page gets them; no per-page redefinition needed.
-async function loadProcedure() {
-    const el = document.getElementById('proc-content');
-    try {
-        const r = await _fetchWithTimeout(`/api/projects/${PROJECT_ID}/files/procedure.md`);
-        if (r.status === 404) {
-            // Phase 4+ (2026-07-25): Edit button is hidden. Procedure
-            // editing is via file API or future Auto-generate. Plain
-            // "no procedure yet" message.
-            el.textContent = '(no procedure yet)';
-            el.classList.remove('italic', 'text-gray-500');
-            el.classList.add('text-gray-400');
-            return;
-        }
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const text = await r.text();
-        if (!text.trim()) {
-            el.textContent = '(empty)';
-            el.classList.remove('italic', 'text-gray-500');
-            el.classList.add('text-gray-400');
-        } else {
-            // Render as plain text in a pre (so we don't need a markdown lib).
-            el.textContent = text;
-            el.classList.remove('italic', 'text-gray-500', 'text-gray-400');
-            el.classList.add('text-gray-800', 'whitespace-pre-wrap', 'font-mono', 'text-xs');
-        }
-    } catch (e) {
-        // AbortError = our timeout fired; anything else = real failure.
-        const reason = e.name === 'AbortError' ? 'request timed out (>5s)' : e.message;
-        el.textContent = 'Failed to load: ' + reason;
-        el.classList.remove('italic', 'text-gray-500', 'text-gray-400', 'text-gray-800', 'whitespace-pre-wrap', 'font-mono', 'text-xs');
-        el.classList.add('text-red-500');
-    }
-}
-let _procInEditMode = false;
-function toggleProcEdit() {
-    _procInEditMode = !_procInEditMode;
-    document.getElementById('proc-view').classList.toggle('hidden', _procInEditMode);
-    document.getElementById('proc-edit-form').classList.toggle('hidden', !_procInEditMode);
-    if (_procInEditMode) {
-        // Pre-fill the textarea with current content (fetch fresh)
-        fetch(`/api/projects/${PROJECT_ID}/files/procedure.md`)
-            .then(r => r.ok ? r.text() : '')
-            .then(text => { document.getElementById('proc-textarea').value = text; });
-    }
-}
-async function saveProcedure(ev) {
-    ev.preventDefault();
-    const text = document.getElementById('proc-textarea').value;
-    const msg = document.getElementById('proc-msg');
-    msg.textContent = "saving...";
-    msg.className = "text-xs text-gray-500";
-    try {
-        const r = await fetch(`/api/projects/${PROJECT_ID}/files/procedure.md`, {
-            method: 'PUT',
-            body: text,
-        });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        msg.textContent = "saved";
-        msg.className = "text-xs text-green-600";
-        // Reload the view, exit edit mode
-        _procInEditMode = false;
-        document.getElementById('proc-edit-form').classList.add('hidden');
-        document.getElementById('proc-view').classList.remove('hidden');
-        await loadProcedure();
-    } catch (e) {
-        msg.textContent = "error: " + e.message;
-        msg.className = "text-xs text-red-600";
-    }
-}
-
-async function autoGenerateProcedure() {
-    // Confirm before overwriting. Most projects have at least a stub
-    // procedure.md, and we don't want to nuke a hand-edited one
-    // without an explicit click.
-    if (!confirm(
-        'Auto-generate procedure.md from this project\'s tasks + facts?\n\n'
-        + 'The LLM will read the project\'s tasks, facts.md, and decision.md, '
-        + 'then write a new procedure.md. Any existing procedure.md (including '
-        + 'your hand-edited version) will be overwritten.'
-    )) return;
-
-    const btn = document.getElementById('proc-autogen-btn');
-    const orig = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = '... generating ...';
-    try {
-        const r = await _fetchWithTimeout(
-            `/api/projects/${PROJECT_ID}/procedure/auto-generate`,
-            { method: 'POST' },
-            30000,  // 30s — LLM call may take 5-15s for big projects
-        );
-        if (!r.ok) {
-            let err;
-            try { err = (await r.json()).detail; } catch { err = `HTTP ${r.status}`; }
-            throw new Error(err || `HTTP ${r.status}`);
-        }
-        const data = await r.json();
-        // Reload the view to show the new content
-        await loadProcedure();
-        // Briefly show success on the button
-        btn.textContent = `✓ ${data.size} bytes`;
-        setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
-    } catch (e) {
-        const reason = e.name === 'AbortError' ? 'request timed out (>30s)' : e.message;
-        alert('Auto-generate failed: ' + reason);
-        btn.textContent = orig;
-        btn.disabled = false;
     }
 }
 
@@ -1418,13 +1254,13 @@ async function submitReplan(projectId) {
             btn.disabled = false;
             return;
         }
-        status.textContent = `Replan queued. ${data.cleared_tasks} task(s) cleared. Reloading...`;
+        status.textContent = `Plan generated (${data.cleared_tasks} task(s) cleared). Reloading — then click ▶️ Run to dispatch.`;
         status.className = 'text-sm text-green-600';
         setTimeout(() => location.reload(), 1500);
-        // Phase 4+ (2026-07-25): the message above is misleading now —
-        // replan leaves the project in 'planned', NOT auto-dispatching.
-        // Replace it with the new flow. The user sees the page reload
-        // 1.5s after submission, and the new Run button is visible.
+        // User feedback (2026-07-26): the old "Replan queued" message
+        // was misleading — it didn't say "you must click Run next". Now
+        // the green text explicitly says "click ▶️ Run to dispatch" so
+        // there's no doubt that Generate plan = plan only, no auto-run.
     } catch (err) {
         status.textContent = 'Network error: ' + err.message;
         status.className = 'text-sm text-red-600';
