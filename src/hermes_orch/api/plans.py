@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -330,3 +331,274 @@ async def delete_project_plan(project_id: str, request: Request):
         )
     except Exception:
         pass
+
+
+# ===== Phase B: materialize plan → tasks (POST /api/projects/{id}/plan/run) =====
+
+
+class RunPlanBody(BaseModel):
+    """Body for POST /api/projects/{id}/plan/run.
+
+    `archive_existing` controls what happens to the project's
+    non-archived tasks when the plan is re-run:
+      - true (default): archive the old tasks before creating new
+        ones. This is the "rerun the plan" semantic — every Run
+        produces a fresh execution row, and the old one is kept
+        in history but hidden from the default view.
+      - false: keep the old tasks AND add the new ones (additive
+        semantics, like the "Apply workflow" feature). The project
+        ends up with N+M tasks after the run.
+    `name_suffix` is appended to the new task names (no effect on
+    existing tasks) — useful when you re-run a plan and want to
+    visually distinguish the new execution (e.g. "_run_2").
+    """
+    archive_existing: bool = True
+    name_suffix: str = ""
+
+
+class RunPlanResponse(BaseModel):
+    """Response shape for POST /api/projects/{id}/plan/run.
+
+    `tasks_created` = how many new task rows this run added.
+    `tasks_archived` = how many old tasks got archived (0 if
+    archive_existing=False, or if there were no prior tasks).
+    `task_ids` = the IDs of the NEW tasks (so the UI can deep-link
+    to the new execution for visual verification).
+    """
+    project_id: str
+    state: str
+    tasks_created: int
+    tasks_archived: int
+    task_ids: list[str]
+    plan_name: str
+    plan_version: str
+    message: str
+
+
+@router.post("/projects/{project_id}/plan/run", response_model=RunPlanResponse)
+async def run_project_plan(
+    project_id: str, body: RunPlanBody, request: Request,
+) -> RunPlanResponse:
+    """Materialize a project's plan into actual tasks (Phase B).
+
+    This is the "Run plan" button in the plan modal. It:
+      1. Loads the project + plan
+      2. (Optionally) archives existing non-archived tasks
+      3. Creates a new task row per plan step (status=pending,
+         depends_on resolved from plan-internal references)
+      4. Sets project state → 'ready' so the supervisor's next
+         tick dispatches the new tasks
+      5. Audits: project.plan.ran + per-task task.created events
+
+    Per the plan-first design, this is the "fork" between intent
+    and execution. The plan JSON is immutable per-run; re-running
+    the same plan produces a fresh set of tasks (the old ones are
+    archived, not deleted, so history is preserved).
+
+    Phase B does NOT do variable substitution — that's Phase D.
+    {{var}} placeholders in step.params_template are stored
+    verbatim in the task row. Phase B also does NOT validate
+    that referenced skills/tools/agents actually exist — that's
+    the supervisor's job at dispatch time.
+    """
+    db = request.app.state.db
+    # 1. Load project
+    proj = await db.fetchone(
+        "SELECT id, state, plan_json FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    # Terminal states can't be re-run. They need explicit unarchive /
+    # undelete first (existing project.py semantics, copied here for
+    # the plan-run path).
+    if proj["state"] in ("deleted", "archived"):
+        raise HTTPException(
+            400,
+            f"Cannot run plan on a {proj['state']!r} project. "
+            f"Restore it first (unarchive / undelete)."
+        )
+    if proj["state"] in ("completed", "cancelled"):
+        raise HTTPException(
+            400,
+            f"Cannot run plan on a terminal-state project "
+            f"(state={proj['state']!r}). Create a new project or "
+            f"manually reset state to 'planned'."
+        )
+    # 2. Load plan
+    has_plan, plan, _ = _load_plan_from_row(proj)
+    if not has_plan or plan is None:
+        raise HTTPException(
+            400,
+            f"project {project_id} has no plan to run. "
+            f"Set a plan first via PUT /api/projects/{project_id}/plan."
+        )
+    if not plan.steps:
+        raise HTTPException(
+            400,
+            f"plan has no steps. Add at least one step before running."
+        )
+    # 3. Optionally archive existing non-archived tasks
+    now = _now_iso()
+    archived_count = 0
+    if body.archive_existing:
+        # We only archive non-archived, non-running tasks. Active
+        # running tasks stay (the user can interrupt them if they
+        # want — archiving a running task would orphan the agent).
+        # We archive EVERYTHING in non-terminal states
+        # (pending/assigned) so the new plan starts clean.
+        cur = await db.fetchone(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? "
+            "AND archived = 0 AND status IN ('pending', 'assigned', 'failed', 'skipped', 'cancelled', 'completed')",
+            (project_id,),
+        )
+        archived_count = int(cur["n"] or 0) if cur else 0
+        await db.execute(
+            "UPDATE tasks SET archived = 1, updated_at = ? "
+            "WHERE project_id = ? AND archived = 0 "
+            "AND status IN ('pending', 'assigned', 'failed', 'skipped', 'cancelled', 'completed')",
+            (now, project_id),
+        )
+    # 4. Resolve depends_on + create task rows. The plan's step
+    # `depends_on` is a list of step NAMES within the same plan
+    # (e.g. ["fetch-data", "fetch-meta"] for a "summarize" step).
+    # We need to convert to task IDs. Two passes:
+    #   a. plan-internal: name -> new task id
+    #   b. project-external: name -> existing non-archived task id
+    #      (lets a plan step depend on a project task with the
+    #      same name — same pattern as apply-workflow)
+    existing_rows = await db.fetchall(
+        "SELECT id, name FROM tasks WHERE project_id = ? AND archived = 0",
+        (project_id,),
+    )
+    existing_name_to_tid: dict[str, str] = {
+        r["name"]: r["id"] for r in existing_rows if r.get("name")
+    }
+    # First pass: assign new task ids
+    name_to_tid: dict[str, str] = {}
+    for step in plan.steps:
+        name_to_tid[step.name] = "t-" + secrets.token_hex(4)
+    # Second pass: build task rows with resolved deps
+    new_task_ids: list[str] = []
+    new_task_rows: list[dict[str, Any]] = []
+    for step in plan.steps:
+        tid = name_to_tid[step.name]
+        new_task_ids.append(tid)
+        # Resolve depends_on
+        dep_tids: list[str] = []
+        unresolved: list[str] = []
+        for d in (step.depends_on or []):
+            if d in name_to_tid:
+                dep_tids.append(name_to_tid[d])
+            elif d in existing_name_to_tid:
+                dep_tids.append(existing_name_to_tid[d])
+            else:
+                unresolved.append(d)
+        if unresolved:
+            try:
+                from hermes_orch.core.audit import audit_log
+                await audit_log(
+                    db, "task.depends_on_unresolved",
+                    actor="plan-runner", project_id=project_id, task_id=tid,
+                    payload={"step_name": step.name,
+                             "unresolved_deps": unresolved,
+                             "source": "plan_run"},
+                )
+            except Exception:
+                pass
+        # Apply optional name suffix (helps users tell runs apart
+        # in the UI when re-running). Suffix is just appended, no
+        # kebab validation — operator override.
+        task_name = step.name
+        if body.name_suffix:
+            task_name = f"{task_name}{body.name_suffix}"
+        # params stored as JSON. No variable substitution in Phase B.
+        params = dict(step.params_template or {})
+        # Skill / tool name carry-through (Object Layer refs).
+        # Mirrors apply-workflow's _workflow_skill param convention
+        # so the supervisor can resolve at dispatch time.
+        if step.skill:
+            params["_workflow_skill"] = step.skill
+        new_task_rows.append({
+            "id": tid,
+            "project_id": project_id,
+            "name": task_name,
+            "agent_role": step.agent_role or "",
+            "depends_on": json.dumps(dep_tids),
+            "on_parent_failure": "skip",
+            "status": "pending",
+            "priority": "normal",
+            "action": step.action or "do_task",
+            "params": json.dumps(params),
+            "retry_count": 0,
+            "max_retries": 2,
+            "timeout_seconds": 1800,
+            "output_path": step.output_path or "",
+            "required_capability": step.required_capability or None,
+            "feedback_to": json.dumps([]),
+            "is_single_task": 0,
+            "archived": 0,
+        })
+    # Insert all tasks. We do this one-at-a-time so a single
+    # bad row doesn't kill the whole run (defensive — params_template
+    # is already Pydantic-validated upstream, so bad rows are
+    # unlikely, but better safe).
+    for t in new_task_rows:
+        try:
+            await db.insert("tasks", t)
+        except Exception as e:
+            raise HTTPException(
+                500, f"failed to insert task {t['name']!r}: {e}"
+            )
+    # 5. Set project state → 'ready' (so supervisor's next tick
+    # dispatches). Same transition as /api/projects/{id}/run —
+    # we reuse the existing flow, no new state introduced.
+    await db.execute(
+        "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
+        (now, project_id),
+    )
+    # 6. Audit: per-task created + top-level plan.ran
+    try:
+        from hermes_orch.core.audit import audit_log
+        for t in new_task_rows:
+            await audit_log(
+                db, "task.created", actor="plan-runner",
+                project_id=project_id, task_id=t["id"],
+                payload={
+                    "agent_role": t["agent_role"],
+                    "action": t["action"],
+                    "name": t["name"],
+                    "source": "run_plan",
+                    "plan_name": plan.name,
+                },
+            )
+        await audit_log(
+            db, "project.plan.ran", actor="operator",
+            project_id=project_id,
+            payload={
+                "plan_name": plan.name,
+                "plan_version": plan.version,
+                "task_count": len(new_task_rows),
+                "archived_count": archived_count,
+                "archive_existing": body.archive_existing,
+                "previous_state": proj["state"],
+            },
+        )
+    except Exception:
+        pass
+    msg = (
+        f"Plan {plan.name!r} materialized into {len(new_task_rows)} task(s). "
+        f"Supervisor will dispatch on next tick (within ~5s)."
+    )
+    if archived_count:
+        msg += f" {archived_count} existing task(s) archived."
+    return RunPlanResponse(
+        project_id=project_id,
+        state="ready",
+        tasks_created=len(new_task_rows),
+        tasks_archived=archived_count,
+        task_ids=new_task_ids,
+        plan_name=plan.name,
+        plan_version=plan.version,
+        message=msg,
+    )

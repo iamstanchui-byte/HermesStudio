@@ -2636,6 +2636,97 @@ async function clearPlan() {
         _showPlanError('Network error: ' + e.message);
     }
 }
+
+// Run plan (Phase B): materialize the saved plan into tasks.
+// Two confirmations because this is a real state-change: save the
+// latest JSON (so the server's plan is what we run), then ask for
+// the destructive archive confirmation.
+async function runPlan() {
+    if (!_planProjectId) return;
+    const btn = document.getElementById('plan-run-btn');
+    const status = document.getElementById('plan-status');
+    const errorEl = document.getElementById('plan-error');
+    errorEl.classList.add('hidden');
+    // 1. Save the current JSON first (so the server has the latest
+    // plan when we call /run). If save fails, abort.
+    btn.disabled = true; btn.textContent = '... Saving';
+    status.textContent = 'Saving plan first...';
+    status.className = 'text-xs text-gray-500 mt-1';
+    const ta = document.getElementById('plan-json');
+    let plan;
+    try { plan = JSON.parse(ta.value); }
+    catch (e) {
+        _showPlanError('Invalid JSON: ' + e.message);
+        btn.disabled = false; btn.textContent = '▶ Run plan';
+        return;
+    }
+    try {
+        const saveR = await _fetchWithTimeout('/api/projects/' + _planProjectId + '/plan', {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({plan: plan}),
+        }, 10000);
+        if (!saveR.ok) {
+            const d = await saveR.json().catch(() => ({}));
+            _showPlanError('Save before run failed: ' + _errDetailToString(d.detail, saveR.status));
+            btn.disabled = false; btn.textContent = '▶ Run plan';
+            return;
+        }
+    } catch (e) {
+        _showPlanError('Save network error: ' + e.message);
+        btn.disabled = false; btn.textContent = '▶ Run plan';
+        return;
+    }
+    // 2. Validate the plan has steps. The server enforces this
+    // too (400), but we can give a nicer message here.
+    if (!plan.steps || plan.steps.length === 0) {
+        _showPlanError('Plan has no steps. Add at least one step before running.');
+        btn.disabled = false; btn.textContent = '▶ Run plan';
+        return;
+    }
+    // 3. Confirm archive. The user can opt out of archive
+    // (additive mode) if they want to keep both old and new tasks.
+    // For Phase B we always archive (the most common case — "I
+    // changed the plan, run the new version"). The JSON view
+    // already shows the plan, so a destructive re-run is the
+    // expected pattern.
+    if (!confirm(
+        `Run plan "${plan.name || '(unnamed)'}" (${plan.steps.length} step${plan.steps.length === 1 ? '' : 's'})?\n\n` +
+        `This will:\n` +
+        `  • Archive the project's existing non-running tasks (pending/assigned/completed/failed/etc.)\n` +
+        `  • Create ${plan.steps.length} new pending task${plan.steps.length === 1 ? '' : 's'} from the plan\n` +
+        `  • Set project state → ready (supervisor will dispatch on next tick)\n\n` +
+        `Continue?`
+    )) {
+        btn.disabled = false; btn.textContent = '▶ Run plan';
+        return;
+    }
+    // 4. Call /run
+    btn.textContent = '... Running';
+    status.textContent = 'Materializing plan into tasks...';
+    status.className = 'text-xs text-cyan-700 mt-1';
+    try {
+        const r = await _fetchWithTimeout('/api/projects/' + _planProjectId + '/plan/run', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({archive_existing: true, name_suffix: ''}),
+        }, 30000);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            _showPlanError(_errDetailToString(d.detail, r.status));
+            btn.disabled = false; btn.textContent = '▶ Run plan';
+            return;
+        }
+        // Success — show the new task IDs briefly, then go to the
+        // project page so the user sees the tasks.
+        status.textContent = `Done: ${d.tasks_created} task(s) created, ${d.tasks_archived} archived. Reloading...`;
+        status.className = 'text-xs text-emerald-700 mt-1';
+        setTimeout(() => location.href = '/projects/' + _planProjectId, 1500);
+    } catch (e) {
+        _showPlanError('Network error: ' + e.message);
+        btn.disabled = false; btn.textContent = '▶ Run plan';
+    }
+}
 </script>
 
 <!-- Plan modal: JSON view + edit + save. Phase A is text-only;
@@ -2666,6 +2757,11 @@ async function clearPlan() {
                     Clear plan
                 </button>
                 <div class="flex items-center gap-2">
+                    <button id="plan-run-btn" onclick="runPlan()" type="button"
+                        class="px-3 py-1.5 text-sm bg-emerald-600 text-white rounded hover:bg-emerald-700 font-medium"
+                        title="Materialize the plan into tasks. The supervisor will dispatch them on the next tick (within ~5s).">
+                        ▶ Run plan
+                    </button>
                     <button onclick="closePlanModal()" type="button"
                         class="px-3 py-1.5 text-sm bg-gray-200 text-gray-700 rounded hover:bg-gray-300">
                         Cancel
