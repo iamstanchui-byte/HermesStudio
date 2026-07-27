@@ -1,0 +1,454 @@
+{# _workflow_actions.html — Promote to workflow + Apply workflow modals + JS.
+   Reusable partial. Included from project.html (where these buttons
+   used to live inline) and from visual_project.html (the new home
+   for these buttons, per UI cleanup 2026-07-27).
+
+   The calling template MUST pass:
+     - project.id, project.name
+     - total_count (current non-archived task count; used for
+       the blast-radius confirmation in submitApplyWorkflow)
+
+   The partial defines globally (with guards so it's safe to include
+   alongside pages that may already have these):
+     - PROJECT_ID, PROJECT_NAME
+     - escapeHtml
+     - openPromoteToWorkflowModal / closePromoteToWorkflowModal /
+       submitPromoteToWorkflow
+     - openApplyWorkflowModal / closeApplyWorkflowModal /
+       onApplyWorkflowSelect / updateApplyWorkflowSubmitState /
+       onApplyWorkflowVarInput / submitApplyWorkflow
+
+   The modals (the <div id="promote-workflow-overlay"> etc.) are
+   rendered here too, and are positioned fixed inset-0 so they
+   overlay any page (visual project or text project). #}
+
+{# Hidden input read by submitApplyWorkflow for the confirm() dialog.
+   Cached at page render so we don't have to fetch /api/projects/{id}
+   just to get a count. #}
+<input type="hidden" id="current-task-count" value="{{ total_count or 0 }}">
+
+<script>
+// ===== Shared constants (guarded) =====
+// project.html already defines PROJECT_ID / PROJECT_NAME inline; the
+// typeof guard keeps this include() safe in both pages.
+if (typeof PROJECT_ID === 'undefined') {
+    var PROJECT_ID = {{ project.id | tojson }};
+    var PROJECT_NAME = {{ (project.name or project.id) | tojson }};
+}
+// escapeHtml is defined in project.html; the guard makes it available
+// to visual_project.html too (where it's not defined).
+if (typeof escapeHtml === 'undefined') {
+    function escapeHtml(s) {
+        if (s == null) return '';
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+}
+</script>
+
+
+<!-- ===== Promote to workflow modal (2026-07-23, moved to visual page
+     toolbar 2026-07-27). LLM synthesizes a reusable workflow package
+     from this project. The output is a parameterized step_template
+     with {{var}} placeholders for any value that would change on
+     a re-run, plus a variables list. Stage 2b will add the
+     run-with-variables action.
+
+     Only available when the project is in a terminal state
+     (completed / failed / cancelled / interrupted). The API
+     enforces this; the UI disables the button when not in a
+     terminal state. -->
+<div id="promote-workflow-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center" style="background-color: rgba(0,0,0,0.5);">
+    <div class="bg-white rounded-lg shadow-xl max-w-lg w-full mx-4">
+        <form id="promote-workflow-form" onsubmit="event.preventDefault(); submitPromoteToWorkflow();" class="p-5">
+            <h2 class="text-lg font-semibold text-gray-800 mb-1">&#x1F501; Promote to workflow</h2>
+            <p class="text-sm text-gray-500 mb-4">
+                LLM synthesizes a reusable workflow package from this project. The output is a parameterized
+                step_template with <code>{{ '{{var}}' }}</code> placeholders for any value that would change
+                on a re-run, plus a variables list. Stage 2b will add the run-with-variables action.
+            </p>
+
+            <label class="block text-sm font-medium text-gray-700 mb-1">
+                Workflow name <span class="text-red-500">*</span>
+            </label>
+            <input id="promote-workflow-name" name="workflow_name" required
+                pattern="^[a-z0-9][a-z0-9-]{1,40}$"
+                class="mt-1 mb-3 block w-full border rounded px-2 py-1 text-sm font-mono"
+                placeholder="e.g. google-drive-list-and-summarize">
+            <p class="text-xs text-gray-500 -mt-2 mb-3">lowercase letters, digits, dashes; max 40 chars; must be unique among workflow packages</p>
+
+            <label class="block text-sm font-medium text-gray-700 mb-1">
+                Description <span class="text-gray-400">(optional, overrides LLM's)</span>
+            </label>
+            <textarea id="promote-workflow-description" name="workflow_description" rows="2" maxlength="500"
+                class="mt-1 mb-3 block w-full border rounded px-2 py-1 text-sm"
+                placeholder="Leave blank to use the LLM-synthesized description."></textarea>
+
+            <div class="mt-4 flex items-center gap-2">
+                <button id="promote-workflow-submit-btn" type="submit" class="px-4 py-2 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700">
+                    Synthesize
+                </button>
+                <button type="button" onclick="closePromoteToWorkflowModal()" class="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm hover:bg-gray-200">
+                    Cancel
+                </button>
+                <span id="promote-workflow-status" class="text-sm text-gray-500 ml-2"></span>
+            </div>
+        </form>
+    </div>
+</div>
+
+
+<!-- ===== Apply workflow modal (2026-07-26, moved to visual page
+     toolbar 2026-07-27) — reverse of Promote to workflow.
+     Pick an existing workflow package, fill in its {{var}}
+     placeholders, and use the substituted step_template as THIS
+     project's task list. Current tasks are kept (additive import);
+     new pending tasks are added. Wakes the project from any
+     terminal state. -->
+<div id="apply-workflow-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center" style="background-color: rgba(0,0,0,0.5);">
+    <div class="bg-white rounded-lg shadow-xl max-w-xl w-full mx-4 max-h-screen overflow-y-auto">
+        <form id="apply-workflow-form" onsubmit="event.preventDefault(); submitApplyWorkflow();" class="p-5">
+            <h2 class="text-lg font-semibold text-gray-800 mb-1">📥 Apply workflow</h2>
+            <p class="text-sm text-gray-500 mb-4">
+                Pick a workflow package and fill in its variables. The
+                workflow's <code>step_template</code> is <strong>imported</strong>
+                as new tasks into this project — your existing tasks
+                are kept untouched. The project state is set to
+                <code>planned</code> so the supervisor pauses dispatch
+                — <strong>click ▶️ Run on the project page to start</strong>.
+                A confirmation dialog summarizes the change before
+                submit.
+            </p>
+
+            <label class="block text-sm font-medium text-gray-700 mb-1">
+                Workflow package <span class="text-red-500">*</span>
+            </label>
+            <select id="apply-workflow-select" required
+                onchange="onApplyWorkflowSelect()"
+                class="mt-1 mb-3 block w-full border rounded px-2 py-1 text-sm">
+                <option value="">Loading workflows...</option>
+            </select>
+            <p id="apply-workflow-empty" class="hidden text-xs text-amber-700 mb-3">
+                No workflow packages yet. Create one from a completed
+                project via "Promote to workflow".
+            </p>
+
+            <div id="apply-workflow-vars-wrap" class="hidden mb-3">
+                <h3 class="text-sm font-semibold text-gray-800 mb-2">
+                    Variables
+                    <span class="text-xs text-gray-500 font-normal">
+                        (fill in values for <code>{{ '{{var}}' }}</code> placeholders)
+                    </span>
+                </h3>
+                <div id="apply-workflow-vars" class="space-y-2"></div>
+            </div>
+
+            <div id="apply-workflow-preview" class="hidden mb-3 text-xs bg-gray-50 border border-gray-200 rounded p-2 max-h-32 overflow-y-auto">
+                <span class="font-medium text-gray-700">Steps (after substitution):</span>
+                <ol id="apply-workflow-preview-list" class="list-decimal ml-5 mt-1 space-y-0.5 text-gray-600"></ol>
+            </div>
+
+            <div class="mt-4 flex items-center gap-2">
+                <button id="apply-workflow-submit-btn" type="submit" disabled
+                    class="px-4 py-2 bg-cyan-600 text-white rounded text-sm hover:bg-cyan-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Import the workflow's steps as new pending tasks. Wakes the project from terminal states.">
+                    Apply
+                </button>
+                <button type="button" onclick="closeApplyWorkflowModal()" class="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm hover:bg-gray-200">
+                    Cancel
+                </button>
+                <span id="apply-workflow-status" class="text-sm text-gray-500 ml-2"></span>
+            </div>
+        </form>
+    </div>
+</div>
+
+
+<script>
+// ===== Promote to workflow (2026-07-23, moved to partial 2026-07-27) =====
+function openPromoteToWorkflowModal() {
+    document.getElementById('promote-workflow-name').value = '';
+    document.getElementById('promote-workflow-description').value = '';
+    document.getElementById('promote-workflow-status').textContent = '';
+    document.getElementById('promote-workflow-overlay').classList.remove('hidden');
+    // Default name: slugify project name + '-v1'
+    const projName = (document.querySelector('h1')?.textContent || 'workflow')
+        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 30);
+    document.getElementById('promote-workflow-name').value = projName + '-v1';
+}
+function closePromoteToWorkflowModal() {
+    document.getElementById('promote-workflow-overlay').classList.add('hidden');
+}
+async function submitPromoteToWorkflow() {
+    const btn = document.getElementById('promote-workflow-submit-btn');
+    const status = document.getElementById('promote-workflow-status');
+    const name = (document.getElementById('promote-workflow-name').value || '').trim();
+    const description = (document.getElementById('promote-workflow-description').value || '').trim();
+    if (!name) { status.textContent = 'Name required'; return; }
+    btn.disabled = true;
+    status.textContent = 'Synthesizing via LLM (60-120s)...';
+    try {
+        const r = await _fetchWithTimeout(`/api/workflows/from-project/${PROJECT_ID}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name, description}),
+        }, 180_000);  // 3 min for LLM call
+        const j = await r.json();
+        if (r.status !== 200 && r.status !== 201) {
+            // j.detail may be a STRING (custom HTTPException) or an ARRAY
+            // (FastAPI 422 Pydantic validation). Convert to a readable
+            // string before throwing, otherwise the catch block shows
+            // "Failed: [object Object]".
+            throw new Error(_errDetailToString(j.detail, r.status));
+        }
+        status.textContent = `Done: ${j.name} (${j.step_count} steps, ${j.variable_count} variables)`;
+        setTimeout(() => {
+            closePromoteToWorkflowModal();
+            // Open the workflow detail page
+            window.open(`/workflows/${j.id}`, '_blank');
+        }, 1500);
+    } catch (e) {
+        // e.message is now always a string (we converted j.detail above
+        // for HTTP errors, and fetch/AbortError gives a string too).
+        status.textContent = 'Failed: ' + (e.message || String(e));
+        btn.disabled = false;
+    }
+}
+
+// ===== Apply workflow (2026-07-26, moved to partial 2026-07-27) =====
+// Fetch the workflow list once on modal open, let the user pick one,
+// render the workflow's `variables` as a form, then POST the values
+// to /api/projects/{id}/apply-workflow. The current tasks are kept
+// and the workflow's steps are added (additive import).
+//
+// We store the workflow list in a module-level variable so the dropdown
+// change handler can look up the full record (with variables + step
+// template) without re-fetching.
+let _applyWorkflowList = [];
+let _applyWorkflowSelected = null;
+async function openApplyWorkflowModal() {
+    // Reset state
+    document.getElementById('apply-workflow-status').textContent = '';
+    document.getElementById('apply-workflow-select').innerHTML =
+        '<option value="">Loading workflows...</option>';
+    document.getElementById('apply-workflow-vars-wrap').classList.add('hidden');
+    document.getElementById('apply-workflow-vars').innerHTML = '';
+    document.getElementById('apply-workflow-preview').classList.add('hidden');
+    document.getElementById('apply-workflow-empty').classList.add('hidden');
+    document.getElementById('apply-workflow-submit-btn').disabled = true;
+    _applyWorkflowSelected = null;
+    document.getElementById('apply-workflow-overlay').classList.remove('hidden');
+
+    try {
+        const r = await _fetchWithTimeout('/api/workflows/', {}, 10000);
+        if (!r.ok) throw new Error(_errDetailToString((await r.json().catch(()=>({}))).detail, r.status));
+        const data = await r.json();
+        _applyWorkflowList = data.workflows || data || [];
+        // Render dropdown
+        const sel = document.getElementById('apply-workflow-select');
+        if (!_applyWorkflowList.length) {
+            sel.innerHTML = '<option value="">(no workflow packages)</option>';
+            document.getElementById('apply-workflow-empty').classList.remove('hidden');
+            return;
+        }
+        // Sort by name asc
+        _applyWorkflowList.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        sel.innerHTML = '<option value="">-- select a workflow --</option>' +
+            _applyWorkflowList.map(w => {
+                const vars = (w.variable_count != null) ? ` (${w.variable_count} var${w.variable_count === 1 ? '' : 's'})` : '';
+                return `<option value="${escapeHtml(w.id)}">${escapeHtml(w.name)}${vars}</option>`;
+            }).join('');
+    } catch (e) {
+        document.getElementById('apply-workflow-status').textContent = 'Failed to load: ' + e.message;
+        document.getElementById('apply-workflow-status').className = 'text-sm text-red-600 ml-2';
+    }
+}
+function closeApplyWorkflowModal() {
+    document.getElementById('apply-workflow-overlay').classList.add('hidden');
+}
+// On dropdown change: fetch the full workflow record (with variables +
+// step_template) and render the variable form + step preview.
+async function onApplyWorkflowSelect() {
+    const sel = document.getElementById('apply-workflow-select');
+    const wid = sel.value;
+    document.getElementById('apply-workflow-vars-wrap').classList.add('hidden');
+    document.getElementById('apply-workflow-vars').innerHTML = '';
+    document.getElementById('apply-workflow-preview').classList.add('hidden');
+    document.getElementById('apply-workflow-submit-btn').disabled = true;
+    if (!wid) { _applyWorkflowSelected = null; return; }
+    try {
+        const r = await _fetchWithTimeout(`/api/workflows/${wid}`, {}, 10000);
+        if (!r.ok) throw new Error(_errDetailToString((await r.json().catch(()=>({}))).detail, r.status));
+        const wf = await r.json();
+        _applyWorkflowSelected = wf;
+        // Render variable form. The workflow's `variables` is the
+        // declared list (each: {name, type, required, default,
+        // description}). We render one input per variable.
+        const vars = wf.variables || [];
+        const wrap = document.getElementById('apply-workflow-vars');
+        wrap.innerHTML = '';
+        if (vars.length === 0) {
+            wrap.innerHTML = '<p class="text-xs text-gray-500 italic">No variables — the workflow has no <code>{{ '{{var}}' }}</code> placeholders.</p>';
+        } else {
+            for (const v of vars) {
+                const isReq = !!v.required;
+                const inputId = `awf-var-${v.name}`;
+                const typeStr = v.type || 'string';
+                const placeholder = v.default != null ? String(v.default) : '';
+                const desc = v.description ? `<p class="text-xs text-gray-400 mt-0.5">${escapeHtml(v.description)}</p>` : '';
+                let input;
+                if (typeStr === 'boolean') {
+                    input = `<select id="${inputId}" name="var-${v.name}" class="block w-full border rounded px-2 py-1 text-sm">
+                        <option value="">(default: ${escapeHtml(String(v.default ?? 'unset'))})</option>
+                        <option value="true">true</option>
+                        <option value="false">false</option>
+                    </select>`;
+                } else if (typeStr === 'number') {
+                    input = `<input type="number" id="${inputId}" name="var-${v.name}" placeholder="${escapeHtml(placeholder)}"
+                        class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                        oninput="onApplyWorkflowVarInput()">`;
+                } else {
+                    input = `<input type="text" id="${inputId}" name="var-${v.name}" placeholder="${escapeHtml(placeholder)}"
+                        class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                        oninput="onApplyWorkflowVarInput()">`;
+                }
+                wrap.insertAdjacentHTML('beforeend', `
+                    <div>
+                        <label for="${inputId}" class="block text-xs font-medium text-gray-700">
+                            <code class="text-cyan-700">${escapeHtml(v.name)}</code>
+                            <span class="text-gray-500">(${typeStr}${isReq ? ', required' : ''})</span>
+                        </label>
+                        ${input}
+                        ${desc}
+                    </div>
+                `);
+            }
+        }
+        document.getElementById('apply-workflow-vars-wrap').classList.remove('hidden');
+
+        // Render step preview (just the step names from the template
+        // — gives the user a sanity check before they hit Apply).
+        const steps = wf.step_template || [];
+        const previewList = document.getElementById('apply-workflow-preview-list');
+        previewList.innerHTML = '';
+        if (steps.length) {
+            steps.forEach(s => {
+                const li = document.createElement('li');
+                const name = s.name || '(unnamed)';
+                const agent = s.agent_role ? ` <span class="text-gray-400">@ ${escapeHtml(s.agent_role)}</span>` : '';
+                li.innerHTML = `${escapeHtml(name)}${agent}`;
+                previewList.appendChild(li);
+            });
+            document.getElementById('apply-workflow-preview').classList.remove('hidden');
+        }
+
+        // Enable submit only if all required vars are filled.
+        updateApplyWorkflowSubmitState();
+    } catch (e) {
+        document.getElementById('apply-workflow-status').textContent = 'Failed: ' + e.message;
+        document.getElementById('apply-workflow-status').className = 'text-sm text-red-600 ml-2';
+        _applyWorkflowSelected = null;
+    }
+}
+// Re-check required vars on every input. Enables Apply only when
+// every required field has a value.
+function updateApplyWorkflowSubmitState() {
+    if (!_applyWorkflowSelected) {
+        document.getElementById('apply-workflow-submit-btn').disabled = true;
+        return;
+    }
+    const vars = _applyWorkflowSelected.variables || [];
+    let allFilled = true;
+    for (const v of vars) {
+        if (!v.required) continue;
+        const inp = document.getElementById(`awf-var-${v.name}`);
+        if (!inp || !inp.value.trim()) { allFilled = false; break; }
+    }
+    document.getElementById('apply-workflow-submit-btn').disabled = !allFilled;
+}
+function onApplyWorkflowVarInput() { updateApplyWorkflowSubmitState(); }
+
+async function submitApplyWorkflow() {
+    const btn = document.getElementById('apply-workflow-submit-btn');
+    const status = document.getElementById('apply-workflow-status');
+    if (!_applyWorkflowSelected) { status.textContent = 'No workflow selected'; return; }
+    // Confirmation dialog with the blast radius. The current task
+    // count comes from a hidden input rendered into the page at
+    // load time (avoids a separate /api/projects/{id} fetch). The
+    // step count comes from the workflow's step_template (already
+    // loaded into _applyWorkflowSelected).
+    // Mental model: "Apply workflow" = IMPORT a workflow object
+    // into the project. The workflow's steps become NEW tasks; the
+    // project's existing tasks are kept untouched. User feedback
+    // (2026-07-26): "我一直都說是import workflow 的object 入project"
+    // — the earlier archive-all-then-insert was wrong.
+    const stepCount = (_applyWorkflowSelected.step_template || []).length;
+    const curEl = document.getElementById('current-task-count');
+    const curCount = curEl ? parseInt(curEl.value || '0', 10) : 0;
+    const totalAfter = curCount + stepCount;
+    const confirmMsg =
+        `Import workflow "${_applyWorkflowSelected.name}" into this project?\n\n` +
+        `• ${stepCount} new pending task${stepCount === 1 ? '' : 's'} will be added\n` +
+        `• ${curCount} existing task${curCount === 1 ? '' : 's'} will be kept ` +
+        `(not archived, not deleted)\n` +
+        `• After: ${totalAfter} active task${totalAfter === 1 ? '' : 's'} in the project\n` +
+        `• Project state → planned (you must click ▶️ Run to dispatch)\n\n` +
+        `Continue?`;
+    if (!confirm(confirmMsg)) {
+        // user cancelled — keep the modal open so they can edit + retry
+        return;
+    }
+    btn.disabled = true;
+    status.textContent = 'Applying...';
+    status.className = 'text-sm text-gray-500 ml-2';
+    // Collect variable values
+    const variables = {};
+    for (const v of (_applyWorkflowSelected.variables || [])) {
+        const inp = document.getElementById(`awf-var-${v.name}`);
+        if (!inp) continue;
+        let val = inp.value;
+        if (v.type === 'boolean') {
+            if (val === 'true') val = true;
+            else if (val === 'false') val = false;
+            // empty string: don't include, let the default apply
+            else continue;
+        } else if (v.type === 'number') {
+            if (val === '' || val == null) continue;
+            val = Number(val);
+            if (Number.isNaN(val)) val = inp.value;  // let server error
+        } else {
+            if (val === '' && v.default == null) continue;
+        }
+        variables[v.name] = val;
+    }
+    try {
+        const r = await _fetchWithTimeout(`/api/projects/${PROJECT_ID}/apply-workflow`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                workflow_id: _applyWorkflowSelected.id,
+                variables: variables,
+            }),
+        }, 30000);
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            // 400 from server (var validation, no steps) — show verbatim
+            status.textContent = 'Failed: ' + _errDetailToString(j.detail, r.status);
+            status.className = 'text-sm text-red-600 ml-2';
+            btn.disabled = false;
+            return;
+        }
+        status.textContent = `Imported: ${j.task_count} new task${j.task_count === 1 ? '' : 's'} added (${j.pre_count} existing kept) · state: ${j.new_state}. Click ▶️ Run to dispatch. Reloading...`;
+        status.className = 'text-sm text-green-600 ml-2';
+        setTimeout(() => location.reload(), 1500);
+    } catch (e) {
+        status.textContent = 'Network error: ' + e.message;
+        status.className = 'text-sm text-red-600 ml-2';
+        btn.disabled = false;
+    }
+}
+</script>

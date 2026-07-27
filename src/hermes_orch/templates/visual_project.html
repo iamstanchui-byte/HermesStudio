@@ -518,6 +518,25 @@ svg.connection.output_2 path {
                 title="Add a new task to this project. The task will be created in 'pending' state and can be edited or deleted before the project runs.">
                 ➕ Add task
             </button>
+            {# UI cleanup 2026-07-27: Promote to workflow + Apply workflow
+               moved here from the project text view. These actions are
+               about the task list (the topic of this page) so the
+               toolbar is the right home. The modals + JS are in
+               _workflow_actions.html (a shared partial). #}
+            {% if project.state in ('completed', 'failed', 'cancelled', 'interrupted') %}
+            <button onclick="openPromoteToWorkflowModal()"
+                class="px-3 py-1 text-xs font-medium rounded border border-emerald-300 text-emerald-700 hover:bg-emerald-50"
+                title="Synthesize a reusable workflow package (parameterized step_template + variables list) from this project. Only available when the project is in a terminal state.">
+                🔁 Promote to workflow
+            </button>
+            {% endif %}
+            {% if project.state != 'deleted' and project.state != 'archived' %}
+            <button onclick="openApplyWorkflowModal()"
+                class="px-3 py-1 text-xs font-medium rounded border border-cyan-300 text-cyan-700 hover:bg-cyan-50"
+                title="Pick a workflow package + fill its variables to import as new tasks into this project. Existing tasks are kept. Wakes the project from terminal states.">
+                📥 Apply workflow
+            </button>
+            {% endif %}
             <span>auto-refresh: 30s</span>
         </div>
     </div>
@@ -1622,4 +1641,12 @@ function _vpBindEditDirtyTracking() {
 }
 _vpBindEditDirtyTracking();
 </script>
+
+{# UI cleanup 2026-07-27: include the workflow-action modals + JS
+   (Promote to workflow, Apply workflow) here. They used to live
+   inline in project.html but moved to the visual project page.
+   The partial's modals are fixed-overlay so they layer on top of
+   this page's drawflow canvas. The endpoint passes total_count so
+   the apply-workflow confirm() dialog can show the blast radius. #}
+{% include "_workflow_actions.html" %}
 {% endblock %}

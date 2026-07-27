@@ -1,21 +1,29 @@
-"""Tests for the project page Plan modal render (Phase A, 2026-07-27).
+"""Tests for the project page toolbar + plan API.
 
-Covers:
-  - The "📋 Plan" button is in the project page toolbar
-  - The Plan modal is in the DOM (with textarea + save/cancel buttons)
-  - The page still works for projects that have no plan yet
-  - The plan-modal text area loads the empty template when has_plan=false
+UI cleanup 2026-07-27: the project page toolbar was simplified. The
+"Plan" (JSON modal) button was removed — the visual plan editor is
+the primary surface. The "Plan editor" link (renamed from "Visual")
+links to /api/projects/{id}/plan/visual.
+
+This test now covers:
+  - The "Plan editor" link is in the project page toolbar
+  - The plan API still works (GET /api/projects/{id}/plan)
+
+The JSON plan modal + its DOM + JS are no longer tested here — they
+were removed along with the Plan button. The plan API itself is
+fully covered in test_project_plan.py and test_run_plan.py.
 """
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 import uuid
 
 import pytest
 
-BASE = "http://127.0.0.1:8765"
+BASE = os.environ.get("HERMES_TEST_BASE", "http://127.0.0.1:8765")
 
 
 def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict | list | str | None]:
@@ -58,53 +66,44 @@ def _delete_project(pid: str) -> None:
         pass
 
 
-def test_project_page_has_plan_button():
-    """The project page toolbar should include a '📋 Plan' button."""
+def test_project_page_has_plan_editor_link():
+    """The project page toolbar should include a '🎨 Plan editor' link
+    to the visual plan editor (the primary editing surface). UI
+    cleanup 2026-07-27 renamed the button from 'Visual' to
+    'Plan editor' to disambiguate from the task-canvas Visual view
+    that was also removed."""
     pid = _create_test_project()
     try:
         html = _get_text(f"/projects/{pid}")
-        # The Plan button is in the toolbar with the cyan border
-        # and the 'openPlanModal' onclick handler.
-        assert "openPlanModal" in html
-        assert "📋 Plan" in html or "Plan" in html
+        # The link is an <a> tag with the visual editor URL
+        assert f'href="/api/projects/{pid}/plan/visual"' in html, \
+            "missing 'Plan editor' link to the visual editor"
+        # The link's label is "Plan editor" (not "Visual")
+        assert "Plan editor" in html, "missing 'Plan editor' label"
     finally:
         _delete_project(pid)
 
 
-def test_project_page_has_plan_modal_dom():
-    """The Plan modal DOM elements should be in the page even when
-    hidden (so openPlanModal can populate them)."""
+def test_project_page_no_legacy_plan_button():
+    """The 'Plan' (JSON modal) button should NOT be on the project
+    page anymore. The visual plan editor covers the same surface
+    and the user said they don't read JSON."""
     pid = _create_test_project()
     try:
         html = _get_text(f"/projects/{pid}")
-        # The modal contains the textarea + buttons
-        assert 'id="plan-modal-overlay"' in html
-        assert 'id="plan-json"' in html
-        assert 'id="plan-submit-btn"' in html
-        assert 'id="plan-status"' in html
-        assert 'id="plan-error"' in html
-        # The Plan modal title
-        assert "Project plan" in html
-        # The clear plan button
-        assert "clearPlan()" in html or "Clear plan" in html
-    finally:
-        _delete_project(pid)
-
-
-def test_project_page_has_plan_js_handlers():
-    """The Plan modal JS functions should be in the page."""
-    pid = _create_test_project()
-    try:
-        html = _get_text(f"/projects/{pid}")
-        for fn in ("openPlanModal", "closePlanModal", "submitPlan", "clearPlan"):
-            assert f"function {fn}" in html, f"missing function {fn}"
+        # No button onclick for the removed openPlanModal
+        assert 'onclick="openPlanModal(' not in html, \
+            "old Plan (JSON) button still present"
+        # No plan modal in the DOM
+        assert 'id="plan-modal-overlay"' not in html, \
+            "old plan modal still in DOM"
     finally:
         _delete_project(pid)
 
 
 def test_plan_api_returns_empty_for_new_project():
     """End-to-end: a new project should have has_plan=False, plan=None
-    via the API (the modal then loads the empty template)."""
+    via the API. The visual plan editor then loads the empty template."""
     pid = _create_test_project()
     try:
         s, body = _http("GET", f"/api/projects/{pid}/plan")
@@ -115,16 +114,18 @@ def test_plan_api_returns_empty_for_new_project():
         _delete_project(pid)
 
 
-def test_project_page_has_visual_plan_button():
-    """Phase C: the project page toolbar should include a '🎨 Visual'
-    button that links to the visual plan editor. The visual editor
-    is the primary editing surface; the JSON modal is secondary."""
+def test_project_page_has_visual_task_canvas_link():
+    """UI cleanup 2026-07-27: the visual task canvas button was removed
+    from the project page toolbar. The page is still reachable via
+    a small 'Open visual task canvas' link at the bottom of the
+    toolbar (for power users who want the drawflow canvas)."""
     pid = _create_test_project()
     try:
         html = _get_text(f"/projects/{pid}")
-        # The Visual button is an <a> tag linking to the visual editor
-        assert f'href="/api/projects/{pid}/plan/visual"' in html, \
-            "missing 'Visual' link to the plan editor"
-        assert "Visual" in html
+        # The small link is a regular <a> with a 'task canvas' hint
+        assert f'href="/projects/{pid}/visual"' in html, \
+            "missing 'Open visual task canvas' link"
+        assert "task canvas" in html or "visual task" in html, \
+            "missing link label"
     finally:
         _delete_project(pid)

@@ -1273,6 +1273,12 @@ async def project_visual_page(
             "status_counts": status_counts,
             "profile_names": profile_names,
             "all_profiles": all_profiles,
+            # UI cleanup 2026-07-27: the workflow_actions partial
+            # (Promote / Apply workflow modals) reads this for the
+            # blast-radius confirm() dialog. Active (non-archived)
+            # task count is the right number — that's what the
+            # apply-workflow will add to.
+            "total_count": len(tasks),
         },
     )
 
