@@ -675,3 +675,166 @@ async def plan_visual_page(project_id: str, request: Request) -> HTMLResponse:
             "active_page": "projects",
         },
     )
+
+
+# ===== Phase D: LLM-driven plan generation (2026-07-27) =====
+# UI cleanup: the project page used to have a "Generate plan" button
+# that called POST /api/projects/{id}/replan which materializes TASKS
+# directly. With the plan layer, we want a different flow:
+#   - "Generate plan" (now in the plan editor) calls the LLM and
+#     gets a plan_json (design-time)
+#   - "Run" materializes the plan into tasks (run-time)
+# This endpoint is the LLM step. It does NOT save the plan — the
+# user reviews in the visual editor first, then clicks "Save".
+
+
+class FromLlmBody(BaseModel):
+    """Body for POST /api/projects/{id}/plan/from-llm.
+
+    `goal` is the natural-language description of what the project
+    should achieve. If empty, we use the project's existing goal
+    column. `name_suffix` is appended to each step name to avoid
+    collisions (e.g. '_draft_1' on first try, '_draft_2' on edit).
+    """
+    goal: str = ""
+    name_suffix: str = ""
+
+
+@router.post("/projects/{project_id}/plan/from-llm", response_model=ProjectPlanResponse)
+async def generate_plan_from_llm(
+    project_id: str, body: FromLlmBody, request: Request,
+) -> ProjectPlanResponse:
+    """Generate a plan_json from a goal using the LLM (Phase D, 2026-07-27).
+
+    Flow:
+      1. Load the project. If body.goal is empty, fall back to
+         projects.goal. 400 if both are blank.
+      2. Load agent roles + their skills so the LLM can pick the
+         right role for each step (matches Planner.plan() signature).
+      3. Call Planner.plan() — this returns a list of task dicts in
+         the same shape that POST /replan used to materialise directly.
+         We do NOT call any /tasks/* insert; we just want the structure.
+      4. Convert each task to a PlanStep:
+           - name: kebab-case the task.name (planner gives snake/kebab,
+             we normalise)
+           - agent_role: pass through
+           - action: 'do_task' (the default task action; user can edit)
+           - depends_on: pass through (planner already returns step
+             NAMES; we keep names — they get resolved to task ids at
+             /plan/run time)
+           - params_template: from task.params (parsed JSON)
+           - output_path: empty (planner doesn't set this; user can add)
+           - skill / tool / required_capability: empty unless the
+             planner included them (we don't lose data — if it did,
+             it ends up in params_template)
+      5. Wrap in ProjectPlan. Don't write to DB.
+      6. Return the plan so the client can render it on the canvas.
+         The user reviews and clicks "Save" (PUT /plan) to persist.
+
+    Edge cases:
+      - No agent roles registered: 400
+      - LLM mock mode: returns a mock 2-step plan (good enough for
+        UX testing; user can edit on the canvas)
+      - LLM real mode: returns whatever the LLM produced; if the
+        LLM fails the planner falls back to mock with a logged
+        `planner_fell_back_to_mock` event (no exception)
+    """
+    db = request.app.state.db
+    proj = await db.fetchone(
+        "SELECT id, name, goal FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    goal = (body.goal or "").strip() or (proj.get("goal") or "").strip()
+    if not goal:
+        raise HTTPException(
+            400,
+            "no goal provided and project has no goal set; "
+            "set a goal first or pass one in the request body",
+        )
+    # Load agent roles (we just need their NAMES — the planner
+    # uses role names as the `agent_role` field in the task).
+    role_rows = await db.fetchall(
+        "SELECT DISTINCT agent_id, name FROM agent_profiles ORDER BY agent_id, name"
+    )
+    available_roles = sorted({r["agent_id"] for r in role_rows if r["agent_id"]})
+    if not available_roles:
+        raise HTTPException(
+            400,
+            "no agent roles registered; add an agent profile first",
+        )
+    # Load role skills (planner uses this to pick the right role).
+    role_skill_rows = await db.fetchall(
+        "SELECT agent_id, name FROM agent_profiles WHERE name IS NOT NULL AND name != ''"
+    )
+    role_skills: dict[str, list[str]] = {}
+    for r in role_skill_rows:
+        role_skills.setdefault(r["agent_id"], []).append(r["name"])
+    # Call the planner. This is the same call that the OLD
+    # /api/projects/{id}/replan used to make, but we capture the
+    # returned list as a plan_json (design-time) instead of writing
+    # rows to the tasks table (run-time).
+    planner = getattr(request.app.state, "planner", None)
+    if planner is None:
+        raise HTTPException(500, "planner not initialized")
+    task_dicts = await planner.plan(
+        goal=goal,
+        available_roles=available_roles,
+        role_skills=role_skills or None,
+    )
+    # Convert task dicts to PlanStep objects.
+    import re as _re
+    _KEBAB = _re.compile(r"[^a-z0-9-]+")
+    def _to_kebab(s: str) -> str:
+        s = (s or "").lower().strip()
+        s = _KEBAB.sub("-", s).strip("-")
+        return s or "step"
+    steps: list[PlanStep] = []
+    for t in task_dicts:
+        raw_name = str(t.get("name") or t.get("id") or "step")
+        name = _to_kebab(raw_name)
+        if body.name_suffix:
+            name = f"{name}{body.name_suffix}"
+        # Planner returns depends_on as a list of step names (or ids
+        # — we treat them as opaque names; the validator at save time
+        # will check they exist in the plan).
+        deps = t.get("depends_on") or []
+        # params may be a JSON string or dict. Normalise to dict.
+        raw_params = t.get("params") or {}
+        if isinstance(raw_params, str):
+            try:
+                raw_params = json.loads(raw_params)
+            except (json.JSONDecodeError, TypeError):
+                raw_params = {}
+        if not isinstance(raw_params, dict):
+            raw_params = {}
+        steps.append(PlanStep(
+            name=name,
+            agent_role=str(t.get("agent_role") or ""),
+            action=str(t.get("action") or "do_task"),
+            skill="",
+            tool="",
+            required_capability=str(t.get("required_capability") or ""),
+            depends_on=[str(d) for d in deps],
+            params_template=raw_params,
+            output_path=str(t.get("output_path") or ""),
+        ))
+    plan = ProjectPlan(
+        version=PLAN_VERSION,
+        name="",
+        description=f"Generated by LLM from goal: {goal[:200]}",
+        trigger="manual",
+        variables=[],
+        steps=steps,
+    )
+    msg = (
+        f"LLM generated {len(steps)} step(s) from goal (len={len(goal)}). "
+        f"Review the canvas, then click Save to persist."
+    )
+    return ProjectPlanResponse(
+        project_id=project_id,
+        has_plan=True,
+        plan=plan,
+        updated_at=_now_iso(),
+    )

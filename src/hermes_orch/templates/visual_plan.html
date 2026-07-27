@@ -28,13 +28,13 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
-<script defer src="/static/visual_plan.js?v=2026-07-27-10"></script>
+<script defer src="/static/visual_plan.js?v=2026-07-27-11"></script>
 <style>
     /* Page-specific layout */
     body { background: #f9fafb; }
     .vp-canvas-wrap {
         width: 100%;
-        height: calc(100vh - 200px);
+        height: calc(100vh - 220px);
         min-height: 480px;
         background: #f9fafb;
         border: 1px solid #e5e7eb;
@@ -46,36 +46,29 @@
         height: 100% !important;
     }
     /* Defensive override: drawflow's default .drawflow-node has
-       background:#0ff (cyan) + color:white + border:2px solid #000.
-       Without these !important rules, drawflow's CSS wins and the
-       cards look washed-out (transparent cyan + illegible white
-       text). We force a SOLID white card with crisp dark text and
-       a 2px cyan-700 border (more saturated than cyan-600 so the
-       cards stand out at a glance) + a subtle shadow for depth.
-       User feedback 2026-07-27: "看不到有什麼分別" — the earlier
-       cyan-600 border + 12px text was too subtle. This version
-       reads as a proper card at first glance. */
+       background:#0ff + color:white + border:2px solid #000. We
+       force a clean white card here. We match the visual_workflow
+       page's design (1px gray-300 border, 12px monospace, no
+       shadow) for consistency — the plan editor and the workflow
+       editor are sister surfaces. */
     .drawflow .drawflow-node.vp-node {
         background: #fff !important;
-        border: 2px solid #0e7490 !important;  /* cyan-700, bolder */
-        border-radius: 8px !important;
-        color: #111827 !important;             /* gray-900, near-black */
-        font-family: ui-sans-serif, system-ui, -apple-system,
-                     BlinkMacSystemFont, sans-serif !important;
-        font-size: 13px !important;
-        line-height: 1.45 !important;
+        border: 1px solid #d1d5db !important;
+        border-radius: 6px !important;
+        color: #111827 !important;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
+        font-size: 12px !important;
+        line-height: 1.4 !important;
         box-sizing: border-box !important;
-        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1),
-                    0 1px 2px rgba(0, 0, 0, 0.06) !important;
     }
-    /* Plan step nodes — simpler than workflow nodes (no skill /
-       feedback_to / loop-back). Just name + role + action. The
-       .vp-node class is applied via drawflow's classoverride
-       parameter in visual_plan.js (addNode). */
+    /* Plan step nodes — same shape as workflow nodes, just the
+       .vp-node class instead of .vf-node. The .vp-node class is
+       applied via drawflow's classoverride parameter in
+       visual_plan.js (addNode). */
     .vp-node {
         width: 220px !important;
         min-height: 80px;
-        padding: 10px 12px;
+        padding: 8px 10px;
         position: relative;
     }
     .vp-node.selected {
@@ -83,32 +76,28 @@
         box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.2);
     }
     .vp-node-name {
-        font-weight: 700;
-        font-size: 14px;
+        font-weight: 600;
         color: #111827;
-        letter-spacing: -0.01em;
+        text-transform: lowercase;
     }
     .vp-node-role {
-        font-size: 11px;
-        color: #374151;       /* gray-700 (darker than before) */
-        background: #e0f2fe;  /* sky-100 (light cyan tint) */
-        padding: 2px 7px;
+        font-size: 10px;
+        color: #6b7280;
+        background: #f3f4f6;
+        padding: 1px 5px;
         border-radius: 3px;
         display: inline-block;
-        margin-top: 5px;
-        font-weight: 500;
+        margin-top: 4px;
     }
     .vp-node-action {
-        color: #1d4ed8;       /* blue-700 (darker than before) */
-        font-size: 12px;
-        margin-top: 4px;
-        font-weight: 500;
-    }
-    .vp-node-deps {
-        color: #4b5563;       /* gray-600 */
+        color: #2563eb;
         font-size: 11px;
         margin-top: 3px;
-        font-weight: 500;
+    }
+    .vp-node-deps {
+        color: #6b7280;
+        font-size: 10px;
+        margin-top: 3px;
     }
     .vp-node-delete {
         position: absolute;
@@ -130,16 +119,12 @@
         opacity: 0.6;
     }
     .vp-node-delete:hover { opacity: 1; background: #fee2e2; color: #b91c1c; }
-    /* Wire (dependency) — drawflow draws SVG <path> for each
-       connection. The default drawflow style is a thin gray line
-       that's hard to see at the canvas scale. We make ours a
-       bolder 2.5px cyan stroke so the dependency relationship
-       between plan steps reads clearly at a glance. */
-    .drawflow svg.connection path.main-path {
-        stroke: #0891b2 !important;  /* cyan-600 */
-        stroke-width: 2.5 !important;
-        fill: none !important;
-    }
+    /* Wire (dependency) — match the workflow page's default
+       drawflow style (1px gray, no override). Per the user's
+       request 2026-07-27, the plan editor should look like the
+       workflow editor for consistency. The gray wire is enough
+       for the depends_on relationship to read clearly. */
+    /* (no explicit wire style — let drawflow's default apply) */
     .vp-side-panel {
         position: absolute;
         top: 0; right: 0;
@@ -237,6 +222,15 @@
             title="Client-side check: duplicate step names, missing depends_on, etc. Doesn't run the plan.">
             Validate plan
         </button>
+        {# UI cleanup 2026-07-27: LLM-generate-plan moved here from
+           the project page. The LLM now produces a plan_json
+           (design-time), not tasks. The user reviews in the canvas
+           then clicks Save (persist) or Run (materialize + dispatch). #}
+        <button onclick="window.vp.openGeneratePlanModal()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
+            title="Ask the LLM to draft a plan from a goal. Returns a plan_json (not tasks) — you review and edit on the canvas, then Save or Run.">
+            ✨ Generate plan
+        </button>
         <button onclick="window.vp.generateTasks()"
             class="px-3 py-1.5 text-xs font-bold rounded border-2 border-emerald-500 text-emerald-700 hover:bg-emerald-50"
             title="Materialize the plan into tasks (POST /api/projects/{id}/plan/run). The supervisor will dispatch the new tasks on the next tick.">
@@ -251,6 +245,46 @@
 </div>
 
 <div class="vp-canvas-wrap" id="vp-canvas-wrap">
+    {# Generate plan modal (UI cleanup 2026-07-27). LLM takes a
+       goal and returns a plan_json. Replaces the old project-page
+       Generate plan that wrote tasks directly. The button lives
+       in the toolbar above; the modal is here so the markup
+       lives near the canvas it overlays. #}
+    <div id="vp-generate-modal-overlay"
+        class="hidden fixed inset-0 z-50 flex items-center justify-center"
+        style="background-color: rgba(0,0,0,0.5);">
+        <div class="bg-white rounded-lg shadow-xl max-w-lg w-full mx-4">
+            <form id="vp-generate-form" onsubmit="event.preventDefault(); window.vp.generatePlanFromLlm();" class="p-5">
+                <h2 class="text-lg font-semibold text-gray-800 mb-1">✨ Generate plan (LLM)</h2>
+                <p class="text-sm text-gray-500 mb-4">
+                    The LLM will draft a plan from your goal and load the steps onto the canvas.
+                    You can then review, edit, and click <strong>Save</strong> to persist or
+                    <strong>Run</strong> to materialize into tasks. Falls back to a 2-step
+                    mock plan if the LLM is not configured.
+                </p>
+                <label class="block text-sm font-medium text-gray-700 mb-1">
+                    Goal <span class="text-red-500">*</span>
+                </label>
+                <textarea id="vp-generate-goal" required rows="4"
+                    class="w-full border rounded px-2 py-1 text-sm"
+                    placeholder="What should the agents do? Be specific — the LLM uses this to break the work into plan steps."></textarea>
+                <p class="text-xs text-gray-500 mt-1">
+                    Leave empty to use the project's existing goal.
+                </p>
+                <div class="mt-4 flex items-center gap-2">
+                    <button type="submit"
+                        class="px-4 py-2 bg-purple-600 text-white rounded text-sm hover:bg-purple-700">
+                        Generate
+                    </button>
+                    <button type="button" onclick="window.vp.closeGeneratePlanModal()"
+                        class="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm hover:bg-gray-200">
+                        Cancel
+                    </button>
+                    <span id="vp-generate-status" class="text-sm text-gray-500 ml-2"></span>
+                </div>
+            </form>
+        </div>
+    </div>
     {# drawflow injects the canvas into this wrap #}
     <div id="vp-canvas" style="width: 100%; height: 100%;"></div>
     {# Side panel — shows step details when a step is selected.

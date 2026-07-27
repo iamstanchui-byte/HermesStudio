@@ -655,6 +655,69 @@
         });
     }
 
+    // ===== LLM-generate-plan (Phase D, 2026-07-27) =====
+    // The LLM produces a plan_json (design-time), not tasks. The
+    // user reviews in the canvas, then clicks Save (persist) or
+    // Run (materialize + dispatch). This replaces the old
+    // project-page "Generate plan" that wrote tasks directly.
+    function openGeneratePlanModal() {
+        const status = $('vp-generate-status');
+        if (status) status.textContent = '';
+        const ta = $('vp-generate-goal');
+        if (ta) ta.value = '';
+        const overlay = $('vp-generate-modal-overlay');
+        if (overlay) overlay.classList.remove('hidden');
+        // focus the textarea after the modal opens
+        setTimeout(() => { if (ta) ta.focus(); }, 50);
+    }
+    function closeGeneratePlanModal() {
+        const overlay = $('vp-generate-modal-overlay');
+        if (overlay) overlay.classList.add('hidden');
+    }
+    async function generatePlanFromLlm() {
+        const goalEl = $('vp-generate-goal');
+        const goal = (goalEl && goalEl.value || '').trim();
+        const status = $('vp-generate-status');
+        if (status) {
+            status.textContent = 'Asking LLM (60-120s)...';
+            status.className = 'text-sm text-gray-500 ml-2';
+        }
+        try {
+            const r = await _fetchWithTimeout(
+                `/api/projects/${_projectId}/plan/from-llm`,
+                {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({goal: goal}),
+                },
+                180_000,  // 3 min for LLM
+            );
+            const j = await r.json();
+            if (!r.ok) {
+                throw new Error(_errDetailToString(j.detail, r.status));
+            }
+            // The endpoint returns a ProjectPlanResponse. Load the
+            // returned plan into the editor state and re-render.
+            _plan = j.plan || {version: '1.0', name: '', description: '', trigger: 'manual', variables: [], steps: []};
+            // Pre-fill name/description inputs
+            $('vp-plan-name').value = _plan.name || '';
+            $('vp-plan-description').value = _plan.description || '';
+            // Close the modal and re-render
+            closeGeneratePlanModal();
+            renderAllSteps();
+            if (status) status.textContent = '';
+            showBanner(
+                `LLM drafted ${(_plan.steps || []).length} step(s). Review and Save or Run.`,
+                'success'
+            );
+        } catch (e) {
+            if (status) {
+                status.textContent = 'Failed: ' + (e.message || String(e));
+                status.className = 'text-sm text-red-600 ml-2';
+            }
+        }
+    }
+
     // ===== Public API (window.vp) =====
     window.vp = {
         addStep: addStep,
@@ -666,6 +729,9 @@
         copyCanvasToJson: copyCanvasToJson,
         saveStepEdits: saveStepEdits,
         deleteSelectedStep: deleteSelectedStep,
+        openGeneratePlanModal: openGeneratePlanModal,
+        closeGeneratePlanModal: closeGeneratePlanModal,
+        generatePlanFromLlm: generatePlanFromLlm,
     };
 
     // ===== Bootstrap =====
