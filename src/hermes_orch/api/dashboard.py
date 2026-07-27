@@ -698,6 +698,38 @@ async def tasks_page(
         # single-task detail URL (the project link would 404
         # because the virtual project has no /projects/{id} page).
         t["is_single_task"] = bool(t.get("is_single_task"))
+    # Per the 2026-07-27 commit 3: profile column shows the human
+    # form "<agent_id> / <profile_name>" instead of just the raw
+    # agent_id. tasks.assigned_profile_id is the agent_profiles.id
+    # (UUID), not the profile name — so key the lookup map by id.
+    # Falls back to agent_role when no profile is assigned.
+    profile_rows = await db.fetchall(
+        "SELECT id, name, agent_id FROM agent_profiles"
+    )
+    profile_label = {
+        p["id"]: f"{p['agent_id']} / {p['name']}" for p in profile_rows
+    }
+    for t in tasks:
+        prof = t.get("assigned_profile_id") or ""
+        if prof and prof in profile_label:
+            t["profile_label"] = profile_label[prof]
+        elif t.get("assigned_agent_id"):
+            t["profile_label"] = t["assigned_agent_id"]
+        else:
+            t["profile_label"] = "—"
+    # Per the 2026-07-27 commit 3: action preset chips. Top 10
+    # distinct actions, ordered by frequency. Helps the user not
+    # have to remember / type the exact action name for common
+    # ones. Excludes 'do_task' (the single-task default) and empty
+    # actions — we want concrete action types, not "no action".
+    action_rows = await db.fetchall(
+        "SELECT action, COUNT(*) AS c FROM tasks "
+        "WHERE action IS NOT NULL AND action != '' "
+        "AND action != 'do_task' "
+        "GROUP BY action ORDER BY c DESC LIMIT 10"
+    )
+    action_presets = [{"name": r["action"], "count": int(r["c"] or 0)}
+                      for r in action_rows]
     # Annotate each artifact with on-disk existence so the template
     # can show "deleted" badges for ephemeral control files
     # (decision.md, status.md, plan.md, etc.) that the supervisor
@@ -707,12 +739,14 @@ async def tasks_page(
     projects_root_t = Path(cfg["projects"]["storage_root"]).resolve()
     for t in tasks:
         _annotate_artifact_exists(t, projects_root_t)
-    profile_rows = await db.fetchall(
-        "SELECT agent_id, name FROM agent_profiles ORDER BY agent_id, name"
+    # Build the ordered list for the create-form dropdown. Reuse
+    # the same query result from earlier (profile_rows above) by
+    # sorting it here.
+    all_profiles = sorted(
+        [{"agent_id": p["agent_id"], "name": p["name"]}
+         for p in profile_rows],
+        key=lambda p: (p["agent_id"], p["name"]),
     )
-    all_profiles = [
-        {"agent_id": r["agent_id"], "name": r["name"]} for r in profile_rows
-    ]
     return templates.TemplateResponse(
         request=request,
         name="tasks.html",
@@ -722,6 +756,7 @@ async def tasks_page(
             "projects": projects,
             "project_map": project_map,
             "all_profiles": all_profiles,
+            "action_presets": action_presets,
             "filter_status": status,
             "filter_days": days,
             "filter_limit": limit,

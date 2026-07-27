@@ -118,6 +118,18 @@
             <input id="nt-action" name="action" type="text"
                 class="mt-1 block w-full border rounded px-2 py-1 text-sm"
                 placeholder="e.g. run_backtest">
+            {% if action_presets %}
+            <div class="mt-1 flex flex-wrap items-center gap-1 text-xs">
+                <span class="text-gray-500">Recent:</span>
+                {% for p in action_presets %}
+                <button type="button" onclick="document.getElementById('nt-action').value='{{ p.name | e }}'; document.getElementById('nt-action').focus();"
+                    class="px-2 py-0.5 bg-gray-100 text-gray-700 rounded font-mono hover:bg-blue-100 hover:text-blue-800"
+                    title="Click to fill action with '{{ p.name }}' (used {{ p.count }} time{{ '' if p.count == 1 else 's' }})">
+                    {{ p.name }}{% if p.count %} <span class="text-gray-400">({{ p.count }})</span>{% endif %}
+                </button>
+                {% endfor %}
+            </div>
+            {% endif %}
         </div>
         <div>
             <label class="block text-xs font-medium text-gray-700">Params (JSON, optional)</label>
@@ -330,8 +342,10 @@ async function submitNewTask() {
             </div>
         </div>
         <div class="mt-2 text-xs text-gray-600 grid grid-cols-2 md:grid-cols-5 gap-2">
-            <div><span class="text-gray-500">role:</span> <span class="font-mono">{{ task.agent_role }}</span></div>
-            <div><span class="text-gray-500">agent:</span> <span class="font-mono">{{ task.assigned_agent_id or '-' }}</span></div>
+            <div class="min-w-0">
+                <span class="text-gray-500">profile:</span>
+                <span class="font-mono" title="assigned: {{ task.assigned_profile_id or '—' }}">{{ task.profile_label }}</span>
+            </div>
             <div class="min-w-0">
                 <span class="text-gray-500">action:</span>
                 {% set action_str = (task.action or '-') %}
@@ -348,6 +362,7 @@ async function submitNewTask() {
                     {% if task.timing.duration_seconds is none %}-{% else %}{{ "%d"|format(task.timing.duration_seconds) }}s{% endif %}
                 </span>
             </div>
+            <div></div>
         </div>
         {% if task.error %}
         <div class="mt-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2">
