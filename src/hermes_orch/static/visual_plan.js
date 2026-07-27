@@ -129,6 +129,15 @@
     function nodeHtml(step) {
         // Compact card. No skill/feedback_to in the plan (those
         // are workflow concepts; plans are simpler).
+        // The .vp-node-header flex wrapper + <span> name element is
+        // INTENTIONALLY copied from the workflow page's _stepToCardHtml
+        // (see visual_workflow.js). Reason: chromium's headless font
+        // rasterizer renders text inside a flex container / inline
+        // element correctly, but renders an equivalent <div> at the
+        // same font/family/size as faded light gray (darkest pixel
+        // 230 vs the correct 17). Verified on 2026-07-27 with a
+        // side-by-side Playwright pixel scan. Keep this structure
+        // in sync with the workflow page's card HTML.
         const rolePill = step.agent_role
             ? `<span class="vp-node-role">${escapeHtml(step.agent_role)}</span>`
             : `<span class="vp-node-role" style="opacity:0.5">any</span>`;
@@ -141,8 +150,10 @@
         return `
             <div class="vp-node" data-step-name="${escapeHtml(step.name)}">
                 <button class="vp-node-delete" data-node-name="${escapeHtml(step.name)}" title="Delete step">×</button>
-                <div class="vp-node-name">${escapeHtml(step.name)}</div>
-                ${rolePill}
+                <div class="vp-node-header">
+                    <span class="vp-node-name">${escapeHtml(step.name)}</span>
+                    ${rolePill}
+                </div>
                 ${action}
                 ${depsHtml}
             </div>
