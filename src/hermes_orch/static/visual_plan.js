@@ -139,11 +139,13 @@
             ? `<div class="vp-node-deps" style="color:#6b7280;font-size:10px;margin-top:3px">← ${step.depends_on.length} dep${step.depends_on.length === 1 ? '' : 's'}</div>`
             : '';
         return `
-            <button class="vp-node-delete" data-node-name="${escapeHtml(step.name)}" title="Delete step">×</button>
-            <div class="vp-node-name">${escapeHtml(step.name)}</div>
-            ${rolePill}
-            ${action}
-            ${depsHtml}
+            <div class="vp-node" data-step-name="${escapeHtml(step.name)}">
+                <button class="vp-node-delete" data-node-name="${escapeHtml(step.name)}" title="Delete step">×</button>
+                <div class="vp-node-name">${escapeHtml(step.name)}</div>
+                ${rolePill}
+                ${action}
+                ${depsHtml}
+            </div>
         `;
     }
 

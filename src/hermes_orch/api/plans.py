@@ -667,12 +667,20 @@ async def plan_visual_page(project_id: str, request: Request) -> HTMLResponse:
     # (set up in main.py: app.state.templates). We import the type
     # only — the actual `templates` instance is on app.state and
     # shared with dashboard.py.
+    # Bug fix 2026-07-27: pass llm_configured into context so the
+    # base.html "Mock mode" banner hides when LLM is configured.
+    # Without this, plan_visual_page always shows the "running in
+    # mock mode" yellow banner even with API key set.
+    from hermes_orch.api.dashboard import _llm_configured
     templates: Jinja2Templates = request.app.state.templates
     return templates.TemplateResponse(
         request, "visual_plan.html",
         {
             "project": proj_view,
             "active_page": "projects",
+            "llm_configured": _llm_configured(
+                getattr(request.app.state, "config", None)
+            ),
         },
     )
 
