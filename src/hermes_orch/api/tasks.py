@@ -1441,6 +1441,185 @@ async def delete_task(task_id: str, request: Request):
     return Response(status_code=204)
 
 
+# ===== Promote task to workflow package (commit 2 of merge, 2026-07-27) =====
+
+
+class PromoteTaskToWorkflowBody(BaseModel):
+    """Body for POST /api/tasks/{id}/promote-to-workflow."""
+    name: str = Field(
+        ..., min_length=1, max_length=80, pattern=r"^[a-z0-9][a-z0-9-]*$",
+        description="kebab-case workflow name (must be unique)",
+    )
+    description: str = Field("", max_length=500)
+
+
+@router.post("/{task_id}/promote-to-workflow")
+async def promote_task_to_workflow(
+    task_id: str, body: PromoteTaskToWorkflowBody, request: Request,
+) -> dict:
+    """Promote a finished task to a single-step workflow package.
+
+    Closes the ad-hoc → reusable loop: a task that worked well can be
+    lifted into the workflow catalog as a 1-step template that other
+    users (or schedules) can run with different variables.
+
+    Per the 2026-07-27 unified-tasks decision: this is the inverse of
+    "apply workflow to project". Use case is "I just did this ad-hoc
+    task and it works well, let me turn it into a reusable template".
+
+    Constraints (so we don't promote half-finished or errored work):
+      - Task must exist
+      - Task must be in a terminal state (completed / failed /
+        cancelled / interrupted / skipped) — pending / running tasks
+        don't have settled action+params to lift
+      - Workflow name must be unique
+
+    What gets lifted:
+      - step_template: one step with the task's action, agent_role,
+        required_capability, and params
+      - variables: empty (the single task was run with concrete params;
+        a workflow consumer can edit the step later if they want vars)
+      - description: from request body (operator-provided); falls back
+        to "Single task {id} promoted to workflow" if empty
+
+    Returns: {workflow_id, name, redirect_url}
+    """
+    import secrets
+    import json as _json
+    db = request.app.state.db
+    task = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    if not task:
+        raise HTTPException(404, f"Task not found: {task_id}")
+    # Only promote from terminal states — the action/params of an
+    # in-flight task are not yet settled. A "failed" task is allowed
+    # because the operator may have learned what NOT to do; they can
+    # still wrap it as a template (and edit the step later).
+    TERMINAL = ("completed", "failed", "cancelled", "interrupted", "skipped")
+    if (task.get("status") or "") not in TERMINAL:
+        raise HTTPException(
+            400,
+            f"Task {task_id} is in state {task.get('status')!r}; "
+            f"only terminal tasks can be promoted. Wait for it to "
+            f"finish, or retry/cancel it first.",
+        )
+    # Name uniqueness
+    existing = await db.fetchone(
+        "SELECT id FROM workflow_packages WHERE name = ?", (body.name,)
+    )
+    if existing:
+        raise HTTPException(
+            409,
+            f"workflow package name={body.name!r} already exists "
+            f"(id={existing['id']}); pick a different name or "
+            f"PATCH the existing one.",
+        )
+    # Build the single step from the task's settled fields.
+    # We use the task's `action` (always set, even single tasks get
+    # 'do_task') as the step action; `agent_role` is the role
+    # requested at create time (or empty if the supervisor picked);
+    # `required_capability` and `params` come from the task.
+    raw_params = task.get("params")
+    step_params: dict = {}
+    if isinstance(raw_params, str) and raw_params.strip():
+        try:
+            p = _json.loads(raw_params)
+            # params for a task is {goal, source, single_task_kind, ...}
+            # — for a workflow step, we want the operator-relevant
+            # knobs only. The operator can edit the step in the
+            # workflow editor to add what they need.
+            if isinstance(p, dict):
+                # Pull out the action-relevant params (not the
+                # metadata like source/goal)
+                for k in ("symbol", "url", "path", "input", "args"):
+                    if k in p:
+                        step_params[k] = p[k]
+        except (_json.JSONDecodeError, TypeError):
+            pass
+    elif isinstance(raw_params, dict):
+        step_params = raw_params
+    # Slugify the step name. The workflow validator requires kebab-case
+    # step names (matching the same pattern as the workflow name).
+    # If the task name doesn't slugify cleanly (e.g. all CJK chars,
+    # empty after slugify), fall back to a generated name.
+    raw_name = task.get("name") or ""
+    step_name = raw_name.lower()
+    step_name = re.sub(r"[^a-z0-9]+", "-", step_name)
+    step_name = step_name.strip("-")[:50]
+    if not step_name or not re.match(r"^[a-z0-9]", step_name):
+        step_name = f"step-from-{task_id}"
+    step = {
+        "name": step_name,
+        "action": task.get("action") or "do_task",
+        "agent_role": task.get("agent_role") or "",
+        # The workflow step field is `params_template` (not `params`).
+        # `required_capability` and `output_path` are not workflow
+        # step fields; output_path IS a valid step field — if the
+        # task had one, lift it.
+        "params_template": step_params,
+        "depends_on": [],
+    }
+    # Lift output_path if the task had one — it's a real workflow
+    # step field (where the step writes its result).
+    task_output_path = task.get("output_path")
+    if task_output_path:
+        step["output_path"] = task_output_path
+    pkg = {
+        "step_template": [step],
+        "variables": [],
+        "description": body.description or (
+            f"Workflow promoted from task {task_id} "
+            f"(action={step['action']!r}, role={step['agent_role']!r})"
+        ),
+    }
+    # Validate the package shape (defensive — we built it ourselves
+    # so it should always pass, but if a validator gets stricter
+    # later we'd rather fail here than write garbage).
+    try:
+        from hermes_orch.api.workflows import _validate_workflow_package
+        ok, err = _validate_workflow_package(pkg)
+        if not ok:
+            raise HTTPException(422, f"Built workflow failed validation: {err}")
+    except ImportError:
+        # workflows module not available (shouldn't happen in normal
+        # operation) — skip validation rather than crash
+        pass
+    wid = f"wf-{secrets.token_hex(6)}"
+    now = _now_iso()
+    try:
+        await db.execute(
+            "INSERT INTO workflow_packages "
+            "(id, name, version, description, step_template, variables, "
+            " source_project_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                wid, body.name, "1.0.0", pkg["description"],
+                _json.dumps(pkg["step_template"], ensure_ascii=False),
+                _json.dumps(pkg["variables"], ensure_ascii=False),
+                task.get("project_id") or None,  # source = the task's project
+                now, now,
+            ),
+        )
+    except Exception as e:
+        raise HTTPException(500, f"workflow insert failed: {type(e).__name__}: {e}")
+    await audit_log(
+        db, "workflow.created",
+        actor="operator",
+        project_id=task.get("project_id"),
+        task_id=task_id,
+        payload={
+            "name": body.name,
+            "from_task": task_id,
+            "from_action": step["action"],
+            "from_agent_role": step["agent_role"],
+        },
+    )
+    return {
+        "workflow_id": wid,
+        "name": body.name,
+        "redirect_url": f"/workflows/{wid}",
+    }
+
+
 # ===== Failure propagation (§4.3) =====
 
 

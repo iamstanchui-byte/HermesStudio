@@ -99,9 +99,123 @@
         ▶ Run
     </button>
     {% endif %}
+    {# Per the 2026-07-27 unified-tasks decision: "ad-hoc task that
+       worked well → promote to workflow" closes the ad-hoc → reusable
+       loop. Show on terminal states (completed/failed/skipped/etc.)
+       so the operator can lift any settled task — even a failed one
+       can be promoted as a template (and edited later). #}
+    {% if task.status in ('completed', 'failed', 'cancelled', 'interrupted', 'skipped') %}
+    <button onclick="openPromoteModal('{{ task.id }}', '{{ (task.name or task.id) | e }}')"
+        class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 font-medium"
+        title="Lift this task into the workflow catalog as a 1-step template. Other users (or schedules) can then run it with different variables.">
+        ↑ Promote to workflow
+    </button>
+    {% endif %}
+</div>
+
+{# Promote-to-workflow modal. Same UX as workflow detail's
+   "Apply workflow" modal — a single text input for the workflow
+   name (kebab-case), plus a description textarea. #}
+<div id="promote-modal" class="modal-overlay hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"
+    onclick="if (event.target === this) closePromoteModal()">
+    <div class="bg-white rounded-lg shadow-xl p-5 max-w-md w-full">
+        <h3 class="text-lg font-semibold text-gray-800 mb-3">Promote to workflow</h3>
+        <p class="text-sm text-gray-600 mb-3" id="promote-modal-desc">
+            Lift this task into the workflow catalog as a 1-step template.
+        </p>
+        <div class="space-y-3 text-sm">
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">
+                    Workflow name (kebab-case, unique) *
+                </label>
+                <input id="promote-name" type="text" maxlength="80"
+                    pattern="[a-z0-9][a-z0-9-]*"
+                    class="w-full border rounded px-2 py-1 font-mono"
+                    placeholder="e.g. summarize-news">
+                <p class="text-xs text-gray-500 mt-1">
+                    Lowercase letters, digits, and hyphens. Must start with a letter or digit.
+                </p>
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-700 mb-1">
+                    Description (optional)
+                </label>
+                <textarea id="promote-desc" rows="2" maxlength="500"
+                    class="w-full border rounded px-2 py-1"
+                    placeholder="What does this workflow do?"></textarea>
+            </div>
+            <div id="promote-error" class="hidden text-sm text-red-700 bg-red-50 border border-red-200 rounded p-2"></div>
+        </div>
+        <div class="mt-4 flex items-center gap-2">
+            <button id="promote-submit" onclick="submitPromote()"
+                class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 font-medium">
+                Promote
+            </button>
+            <button onclick="closePromoteModal()"
+                class="px-4 py-2 bg-gray-200 text-gray-700 rounded text-sm hover:bg-gray-300">
+                Cancel
+            </button>
+        </div>
+    </div>
 </div>
 
 <script>
+let _promoteTaskId = null;
+function openPromoteModal(taskId, taskName) {
+    _promoteTaskId = taskId;
+    document.getElementById('promote-modal-desc').innerHTML =
+        `Lift task <code class="bg-gray-100 px-1 rounded">${taskName}</code> into the workflow catalog as a 1-step template.`;
+    // Pre-fill name from task name (slugify). User can override.
+    const slug = taskName.toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 60) || 'promoted-task';
+    document.getElementById('promote-name').value = slug;
+    document.getElementById('promote-desc').value = '';
+    document.getElementById('promote-error').classList.add('hidden');
+    document.getElementById('promote-modal').classList.remove('hidden');
+    setTimeout(() => document.getElementById('promote-name').focus(), 50);
+}
+function closePromoteModal() {
+    document.getElementById('promote-modal').classList.add('hidden');
+    _promoteTaskId = null;
+}
+function _showPromoteError(msg) {
+    const el = document.getElementById('promote-error');
+    el.textContent = msg;
+    el.classList.remove('hidden');
+}
+async function submitPromote() {
+    if (!_promoteTaskId) return;
+    const name = document.getElementById('promote-name').value.trim();
+    const description = document.getElementById('promote-desc').value.trim();
+    if (!name) { _showPromoteError('Name is required.'); return; }
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+        _showPromoteError('Name must be kebab-case (lowercase letters, digits, hyphens; start with letter or digit).');
+        return;
+    }
+    const btn = document.getElementById('promote-submit');
+    btn.disabled = true; btn.textContent = 'Promoting...';
+    try {
+        const r = await _fetchWithTimeout('/api/tasks/' + _promoteTaskId + '/promote-to-workflow', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name, description}),
+        }, 15000);
+        const d = await r.json();
+        if (!r.ok) {
+            _showPromoteError(_errDetailToString(d.detail, r.status));
+            btn.disabled = false; btn.textContent = 'Promote';
+            return;
+        }
+        // Success — go to the new workflow
+        location.href = d.redirect_url || ('/workflows/' + d.workflow_id);
+    } catch (e) {
+        _showPromoteError('Network error: ' + e.message);
+        btn.disabled = false; btn.textContent = 'Promote';
+    }
+}
+
 async function runTask(taskId) {
     if (!confirm('Run this single task now? The supervisor will pick it up on the next tick.')) return;
     try {
