@@ -39,6 +39,16 @@
     let _projectId = null;
     let _selectedNodeName = null;   // which step's details are shown in the side panel
     let _jsonMode = false;          // toggle between visual and JSON textarea
+    // Map from step name -> drawflow's INTERNAL node id (the
+    // counter it uses as the key in its data map, e.g. '1' / '2'
+    // for the first two nodes, NOT the name we passed to addNode
+    // and NOT the DOM id 'node-1' / 'node-2'). drawflow's
+    // addConnection looks nodes up by this internal id (it does
+    // NOT use the name, and it does NOT use the DOM id). So we
+    // capture the internal id right after addNode by scanning
+    // the module's data map for the node whose `.name` matches
+    // the one we just added. Rebuilt on every renderAllSteps.
+    const _internalIdByStepName = new Map();
 
     // kebab-case validator (must match server-side). Centralized
     // here so the visual editor gives the same error as the API.
@@ -96,6 +106,11 @@
             zoom_min: 0.5,
         });
         _editor.start();
+        // DEBUG: expose for inspection in dev tools / tests
+        if (typeof window !== 'undefined') {
+            window.__vp_editor = _editor;
+            window.__vp_plan = _plan;
+        }
         // Pre-fill plan name/description inputs
         $('vp-plan-name').value = _plan.name || '';
         $('vp-plan-description').value = _plan.description || '';
@@ -134,43 +149,129 @@
 
     function addNodeToCanvas(step, x, y) {
         // drawflow 0.0.59: editor.addNode(name, inputs, outputs, posx, posy, class, data, html)
+        // The 6th arg is the class applied to the .drawflow-node
+        // wrapper. We use 'vp-node' so the .vp-node CSS in the
+        // template applies (white card with cyan border, etc.).
+        // Without this, drawflow's default style (cyan #0ff bg,
+        // white text) leaks through and the card looks washed-out.
         // We give each node 1 input + 1 output, so depends_on wires
         // use the standard 1-to-1 connection.
         // eslint-disable-next-line no-undef
         _editor.addNode(
-            'vp-' + step.name,     // node name (also used as id prefix)
+            'vp-' + step.name,     // node name (stored as `name` on
+                                   // the node data, but NOT used as
+                                   // the key in drawflow's data map
+                                   // — see below)
             1,                      // inputs
             1,                      // outputs
             x, y,
-            'vp-node-wrapper',      // wrapper class (drawflow adds this)
+            'vp-node',              // class applied to .drawflow-node
             { stepName: step.name }, // node data (custom field)
             nodeHtml(step),         // inner HTML
         );
+        // After addNode, drawflow has stored the new node in its
+        // data map under an INTERNAL counter id (NOT the name we
+        // passed, NOT the DOM id 'node-N'). addConnection uses
+        // these internal ids. drawflow's getModuleFromNodeId looks
+        // up by data key (counter), not by name, so we have to
+        // walk the data map ourselves. There should only be one
+        // module ('Home' by default) but we don't hardcode that.
+        for (const moduleName of Object.keys(_editor.drawflow.drawflow)) {
+            const data = _editor.drawflow.drawflow[moduleName].data;
+            for (const k of Object.keys(data)) {
+                if (data[k].name === 'vp-' + step.name) {
+                    _internalIdByStepName.set(step.name, k);
+                    return;
+                }
+            }
+        }
     }
 
     function wireDepsForStep(step) {
-        // For each dep, find the target node by step name and
-        // connect output_1 -> input_1. drawflow stores connections
-        // as {nodeId, outputId, inputId, class}.
+        // addConnection uses the INTERNAL id (the data-map key
+        // for the node), NOT the name and NOT the DOM id. We
+        // captured these in addNodeToCanvas.
         if (!step.depends_on) return;
         for (const depName of step.depends_on) {
-            const sourceId = 'vp-' + depName;
-            const targetId = 'vp-' + step.name;
-            try {
-                // eslint-disable-next-line no-undef
-                _editor.addConnection(sourceId, 'output_1', targetId, 'input_1');
-            } catch (e) {
-                // source not found yet — happens when drawing
-                // forward refs. We'll retry after all nodes are
-                // rendered. See renderAllSteps.
+            const sourceId = _internalIdByStepName.get(depName);
+            const targetId = _internalIdByStepName.get(step.name);
+            if (!sourceId || !targetId) {
+                // Forward ref — the dep hasn't been added yet (or
+                // this step was just added and we don't have its
+                // internal id yet). renderAllSteps retries after
+                // a tick.
+                continue;
             }
+            // WORKAROUND: drawflow 0.0.59's addConnection silently
+            // no-ops on a fresh state (we confirmed by reading its
+            // source: the if-cond evaluates correctly, the push
+            // should fire, but the live array length stays 0).
+            // Manual push works reliably. So we do the data push
+            // + SVG creation by hand instead.
+            _addWireManually(sourceId, targetId);
+        }
+    }
+
+    // Manually add a connection: push to the data map + create the
+    // SVG path. Mirrors what drawflow 0.0.59's addConnection does,
+    // but the in-library version silently no-ops (see wireDepsForStep
+    // comment). Tested by: doing the same push by hand in the dev
+    // console — array length goes 0 -> 1 as expected.
+    function _addWireManually(sourceId, targetId) {
+        if (!_editor) return;
+        try {
+            // Push to data: source's outputs.output_1.connections
+            const sourceData = _editor.drawflow.drawflow.Home.data[sourceId];
+            const targetData = _editor.drawflow.drawflow.Home.data[targetId];
+            if (!sourceData || !targetData) return;
+            const sourceOut = sourceData.outputs.output_1;
+            const targetIn = targetData.inputs.input_1;
+            if (!sourceOut || !targetIn) return;
+            // Skip if already connected
+            for (const c of sourceOut.connections) {
+                if (c.node == targetId && c.output == 'input_1') return;
+            }
+            sourceOut.connections.push({node: targetId.toString(), output: 'input_1'});
+            targetIn.connections.push({node: sourceId.toString(), input: 'output_1'});
+            // Create the SVG path (drawflow uses SVG for wires)
+            if (_editor.precanvas && _editor.module === 'Home') {
+                const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+                const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                path.classList.add("main-path");
+                path.setAttributeNS(null, "d", "");
+                svg.classList.add("connection");
+                svg.classList.add("node_in_node-" + targetId);
+                svg.classList.add("node_out_node-" + sourceId);
+                svg.classList.add("output_1");
+                svg.classList.add("input_1");
+                svg.appendChild(path);
+                _editor.precanvas.appendChild(svg);
+                // Update the wire geometry (drawflow's updateConnectionNodes)
+                if (typeof _editor.updateConnectionNodes === 'function') {
+                    _editor.updateConnectionNodes("node-" + sourceId);
+                    _editor.updateConnectionNodes("node-" + targetId);
+                }
+            }
+            // Fire the event for any listeners
+            if (typeof _editor.dispatch === 'function') {
+                _editor.dispatch("connectionCreated", {
+                    output_id: sourceId, input_id: targetId,
+                    output_class: "output_1", input_class: "input_1",
+                });
+            }
+        } catch (e) {
+            // swallow — drawflow throws if either node is gone
         }
     }
 
     function renderAllSteps() {
         if (!_editor) return;
-        // Clear existing
+        // Clear existing (also resets drawflow's internal counter,
+        // so subsequent node ids start back from 1)
         _editor.clear();
+        // Reset our step name -> internal id map; rebuild as we
+        // add nodes (each addNodeToCanvas populates it)
+        _internalIdByStepName.clear();
         // Add each step at a default position (later, Phase C+
         // will use the visual_layout field for persisted positions)
         const baseX = 100, baseY = 100;
@@ -254,13 +355,14 @@
         $('vp-f-params').value = JSON.stringify(step.params_template || {}, null, 2);
         $('vp-f-deps').value = (step.depends_on || []).join(', ');
         $('vp-side-panel').classList.remove('hidden');
-        // Highlight the selected node visually
+        // Highlight the selected node visually. drawflow wraps the
+        // node in <div id="node-vp-{name}" class="parent-node
+        // drawflow-node vp-node ...">. The .vp-node class is the one
+        // we apply via addNode's classoverride; we just need to
+        // query the .drawflow-node element by its id.
         document.querySelectorAll('.vp-node').forEach(n => n.classList.remove('selected'));
-        const nodeEl = document.querySelector('.vp-node-wrapper#node-vp-' + stepName);
-        if (nodeEl) {
-            const inner = nodeEl.querySelector('.vp-node');
-            if (inner) inner.classList.add('selected');
-        }
+        const nodeEl = document.getElementById('node-vp-' + stepName);
+        if (nodeEl) nodeEl.classList.add('selected');
     }
 
     function closeSidePanel() {

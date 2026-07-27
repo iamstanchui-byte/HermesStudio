@@ -28,7 +28,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
-<script defer src="/static/visual_plan.js?v=2026-07-27-1"></script>
+<script defer src="/static/visual_plan.js?v=2026-07-27-9"></script>
 <style>
     /* Page-specific layout */
     body { background: #f9fafb; }
@@ -45,19 +45,33 @@
         width: 100% !important;
         height: 100% !important;
     }
+    /* Defensive override: drawflow's default .drawflow-node has
+       background:#0ff (cyan) + color:white + border:2px solid #000.
+       Without these !important rules, drawflow's CSS wins and the
+       cards look washed-out (transparent cyan + illegible white
+       text). We force a clean white card with dark text here, and
+       the .vp-node rules below add the cyan border + padding +
+       selection highlight on top. NOTE: we don't override padding
+       here — that's owned by .vp-node below (8px 10px) so the
+       content has breathing room. */
+    .drawflow .drawflow-node.vp-node {
+        background: #fff !important;
+        border: 1.5px solid #0891b2 !important;  /* cyan-600 */
+        border-radius: 6px !important;
+        color: #1f2937 !important;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
+        font-size: 12px !important;
+        line-height: 1.4 !important;
+        box-sizing: border-box !important;
+    }
     /* Plan step nodes — simpler than workflow nodes (no skill /
-       feedback_to / loop-back). Just name + role + action. */
+       feedback_to / loop-back). Just name + role + action. The
+       .vp-node class is applied via drawflow's classoverride
+       parameter in visual_plan.js (addNode). */
     .vp-node {
         width: 200px !important;
         min-height: 70px;
         padding: 8px 10px;
-        background: #fff !important;
-        border: 1.5px solid #0891b2 !important;  /* cyan-600, matches toolbar accent */
-        border-radius: 6px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 12px;
-        line-height: 1.4;
-        box-sizing: border-box;
         position: relative;
     }
     .vp-node.selected {
