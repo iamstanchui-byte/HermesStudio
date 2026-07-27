@@ -140,6 +140,7 @@ def create_app() -> FastAPI:
     from hermes_orch.api.dashboard import router as dashboard_router
     from hermes_orch.api.objects import router as objects_router
     from hermes_orch.api.optimize import router as optimize_router
+    from hermes_orch.api.plans import router as plans_router
     from hermes_orch.api.projects import router as projects_router
     from hermes_orch.api.schedules import router as schedules_router
     from hermes_orch.api.settings import router as settings_router
@@ -154,6 +155,7 @@ def create_app() -> FastAPI:
     app.include_router(contracts_router, prefix="/api/contracts", tags=["contracts"])
     app.include_router(objects_router, prefix="/api/objects", tags=["objects"])
     app.include_router(optimize_router, prefix="/api/contracts/optimize-tasks", tags=["optimize"])
+    app.include_router(plans_router, prefix="/api", tags=["plans"])
     app.include_router(single_tasks_router, prefix="/api/single-tasks", tags=["single-tasks"])
     app.include_router(projects_router, prefix="/api/projects", tags=["projects"])
     app.include_router(schedules_router, prefix="/api/schedules", tags=["schedules"])

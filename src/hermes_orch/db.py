@@ -55,6 +55,15 @@ CREATE TABLE IF NOT EXISTS projects (
     supervisor_turn_count INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    -- plan_json: Per the 2026-07-27 plan-layer foundation. NULL for
+    -- projects that don't use a plan (legacy behavior, tasks added
+    -- directly). When set (even to '{}'), the project is in plan
+    -- mode — the orchestrator reads the plan, the user can edit it
+    -- via the JSON view, and "Run plan" materializes it into tasks.
+    -- Plan vs tasks separation: plan is the intent, tasks are the
+    -- execution; plans are immutable per "run" (each Run creates a
+    -- new execution row, not a new plan).
+    , plan_json TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -497,6 +506,12 @@ MIGRATIONS = [
     # project canvas).
     "ALTER TABLE tasks ADD COLUMN is_single_task INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_tasks_is_single ON tasks(is_single_task)",
+    # Plan layer foundation (2026-07-27): nullable plan_json on projects.
+    # Fresh DBs get the column from CREATE TABLE above; this ALTER
+    # backfills existing DBs that were created before plan_json was
+    # a thing. The 'duplicate column' error is caught silently in
+    # connect() so the migration is idempotent.
+    "ALTER TABLE projects ADD COLUMN plan_json TEXT DEFAULT NULL",
 ]
 
 

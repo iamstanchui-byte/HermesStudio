@@ -110,6 +110,17 @@
                         title="Re-trigger the LLM planner: set/update the project goal and configure iter-loop settings. Existing pending tasks are kept unless you also tick 'clear tasks'. After planning, the project stays in 'planned' state — click Run to start dispatch.">
                         ✨ Generate plan
                     </button>
+                    {# Plan layer foundation (2026-07-27): view / edit the
+                       project's plan_json (Phase A). Plan-first architecture
+                       — the plan is the source of truth; tasks are
+                       materialized from it. Phase A is JSON-only (no visual
+                       editor yet, that's Phase C). The "Run plan" button
+                       (Phase B) will turn the plan into tasks. #}
+                    <button onclick="openPlanModal('{{ project.id }}')"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-cyan-300 text-cyan-700 hover:bg-cyan-50"
+                        title="View / edit the project plan (JSON). The plan describes the workflow structure; 'Run plan' (Phase B) will materialize it into tasks. Foundation only — no visual editor yet.">
+                        📋 Plan
+                    </button>
                     {# Phase 4+ (2026-07-25): explicit Run button. Originally
                        only shown when state='planned' (or 'planning') so
                        the user has to opt-in to dispatch. User feedback
@@ -2512,6 +2523,161 @@ function escapeHtml(s) {
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
 }
+
+// ===== Plan modal (2026-07-27, Phase A foundation) =====
+//
+// JSON-only view for now. The plan describes the WHAT (steps,
+// variables, refs to skills/tools/agents); tasks are the HOW
+// (materialized in Phase B by the "Run plan" endpoint).
+//
+// UX: open → fetch current plan (or empty template) → user edits
+// JSON → Save → PUT /api/projects/{id}/plan. Validation errors
+// surface as 422 with field-level messages.
+
+let _planProjectId = null;
+
+async function openPlanModal(projectId) {
+    _planProjectId = projectId;
+    const status = document.getElementById('plan-status');
+    status.textContent = 'Loading...';
+    status.className = 'text-sm text-gray-500';
+    document.getElementById('plan-error').classList.add('hidden');
+    document.getElementById('plan-modal-overlay').classList.remove('hidden');
+    try {
+        const r = await _fetchWithTimeout('/api/projects/' + projectId + '/plan', {}, 10000);
+        const d = await r.json();
+        const ta = document.getElementById('plan-json');
+        if (d && d.has_plan && d.plan) {
+            ta.value = JSON.stringify(d.plan, null, 2);
+            status.textContent = `Loaded — last updated ${d.updated_at || 'never'}`;
+        } else {
+            // No plan yet — show a template the user can edit
+            ta.value = JSON.stringify({
+                "version": "1.0",
+                "name": "",
+                "description": "",
+                "trigger": "manual",
+                "variables": [],
+                "steps": []
+            }, null, 2);
+            status.textContent = 'No plan yet — edit the template and Save';
+        }
+        status.className = 'text-xs text-gray-500 mt-1';
+    } catch (e) {
+        status.textContent = 'Load failed: ' + e.message;
+        status.className = 'text-sm text-red-600';
+    }
+}
+
+function closePlanModal() {
+    document.getElementById('plan-modal-overlay').classList.add('hidden');
+    _planProjectId = null;
+}
+
+function _showPlanError(msg) {
+    const el = document.getElementById('plan-error');
+    el.textContent = msg;
+    el.classList.remove('hidden');
+}
+
+async function submitPlan() {
+    if (!_planProjectId) return;
+    const ta = document.getElementById('plan-json');
+    const status = document.getElementById('plan-status');
+    const btn = document.getElementById('plan-submit-btn');
+    btn.disabled = true; status.textContent = 'Saving...';
+    // Parse JSON
+    let plan;
+    try { plan = JSON.parse(ta.value); }
+    catch (e) {
+        _showPlanError('Invalid JSON: ' + e.message);
+        btn.disabled = false; status.textContent = 'Save failed';
+        return;
+    }
+    try {
+        const r = await _fetchWithTimeout('/api/projects/' + _planProjectId + '/plan', {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({plan: plan}),
+        }, 10000);
+        const d = await r.json();
+        if (!r.ok) {
+            _showPlanError(_errDetailToString(d.detail, r.status));
+            btn.disabled = false; status.textContent = 'Save failed';
+            return;
+        }
+        // Refresh JSON with the canonical form from the server
+        // (Pydantic may reorder fields, drop nulls, etc.)
+        ta.value = JSON.stringify(d.plan, null, 2);
+        status.textContent = `Saved — ${d.plan.steps.length} step(s), ${d.plan.variables.length} variable(s)`;
+        status.className = 'text-xs text-emerald-600 mt-1';
+        btn.disabled = false; btn.textContent = 'Save';
+    } catch (e) {
+        _showPlanError('Network error: ' + e.message);
+        btn.disabled = false; status.textContent = 'Save failed';
+    }
+}
+
+async function clearPlan() {
+    if (!_planProjectId) return;
+    if (!confirm('Clear the plan? This sets plan_json = NULL (back to legacy direct-task mode). Existing tasks are NOT affected.')) return;
+    try {
+        const r = await _fetchWithTimeout('/api/projects/' + _planProjectId + '/plan', {
+            method: 'DELETE'
+        }, 10000);
+        if (!r.ok && r.status !== 204) {
+            const d = await r.json().catch(() => ({}));
+            _showPlanError(_errDetailToString(d.detail, r.status));
+            return;
+        }
+        closePlanModal();
+        location.reload();
+    } catch (e) {
+        _showPlanError('Network error: ' + e.message);
+    }
+}
 </script>
+
+<!-- Plan modal: JSON view + edit + save. Phase A is text-only;
+     Phase C will add a visual editor on top of this JSON. -->
+<div id="plan-modal-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center"
+    style="background-color: rgba(0,0,0,0.5);">
+    <div class="bg-white rounded-lg shadow-xl max-w-3xl w-full mx-4 max-h-screen overflow-y-auto">
+        <div class="p-5">
+            <div class="flex items-center justify-between mb-2">
+                <h2 class="text-lg font-semibold text-gray-800">📋 Project plan</h2>
+                <button onclick="closePlanModal()" class="text-gray-500 hover:text-gray-700 text-2xl leading-none">&times;</button>
+            </div>
+            <p class="text-xs text-gray-500 mb-3">
+                Plan-first: this describes the workflow structure. Phase A is JSON only —
+                a visual editor and "Run plan" button are coming in Phase B/C. Required schema:
+                <code>version</code> + <code>name</code> (kebab-case or empty) +
+                <code>steps</code> (each step needs a kebab-case <code>name</code>).
+            </p>
+            <textarea id="plan-json" rows="20"
+                class="w-full font-mono text-xs border rounded p-2"
+                spellcheck="false"
+                placeholder='{"version": "1.0", "name": "my-plan", "steps": [...]}'></textarea>
+            <div id="plan-status" class="text-xs text-gray-500 mt-1">Loading...</div>
+            <div id="plan-error" class="hidden mt-2 text-sm text-red-700 bg-red-50 border border-red-200 rounded p-2"></div>
+            <div class="mt-4 flex items-center gap-2 justify-between">
+                <button onclick="clearPlan()" type="button"
+                    class="px-3 py-1.5 text-sm text-red-700 border border-red-200 rounded hover:bg-red-50">
+                    Clear plan
+                </button>
+                <div class="flex items-center gap-2">
+                    <button onclick="closePlanModal()" type="button"
+                        class="px-3 py-1.5 text-sm bg-gray-200 text-gray-700 rounded hover:bg-gray-300">
+                        Cancel
+                    </button>
+                    <button id="plan-submit-btn" onclick="submitPlan()" type="button"
+                        class="px-4 py-2 bg-cyan-600 text-white rounded text-sm hover:bg-cyan-700 font-medium">
+                        Save
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
 
 {% endblock %}
