@@ -113,3 +113,18 @@ def test_plan_api_returns_empty_for_new_project():
         assert body["plan"] is None
     finally:
         _delete_project(pid)
+
+
+def test_project_page_has_visual_plan_button():
+    """Phase C: the project page toolbar should include a '🎨 Visual'
+    button that links to the visual plan editor. The visual editor
+    is the primary editing surface; the JSON modal is secondary."""
+    pid = _create_test_project()
+    try:
+        html = _get_text(f"/projects/{pid}")
+        # The Visual button is an <a> tag linking to the visual editor
+        assert f'href="/api/projects/{pid}/plan/visual"' in html, \
+            "missing 'Visual' link to the plan editor"
+        assert "Visual" in html
+    finally:
+        _delete_project(pid)

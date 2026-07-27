@@ -1,4 +1,4 @@
-"""Project Plan layer (Phase A foundation, 2026-07-27).
+"""Project Plan layer (2026-07-27).
 
 The plan-first architectural shift: a project can carry a "plan"
 (structured intent) separate from its "tasks" (actual execution).
@@ -7,16 +7,13 @@ user-stated direction, the goal is to remove the archive/complexity
 tax by making plans immutable per-run — every click of "Run plan"
 materializes a fresh set of tasks from the current plan state.
 
-Phase A is foundation only:
-  - Schema: projects.plan_json TEXT (nullable, NULL = legacy mode)
-  - Pydantic model: ProjectPlan with steps + variables + object refs
-  - API: GET/PUT /api/projects/{id}/plan (JSON only, no editor yet)
-  - Audit: project.plan.updated event
-
-Phase B (next): POST /api/projects/{id}/plan/run — materialize the
-plan into tasks (the actual "Run" button).
-
-Phase C (later): Visual editor + migration path for legacy projects.
+Phase A (shipped): schema + Pydantic + GET/PUT/DELETE /api/projects/{id}/plan
+Phase B (shipped): POST /api/projects/{id}/plan/run — materialize the
+  plan into tasks (the actual "Run" button).
+Phase C (shipped): visual editor at /api/projects/{id}/plan/visual
+  (drawflow canvas, side panel for step details, Plan/Text mode
+  toggle, Validate / Save / Generate tasks buttons). See the
+  `plan_visual_page` endpoint below.
 
 Per the design contract:
   - A plan is project-scoped (1:1 with project)
@@ -27,9 +24,8 @@ Per the design contract:
   - The plan can be empty ({}) which means "no plan yet, use
     legacy direct-task mode" — this is the default for projects
     that haven't opted into the plan layer
-  - The plan is NOT visible to the agent runtime until Phase B
-    wires the "Run" endpoint. For now, plans are a no-op design
-    surface — saving a plan doesn't create any tasks.
+  - The plan is a design-time artifact; "Run" materializes it
+    into tasks (Phase B), and the supervisor then dispatches
 """
 from __future__ import annotations
 
@@ -39,6 +35,7 @@ import secrets
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
 
 from hermes_orch.utils import now_iso as _now_iso
@@ -601,4 +598,80 @@ async def run_project_plan(
         plan_name=plan.name,
         plan_version=plan.version,
         message=msg,
+    )
+
+
+# ===== Phase C: visual plan editor page (GET /api/projects/{id}/plan/visual) =====
+
+
+@router.get("/projects/{project_id}/plan/visual", response_class=HTMLResponse)
+async def plan_visual_page(project_id: str, request: Request) -> HTMLResponse:
+    """Render the visual plan editor page (Phase C, 2026-07-27).
+
+    This is the PRIMARY editing surface for plans (the JSON modal in
+    the project page is a secondary surface for power users / quick
+    edits). The visual page uses drawflow for the canvas, has a side
+    panel for step details, a minimap, and a Plan/Text mode toggle.
+
+    URL: /api/projects/{id}/plan/visual
+    (mounted at /api prefix via plans_router in main.py)
+
+    The plan JSON is embedded server-side into a data-* attribute on
+    the wrap div (data-plan-json), so the page renders correctly even
+    before any JS runs. The JS then re-renders from that attribute on
+    DOMContentLoaded and wires up drawflow.
+
+    Save = PUT /api/projects/{id}/plan (overwrites plan_json)
+    Generate tasks = POST /api/projects/{id}/plan/run (materializes
+    the plan into actual task rows; supervisor dispatches next tick)
+
+    Per the Perplexity / user-stated design (2026-07-27):
+      - The canvas shows the PLAN (intent), not runtime task status
+      - Validation state badges (Ready/Review/etc.) are plan-level
+        concerns — out of scope for Phase C
+      - "Generate tasks" = "Run plan" in our model (we materialize
+        the plan into actual tasks, not synthesize via LLM)
+    """
+    from fastapi.templating import Jinja2Templates
+    db = request.app.state.db
+    proj = await db.fetchone(
+        "SELECT id, name, plan_json FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    # Parse plan_json into a dict (so the template's `tojson` filter
+    # produces a single layer of encoding). projects.plan_json is a
+    # TEXT column holding a JSON string; if we pass it through as a
+    # string and then `|tojson` it, the JS gets a double-encoded
+    # value (string-within-string) and JSON.parse returns a string
+    # instead of an object — then `_plan.steps.map(...)` crashes
+    # with "Cannot read properties of undefined (reading 'map')".
+    # The fix: parse it here so the template emits a proper object.
+    import json
+    plan_obj = None
+    if proj.get("plan_json"):
+        try:
+            plan_obj = json.loads(proj["plan_json"])
+        except (json.JSONDecodeError, TypeError):
+            plan_obj = None
+    # Build a context that includes the parsed plan object (None when
+    # no plan). The template uses data-plan-json to bootstrap the
+    # JS-side plan state.
+    proj_view = {
+        "id": proj["id"],
+        "name": proj["name"],
+        "plan": plan_obj,
+    }
+    # Use the same Jinja templates env as the rest of the app
+    # (set up in main.py: app.state.templates). We import the type
+    # only — the actual `templates` instance is on app.state and
+    # shared with dashboard.py.
+    templates: Jinja2Templates = request.app.state.templates
+    return templates.TemplateResponse(
+        request, "visual_plan.html",
+        {
+            "project": proj_view,
+            "active_page": "projects",
+        },
     )

@@ -121,6 +121,16 @@
                         title="View / edit the project plan (JSON). The plan describes the workflow structure; 'Run plan' (Phase B) will materialize it into tasks. Foundation only — no visual editor yet.">
                         📋 Plan
                     </button>
+                    {# Phase C (2026-07-27): visual plan editor. Links to
+                       the dedicated drawflow-based editor at
+                       /api/projects/{id}/plan/visual. Primary surface
+                       for designing plans; the JSON modal is a
+                       secondary view for power users. #}
+                    <a href="/api/projects/{{ project.id }}/plan/visual"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-violet-300 text-violet-700 hover:bg-violet-50 inline-block"
+                        title="Open the visual plan editor (drawflow canvas with side panel, validate, save, and Generate tasks). This is the primary editing surface — the JSON modal is the secondary view.">
+                        🎨 Visual
+                    </a>
                     {# Phase 4+ (2026-07-25): explicit Run button. Originally
                        only shown when state='planned' (or 'planning') so
                        the user has to opt-in to dispatch. User feedback

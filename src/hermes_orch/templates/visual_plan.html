@@ -1,0 +1,304 @@
+{% extends "base.html" %}
+
+{# Visual plan editor — Phase C (2026-07-27).
+   This is the PRIMARY editing surface for a project's plan. Per the
+   Perplexity / user-stated design:
+     - The canvas shows the PLAN (intent), NOT runtime task status.
+       Runtime state lives on the project page / visual builder for
+       tasks; the plan editor is design-time only.
+     - Step cards are minimal: name, profile (agent_role), action.
+       The full schema (skill, tool, params_template, depends_on,
+       required_capability, output_path, notes) lives in the side
+       panel when a step is selected.
+     - Validation state badges (Ready/Review/Warning) are out of
+       scope for Phase C — they need a /plan/validate endpoint to
+       compute and that's a separate task.
+     - "Generate tasks" = the existing /api/projects/{id}/plan/run
+       (we materialize the plan into actual tasks; we don't
+       synthesize via LLM).
+   The page is a thin shell — all the behavior lives in
+   /static/visual_plan.js, loaded below. We pass the project id
+   + initial plan JSON to JS via a data-* attribute on the wrap. #}
+
+{% block head %}
+{# drawflow 0.0.59 from CDN. Same version as the workflow builder
+   so they share visual conventions (node card style, connection
+   rendering). dagre is loaded too for Phase C+ auto-layout (not
+   used in Phase C, but no extra cost to include now). #}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+<script defer src="/static/visual_plan.js?v=2026-07-27-1"></script>
+<style>
+    /* Page-specific layout */
+    body { background: #f9fafb; }
+    .vp-canvas-wrap {
+        width: 100%;
+        height: calc(100vh - 200px);
+        min-height: 480px;
+        background: #f9fafb;
+        border: 1px solid #e5e7eb;
+        border-radius: 0.5rem;
+        position: relative;
+    }
+    .vp-canvas-wrap > div:not(.vp-side-panel) {
+        width: 100% !important;
+        height: 100% !important;
+    }
+    /* Plan step nodes — simpler than workflow nodes (no skill /
+       feedback_to / loop-back). Just name + role + action. */
+    .vp-node {
+        width: 200px !important;
+        min-height: 70px;
+        padding: 8px 10px;
+        background: #fff !important;
+        border: 1.5px solid #0891b2 !important;  /* cyan-600, matches toolbar accent */
+        border-radius: 6px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        line-height: 1.4;
+        box-sizing: border-box;
+        position: relative;
+    }
+    .vp-node.selected {
+        border-color: #1d4ed8 !important;
+        box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.2);
+    }
+    .vp-node-name {
+        font-weight: 600;
+        color: #111827;
+    }
+    .vp-node-role {
+        font-size: 10px;
+        color: #6b7280;
+        background: #f3f4f6;
+        padding: 1px 5px;
+        border-radius: 3px;
+        display: inline-block;
+        margin-top: 4px;
+    }
+    .vp-node-action {
+        color: #2563eb;
+        font-size: 11px;
+        margin-top: 3px;
+    }
+    .vp-node-delete {
+        position: absolute;
+        top: 4px;
+        right: 6px;
+        width: 20px;
+        height: 20px;
+        padding: 0;
+        margin: 0;
+        border: 0;
+        background: transparent;
+        color: #9ca3af;
+        font-size: 16px;
+        line-height: 18px;
+        text-align: center;
+        cursor: pointer;
+        border-radius: 4px;
+        z-index: 3;
+        opacity: 0.6;
+    }
+    .vp-node-delete:hover { opacity: 1; background: #fee2e2; color: #b91c1c; }
+    .vp-side-panel {
+        position: absolute;
+        top: 0; right: 0;
+        width: 360px;
+        height: 100%;
+        background: #f9fafb;
+        border-left: 1px solid #e5e7eb;
+        padding: 12px 14px;
+        overflow-y: auto;
+        font-size: 12px;
+    }
+    .vp-side-panel h3 { font-size: 13px; font-weight: 600; margin-bottom: 8px; color: #111827; }
+    .vp-side-panel label {
+        display: block; font-size: 11px; color: #6b7280;
+        margin-top: 8px; margin-bottom: 2px; font-weight: 500;
+    }
+    .vp-side-panel input, .vp-side-panel select, .vp-side-panel textarea {
+        width: 100%; padding: 6px 8px; font-size: 12px;
+        border: 1px solid #d1d5db; border-radius: 4px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .vp-side-panel textarea { min-height: 60px; resize: vertical; }
+    .vp-side-panel .vp-row { display: flex; gap: 6px; align-items: center; }
+    .vp-side-panel .vp-row > * { flex: 1; }
+    /* JSON view (Text mode) */
+    .vp-json-form { display: none; margin-top: 12px; }
+    .vp-json-form.open { display: block; }
+    .vp-json-form textarea {
+        width: 100%; min-height: 320px; padding: 8px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px; border: 1px solid #d1d5db; border-radius: 4px;
+    }
+    /* Save banner (top-right, fades in/out) */
+    .vp-save-banner {
+        position: fixed; top: 16px; right: 16px;
+        padding: 8px 16px; border-radius: 6px;
+        font-size: 12px; font-weight: 500;
+        opacity: 0; transition: opacity 0.2s;
+        z-index: 50;
+    }
+    .vp-save-banner.show { opacity: 1; }
+    .vp-save-banner.success { background: #d1fae5; color: #065f46; }
+    .vp-save-banner.error { background: #fee2e2; color: #991b1b; }
+    /* Min-map (bottom-left, small) — Phase C basic: a scaled-down
+       drawflow view. Phase C+ will replace with a real minimap lib. */
+    .vp-minimap {
+        position: absolute; bottom: 12px; left: 12px;
+        width: 140px; height: 100px;
+        background: rgba(255, 255, 255, 0.9);
+        border: 1px solid #d1d5db;
+        border-radius: 4px;
+        overflow: hidden;
+        z-index: 10;
+    }
+    .vp-minimap-inner {
+        transform: scale(0.1);
+        transform-origin: top left;
+        width: 1400px; height: 1000px;
+        pointer-events: none;
+    }
+    .vp-minimap-empty {
+        padding: 10px; color: #9ca3af; font-size: 10px;
+        text-align: center;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+{# Pass project + initial plan data to JS via a data attribute. JS
+   reads this on DOMContentLoaded to bootstrap the editor. #}
+<div id="vp-wrap"
+    data-project-id="{{ project.id }}"
+    data-project-name="{{ project.name }}"
+    data-plan-json='{{ project.plan | tojson if project.plan else "" }}'
+    class="flex items-center justify-between mb-3 px-1">
+    <div>
+        <h1 class="text-lg font-bold text-gray-800">
+            <a href="/projects/{{ project.id }}" class="text-blue-600 hover:underline">
+                {{ project.name }}
+            </a>
+            <span class="text-gray-400 font-normal text-base">/ plan</span>
+        </h1>
+        <p class="text-xs text-gray-500 mt-0.5">
+            Visual plan editor (Phase C) · design-time only · changes here don't dispatch until you click "Generate tasks"
+        </p>
+    </div>
+    <div class="flex items-center gap-2">
+        <button onclick="window.vp.toggleJsonMode()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            title="Toggle the text/JSON editor (for power users who prefer raw JSON)">
+            Text
+        </button>
+        <button onclick="window.vp.validatePlan()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-amber-300 text-amber-700 hover:bg-amber-50"
+            title="Client-side check: duplicate step names, missing depends_on, etc. Doesn't run the plan.">
+            Validate plan
+        </button>
+        <button onclick="window.vp.generateTasks()"
+            class="px-3 py-1.5 text-xs font-bold rounded border-2 border-emerald-500 text-emerald-700 hover:bg-emerald-50"
+            title="Materialize the plan into tasks (POST /api/projects/{id}/plan/run). The supervisor will dispatch the new tasks on the next tick.">
+            ▶ Generate tasks
+        </button>
+        <button onclick="window.vp.savePlan()"
+            class="px-3 py-1.5 text-xs font-bold rounded border-2 border-cyan-500 text-cyan-700 hover:bg-cyan-50"
+            title="Save the plan JSON to the server (PUT /api/projects/{id}/plan)">
+            💾 Save
+        </button>
+    </div>
+</div>
+
+<div class="vp-canvas-wrap" id="vp-canvas-wrap">
+    {# drawflow injects the canvas into this wrap #}
+    <div id="vp-canvas" style="width: 100%; height: 100%;"></div>
+    {# Side panel — shows step details when a step is selected.
+       Hidden when no step is selected (the canvas takes full width). #}
+    <div class="vp-side-panel hidden" id="vp-side-panel">
+        <h3 id="vp-side-title">Step details</h3>
+        <div class="vp-row">
+            <div style="flex: 2">
+                <label>Name (kebab-case)</label>
+                <input id="vp-f-name" type="text" placeholder="fetch-data">
+            </div>
+            <div style="flex: 1">
+                <label>Action</label>
+                <input id="vp-f-action" type="text" placeholder="fetch">
+            </div>
+        </div>
+        <label>Agent role</label>
+        <input id="vp-f-role" type="text" placeholder="e.g. super">
+        <label>Required capability</label>
+        <input id="vp-f-capability" type="text" placeholder="(optional) e.g. summarize">
+        <label>Skill (canonical name)</label>
+        <input id="vp-f-skill" type="text" placeholder="(optional)">
+        <label>Output path</label>
+        <input id="vp-f-output" type="text" placeholder="(optional) e.g. ./report.md">
+        <label>Params (JSON)</label>
+        <textarea id="vp-f-params" placeholder='{"key": "value"}'></textarea>
+        <label>Depends on (comma-separated step names)</label>
+        <input id="vp-f-deps" type="text" placeholder="(optional)">
+        <div class="flex gap-2 mt-3">
+            <button onclick="window.vp.saveStepEdits()"
+                class="flex-1 px-3 py-1.5 text-xs font-medium rounded bg-cyan-600 text-white hover:bg-cyan-700">
+                Save step
+            </button>
+            <button onclick="window.vp.deleteSelectedStep()"
+                class="px-3 py-1.5 text-xs font-medium rounded border border-red-200 text-red-700 hover:bg-red-50">
+                Delete
+            </button>
+        </div>
+    </div>
+    {# Mini-map — basic scaled view, no interactivity in Phase C #}
+    <div class="vp-minimap" id="vp-minimap">
+        <div class="vp-minimap-empty" id="vp-minimap-empty">No steps yet</div>
+    </div>
+    {# JSON view — hidden by default, shown when user clicks "Text" #}
+    <div class="vp-json-form" id="vp-json-form">
+        <label class="block text-xs font-medium text-gray-700 mb-1">
+            Plan JSON (advanced — edit then click Save)
+        </label>
+        <textarea id="vp-json-textarea" spellcheck="false"></textarea>
+        <div class="flex items-center gap-2 mt-2">
+            <button onclick="window.vp.applyJsonToCanvas()"
+                class="px-3 py-1.5 text-xs font-medium rounded border border-cyan-300 text-cyan-700 hover:bg-cyan-50">
+                Apply JSON to canvas
+            </button>
+            <button onclick="window.vp.copyCanvasToJson()"
+                class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50">
+                Copy canvas → JSON
+            </button>
+        </div>
+    </div>
+</div>
+
+<div class="vp-save-banner" id="vp-save-banner"></div>
+
+{# Plan-level inputs (above the canvas). The plan has name +
+   description; the JSON has them too. #}
+<div class="flex items-center gap-3 mb-3 px-1">
+    <div class="flex-1">
+        <label class="block text-xs font-medium text-gray-700 mb-0.5">Plan name (kebab-case or empty)</label>
+        <input id="vp-plan-name" type="text" maxlength="80"
+            placeholder="my-project-plan"
+            class="w-full px-2 py-1 text-sm border rounded font-mono">
+    </div>
+    <div class="flex-1">
+        <label class="block text-xs font-medium text-gray-700 mb-0.5">Description</label>
+        <input id="vp-plan-description" type="text" maxlength="500"
+            placeholder="What this plan does"
+            class="w-full px-2 py-1 text-sm border rounded">
+    </div>
+    <div class="flex items-end gap-2">
+        <button onclick="window.vp.addStep()"
+            class="px-3 py-1.5 text-sm font-medium rounded border border-cyan-300 text-cyan-700 hover:bg-cyan-50"
+            title="Add a new step to the canvas (default name 'step-N')">
+            + Add step
+        </button>
+    </div>
+</div>
+
+{% endblock %}
