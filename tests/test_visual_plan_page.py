@@ -110,14 +110,17 @@ def test_visual_plan_page_renders_with_plan():
         # Embedded plan JSON
         assert "vp-render-test" in html
         # Toolbar buttons
-        for label in ("Add step", "Validate plan", "Generate tasks", "Save"):
+        for label in ("Add step", "Apply workflow", "Validate plan",
+                      "Generate plan", "Generate tasks", "Save"):
             assert label in html, f"missing toolbar button: {label}"
-        # Side panel + minimap DOM
+        # Side panel DOM. The minimap was removed 2026-07-28
+        # (no interactivity + was the source of the fade-text bug)
+        # so we no longer assert on its id.
         assert 'id="vp-side-panel"' in html
-        assert 'id="vp-minimap"' in html
         # JS function bindings
         for fn in ("addStep", "savePlan", "generateTasks", "validatePlan",
-                   "toggleJsonMode"):
+                   "toggleJsonMode", "saveStepEdits", "deleteSelectedStep",
+                   "openGeneratePlanModal", "generatePlanFromLlm"):
             assert fn in html, f"missing JS function: {fn}"
     finally:
         _delete_project(pid)

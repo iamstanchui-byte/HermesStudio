@@ -28,7 +28,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
-<script defer src="/static/visual_plan.js?v=2026-07-27-14"></script>
+<script defer src="/static/visual_plan.js?v=2026-07-28-02"></script>
 <style>
     /* Page-specific layout */
     body { background: #f9fafb; }
@@ -182,27 +182,17 @@
     .vp-save-banner.show { opacity: 1; }
     .vp-save-banner.success { background: #d1fae5; color: #065f46; }
     .vp-save-banner.error { background: #fee2e2; color: #991b1b; }
-    /* Min-map (bottom-left, small) — Phase C basic: a scaled-down
-       drawflow view. Phase C+ will replace with a real minimap lib. */
-    .vp-minimap {
-        position: absolute; bottom: 12px; left: 12px;
-        width: 140px; height: 100px;
-        background: rgba(255, 255, 255, 0.9);
-        border: 1px solid #d1d5db;
-        border-radius: 4px;
-        overflow: hidden;
-        z-index: 10;
-    }
-    .vp-minimap-inner {
-        transform: scale(0.1);
-        transform-origin: top left;
-        width: 1400px; height: 1000px;
-        pointer-events: none;
-    }
-    .vp-minimap-empty {
-        padding: 10px; color: #9ca3af; font-size: 10px;
-        text-align: center;
-    }
+    /* Minimap hidden 2026-07-28: the Phase C minimap was a
+       non-interactive scaled-down drawflow view. It had no zoom
+       or pan controls, so users couldn't actually use it for
+       anything. The bigger problem: in commit c467a37 we found
+       that the .vp-canvas-wrap > div:not(.vp-side-panel) rule
+       was sizing the minimap to 1230x678 (the full wrap) and
+       its rgba(255,255,255,0.9) background was making every
+       card text appear faded. Removing the minimap entirely
+       kills that bug surface. We'll add a real minimap lib
+       (e.g. drawflow-plugin-minimap) when there's a concrete
+       use case (zoom-to-fit, pan-to-node, etc.). */
 </style>
 {% endblock %}
 
@@ -235,6 +225,24 @@
             class="px-3 py-1.5 text-xs font-medium rounded border border-amber-300 text-amber-700 hover:bg-amber-50"
             title="Client-side check: duplicate step names, missing depends_on, etc. Doesn't run the plan.">
             Validate plan
+        </button>
+        {# Apply workflow (2026-07-28): moved into the plan editor
+           because the plan is the new design-time entry point and
+           the user expects to seed the plan from a saved workflow
+           package without first bouncing through the project page.
+           Uses the same _workflow_actions.html partial + modal as
+           visual_project.html — the partial is guard-safe (typeof
+           guards on every global) so it coexists with whatever
+           else is in the page. The action is the same: pick a
+           workflow package, fill {{var}} placeholders, and the
+           workflow's step_template is imported as new pending
+           tasks (additive — existing tasks are kept). The user
+           can then either Save + Generate tasks from the plan, or
+           skip the plan and let the imported tasks run as-is. #}
+        <button onclick="openApplyWorkflowModal()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-cyan-300 text-cyan-700 hover:bg-cyan-50"
+            title="Import a saved workflow package as new pending tasks. Additive — existing tasks are kept. Modal opens below.">
+            📥 Apply workflow
         </button>
         {# UI cleanup 2026-07-27: LLM-generate-plan moved here from
            the project page. The LLM now produces a plan_json
@@ -338,10 +346,7 @@
             </button>
         </div>
     </div>
-    {# Mini-map — basic scaled view, no interactivity in Phase C #}
-    <div class="vp-minimap" id="vp-minimap">
-        <div class="vp-minimap-empty" id="vp-minimap-empty">No steps yet</div>
-    </div>
+    {# Minimap removed 2026-07-28 — see CSS comment. #}
     {# JSON view — hidden by default, shown when user clicks "Text" #}
     <div class="vp-json-form" id="vp-json-form">
         <label class="block text-xs font-medium text-gray-700 mb-1">
@@ -386,5 +391,16 @@
         </button>
     </div>
 </div>
+
+{# Apply workflow + Promote to workflow modals (2026-07-28). The
+   partial is guard-safe so it's safe to include alongside the
+   plan editor's own modals (generate-plan, json-form). The
+   partial needs project.id, project.name, and total_count. We
+   pass total_count = current plan step count (the plan-first
+   architecture's "pending work" — the additive import will
+   append the workflow's steps on top of this). #}
+{% with total_count = (project.plan.steps | length) if (project.plan and project.plan.steps) else 0 %}
+{% include "_workflow_actions.html" %}
+{% endwith %}
 
 {% endblock %}

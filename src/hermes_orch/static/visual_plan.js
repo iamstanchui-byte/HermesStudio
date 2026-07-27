@@ -106,6 +106,41 @@
             zoom_min: 0.5,
         });
         _editor.start();
+        // Wire the connection lifecycle to _plan.steps[i].depends_on
+        // (mirrors visual_workflow.js's pattern). Without this, the
+        // user drags a wire on the canvas, drawflow stores it in its
+        // internal data map, but _plan.steps[i].depends_on is never
+        // updated — so on Save, the empty depends_on is sent and the
+        // wire disappears on reload. drawflow 0.0.59 fires
+        // 'connectionCreated' with payload { output_id, input_id,
+        // output_class, input_class }; payload ids are INTERNAL
+        // numeric ids (e.g. "3"), NOT "node-3" or step names.
+        _editor.on('connectionCreated', (connection) => {
+            _onConnectionCreated(connection);
+        });
+        // drawflow 0.0.59 does NOT fire a connectionRemoved event
+        // when the user removes a wire (only connectionCreated on
+        // add). Patch _editor.removeConnection to call our handler
+        // manually with the same shape.
+        if (_editor.removeConnection && !_editor._vpRemoveConnPatched) {
+            const _origRemove = _editor.removeConnection.bind(_editor);
+            _editor.removeConnection = (outputId, inputId, outputClass, inputClass) => {
+                _origRemove(outputId, inputId, outputClass, inputClass);
+                _onConnectionRemoved({
+                    output_id: outputId, input_id: inputId,
+                    output_class: outputClass, input_class: inputClass,
+                });
+            };
+            _editor._vpRemoveConnPatched = true;
+        }
+        // nodeRemoved: drawflow fires this when a card is deleted
+        // (Delete key, removeNodeId, or our X button calling
+        // removeNodeId). Payload is the NUMERIC id string. We use
+        // it to scrub the step from _plan.steps so the data stays
+        // in sync even if the caller forgot to update _plan first.
+        _editor.on('nodeRemoved', (numericId) => {
+            _onNodeRemoved(numericId);
+        });
         // DEBUG: expose for inspection in dev tools / tests
         if (typeof window !== 'undefined') {
             window.__vp_editor = _editor;
@@ -124,6 +159,85 @@
     // _plan model is the source of truth. The canvas is REBUILT
     // from _plan whenever the user clicks "Apply JSON to canvas"
     // or when we want to re-render after a delete-all.
+
+    // ===== Connection / node lifecycle helpers =====
+    // drawflow 0.0.59 stores nodes in
+    //   _editor.drawflow.drawflow.Home.data[internalId]
+    // where each entry has fields: name (we set to "vp-" + step.name),
+    // class, html, inputs, outputs, pos_x, pos_y. The keys are
+    // STRING numbers ("1", "2", ...). Walk this map to translate
+    // between step names and internal ids.
+    function _dataMap() {
+        if (!_editor || !_editor.drawflow || !_editor.drawflow.drawflow) return null;
+        const modules = _editor.drawflow.drawflow;
+        // The first module is "Home" by default; we don't hardcode
+        // it in case a future config has a different default module.
+        const moduleName = Object.keys(modules)[0];
+        return moduleName ? modules[moduleName].data : null;
+    }
+    function _stepNameFromInternalId(internalId) {
+        const data = _dataMap();
+        if (!data) return null;
+        const node = data[internalId];
+        if (!node || !node.name) return null;
+        const m = /^vp-(.+)$/.exec(node.name);
+        return m ? m[1] : null;
+    }
+    function _internalIdFromStepName(name) {
+        const data = _dataMap();
+        if (!data) return null;
+        for (const k of Object.keys(data)) {
+            if (data[k] && data[k].name === 'vp-' + name) return k;
+        }
+        return null;
+    }
+    // drawflow's connectionCreated payload uses internal numeric ids
+    // for output_id and input_id. We translate to step names and
+    // append to target.depends_on. This is what was missing before
+    // 2026-07-27 — without it, dragging a wire updated drawflow's
+    // data but not _plan, so Save sent depends_on=[] and the wire
+    // disappeared on reload.
+    function _onConnectionCreated(connection) {
+        const sourceInternal = connection.output_id;
+        const targetInternal = connection.input_id;
+        const sourceName = _stepNameFromInternalId(sourceInternal);
+        const targetName = _stepNameFromInternalId(targetInternal);
+        if (!sourceName || !targetName) return;
+        const target = _plan.steps.find(s => s.name === targetName);
+        if (!target) return;
+        if (!Array.isArray(target.depends_on)) target.depends_on = [];
+        if (!target.depends_on.includes(sourceName)) {
+            target.depends_on.push(sourceName);
+        }
+    }
+    // Mirror of _onConnectionCreated for the patched removeConnection.
+    // drawflow doesn't fire a "connectionRemoved" event, so we wrap
+    // removeConnection (above in init) to call this manually.
+    function _onConnectionRemoved(connection) {
+        const sourceInternal = connection.output_id;
+        const targetInternal = connection.input_id;
+        const sourceName = _stepNameFromInternalId(sourceInternal);
+        const targetName = _stepNameFromInternalId(targetInternal);
+        if (!sourceName || !targetName) return;
+        const target = _plan.steps.find(s => s.name === targetName);
+        if (!target || !Array.isArray(target.depends_on)) return;
+        target.depends_on = target.depends_on.filter(n => n !== sourceName);
+    }
+    // drawflow fires nodeRemoved when a card is removed (Delete key,
+    // our X button via removeNodeId, or any removeNode call). Payload
+    // is the numeric id as a string. We scrub the step from _plan
+    // so the in-memory model matches what's on canvas.
+    function _onNodeRemoved(numericId) {
+        const name = _stepNameFromInternalId(String(numericId));
+        if (!name) return;
+        _plan.steps = _plan.steps.filter(s => s.name !== name);
+        for (const s of _plan.steps) {
+            if (Array.isArray(s.depends_on)) {
+                s.depends_on = s.depends_on.filter(n => n !== name);
+            }
+        }
+        if (_selectedNodeName === name) closeSidePanel();
+    }
 
     // ===== Step rendering =====
     function nodeHtml(step) {
@@ -332,18 +446,32 @@
     }
 
     function deleteStepByName(name) {
-        // Remove from plan model
+        // Remove from plan model (in-memory). The nodeRemoved event
+        // listener we registered in init() will fire when drawflow
+        // actually removes the card, and that listener will run
+        // ANOTHER filter pass — that's a no-op the second time
+        // because the step is already gone. We do the filter here
+        // first so the in-memory model is correct even if removeNodeId
+        // throws (e.g. on a stale step name).
         _plan.steps = _plan.steps.filter(s => s.name !== name);
-        // Remove from any other step's depends_on
+        // Scrub from any other step's depends_on
         for (const s of _plan.steps) {
             if (s.depends_on) s.depends_on = s.depends_on.filter(d => d !== name);
         }
-        // Remove from canvas (drawflow: editor.removeNode(nodeId))
-        const nodeId = 'vp-' + name;
-        try { _editor.removeNode(nodeId); } catch (e) { /* may already be removed */ }
+        // Remove the card from the canvas. drawflow expects the
+        // DOM id (e.g. "node-3"), NOT the step name. We look up
+        // the internal id by walking the data map (set up in
+        // addNodeToCanvas). removeNodeId is the public API; it
+        // fires the 'nodeRemoved' event which we listen to.
+        if (_editor) {
+            const internalId = _internalIdFromStepName(name);
+            if (internalId != null) {
+                try { _editor.removeNodeId('node-' + internalId); }
+                catch (e) { /* may already be removed */ }
+            }
+        }
         // Clear side panel if it was showing this step
         if (_selectedNodeName === name) closeSidePanel();
-        updateMinimap();
     }
 
     function deleteSelectedStep() {
@@ -488,11 +616,12 @@
         // Refresh plan model from the toolbar inputs
         _plan.name = $('vp-plan-name').value.trim();
         _plan.description = $('vp-plan-description').value.trim();
-        // Re-sync depends_on from drawflow's connection data.
-        // drawflow 0.0.59 stores connections in editor.drawflow
-        // (a map: nodeId -> {data, inputs, outputs, class, html, ...}).
-        // We pull depends_on from the outputs of each node.
-        syncDepsFromCanvas();
+        // depends_on is kept in sync by the connectionCreated /
+        // connectionRemoved listeners we registered in init() — no
+        // need to walk the drawflow data map here. (The old
+        // syncDepsFromCanvas() did this walk and had a wrong path,
+        // which is why wires were silently lost on Save before
+        // 2026-07-27.)
         try {
             const r = await fetch('/api/projects/' + _projectId + '/plan', {
                 method: 'PUT',
@@ -510,25 +639,28 @@
         }
     }
 
+    // Keep syncDepsFromCanvas around as a defensive backup in case
+    // a connection was created/removed before our listeners were
+    // bound (race during init). It's not used by savePlan() anymore
+    // — the connection lifecycle is the source of truth. If we ever
+    // need to forcibly resync (e.g. after a JSON import), call this.
     function syncDepsFromCanvas() {
-        // drawflow connection model: editor.drawflow[nodeId].outputs
-        // = {output_1: {connections: [{node: targetNodeId, output: 'input_1'}]}}
-        // We translate that back to step-name depends_on by stripping
-        // the 'vp-' prefix from each side.
-        if (!_editor || !_editor.drawflow) return;
-        const df = _editor.drawflow;
+        if (!_editor) return;
+        const data = _dataMap();
+        if (!data) return;
         for (const step of _plan.steps) {
-            const nodeId = 'vp-' + step.name;
-            const node = df[nodeId];
+            const internalId = _internalIdFromStepName(step.name);
+            if (internalId == null) { step.depends_on = []; continue; }
+            const node = data[internalId];
             if (!node || !node.outputs) { step.depends_on = []; continue; }
             const deps = [];
             for (const outKey of Object.keys(node.outputs)) {
                 const out = node.outputs[outKey];
-                if (!out.connections) continue;
+                if (!out || !out.connections) continue;
                 for (const conn of out.connections) {
-                    if (conn.node && conn.node.startsWith('vp-')) {
-                        deps.push(conn.node.substring(3));
-                    }
+                    if (conn.node == null) continue;
+                    const sourceName = _stepNameFromInternalId(String(conn.node));
+                    if (sourceName) deps.push(sourceName);
                 }
             }
             step.depends_on = deps;
@@ -654,16 +786,18 @@
                 }
                 return;
             }
-            // Node click: any element inside .vp-node (or .vp-node itself).
-            // The drawflow canvas puts the node HTML inside a wrapper
-            // div with id "node-vp-{name}".
-            const nodeInner = ev.target.closest('.vp-node');
+            // Node click: any element inside .vp-node (or .vp-node
+            // itself). The .vp-node inner div has data-step-name set
+            // by nodeHtml() in renderAllSteps. This was the bug
+            // before 2026-07-27 — the handler used to look for
+            // `[id^="node-vp-"]` but drawflow's DOM id is just
+            // "node-1", "node-2", etc., so the wrapper was never
+            // found and openSidePanel was never called. That's why
+            // double-clicking a card did nothing.
+            const nodeInner = ev.target.closest('.vp-node[data-step-name]');
             if (nodeInner) {
-                const wrapper = nodeInner.closest('[id^="node-vp-"]');
-                if (wrapper) {
-                    const name = wrapper.id.replace('node-vp-', '');
-                    openSidePanel(name);
-                }
+                const name = nodeInner.dataset.stepName;
+                if (name) openSidePanel(name);
             }
         });
     }
