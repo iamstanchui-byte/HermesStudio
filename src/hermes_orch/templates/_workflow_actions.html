@@ -372,21 +372,108 @@ function updateApplyWorkflowSubmitState() {
 }
 function onApplyWorkflowVarInput() { updateApplyWorkflowSubmitState(); }
 
+// Recursive {{var}} substitution for a step dict (or any
+// nested object/array of strings). Used by the plan editor's
+// "Apply workflow" path so the user can import a workflow as
+// plan steps with the {{var}} placeholders filled in client-
+// side (no extra server round-trip needed — the server has
+// already done this on its side too).
+function _substituteWorkflowVars(obj, vars) {
+    if (obj == null) return obj;
+    if (typeof obj === 'string') {
+        return obj.replace(/\{\{\s*([^{}\s]+?)\s*\}\}/g, (m, name) => {
+            return (name in vars) ? String(vars[name]) : m;
+        });
+    }
+    if (Array.isArray(obj)) return obj.map(v => _substituteWorkflowVars(v, vars));
+    if (typeof obj === 'object') {
+        const out = {};
+        for (const k of Object.keys(obj)) out[k] = _substituteWorkflowVars(obj[k], vars);
+        return out;
+    }
+    return obj;
+}
+
 async function submitApplyWorkflow() {
     const btn = document.getElementById('apply-workflow-submit-btn');
     const status = document.getElementById('apply-workflow-status');
     if (!_applyWorkflowSelected) { status.textContent = 'No workflow selected'; return; }
-    // Confirmation dialog with the blast radius. The current task
-    // count comes from a hidden input rendered into the page at
-    // load time (avoids a separate /api/projects/{id} fetch). The
-    // step count comes from the workflow's step_template (already
-    // loaded into _applyWorkflowSelected).
     // Mental model: "Apply workflow" = IMPORT a workflow object
     // into the project. The workflow's steps become NEW tasks; the
     // project's existing tasks are kept untouched. User feedback
     // (2026-07-26): "我一直都說是import workflow 的object 入project"
     // — the earlier archive-all-then-insert was wrong.
     const stepCount = (_applyWorkflowSelected.step_template || []).length;
+    // Per 2026-07-28: the plan editor sets window._VP_CONTEXT = 'plan'.
+    // In that case the action is "add the workflow's steps to the
+    // current plan" (design-time), not "create runtime tasks". The
+    // variable substitution + dedupe + render is done client-side
+    // so the user can keep editing in place. Save is still required
+    // to persist to the server.
+    const inPlanEditor = (typeof window !== 'undefined' && window._VP_CONTEXT === 'plan');
+    if (inPlanEditor) {
+        if (stepCount === 0) {
+            status.textContent = 'Workflow has no steps to import';
+            status.className = 'text-sm text-amber-700 ml-2';
+            return;
+        }
+        const confirmMsg =
+            `Import workflow "${_applyWorkflowSelected.name}" into the current plan?\n\n` +
+            `• ${stepCount} new step${stepCount === 1 ? '' : 's'} will be added to the canvas\n` +
+            `• depends_on wires will be drawn automatically\n` +
+            `• Click 💾 Save to persist (or close to discard)\n\n` +
+            `Continue?`;
+        if (!confirm(confirmMsg)) return;
+        btn.disabled = true;
+        status.textContent = 'Importing...';
+        status.className = 'text-sm text-gray-500 ml-2';
+        // Collect variable values (same logic as the runtime-task path)
+        const variables = {};
+        for (const v of (_applyWorkflowSelected.variables || [])) {
+            const inp = document.getElementById(`awf-var-${v.name}`);
+            if (!inp) continue;
+            let val = inp.value;
+            if (v.type === 'boolean') {
+                if (val === 'true') val = true;
+                else if (val === 'false') val = false;
+                else continue;
+            } else if (v.type === 'number') {
+                if (val === '' || val == null) continue;
+                val = Number(val);
+                if (Number.isNaN(val)) val = inp.value;
+            } else {
+                if (val === '' && v.default == null) continue;
+            }
+            variables[v.name] = val;
+        }
+        // Substitute {{var}} in each step, then hand to the plan editor.
+        // importSteps() handles dedupe (renames -2 / -3 on collision) and
+        // re-renders the canvas so drawflow wires appear for depends_on.
+        const newSteps = (_applyWorkflowSelected.step_template || [])
+            .map(s => _substituteWorkflowVars(s, variables));
+        let nAdded = 0;
+        try {
+            if (typeof window.vp !== 'undefined' && typeof window.vp.importSteps === 'function') {
+                nAdded = window.vp.importSteps(newSteps);
+            } else {
+                throw new Error('Plan editor not loaded');
+            }
+        } catch (e) {
+            status.textContent = 'Import failed: ' + e.message;
+            status.className = 'text-sm text-red-600 ml-2';
+            btn.disabled = false;
+            return;
+        }
+        status.textContent = `Imported ${nAdded} step${nAdded === 1 ? '' : 's'} from "${_applyWorkflowSelected.name}" into the plan. Click 💾 Save to persist.`;
+        status.className = 'text-sm text-green-600 ml-2';
+        // Close the modal after a short pause so the user sees the
+        // success message.
+        setTimeout(() => closeApplyWorkflowModal(), 1500);
+        btn.disabled = false;
+        return;
+    }
+    // Non-plan-editor path (project / visual_project page): create
+    // runtime tasks. Legacy behavior preserved for the project pages.
     const curEl = document.getElementById('current-task-count');
     const curCount = curEl ? parseInt(curEl.value || '0', 10) : 0;
     const totalAfter = curCount + stepCount;

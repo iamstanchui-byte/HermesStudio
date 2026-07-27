@@ -28,7 +28,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
-<script defer src="/static/visual_plan.js?v=2026-07-28-02"></script>
+<script defer src="/static/visual_plan.js?v=2026-07-28-03"></script>
 <style>
     /* Page-specific layout */
     body { background: #f9fafb; }
@@ -398,7 +398,15 @@
    partial needs project.id, project.name, and total_count. We
    pass total_count = current plan step count (the plan-first
    architecture's "pending work" — the additive import will
-   append the workflow's steps on top of this). #}
+   append the workflow's steps on top of this).
+
+   Per 2026-07-28 user feedback: in the plan editor the user
+   expects "Apply workflow" to ADD STEPS TO THE PLAN (not
+   create runtime tasks). We set window._VP_CONTEXT = 'plan'
+   before including the partial; submitApplyWorkflow() checks
+   this flag and dispatches to the right action (plan update
+   vs task creation). #}
+<script>window._VP_CONTEXT = 'plan';</script>
 {% with total_count = (project.plan.steps | length) if (project.plan and project.plan.steps) else 0 %}
 {% include "_workflow_actions.html" %}
 {% endwith %}

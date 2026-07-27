@@ -879,6 +879,32 @@
         openGeneratePlanModal: openGeneratePlanModal,
         closeGeneratePlanModal: closeGeneratePlanModal,
         generatePlanFromLlm: generatePlanFromLlm,
+        // Per 2026-07-28: called by the "Apply workflow" modal when
+        // the plan editor is the host page. Appends the supplied
+        // step dicts to _plan.steps, re-renders the canvas so
+        // drawflow wires appear for depends_on, and re-points the
+        // toolbar form fields at the new plan. No HTTP call here
+        // — the user still has to click 💾 Save to persist. We
+        // pick the (silent) re-render over a page reload so the
+        // user can keep editing the imported steps in place.
+        importSteps: function(newSteps) {
+            if (!Array.isArray(newSteps) || newSteps.length === 0) return 0;
+            // Dedupe by name: if the plan already has a step with
+            // the same name, rename the new one with -2, -3 suffix.
+            const used = new Set(_plan.steps.map(s => s.name));
+            for (const s of newSteps) {
+                if (!s.name) continue;
+                let n = s.name, i = 2;
+                while (used.has(n)) n = s.name + '-' + (i++);
+                if (n !== s.name) s.name = n;
+                used.add(s.name);
+            }
+            _plan.steps = _plan.steps.concat(newSteps);
+            renderAllSteps();
+            $('vp-plan-name').value = _plan.name || '';
+            $('vp-plan-description').value = _plan.description || '';
+            return newSteps.length;
+        },
     };
 
     // ===== Bootstrap =====
