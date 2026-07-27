@@ -687,7 +687,15 @@ async def tasks_page(
                 except (json.JSONDecodeError, TypeError):
                     r[col] = {} if col != "depends_on" else []
         tasks.append(r)
-    projects = await db.fetchall("SELECT id, name FROM projects ORDER BY created_at DESC")
+    # Pull all projects with their state. The dropdown in
+    # tasks.html filters to active states itself (it can also
+    # show the project id next to the name to disambiguate
+    # duplicates). project_map keeps the full list so archived
+    # tasks still show a sensible name (e.g. "vp-smoke-addfe8"
+    # not the raw id).
+    projects = await db.fetchall(
+        "SELECT id, name, state FROM projects ORDER BY created_at DESC"
+    )
     project_map = {p["id"]: (p["name"] or p["id"]) for p in projects}
     # Attach project name + timing to each task for the template
     for t in tasks:

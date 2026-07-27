@@ -46,12 +46,17 @@
             <select id="nt-project" name="project_id" class="mt-1 block w-full border rounded px-2 py-1 text-sm" onchange="onProjectChange()">
                 <option value="">(Single — no project)</option>
                 {% for p in projects %}
-                {# Hide the virtual __single_tasks__ project — selecting
+                {# Skip the virtual __single_tasks__ project (selecting
                    it would create a regular project task in the virtual
-                   project (which is state=completed, supervisor would
-                   ignore it). For single tasks, leave the dropdown empty. #}
-                {% if p.id != '__single_tasks__' %}
-                <option value="{{ p.id }}">{{ p.name or p.id }}</option>
+                   project — supervisor would ignore it) AND skip
+                   archived/deleted projects (no point assigning a new
+                   task to a project that's been archived or trashed).
+                   Per 2026-07-28 user feedback: many projects share
+                   the same name (e.g. multiple "phase-c-test" runs),
+                   so we append the project id in [brackets] to
+                   disambiguate. #}
+                {% if p.id != '__single_tasks__' and p.state not in ('archived', 'deleted') %}
+                <option value="{{ p.id }}">{{ p.name or p.id }} [{{ p.id }}]</option>
                 {% endif %}
                 {% endfor %}
             </select>
