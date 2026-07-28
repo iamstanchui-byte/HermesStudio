@@ -690,7 +690,55 @@
             });
             if (!r.ok) {
                 const d = await r.json().catch(() => ({}));
-                showBanner('Generate failed: ' + _errDetailToString(d.detail, r.status), 'error');
+                const detail = _errDetailToString(d.detail, r.status);
+                showBanner('Generate failed: ' + detail, 'error');
+                // Per user feedback 2026-07-28: the plan editor
+                // used to fail with "Cannot run plan on a
+                // terminal-state project" and the user had no
+                // UI affordance to fix it (had to SQL-update or
+                // create a new project). Offer a one-click
+                // "Reset to planned" right here.
+                if (typeof detail === 'string' && detail.includes('terminal-state project')) {
+                    if (confirm(
+                        'This project is in a terminal state (' + detail + ').\n\n' +
+                        'Reset to "planned" so you can re-run with the new plan steps?\n\n' +
+                        '(Existing tasks will be kept in the DB as archived; the plan\n' +
+                        'is preserved; this just clears the completion flag.)'
+                    )) {
+                        try {
+                            const rr = await fetch('/api/projects/' + _projectId + '/plan/reset', {
+                                method: 'POST',
+                            });
+                            const rj = await rr.json().catch(() => ({}));
+                            if (!rr.ok) {
+                                showBanner('Reset failed: ' + _errDetailToString(rj.detail, rr.status), 'error');
+                                return;
+                            }
+                            showBanner('Reset to planned. Retrying...', 'success');
+                            // Retry the run. We bypass the
+                            // confirm() this time (the user
+                            // already confirmed) and skip
+                            // re-saving (the plan is unchanged).
+                            const r2 = await fetch('/api/projects/' + _projectId + '/plan/run', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({archive_existing: true, name_suffix: ''}),
+                            });
+                            if (!r2.ok) {
+                                const d2 = await r2.json().catch(() => ({}));
+                                showBanner('Generate failed: ' + _errDetailToString(d2.detail, r2.status), 'error');
+                                return;
+                            }
+                            const d2 = await r2.json();
+                            showBanner('Generated ' + d2.tasks_created + ' task(s) — going to project...', 'success');
+                            setTimeout(() => { location.href = '/projects/' + _projectId; }, 1500);
+                            return;
+                        } catch (e2) {
+                            showBanner('Reset retry error: ' + e2.message, 'error');
+                            return;
+                        }
+                    }
+                }
                 return;
             }
             const d = await r.json();

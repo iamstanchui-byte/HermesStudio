@@ -330,6 +330,115 @@ async def delete_project_plan(project_id: str, request: Request):
         pass
 
 
+# ===== Phase B: reset terminal-state project to planned =====
+# (POST /api/projects/{id}/plan/reset)
+#
+# A project in state='completed' or 'cancelled' can't have its plan
+# re-run (see run_project_plan guard below). The user has two options:
+#   1. Create a new project
+#   2. Reset the current one back to 'planned' and re-run
+#
+# Per user feedback 2026-07-28: "我加了action 目標, 但再跑就出
+# Cannot run plan on a terminal-state project (state='completed')"
+# — the plan editor's "▶ Generate tasks" button needs a way out
+# of the terminal-state guard. This endpoint is the way out. The
+# plan is preserved (not deleted), the previous tasks are kept in
+# the DB (already marked archived by the prior run), and the user
+# can edit the plan + re-run.
+#
+# NOT the same as unarchive: unarchive goes from state='archived' to
+# state='completed' (existing in projects.py:734-744). This endpoint
+# goes from state='completed' or 'cancelled' to state='planned'.
+#
+# NOT the same as undelete: undelete goes from state='deleted' back
+# to its prior state (existing in projects.py:783-799).
+
+
+class ResetPlanResponse(BaseModel):
+    project_id: str
+    state: str
+    previous_state: str
+    plan_steps: int
+    message: str
+
+
+@router.post(
+    "/projects/{project_id}/plan/reset",
+    response_model=ResetPlanResponse,
+)
+async def reset_plan_to_planned(
+    project_id: str, request: Request,
+) -> ResetPlanResponse:
+    """Reset a terminal-state (completed/cancelled) project to 'planned'
+    so its plan can be re-run. Preserves the plan + existing tasks.
+    """
+    db = request.app.state.db
+    proj = await db.fetchone(
+        "SELECT id, state, plan_json FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    if proj["state"] in ("deleted", "archived"):
+        raise HTTPException(
+            400,
+            f"Cannot reset a {proj['state']!r} project via /plan/reset. "
+            f"Use the unarchive / undelete endpoints first.",
+        )
+    if proj["state"] not in ("completed", "cancelled"):
+        raise HTTPException(
+            400,
+            f"Project is in state {proj['state']!r}; nothing to reset. "
+            f"Only completed/cancelled projects need this endpoint.",
+        )
+    # Parse plan to count steps (for the response message)
+    import json as _json
+    plan_steps = 0
+    if proj.get("plan_json"):
+        try:
+            plan_obj = _json.loads(proj["plan_json"])
+            plan_steps = len(plan_obj.get("steps") or [])
+        except (_json.JSONDecodeError, TypeError):
+            pass
+    previous_state = proj["state"]
+    now = _now_iso()
+    # Reset to 'planned'. We do NOT clear plan_json or tasks — the
+    # user is going to click Generate tasks next, which will
+    # archive the existing tasks (with archive_existing=true, the
+    # default in visual_plan.js generateTasks) and create new ones.
+    # current_iteration stays so the audit log can correlate runs.
+    await db.execute(
+        "UPDATE projects SET state = 'planned', updated_at = ? WHERE id = ?",
+        (now, project_id),
+    )
+    # Audit the reset so the operator can trace state changes.
+    try:
+        from hermes_orch.core.audit import audit_log
+        await audit_log(
+            db, "project.plan.reset", actor="operator",
+            project_id=project_id,
+            payload={
+                "previous_state": previous_state,
+                "plan_steps": plan_steps,
+                "reason": "operator_initiated",
+            },
+        )
+    except Exception:
+        # audit is best-effort; don't fail the reset if it's missing
+        pass
+    return ResetPlanResponse(
+        project_id=project_id,
+        state="planned",
+        previous_state=previous_state,
+        plan_steps=plan_steps,
+        message=(
+            f"Project reset from {previous_state!r} to 'planned'. "
+            f"{plan_steps} plan step(s) preserved. "
+            f"Click ▶ Generate tasks to re-run."
+        ),
+    )
+
+
 # ===== Phase B: materialize plan → tasks (POST /api/projects/{id}/plan/run) =====
 
 
