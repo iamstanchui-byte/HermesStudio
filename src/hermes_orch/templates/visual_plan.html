@@ -318,13 +318,29 @@
                 <label>Name (kebab-case)</label>
                 <input id="vp-f-name" type="text" placeholder="fetch-data">
             </div>
-            <div style="flex: 1">
-                <label>Action</label>
-                <input id="vp-f-action" type="text" placeholder="fetch">
-            </div>
         </div>
+        <label>Action (free-form — what the agent should do)</label>
+        {# Per user feedback 2026-07-28: a single-line <input> was too
+           small for "add a few more 分析目標" to a step like
+           analyze-nf-problems. The action doubles as the agent's
+           task description (the LLM uses it as the verb + the
+           operator uses it to specify the analysis goals). Use a
+           textarea with reasonable height (3 rows) — long enough for
+           several goals, short enough to scan at a glance. #}
+        <textarea id="vp-f-action" rows="3" class="vp-sp-textarea" placeholder="fetch / analyze / write_report — describe the step in plain language, the agent will execute it"></textarea>
         <label>Agent role</label>
-        <input id="vp-f-role" type="text" placeholder="e.g. super">
+        {# Dropdown of registered profile names. The free-text input
+           was a footgun: operators could type "linux-a-01" (machine id)
+           instead of "win-agent01" (role name), and the supervisor
+           would fail to dispatch. Use a <select> so the value is
+           always a valid role name. The list is rendered server-side
+           from agent_profiles (see plans.py:plan_visual_page). #}
+        <select id="vp-f-role" class="vp-sp-input">
+            <option value="">(no role — supervisor picks)</option>
+            {% for r in available_roles %}
+            <option value="{{ r }}">{{ r }}</option>
+            {% endfor %}
+        </select>
         <label>Required capability</label>
         <input id="vp-f-capability" type="text" placeholder="(optional) e.g. summarize">
         <label>Skill (canonical name)</label>

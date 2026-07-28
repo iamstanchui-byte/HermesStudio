@@ -869,8 +869,17 @@ getHistOpen().forEach(taskId => {
     if (el) el.classList.remove('hidden');
 });
 
-const PROJECT_ID = "{{ project.id }}";
-const PROJECT_NAME = {{ (project.name or project.id) | tojson }};
+// Use `var` (not `const`) so _workflow_actions.html's `typeof PROJECT_ID === 'undefined'`
+// guard works correctly. With `const`, the typeof check throws
+// "Cannot access 'PROJECT_ID' before initialization" (TDZ), the guard
+// fails, and the partial's `var PROJECT_ID = ...` line redeclares the
+// const, breaking the entire page's JS — including the auto-refresh
+// toggle in the nav. Symptom: user reports "auto-refresh button 按不了".
+// Regression introduced 2026-07-28 when the partial was made conditional
+// on _VP_CONTEXT but the guard was kept as a typeof check (which doesn't
+// play well with const).
+var PROJECT_ID = "{{ project.id }}";
+var PROJECT_NAME = {{ (project.name or project.id) | tojson }};
 
 document.getElementById('new-task-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1868,6 +1877,17 @@ async function clearChat() {
         alert('Error: ' + e.message);
     }
 }
+</script>
+{# Bug fix 2026-07-28: the chat assistant <script> tag at L1436 was
+   never closed. The browser kept consuming HTML into the script
+   until it found the next </script> in base.html (the polling
+   script at the bottom of the page). That made the chat assistant
+   script 24k+ chars long, included the polling script + the
+   closing </body></html> as JS, and tripped a "Unexpected token '<'"
+   parse error. Symptom: every script after this point failed to
+   define its functions, so the auto-refresh toggle button in the
+   nav was dead (toggleAutoRefresh was undefined). The fix is just
+   closing the script tag. #}
 
 
 {% endblock %}
