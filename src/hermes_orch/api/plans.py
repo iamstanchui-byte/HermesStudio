@@ -34,7 +34,7 @@ import re
 import secrets
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -161,6 +161,20 @@ class ProjectPlanUpdate(BaseModel):
     plan: ProjectPlan
 
 
+class ProjectPlanAgentsResponse(BaseModel):
+    """Response shape for GET /api/projects/{id}/plan/agents.
+
+    Returned to the chatbox LLM (docs/chatbox-plan-editor.md §5 §7.3)
+    so it can validate the agent_role / skill / tool names it puts in
+    PlanStep suggestions. The visual editor (Phase C) does not use this
+    — it renders the same list inline in the side panel.
+    """
+    project_id: str
+    agent_roles: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
+    tools: list[str] = Field(default_factory=list)
+
+
 # ===== Helpers =====
 
 
@@ -233,11 +247,101 @@ async def get_project_plan(project_id: str, request: Request) -> ProjectPlanResp
     )
 
 
+@router.get(
+    "/projects/{project_id}/plan/agents",
+    response_model=ProjectPlanAgentsResponse,
+)
+async def get_plan_agents(
+    project_id: str, request: Request
+) -> ProjectPlanAgentsResponse:
+    """Return valid agent_role / skill / tool names for plan validation.
+
+    Added 2026-07-28 for the chatbox plan editor (Phase 1,
+    docs/chatbox-plan-editor.md §5 §7.3). The chatbox LLM calls
+    this once per session (cached for the conversation lifetime) to
+    learn which names it can safely use in PlanStep suggestions,
+    avoiding the round-trip-and-fail cycle of suggesting an invalid
+    `agent_role` and getting a 400 from PUT.
+
+    Source of truth:
+      agent_roles ← agent_profiles.name (filtered to active profiles)
+      tools       ← tool_definitions.name (may be empty if no tools
+                    registered yet — the LLM should pass "" for now)
+      skills      ← unique non-null values found in
+                    workflow_packages.step_template[*].skill across
+                    all existing packages (best-effort, no canonical
+                    skill registry yet). Empty list is valid.
+
+    This endpoint is read-only, project-scoped for path consistency
+    with the other /plan/* endpoints, but the data itself is global
+    (not per-project).
+    """
+    db = request.app.state.db
+    proj = await db.fetchone(
+        "SELECT id FROM projects WHERE id = ?", (project_id,),
+    )
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    # agent_roles: only include non-disabled profiles
+    profile_rows = await db.fetchall(
+        "SELECT name FROM agent_profiles "
+        "WHERE status IS NULL OR status != 'disabled' "
+        "ORDER BY name"
+    )
+    agent_roles = [r["name"] for r in profile_rows]
+    # tools: from tool_definitions; table may be empty
+    tools: list[str] = []
+    try:
+        tool_rows = await db.fetchall(
+            "SELECT name FROM tool_definitions ORDER BY name"
+        )
+        tools = [r["name"] for r in tool_rows]
+    except Exception:
+        # table missing or other issue — return empty list
+        pass
+    # skills: best-effort scan of workflow_packages.step_template
+    skills: list[str] = []
+    try:
+        wf_rows = await db.fetchall(
+            "SELECT step_template FROM workflow_packages"
+        )
+        seen: set[str] = set()
+        for row in wf_rows:
+            raw = row.get("step_template")
+            if not raw:
+                continue
+            try:
+                steps = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(steps, list):
+                continue
+            for s in steps:
+                if not isinstance(s, dict):
+                    continue
+                skill = s.get("skill")
+                if isinstance(skill, str) and skill and skill not in seen:
+                    seen.add(skill)
+                    skills.append(skill)
+    except Exception:
+        pass
+    return ProjectPlanAgentsResponse(
+        project_id=project_id,
+        agent_roles=agent_roles,
+        skills=sorted(skills),
+        tools=tools,
+    )
+
+
 @router.put("/projects/{project_id}/plan", response_model=ProjectPlanResponse)
 async def put_project_plan(
-    project_id: str, body: ProjectPlanUpdate, request: Request,
+    project_id: str,
+    body: ProjectPlanUpdate,
+    request: Request,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    audit_actor: str = "operator",
 ) -> ProjectPlanResponse:
-    """Write a project's plan (Phase A).
+    """Write a project's plan (Phase A, optimistic-lock enabled 2026-07-28).
 
     The plan is stored as JSON in projects.plan_json. Any PUT
     replaces the previous plan (no merge / partial update) — this
@@ -245,13 +349,31 @@ async def put_project_plan(
     parts of it gets messy. The previous plan is not preserved as
     history (Phase D may add plan_history; for now, last-write-wins).
 
-    Audit: project.plan.updated.
+    Optimistic lock (chatbox contract, docs/chatbox-plan-editor.md §7.1):
+      The `If-Match: <updated_at>` header is **optional** for backward
+      compat with the visual editor (Phase C). When provided:
+        - If a plan already exists (plan_json non-NULL) and the
+          provided value doesn't match the current `updated_at`,
+          return 409 Conflict with the current plan in the body
+          so the client can show a 3-way merge.
+        - If a plan does not exist yet (first PUT), the header is
+          ignored (no prior state to lock against).
+        - If matching, the write proceeds.
+      When omitted, the write proceeds (legacy last-write-wins).
+      The chatbox LLM always provides If-Match; the visual editor
+      can be upgraded later to do the same.
+
+    Audit: project.plan.updated (actor defaults to "operator"; the
+    chatbox apply endpoint passes "operator:chat" so audit logs
+    distinguish AI-applied updates from human edits).
 
     Edge cases:
       - Project not found: 404
       - Invalid plan (Pydantic validation): 422 with the field error
       - Empty plan (steps=[]): valid — represents "no plan yet"
       - Same plan PUT twice: idempotent (just overwrites the row)
+      - If-Match mismatch on existing plan: 409 with current_plan
+      - First PUT (plan_json IS NULL): If-Match ignored, write proceeds
     """
     db = request.app.state.db
     proj = await db.fetchone(
@@ -260,6 +382,24 @@ async def put_project_plan(
     )
     if not proj:
         raise HTTPException(404, f"Project not found: {project_id}")
+    # Optimistic lock: if the client provided If-Match AND a plan
+    # already exists, the value must match the current updated_at.
+    has_plan_json = proj.get("plan_json") is not None
+    current_updated_at = proj.get("updated_at")
+    if has_plan_json and if_match is not None and if_match != current_updated_at:
+        # Build a 409 with the current plan so the client can diff
+        has_plan, current_plan, _ = _load_plan_from_row(proj)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "plan was modified since you last read it",
+                "your_if_match": if_match,
+                "current_updated_at": current_updated_at,
+                "current_plan": (
+                    current_plan.model_dump(mode="json") if current_plan else None
+                ),
+            },
+        )
     plan = body.plan
     # Serialize via Pydantic to ensure we write a clean JSON shape
     # (round-trip removes None, sorts fields, etc.). Then dump with
@@ -274,7 +414,7 @@ async def put_project_plan(
     try:
         from hermes_orch.core.audit import audit_log
         await audit_log(
-            db, "project.plan.updated", actor="operator",
+            db, "project.plan.updated", actor=audit_actor,
             project_id=project_id,
             payload={
                 "name": plan.name,

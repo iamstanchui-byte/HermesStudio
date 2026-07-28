@@ -29,12 +29,15 @@ BASE = "http://127.0.0.1:8765"
 DB_PATH = Path.home() / ".hermes-orchestrator" / "hermes-orch.db"
 
 
-def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict | list | str | None]:
+def _http(method: str, path: str, body: dict | None = None, headers: dict | None = None) -> tuple[int, dict | list | str | None]:
     url = f"{BASE}{path}"
     data = json.dumps(body).encode("utf-8") if body is not None else None
+    final_headers = {"Content-Type": "application/json"} if data else {}
+    if headers:
+        final_headers.update(headers)
     req = urllib.request.Request(
         url, data=data, method=method,
-        headers={"Content-Type": "application/json"} if data else {},
+        headers=final_headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -345,5 +348,123 @@ def test_existing_project_endpoint_still_works():
         assert body["id"] == pid
         # No plan yet — fields are None / default
         assert body.get("state")  # has a state
+    finally:
+        _delete_project(pid)
+
+
+# ===== Optimistic lock (If-Match header, 2026-07-28, chatbox contract) =====
+#
+# Contract (docs/chatbox-plan-editor.md §7.1):
+#   - If-Match: <updated_at> is OPTIONAL (backward compat with Phase C visual editor)
+#   - When plan_json is NULL (first PUT): If-Match is ignored
+#   - When plan_json is non-NULL + If-Match provided + matches: write proceeds
+#   - When plan_json is non-NULL + If-Match provided + mismatches: 409 with
+#     current_plan in detail body so the client can 3-way merge
+#   - When plan_json is non-NULL + If-Match omitted: write proceeds (legacy)
+
+
+def test_first_put_without_if_match_succeeds():
+    """First PUT (no plan yet) should succeed even without If-Match header."""
+    pid = _create_test_project()
+    try:
+        plan = {"version": "1.0", "name": "first", "steps": [{"name": "a"}]}
+        s, body = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
+        assert s == 200
+        assert body["has_plan"] is True
+        assert body["updated_at"] is not None
+    finally:
+        _delete_project(pid)
+
+
+def test_put_without_if_match_succeeds_when_plan_exists():
+    """Backward compat: PUT without If-Match still works when a plan exists.
+    The visual editor (Phase C) does not send If-Match; this must not break."""
+    pid = _create_test_project()
+    try:
+        plan = {"version": "1.0", "name": "first", "steps": [{"name": "a"}]}
+        s, _ = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
+        assert s == 200
+        # Second PUT without If-Match should still succeed
+        plan2 = {"version": "1.0", "name": "second", "steps": [{"name": "b"}]}
+        s, body = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan2})
+        assert s == 200
+        assert body["plan"]["name"] == "second"
+    finally:
+        _delete_project(pid)
+
+
+def test_put_with_matching_if_match_succeeds():
+    """PUT with correct If-Match (current updated_at) should succeed."""
+    pid = _create_test_project()
+    try:
+        plan = {"version": "1.0", "name": "v1", "steps": [{"name": "a"}]}
+        s, body = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
+        assert s == 200
+        current_uat = body["updated_at"]
+        # Second PUT echoing the updated_at we just got
+        plan2 = {"version": "1.0", "name": "v2", "steps": [{"name": "a"}, {"name": "b"}]}
+        s, body = _http(
+            "PUT",
+            f"/api/projects/{pid}/plan",
+            {"plan": plan2},
+            headers={"If-Match": current_uat},
+        )
+        assert s == 200
+        assert body["plan"]["name"] == "v2"
+        # updated_at should be fresh
+        assert body["updated_at"] != current_uat
+    finally:
+        _delete_project(pid)
+
+
+def test_put_with_stale_if_match_returns_409():
+    """PUT with stale If-Match returns 409 with current_plan in detail body."""
+    pid = _create_test_project()
+    try:
+        # 1. First write
+        plan_v1 = {"version": "1.0", "name": "v1", "steps": [{"name": "a"}]}
+        s, body = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan_v1})
+        assert s == 200
+        # 2. Second write (changes the plan and updated_at)
+        plan_v2 = {"version": "1.0", "name": "v2", "steps": [{"name": "b"}]}
+        s, _ = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan_v2})
+        assert s == 200
+        # 3. Third write with STALE If-Match (the v1 updated_at)
+        plan_v3 = {"version": "1.0", "name": "v3", "steps": [{"name": "c"}]}
+        s, body = _http(
+            "PUT",
+            f"/api/projects/{pid}/plan",
+            {"plan": plan_v3},
+            headers={"If-Match": "2020-01-01T00:00:00+00:00"},  # stale
+        )
+        assert s == 409
+        # FastAPI wraps the detail in {"detail": {...}}
+        detail = body.get("detail") if isinstance(body, dict) else None
+        assert detail is not None, f"expected detail in 409 body, got: {body!r}"
+        assert detail.get("error") == "plan was modified since you last read it"
+        assert detail.get("your_if_match") == "2020-01-01T00:00:00+00:00"
+        assert detail.get("current_updated_at") is not None
+        # current_plan must reflect the v2 plan (the last successful write)
+        cp = detail.get("current_plan")
+        assert cp is not None
+        assert cp["name"] == "v2"
+    finally:
+        _delete_project(pid)
+
+
+def test_put_with_if_match_ignored_when_plan_is_null():
+    """If-Match on a project with no plan yet is ignored (no prior state to lock)."""
+    pid = _create_test_project()
+    try:
+        plan = {"version": "1.0", "name": "first", "steps": [{"name": "a"}]}
+        # Send a stale If-Match on a fresh project — should still succeed
+        s, body = _http(
+            "PUT",
+            f"/api/projects/{pid}/plan",
+            {"plan": plan},
+            headers={"If-Match": "anything-stale-here"},
+        )
+        assert s == 200
+        assert body["plan"]["name"] == "first"
     finally:
         _delete_project(pid)

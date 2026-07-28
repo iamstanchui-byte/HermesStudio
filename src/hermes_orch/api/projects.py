@@ -2169,13 +2169,15 @@ You will see a JSON snapshot of the project (goal, state, tasks
 with status/result, recent audit events, available_profiles) before
 each user message. Use it to ground every response.
 
-CRITICAL: agent_role field for create_task
+CRITICAL: PlanStep.agent_role field
   The `available_profiles` list in the snapshot shows the EXACT
-  profile names you can use. The system REJECTS any other
-  name with a 400. NEVER invent names like 'google-drive-uploader',
-  'script-runner', 'data-analyst', etc. — use one of:
+  profile names you can put in plan.steps[*].agent_role. The
+  system REJECTS any other name with a 422 (Pydantic validator
+  via PUT /api/projects/{id}/plan). NEVER invent names like
+  'google-drive-uploader', 'script-runner', 'data-analyst', etc.
+  — use one of:
   {available_profiles_inline}
-  If the task genuinely fits no profile, leave agent_role empty
+  If the step genuinely fits no profile, leave agent_role empty
   and the system defaults to the first one.
 
 Output rules:
@@ -2195,12 +2197,15 @@ Output rules:
   - If the user just asks a question (no concrete action), no
     JSON block. Just answer.
   - Never suggest actions you don't have a type for. The
-    allowed types are: create_task, run, replan.
+    allowed types are: update_plan.
 
 Allowed suggestion types (all optional, only when relevant):
-  - create_task: {type, name, agent_role, action, params (dict, optional), depends_on (list of names, optional)}
-  - run: {type, note: "click Run to dispatch pending tasks"}
-  - replan: {type, goal: "<updated goal text>"}
+  - update_plan: {type, plan: <ProjectPlan>, if_match: "<updated_at>"}
+    where <ProjectPlan> matches the ProjectPlan Pydantic schema
+    (version, name, description, trigger, variables, steps[]).
+    if_match is the updated_at value from the most recent
+    GET /api/projects/{id}/plan (optimistic lock). See
+    docs/chatbox-plan-editor.md §7.1 §7.3.
 
 Do not invent other fields. The frontend parses the JSON block
 verbatim and uses those exact fields. Keep the JSON to a single
@@ -2354,11 +2359,11 @@ async def _build_chat_context(project_id: str, db) -> dict:
             "created_at": a["created_at"][:19] if a["created_at"] else None,
         })
     # Available agent profiles — included in the chat context so
-    # the LLM uses a REAL profile name for agent_role in
-    # create_task suggestions. Without this, the LLM invents
+    # the LLM uses a REAL profile name in plan.steps[*].agent_role
+    # within update_plan suggestions. Without this, the LLM invents
     # plausible-looking names like 'google-drive-uploader' or
-    # 'script-runner' that don't exist; apply then 400s.
-    # (LLM-fooling pattern #7 — see memory catalog.)
+    # 'script-runner' that don't exist; the Pydantic plan validator
+    # then 422s. (LLM-fooling pattern #7 — see memory catalog.)
     profiles = await db.fetchall(
         "SELECT name, agent_id FROM agent_profiles ORDER BY agent_id, name"
     )
@@ -2505,9 +2510,9 @@ async def chat_with_project(
     # Fill the {available_profiles_inline} placeholder in the
     # system prompt with the comma-separated profile names from
     # the project context. This stops the LLM from inventing
-    # names like 'google-drive-uploader' or 'script-runner' (the
-    # apply endpoint validates and 400s on unknown names, so
-    # the LLM MUST use a real name).
+    # names like 'google-drive-uploader' or 'script-runner' in
+    # plan.steps[*].agent_role (the Pydantic validator on PUT
+    # /plan 422s on unknown names, so the LLM MUST use a real one).
     profile_names = [p["name"] for p in ctx.get("available_profiles", [])]
     if profile_names:
         inline = ", ".join(f"`{n}`" for n in profile_names)
@@ -2657,9 +2662,11 @@ object with a "suggestions" array. Return ONLY the JSON object.
 No other text. No preamble. No explanation. No markdown fence.
 
 Allowed suggestion types:
-  - create_task: {type, name, agent_role, action, depends_on (optional)}
-  - run: {type, note}
-  - replan: {type, goal}
+  - update_plan: {type, plan: <ProjectPlan>, if_match: "<updated_at>"}
+    where <ProjectPlan> matches the project's plan schema
+    (version, name, description, trigger, variables, steps[]).
+    if_match is the updated_at value from the most recent
+    GET /api/projects/{id}/plan (optimistic lock).
 
 If the user's request is just a question (no concrete action),
 return {"suggestions": []}.
@@ -2789,179 +2796,74 @@ async def apply_chat_suggestion(
 ) -> dict:
     """Apply a structured suggestion from a chat message.
 
-    Supported types:
-      - create_task: calls /api/tasks/ with the suggestion's
-        name/agent_role/action/params/depends_on
-      - run: calls /api/projects/{id}/run (state planned -> ready)
-      - replan: calls /api/projects/{id}/replan with new goal
+    Added 2026-07-28 (chatbox-as-plan-editor, Phase 0):
+    The only supported suggestion type is now `update_plan`. This
+    replaces the entire plan via PUT /api/projects/{id}/plan with
+    the suggestion's plan object. Optimistic lock (If-Match) is
+    taken from suggestion.if_match (the LLM should echo the
+    updated_at it last read). Lock failures (409) propagate to
+    the client so the chatbox can show a 3-way merge.
 
-    For create_task, depends_on names are resolved to task IDs
-    in the same project. Missing names return 400 (operator
-    can pick different names or use a workflow to get the
-    chain right).
+    Removed (2026-07-28):
+      - create_task: chatbox no longer creates tasks directly. The
+        LLM edits the plan, and the user clicks Run on the dashboard
+        to materialize plan → tasks.
+      - run: dispatch is human-only (Run button on dashboard).
+      - replan: superseded by update_plan (the LLM produces a fresh
+        plan object, not just a new goal string).
 
-    For replan, this triggers the supervisor to call the LLM
-    planner. After it returns, the project is in 'planned' state
-    (not auto-dispatched; user clicks Run separately).
+    Allowed types: ["update_plan"].
     """
-    import logging as _logging
-    log = _logging.getLogger(__name__)
+    # Local import: avoid module-level cycle (projects.py is loaded
+    # before plans.py in main.py's router mount order; keeping this
+    # lazy means either order is safe).
+    from hermes_orch.api.plans import (
+        ProjectPlan,
+        ProjectPlanUpdate,
+        put_project_plan,
+    )
     s = body.suggestion
     if not isinstance(s, dict) or not isinstance(s.get("type"), str):
         raise HTTPException(400, "suggestion must be a dict with a 'type' field")
     stype = s["type"]
-    db = request.app.state.db
-    proj = await db.fetchone("SELECT id FROM projects WHERE id = ?", (project_id,))
-    if not proj:
-        raise HTTPException(404, f"Project not found: {project_id}")
-    if stype == "create_task":
-        # Build task body
-        name = (s.get("name") or "").strip()
-        agent_role = (s.get("agent_role") or "").strip()
-        action = (s.get("action") or "").strip()
-        if not action:
-            raise HTTPException(400, "create_task suggestion missing 'action'")
-        # agent_role: validate if provided, default to first if not.
-        # LLM can invent non-existent profile names; we reject with
-        # a clear error + a list of available names so the user can
-        # either pick one or re-ask the assistant.
-        if agent_role:
-            prof = await db.fetchone(
-                "SELECT id FROM agent_profiles WHERE name = ?",
-                (agent_role,),
-            )
-            if not prof:
-                available = await db.fetchall(
-                    "SELECT name FROM agent_profiles ORDER BY name"
-                )
-                names = [p["name"] for p in available]
-                raise HTTPException(
-                    400,
-                    f"agent_role '{agent_role}' is not a registered profile. "
-                    f"Available profiles: {names}. Either pick one and re-ask the "
-                    f"assistant, or click 'Apply' again with no agent_role to "
-                    f"default to the first one ({names[0] if names else 'none'}).",
-                )
-        else:
-            profiles = await db.fetchall(
-                "SELECT name FROM agent_profiles ORDER BY name LIMIT 1"
-            )
-            if not profiles:
-                raise HTTPException(
-                    400,
-                    "create_task suggestion has no agent_role and no profiles are registered",
-                )
-            agent_role = profiles[0]["name"]
-        params = s.get("params") or {}
-        if not isinstance(params, dict):
-            raise HTTPException(400, "create_task suggestion 'params' must be a dict")
-        # Resolve depends_on names to ids
-        dep_names = s.get("depends_on") or []
-        if not isinstance(dep_names, list):
-            raise HTTPException(400, "create_task suggestion 'depends_on' must be a list")
-        dep_ids: list[str] = []
-        for n in dep_names:
-            if not isinstance(n, str):
-                continue
-            row = await db.fetchone(
-                "SELECT id FROM tasks WHERE project_id = ? AND name = ?",
-                (project_id, n),
-            )
-            if not row:
-                raise HTTPException(
-                    400,
-                    f"create_task: depends_on references '{n}' which doesn't exist "
-                    f"in this project. Add that task first, or remove from depends_on.",
-                )
-            dep_ids.append(row["id"])
-        # Insert task
-        import uuid as _uuid
-        task_id = "t-" + _uuid.uuid4().hex[:8]
-        now = _now_iso()
-        await db.insert("tasks", {
-            "id": task_id,
-            "project_id": project_id,
-            "name": name or None,
-            "agent_role": agent_role,
-            "action": action,
-            "depends_on": json.dumps(dep_ids),
-            "on_parent_failure": "skip",
-            "status": "pending",
-            "priority": "normal",
-            "params": json.dumps(params),
-            "retry_count": 0,
-            "max_retries": 2,
-            "timeout_seconds": 1800,
-        })
-        await audit_log(
-            db, "task.created",
-            actor="operator:chat",
-            project_id=project_id,
-            payload={"task_id": task_id, "name": name, "source": "chat_suggestion"},
+    if stype != "update_plan":
+        raise HTTPException(
+            400,
+            f"unknown suggestion type: {stype!r}. Allowed: update_plan.",
         )
-        return {"applied": True, "type": "create_task", "task_id": task_id, "name": name}
-    if stype == "run":
-        # Reuse the /run endpoint logic in-place (avoids an HTTP
-        # round-trip to ourselves). Mirrors the run_project() body.
-        project = await db.fetchone(
-            "SELECT id, state FROM projects WHERE id = ?", (project_id,),
+    plan_data = s.get("plan")
+    if not isinstance(plan_data, dict):
+        raise HTTPException(400, "update_plan suggestion missing 'plan' object")
+    # Validate the plan shape early (Pydantic) so we fail fast with a
+    # clear 422 instead of letting put_project_plan do it.
+    try:
+        plan = ProjectPlan.model_validate(plan_data)
+    except Exception as e:
+        raise HTTPException(422, f"update_plan: invalid plan: {e}")
+    # If-Match: optional, but if present must be a string
+    if_match = s.get("if_match")
+    if if_match is not None and not isinstance(if_match, str):
+        raise HTTPException(
+            400, "update_plan 'if_match' must be a string when provided"
         )
-        cur_state = project["state"]
-        if cur_state in ("completed", "cancelled", "archived", "deleted"):
-            raise HTTPException(400, f"Cannot Run in state '{cur_state}' (terminal).")
-        if cur_state in ("ready", "running"):
-            return {"applied": True, "type": "run", "noop": True, "state": cur_state}
-        if cur_state != "planned":
-            raise HTTPException(
-                400, f"Cannot Run in state '{cur_state}'; wait for planning."
-            )
-        tc = await db.fetchone(
-            "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ?", (project_id,),
-        )
-        if not tc or tc["n"] == 0:
-            raise HTTPException(400, "No tasks yet — add tasks first, then Run.")
-        await db.execute(
-            "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
-            (_now_iso(), project_id),
-        )
-        await audit_log(
-            db, "project.run_requested",
-            actor="operator:chat",
-            project_id=project_id,
-            payload={"previous_state": cur_state, "task_count": tc["n"], "source": "chat_suggestion"},
-        )
-        return {"applied": True, "type": "run", "state": "ready", "task_count": tc["n"]}
-    if stype == "replan":
-        new_goal = (s.get("goal") or "").strip()
-        if not new_goal:
-            raise HTTPException(400, "replan suggestion missing 'goal'")
-        # Reuse replan logic in-place. clear_tasks defaults True
-        # (chat is a fresh plan, not a tweak).
-        if (await db.fetchone("SELECT state FROM projects WHERE id = ?", (project_id,))) is None:
-            raise HTTPException(404, f"Project not found: {project_id}")
-        await db.execute(
-            "DELETE FROM tasks WHERE project_id = ? "
-            "AND status IN ('pending', 'assigned', 'running', 'failed', 'cancelled', 'skipped', 'interrupted')",
-            (project_id,),
-        )
-        await db.execute(
-            "UPDATE projects SET state = 'planning', current_iteration = 0, "
-            "last_iteration_summary = '', goal = ?, updated_at = ? "
-            "WHERE id = ?",
-            (new_goal, _now_iso(), project_id),
-        )
-        try:
-            dpath = _project_dir(request, project_id) / "decision.md"
-            if dpath.exists():
-                dpath.unlink()
-        except Exception:
-            pass
-        await audit_log(
-            db, "project.replan_requested",
-            actor="operator:chat",
-            project_id=project_id,
-            payload={"new_goal_preview": new_goal[:200], "source": "chat_suggestion"},
-        )
-        return {"applied": True, "type": "replan", "state": "planning", "goal": new_goal}
-    raise HTTPException(400, f"unknown suggestion type: {stype!r}. Allowed: create_task, run, replan.")
+    # Delegate to put_project_plan. It handles:
+    #   - 404 for unknown project
+    #   - optimistic lock (409 with current_plan in body)
+    #   - audit log with actor=operator:chat
+    # HTTPException from put_project_plan (e.g. 409) propagates to
+    # the chatbox client so it can show a 3-way merge UI.
+    result = await put_project_plan(
+        project_id=project_id,
+        body=ProjectPlanUpdate(plan=plan),
+        request=request,
+        if_match=if_match,
+        audit_actor="operator:chat",
+    )
+    return {
+        "applied": True,
+        "type": "update_plan",
+        "project_id": result.project_id,
+        "updated_at": result.updated_at,
+        "step_count": len(result.plan.steps) if result.plan else 0,
+    }
 
