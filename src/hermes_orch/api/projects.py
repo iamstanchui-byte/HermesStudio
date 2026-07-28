@@ -2147,72 +2147,126 @@ async def apply_soul_presets(
 # server-side: the assistant can suggest a structure, the user
 # confirms, and the action runs through the normal API.
 
-# System prompt for the chat assistant. Kept terse — the LLM
-# already knows what a project is, so we just remind it of the
-# project-page context and the 4 capabilities.
+# System prompt for the chat assistant. Rewritten 2026-07-28 for
+# chatbox-as-plan-editor (docs/chatbox-plan-editor.md §7.3). The
+# LLM's job is now narrow: edit the project's plan workflow
+# object, never create tasks or trigger dispatch.
 _CHAT_SYSTEM_PROMPT = """\
-You are the orchestrator chat assistant for a single project in
+You are the chatbox plan editor for a single project in
 hermes-orchestrator. The operator sees you as a panel in the
-project page. They can ask you to:
+project page. Your ONLY job is to help the user design the
+project's `plan` — the structured workflow object that gets
+materialized into tasks when they click Run on the dashboard.
 
-  1. ANALYZE project status (read-only summary of tasks +
-     recent audit events)
-  2. GENERATE workflow steps (return a list of suggested tasks
-     the operator can add with one click)
-  3. IDENTIFY script-able tasks (which current/pending tasks
-     could be done by a small Python script instead of an LLM
-     agent, saving tokens)
-  4. SUGGEST next steps (after a task completes, what should
-     happen next, given the project's goal)
+# What you can do
+  - Read the current plan (snapshot below)
+  - Suggest edits to plan.steps (add / remove / modify / re-order)
+  - Explain what a plan does in plain language
+  - Suggest an initial plan from a goal description
 
-You will see a JSON snapshot of the project (goal, state, tasks
-with status/result, recent audit events, available_profiles) before
-each user message. Use it to ground every response.
+# What you MUST NEVER do
+  - NEVER create tasks directly (no `create_task` suggestion)
+  - NEVER trigger dispatch (no `run` / `replan` / `materialize`)
+  - NEVER invent agent_role / skill / tool names that aren't in
+    the `agents_info` block below — the Pydantic validator on
+    PUT /api/projects/{id}/plan rejects unknown names with 422
+  - NEVER call /api/tasks/ or /api/projects/{id}/run directly
+  - Run is human-only (user clicks the Run button on the dashboard)
 
-CRITICAL: PlanStep.agent_role field
-  The `available_profiles` list in the snapshot shows the EXACT
-  profile names you can put in plan.steps[*].agent_role. The
-  system REJECTS any other name with a 422 (Pydantic validator
-  via PUT /api/projects/{id}/plan). NEVER invent names like
-  'google-drive-uploader', 'script-runner', 'data-analyst', etc.
-  — use one of:
-  {available_profiles_inline}
-  If the step genuinely fits no profile, leave agent_role empty
-  and the system defaults to the first one.
+# Snapshot you receive (per turn, see below)
+  - `project`: id, name, state, plan_updated_at (echo this in
+    every `update_plan` suggestion's `if_match` field for the
+    optimistic lock; null if no plan yet)
+  - `plan`: current ProjectPlan or null. If null, you're starting
+    from scratch — build one
+  - `agents_info.agent_roles` / `.skills` / `.tools`: valid names
+    you can put in plan.steps[*]. Use ONLY these, otherwise
+    PUT /api/projects/{id}/plan will 422
+  - `audit_tail`: last 5 audit events for context
 
-Output rules:
-  - Plain markdown, 1-15 lines, terse.
-  - If you have CONCRETE actions to propose (create tasks, run,
-    re-plan, etc.), you MUST end with EXACTLY ONE fenced JSON
-    block:
-    ```json
-    {"suggestions": [{"type": "create_task", "name": "...", ...}]}
-    ```
-    This includes implicit action requests: when the user says
-    "yes do it", "add it", "幫加上去", "ok run", "yes please",
-    "做啦", etc., they want the action EXECUTED. Always return
-    a JSON block — never just describe what should happen in
-    text. The user reads the markdown for context, then clicks
-    Apply on the JSON suggestions.
-  - If the user just asks a question (no concrete action), no
-    JSON block. Just answer.
-  - Never suggest actions you don't have a type for. The
-    allowed types are: update_plan.
+# Workflow per user turn
+  1. Read the snapshot (provided below)
+  2. Apply the user's edit to your in-memory draft of the plan
+  3. Validate your draft (see Validation rules below)
+  4. Render the CURRENT plan as a DAG (see DAG format below)
+  5. Respond in markdown, then end with EXACTLY ONE fenced JSON
+     block (the Apply chip) containing the full new plan:
+     ```json
+     {{"suggestions": [{{"type": "update_plan", "plan": <full ProjectPlan>, "if_match": "<plan_updated_at>"}}]}}
+     ```
+     - if_match is the plan_updated_at from the snapshot. If
+       plan was null, set if_match to null (server treats null
+       as "no prior state, just write").
+     - The plan field must be the FULL new plan, not a diff.
+       The apply endpoint replaces the whole plan.
 
-Allowed suggestion types (all optional, only when relevant):
-  - update_plan: {type, plan: <ProjectPlan>, if_match: "<updated_at>"}
-    where <ProjectPlan> matches the ProjectPlan Pydantic schema
-    (version, name, description, trigger, variables, steps[]).
-    if_match is the updated_at value from the most recent
-    GET /api/projects/{id}/plan (optimistic lock). See
-    docs/chatbox-plan-editor.md §7.1 §7.3.
+# Validation rules (your draft must pass)
+  - Every step `name` is kebab-case (lowercase letters, digits,
+    hyphens; no spaces, no underscores, no uppercase)
+  - Step names are unique within the plan
+  - `depends_on` is a list of OTHER STEP NAMES (never IDs)
+  - All `depends_on` names resolve to steps in the plan (no
+    dangling references)
+  - No cycles (A→B→A)
+  - `agent_role` is in `agents_info.agent_roles` (or empty string)
+  - `skill` is in `agents_info.skills` (or empty string)
+  - `tool` is in `agents_info.tools` (or empty string)
+  - The plan's overall `name` is kebab-case (or empty for "no
+    plan yet")
+  - `version` is the string "1.0"
 
-Do not invent other fields. The frontend parses the JSON block
-verbatim and uses those exact fields. Keep the JSON to a single
-line if possible; no comments.
+# DAG render format (plain text, box-drawing)
+  Always end your markdown response with the current plan as a
+  DAG so the user can see the shape at a glance. Use exactly
+  these box-drawing characters: └─, ├─, │.
 
-Respond in the operator's language. They write in mixed Cantonese
-/ Mandarin / English; mirror their tone.
+  Linear chain:
+      step-1
+      └─ step-2
+          └─ step-3
+
+  Branching (fan-out + fan-in via duplicate rendering):
+      step-1
+      ├─ step-2
+      │     └─ step-4
+      └─ step-3
+            └─ step-4
+
+  Multiple roots:
+      step-1
+      └─ step-2
+      step-3
+
+  If you include agent_role for clarity (optional, use only when
+  user asks "who runs each step?"):
+      step-1  (super)
+      └─ step-2  (win-agent01)
+
+# Drift detection (per turn)
+  Each turn you receive a fresh snapshot. The `plan_updated_at`
+  field tells you when the plan last changed. If the user has
+  been editing the visual editor or another chat, the snapshot
+  may differ from the plan in your in-memory draft. If your
+  draft's plan_updated_at is older than the snapshot's, your
+  draft is stale. Warn the user ("⚠ plan was edited externally,
+  reload?") and use the snapshot's plan_updated_at in your
+  if_match.
+
+# Conflict (409) on Apply
+  The server returns 409 if your if_match is stale. The chat
+  UI handles this automatically and offers a 3-way merge. You
+  don't need to do anything special — the UI re-fetches the
+  current plan and the user re-applies.
+
+# Response format
+  - Plain markdown, terse. 1-15 lines.
+  - If user asks a question (no edit), no JSON block.
+  - If user wants an edit, end with EXACTLY ONE fenced JSON
+    block. Never multiple blocks. Never inline JSON.
+  - Never include text after the JSON block.
+
+# Available profiles for plan.steps[*].agent_role
+{available_profiles_inline}
 """
 
 
@@ -2279,74 +2333,47 @@ async def list_chat_messages(
 
 
 async def _build_chat_context(project_id: str, db) -> dict:
-    """Build a JSON snapshot of the project for the LLM. Capped
-    sizes so the prompt doesn't blow up on a 100-task project."""
+    """Build a JSON snapshot of the project for the LLM.
+
+    Rewritten 2026-07-28 for chatbox-as-plan-editor
+    (docs/chatbox-plan-editor.md §7.3). The chat is now plan-focused:
+    it edits the project plan, not individual tasks. The snapshot
+    includes the current plan (if any), the valid agent_role /
+    skill / tool names (so the LLM doesn't invent any), the
+    plan_updated_at (for the optimistic lock), and a short audit
+    trail for context.
+
+    Capped sizes so the prompt doesn't blow up on a 200-step plan.
+    """
+    # Lazy import: projects.py is loaded before plans.py in main.py's
+    # router mount order, and we want either order to be safe.
+    from hermes_orch.api.plans import ProjectPlan, _compute_plan_agents
     proj = await db.fetchone(
-        "SELECT id, name, goal, state, max_iterations, current_iteration "
+        "SELECT id, name, goal, state, max_iterations, current_iteration, "
+        "       plan_json, updated_at "
         "FROM projects WHERE id = ?", (project_id,),
     )
     if not proj:
         return None
-    # Tasks: cap at 50 most recent (chat shouldn't need more)
-    tasks = await db.fetchall(
-        "SELECT id, name, agent_role, action, status, depends_on, "
-        "       result, error, created_at "
-        "FROM tasks WHERE project_id = ? "
-        "ORDER BY created_at DESC LIMIT 50",
-        (project_id,),
-    )
-    # Recent audit: cap at 20
+    # Parse the current plan (may be null or empty string)
+    plan_obj = None
+    raw_plan = proj.get("plan_json")
+    if raw_plan:
+        try:
+            data = json.loads(raw_plan) if isinstance(raw_plan, str) else raw_plan
+            plan_obj = ProjectPlan.model_validate(data).model_dump(mode="json")
+        except Exception:
+            # Malformed plan — treat as null in the snapshot so the
+            # LLM can rewrite it from scratch.
+            plan_obj = None
+    # Get the valid agent_role / skill / tool names (shared helper).
+    agents_info = await _compute_plan_agents(db, project_id)
+    # Recent audit: cap at 5 (chat is plan-focused, not audit-focused)
     audit = await db.fetchall(
         "SELECT event_type, payload, created_at FROM audit_log "
-        "WHERE project_id = ? ORDER BY id DESC LIMIT 20",
+        "WHERE project_id = ? ORDER BY id DESC LIMIT 5",
         (project_id,),
     )
-    def _clean_result(r):
-        if not r:
-            return None
-        if isinstance(r, str):
-            try:
-                d = json.loads(r)
-                if isinstance(d, dict):
-                    return {
-                        "summary": (d.get("summary") or "")[:300],
-                        "error": (d.get("error") or "")[:200],
-                        "artifacts_count": len(d.get("artifacts") or []),
-                        "session_id": (d.get("session_id") or "")[:16] if d.get("session_id") else None,
-                    }
-            except (json.JSONDecodeError, TypeError):
-                return {"raw": r[:300]}
-        return None
-    task_list = []
-    for t in tasks:
-        dep_ids_raw = t.get("depends_on")
-        # depends_on may be a JSON string (in the tasks table) or
-        # already a list. Normalize.
-        if isinstance(dep_ids_raw, str):
-            try:
-                dep_ids = json.loads(dep_ids_raw) or []
-            except (json.JSONDecodeError, TypeError):
-                dep_ids = []
-        else:
-            dep_ids = dep_ids_raw or []
-        dep_names = []
-        if dep_ids:
-            placeholders = ",".join("?" * len(dep_ids))
-            dep_rows = await db.fetchall(
-                f"SELECT id, name FROM tasks WHERE id IN ({placeholders})",
-                tuple(dep_ids),
-            )
-            dep_names = [(r["name"] or r["id"]) for r in dep_rows]
-        task_list.append({
-            "id": t["id"],
-            "name": t["name"],
-            "agent_role": t["agent_role"],
-            "action": t["action"],
-            "status": t["status"],
-            "depends_on": dep_names,
-            "result": _clean_result(t.get("result")),
-            "error": (t.get("error") or "")[:200] if t.get("error") else None,
-        })
     audit_list = []
     for a in audit:
         try:
@@ -2358,18 +2385,6 @@ async def _build_chat_context(project_id: str, db) -> dict:
             "summary": {k: str(v)[:200] for k, v in payload.items()},
             "created_at": a["created_at"][:19] if a["created_at"] else None,
         })
-    # Available agent profiles — included in the chat context so
-    # the LLM uses a REAL profile name in plan.steps[*].agent_role
-    # within update_plan suggestions. Without this, the LLM invents
-    # plausible-looking names like 'google-drive-uploader' or
-    # 'script-runner' that don't exist; the Pydantic plan validator
-    # then 422s. (LLM-fooling pattern #7 — see memory catalog.)
-    profiles = await db.fetchall(
-        "SELECT name, agent_id FROM agent_profiles ORDER BY agent_id, name"
-    )
-    available_profiles = [
-        {"name": p["name"], "agent_id": p["agent_id"]} for p in profiles
-    ]
     return {
         "project": {
             "id": proj["id"],
@@ -2379,9 +2394,14 @@ async def _build_chat_context(project_id: str, db) -> dict:
             "max_iterations": proj["max_iterations"],
             "current_iteration": proj["current_iteration"],
         },
-        "tasks": task_list,
+        "plan": plan_obj,
+        # plan_updated_at is the value the LLM must echo in
+        # update_plan.if_match for the optimistic lock. None if
+        # the project has no plan yet (LLM passes null and the
+        # server treats it as "no prior state, just write").
+        "plan_updated_at": proj.get("updated_at"),
+        "agents_info": agents_info,
         "audit_tail": audit_list,
-        "available_profiles": available_profiles,
     }
 
 
@@ -2458,6 +2478,49 @@ def _extract_suggestions(llm_text: str) -> tuple[str, list[dict] | None]:
     return llm_text.strip(), None
 
 
+def _render_dag_section(suggestions: list | None) -> str:
+    """Render a DAG code block from any `update_plan` suggestions.
+
+    Added 2026-07-28 for chatbox-as-plan-editor. If any suggestion
+    in the list is of type `update_plan` and has a non-empty
+    `steps` array, render the plan as a plain-text DAG (via
+    `hermes_orch.dag_render.render_plan_dag`) and return a
+    markdown-fenced code block to append to the assistant's
+    response. If no update_plan suggestion is present, or all
+    such suggestions are empty, return "".
+
+    The output is wrapped in a ```text fence so the frontend can
+    render it in monospace <pre>. Box-drawing characters
+    (└─ ├─ │) are not interpreted as markdown.
+
+    Defensive: any exception (e.g. import error) returns "" so
+    the chat endpoint still works.
+    """
+    if not suggestions:
+        return ""
+    try:
+        from hermes_orch.dag_render import render_plan_dag
+    except ImportError:
+        return ""
+    dag_blocks: list[str] = []
+    for s in suggestions:
+        if not isinstance(s, dict):
+            continue
+        if s.get("type") != "update_plan":
+            continue
+        plan_obj = s.get("plan")
+        if not isinstance(plan_obj, dict):
+            continue
+        steps = plan_obj.get("steps")
+        if not isinstance(steps, list) or not steps:
+            continue
+        dag_text = render_plan_dag(steps)
+        dag_blocks.append(dag_text)
+    if not dag_blocks:
+        return ""
+    return "\n\nCurrent plan:\n```text\n" + "\n\n".join(dag_blocks) + "\n```"
+
+
 @router.post("/{project_id}/chat")
 async def chat_with_project(
     project_id: str, body: ChatRequest, request: Request
@@ -2513,7 +2576,9 @@ async def chat_with_project(
     # names like 'google-drive-uploader' or 'script-runner' in
     # plan.steps[*].agent_role (the Pydantic validator on PUT
     # /plan 422s on unknown names, so the LLM MUST use a real one).
-    profile_names = [p["name"] for p in ctx.get("available_profiles", [])]
+    # Snapshot uses 'agents_info' (2026-07-28) — same data shape
+    # as the old 'available_profiles' list (list of {name, agent_id}).
+    profile_names = [p["name"] for p in ctx.get("agents_info", {}).get("agent_roles", [])]
     if profile_names:
         inline = ", ".join(f"`{n}`" for n in profile_names)
     else:
@@ -2574,6 +2639,16 @@ async def chat_with_project(
     text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
     # Extract suggestions
     display_text, suggestions = _extract_suggestions(text)
+    # Render the DAG from any update_plan suggestions and append it
+    # to the assistant message so the user can see the current shape
+    # without expanding the JSON suggestion chip. (Added 2026-07-28
+    # for chatbox-as-plan-editor.)
+    try:
+        dag_section = _render_dag_section(suggestions)
+        if dag_section:
+            display_text = display_text + dag_section
+    except Exception as e:
+        log.warning(f"failed to render DAG for chat: {e}")
     # Persist assistant message
     sugg_json = json.dumps(suggestions) if suggestions else None
     assistant_now = _now_iso()

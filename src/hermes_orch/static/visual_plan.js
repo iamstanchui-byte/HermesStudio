@@ -953,6 +953,32 @@
             $('vp-plan-description').value = _plan.description || '';
             return newSteps.length;
         },
+        // Phase 1.5 (2026-07-29): replace the entire plan from
+        // an external source (e.g. chatbox apply). Unlike
+        // importSteps which appends, this REPLACES _plan and
+        // re-renders. Used by the chatbox onPlanApplied hook so
+        // the visual canvas reflects the LLM-applied plan
+        // without a page reload.
+        loadPlan: function(newPlan) {
+            if (!newPlan || typeof newPlan !== 'object') return false;
+            // Ensure required fields with safe defaults
+            _plan = {
+                version: newPlan.version || '1.0',
+                name: newPlan.name || '',
+                description: newPlan.description || '',
+                trigger: newPlan.trigger || 'manual',
+                variables: Array.isArray(newPlan.variables) ? newPlan.variables : [],
+                steps: Array.isArray(newPlan.steps) ? newPlan.steps : [],
+            };
+            renderAllSteps();
+            $('vp-plan-name').value = _plan.name || '';
+            $('vp-plan-description').value = _plan.description || '';
+            // Clear the unsaved-changes banner (a fresh plan from
+            // the server is already saved, so there's nothing to
+            // save until the user edits it).
+            try { window.dispatchEvent(new CustomEvent('vp:plan-loaded')); } catch (e) {}
+            return true;
+        },
     };
 
     // ===== Bootstrap =====

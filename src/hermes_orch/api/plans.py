@@ -282,7 +282,18 @@ async def get_plan_agents(
     )
     if not proj:
         raise HTTPException(404, f"Project not found: {project_id}")
-    # agent_roles: only include non-disabled profiles
+    data = await _compute_plan_agents(db, project_id)
+    return ProjectPlanAgentsResponse(**data)
+
+
+async def _compute_plan_agents(db, project_id: str) -> dict:
+    """Compute the agent_role / skill / tool names for a project.
+
+    Shared helper for the /plan/agents endpoint AND the chatbox
+    snapshot builder (which needs the same data inline). Returns
+    a dict with keys: project_id, agent_roles, skills, tools.
+    Does NOT raise 404 — the caller decides whether to.
+    """
     profile_rows = await db.fetchall(
         "SELECT name FROM agent_profiles "
         "WHERE status IS NULL OR status != 'disabled' "
@@ -325,12 +336,12 @@ async def get_plan_agents(
                     skills.append(skill)
     except Exception:
         pass
-    return ProjectPlanAgentsResponse(
-        project_id=project_id,
-        agent_roles=agent_roles,
-        skills=sorted(skills),
-        tools=tools,
-    )
+    return {
+        "project_id": project_id,
+        "agent_roles": agent_roles,
+        "skills": sorted(skills),
+        "tools": tools,
+    }
 
 
 @router.put("/projects/{project_id}/plan", response_model=ProjectPlanResponse)

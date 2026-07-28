@@ -1377,8 +1377,12 @@ async function deletePreset(agentId, profileName, btn) {
      orchestrator LLM. The LLM can analyze, plan, identify
      script-able tasks, and suggest next steps. Suggestions
      (structured JSON) are extracted from the LLM response
-     and rendered as one-click Apply buttons. -->
-<button id="chat-toggle-btn" onclick="toggleChatPanel()"
+     and rendered as one-click Apply buttons.
+
+     Phase 1.5 (2026-07-29): the chat behavior lives in
+     /static/chatbox.js so visual_plan.html can reuse it.
+     Inline onclick handlers use window.chatbox.* below. -->
+<button id="chat-toggle-btn" onclick="window.chatbox.toggleChatPanel()"
     class="fixed bottom-6 right-6 z-40 w-14 h-14 rounded-full bg-blue-600 text-white text-2xl shadow-lg hover:bg-blue-700 flex items-center justify-center"
     title="Open LLM chat assistant">
     💬
@@ -1387,11 +1391,11 @@ async function deletePreset(agentId, profileName, btn) {
     <div class="flex items-center justify-between p-3 border-b border-gray-200 bg-gray-50 shrink-0">
         <div class="min-w-0 flex-1">
             <div class="font-semibold text-gray-800">💬 Orchestrator assistant</div>
-            <div id="chat-subtitle" class="text-xs text-gray-500">Analyzes state, plans, suggests. LLM-driven, applies only when you click.</div>
+            <div id="chat-subtitle" class="text-xs text-gray-500">Plan editor. Describe your goal; refine; click Apply. Run is human-only.</div>
         </div>
         <div class="flex items-center gap-1 shrink-0">
-            <button onclick="clearChat()" class="text-xs text-gray-500 hover:text-red-600 px-2 py-1" title="Clear chat history">Clear</button>
-            <button onclick="toggleChatPanel()"
+            <button onclick="window.chatbox.clearChat()" class="text-xs text-gray-500 hover:text-red-600 px-2 py-1" title="Clear chat history">Clear</button>
+            <button onclick="window.chatbox.toggleChatPanel()"
                 class="text-gray-500 hover:text-gray-800 px-2 py-1 text-base leading-none"
                 title="Close chat panel">
                 ✕
@@ -1400,7 +1404,7 @@ async function deletePreset(agentId, profileName, btn) {
     </div>
     <div id="chat-messages" class="flex-1 overflow-y-auto p-3 space-y-2 text-sm">
         <div class="text-center text-gray-400 italic py-8 text-xs">
-            Ask the assistant to analyze the project, suggest tasks, identify which tasks are script-able, or recommend next steps.
+            Describe your goal in plain language. The assistant drafts a plan; you refine conversationally, then click Apply to write it.
         </div>
     </div>
     <div id="chat-input-area" class="border-t border-gray-200 p-3 shrink-0">
@@ -1409,13 +1413,13 @@ async function deletePreset(agentId, profileName, btn) {
             <textarea id="chat-input" rows="3"
                 class="flex-1 border rounded px-2 py-1 text-sm resize-none"
                 placeholder="Ask something... (Enter to send, Shift+Enter for newline)"
-                onkeydown="if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendChatMessage(); }"
+                onkeydown="if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); window.chatbox.sendChatMessage(); }"
                 oninput="document.getElementById('chat-send-btn').disabled = !this.value.trim();"></textarea>
             <div class="flex flex-col gap-1 w-20">
-                <button id="chat-send-btn" onclick="sendChatMessage()" disabled
+                <button id="chat-send-btn" onclick="window.chatbox.sendChatMessage()" disabled
                     class="flex-1 px-3 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
                     title="Send (Enter)">Send</button>
-                <button onclick="toggleChatPanel()"
+                <button onclick="window.chatbox.toggleChatPanel()"
                     class="text-xs text-gray-500 hover:text-gray-800 px-2 py-1"
                     title="Close panel">Close ✕</button>
             </div>
@@ -1423,355 +1427,7 @@ async function deletePreset(agentId, profileName, btn) {
     </div>
 </div>
 
-<script>
-// Phase 4+ #25 (2026-07-25): LLM chat assistant
-// _fetchWithTimeout + _errDetailToString are defined in base.html now
-// (moved from project.html in commit 3bbf5aa), so they're available here.
-
-// Persist the open/closed state in localStorage so the panel
-// re-opens after page reload (e.g. from the 30s auto-refresh
-// or from the post-apply reload). Key per-project so each
-// project's chat state is remembered independently.
-const _chatStateKey = 'chatOpen:' + PROJECT_ID;
-let _chatPanelOpen = false;
-
-function toggleChatPanel() {
-    const panel = document.getElementById('chat-panel');
-    _chatPanelOpen = !_chatPanelOpen;
-    if (_chatPanelOpen) {
-        panel.classList.remove('hidden');
-        try { localStorage.setItem(_chatStateKey, '1'); } catch (e) {}
-        if (document.getElementById('chat-messages').children.length <= 1) {
-            loadChatHistory();
-        }
-        setTimeout(() => document.getElementById('chat-input').focus(), 50);
-    } else {
-        panel.classList.add('hidden');
-        try { localStorage.setItem(_chatStateKey, '0'); } catch (e) {}
-    }
-}
-
-// On page load, restore the open state (default = open if no key).
-// This handles the auto-refresh case: chat was open, page reloaded,
-// panel re-opens without the user needing to click the button.
-(function _restoreChatState() {
-    let saved = '1';  // default open
-    try { saved = localStorage.getItem(_chatStateKey) || '1'; } catch (e) {}
-    if (saved === '1') {
-        const panel = document.getElementById('chat-panel');
-        if (panel) {
-            panel.classList.remove('hidden');
-            _chatPanelOpen = true;
-            // Load history only after a tick (don't block initial render)
-            setTimeout(() => {
-                if (document.getElementById('chat-messages').children.length <= 1) {
-                    loadChatHistory();
-                }
-            }, 200);
-        }
-    }
-})();
-
-async function loadChatHistory() {
-    try {
-        const r = await _fetchWithTimeout(`/api/projects/${PROJECT_ID}/chat`, {}, 10000);
-        if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            document.getElementById('chat-messages').innerHTML =
-                `<div class="text-red-600 text-xs">Failed to load history: ${_errDetailToString(err.detail, r.status)}</div>`;
-            return;
-        }
-        const data = await r.json();
-        renderChatMessages(data.messages || []);
-    } catch (e) {
-        if (e.name !== 'AbortError') {
-            document.getElementById('chat-messages').innerHTML =
-                `<div class="text-red-600 text-xs">Load error: ${e.message}</div>`;
-        }
-    }
-}
-
-function renderChatMessages(messages) {
-    const wrap = document.getElementById('chat-messages');
-    if (!messages.length) {
-        wrap.innerHTML = `<div class="text-center text-gray-400 italic py-8 text-xs">
-            Ask the assistant to analyze the project, suggest tasks, identify which tasks are script-able, or recommend next steps.
-        </div>`;
-        return;
-    }
-    wrap.innerHTML = '';
-    for (const m of messages) {
-        wrap.appendChild(renderChatMessage(m));
-    }
-    // Scroll to bottom
-    wrap.scrollTop = wrap.scrollHeight;
-}
-
-function renderChatMessage(m) {
-    const div = document.createElement('div');
-    if (m.role === 'user') {
-        div.className = 'bg-blue-50 border border-blue-200 rounded p-2 ml-8';
-        div.innerHTML = `<div class="text-xs text-gray-500 mb-1">You</div>
-            <div class="whitespace-pre-wrap">${escapeHtml(m.content)}</div>`;
-    } else {
-        div.className = 'bg-gray-50 border border-gray-200 rounded p-2 mr-8';
-        let html = `<div class="text-xs text-gray-500 mb-1">Assistant</div>
-            <div class="prose-sm whitespace-pre-wrap">${escapeHtml(m.content)}</div>`;
-        if (m.suggestions && m.suggestions.length) {
-            html += `<div class="mt-2 space-y-1">${m.suggestions.map((s, i) =>
-                renderSuggestion(s, i, m.id)).join('')}</div>`;
-        } else {
-            // LLM-fooling pattern #9: LLM sometimes describes the
-            // action in text without a JSON block. Show a Reformat
-            // button that asks the LLM to wrap the action in JSON
-            // (auto-triggers a follow-up chat with the same intent).
-            html += `<div class="mt-2">
-                <button onclick="reformatLastAssistant()"
-                    class="text-xs px-2 py-0.5 bg-amber-100 text-amber-800 border border-amber-300 rounded hover:bg-amber-200"
-                    title="Ask the assistant to reformat its last response as structured actions (one-click retry with stronger instruction)">
-                    ✨ Reformat as actions
-                </button>
-            </div>`;
-        }
-        div.innerHTML = html;
-    }
-    return div;
-}
-
-// Phase 4+ #25 v2 (2026-07-25): reformat fallback
-// LLM-fooling pattern #9: when the LLM describes an action
-// in plain text without a JSON block, the user clicks this
-// button to ask the LLM to retry with explicit instruction to
-// format as JSON. Uses a DEDICATED server endpoint
-// (/chat/reformat) instead of resending the chat message — the
-// dedicated call has a focused, single-purpose system prompt
-// (just "return JSON, nothing else") which the LLM follows
-// far more reliably than adding a suffix to the conversation.
-async function reformatLastAssistant() {
-    const status = document.getElementById('chat-status');
-    status.textContent = 'Reformatting...';
-    status.className = 'text-xs text-gray-500 mt-1 h-4';
-    // Find the last user message in DOM. The user bubble is
-    // a div with class 'bg-blue-50'. Use classList.contains()
-    // because querySelector() searches descendants, not the
-    // element itself — the old code searched itself for a
-    // class it has, which always returned null.
-    const allBubbles = Array.from(document.querySelectorAll('#chat-messages > div'));
-    const lastUser = allBubbles.reverse().find(d => d.classList.contains('bg-blue-50'));
-    if (!lastUser) {
-        status.textContent = 'No prior user message to reformat';
-        status.className = 'text-xs text-red-600 mt-1 h-4';
-        return;
-    }
-    const text = lastUser.querySelector('.whitespace-pre-wrap')?.textContent || '';
-    if (!text) {
-        status.textContent = 'Could not read user message text';
-        status.className = 'text-xs text-red-600 mt-1 h-4';
-        return;
-    }
-    // Call the dedicated reformat endpoint (focused system
-    // prompt = "return JSON only, no other text"). This is far
-    // more reliable than appending a suffix to the chat.
-    try {
-        const r = await _fetchWithTimeout(
-            `/api/projects/${PROJECT_ID}/chat/reformat`,
-            {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({message: text}),
-            },
-            60000,
-        );
-        const data = await r.json().catch(() => ({}));
-        if (!r.ok) {
-            status.textContent = 'Reformat failed: ' + _errDetailToString(data.detail, r.status);
-            status.className = 'text-xs text-red-600 mt-1 h-4';
-            return;
-        }
-        // The reformat endpoint returns {message, suggestions}.
-        // Append as a fresh assistant message in the chat.
-        const wrap = document.getElementById('chat-messages');
-        wrap.appendChild(renderChatMessage({
-            role: 'assistant',
-            content: data.message || '(empty)',
-            suggestions: data.suggestions || [],
-            id: data.message_id,
-        }));
-        wrap.scrollTop = wrap.scrollHeight;
-        status.textContent = 'Reformatted';
-        status.className = 'text-xs text-green-600 mt-1 h-4';
-    } catch (e) {
-        const reason = e.name === 'AbortError' ? 'timed out (>60s)' : e.message;
-        status.textContent = 'Error: ' + reason;
-        status.className = 'text-xs text-red-600 mt-1 h-4';
-    }
-}
-
-function renderSuggestion(s, idx, messageId) {
-    const type = s.type || 'unknown';
-    let label, desc;
-    if (type === 'create_task') {
-        label = `➕ Add task: ${s.name || s.action || '(unnamed)'}`;
-        desc = `agent=${s.agent_role || '?'}, action=${s.action || '?'}` +
-            (s.depends_on && s.depends_on.length ? `, after=[${s.depends_on.join(', ')}]` : '');
-    } else if (type === 'run') {
-        label = '▶️ Run project';
-        desc = s.note || 'Dispatch all pending tasks';
-    } else if (type === 'replan') {
-        label = '✨ Replan';
-        desc = `goal: ${(s.goal || '').slice(0, 80)}${(s.goal || '').length > 80 ? '…' : ''}`;
-    } else {
-        label = `? ${type}`;
-        desc = JSON.stringify(s).slice(0, 80);
-    }
-    return `<div class="flex items-center justify-between gap-2 bg-white border border-gray-300 rounded px-2 py-1 text-xs">
-        <div class="flex-1 min-w-0">
-            <div class="font-medium text-gray-800">${escapeHtml(label)}</div>
-            <div class="text-gray-500 truncate" title="${escapeHtml(desc)}">${escapeHtml(desc)}</div>
-        </div>
-        <button onclick="applySuggestion(${messageId || 0}, ${idx}, event)"
-            class="px-2 py-0.5 bg-green-600 text-white rounded text-xs hover:bg-green-700 shrink-0">
-            Apply
-        </button>
-    </div>`;
-}
-
-function appendChatElement(el) {
-    const wrap = document.getElementById('chat-messages');
-    if (!wrap) return;
-    // Remove the empty-state placeholder if present
-    const placeholder = wrap.querySelector('.italic.py-8');
-    if (placeholder) placeholder.remove();
-    wrap.appendChild(el);
-    wrap.scrollTop = wrap.scrollHeight;
-}
-
-async function sendChatMessage() {
-    const input = document.getElementById('chat-input');
-    const text = input.value.trim();
-    if (!text) return;
-    const sendBtn = document.getElementById('chat-send-btn');
-    const status = document.getElementById('chat-status');
-    input.value = '';
-    sendBtn.disabled = true;
-    status.textContent = 'Sending...';
-    // Optimistic: render the user message immediately
-    const wrap = document.getElementById('chat-messages');
-    if (wrap.querySelector('.italic')) wrap.innerHTML = '';
-    wrap.appendChild(renderChatMessage({role: 'user', content: text}));
-    wrap.scrollTop = wrap.scrollHeight;
-    try {
-        const r = await _fetchWithTimeout(
-            `/api/projects/${PROJECT_ID}/chat`,
-            {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({message: text}),
-            },
-            60000,  // 60s for LLM
-        );
-        if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            status.textContent = 'Error: ' + _errDetailToString(err.detail, r.status);
-            status.className = 'text-xs text-red-600 mt-1 h-4';
-            // Reload history to sync (in case the user message
-            // was persisted but the assistant failed)
-            loadChatHistory();
-            return;
-        }
-        const data = await r.json();
-        status.textContent = 'Sent';
-        status.className = 'text-xs text-green-600 mt-1 h-4';
-        // Append the assistant message
-        wrap.appendChild(renderChatMessage({
-            role: 'assistant',
-            content: data.message || '(empty response)',
-            suggestions: data.suggestions || [],
-            id: data.message_id,
-        }));
-        wrap.scrollTop = wrap.scrollHeight;
-    } catch (e) {
-        const reason = e.name === 'AbortError' ? 'request timed out (>60s)' : e.message;
-        status.textContent = 'Error: ' + reason;
-        status.className = 'text-xs text-red-600 mt-1 h-4';
-    } finally {
-        sendBtn.disabled = false;
-        input.focus();
-    }
-}
-
-async function applySuggestion(messageId, suggestionIdx, ev) {
-    // IMPORTANT: capture the clicked button BEFORE the first await.
-    // The original `event` object is lost across async boundaries
-    // in older browsers / strict mode. Pass `ev` from the inline
-    // onclick (we read ev.currentTarget) and stash it for later.
-    const btn = ev ? (ev.currentTarget || ev.target) : null;
-    try {
-        const r = await _fetchWithTimeout(`/api/projects/${PROJECT_ID}/chat`, {}, 10000);
-        if (!r.ok) return;
-        const data = await r.json();
-        const msg = (data.messages || []).find(m => m.id === messageId);
-        if (!msg || !msg.suggestions || !msg.suggestions[suggestionIdx]) {
-            alert('Suggestion no longer available. Reopen the chat to refresh.');
-            return;
-        }
-        const suggestion = msg.suggestions[suggestionIdx];
-        const confirmMsg = `Apply this action?\n\n${JSON.stringify(suggestion, null, 2)}`;
-        if (!confirm(confirmMsg)) return;
-        const status = document.getElementById('chat-status');
-        status.textContent = 'Applying...';
-        status.className = 'text-xs text-gray-500 mt-1 h-4';
-        const ar = await _fetchWithTimeout(
-            `/api/projects/${PROJECT_ID}/chat/apply`,
-            {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({suggestion, message_id: messageId}),
-            },
-            30000,
-        );
-        const adata = await ar.json().catch(() => ({}));
-        if (!ar.ok) {
-            status.textContent = 'Apply failed: ' + _errDetailToString(adata.detail, ar.status);
-            status.className = 'text-xs text-red-600 mt-1 h-4';
-            return;
-        }
-        status.textContent = 'Applied: ' + (adata.type || '?');
-        status.className = 'text-xs text-green-600 mt-1 h-4';
-        // Mark the suggestion as applied in the UI (using stashed btn)
-        if (btn) {
-            btn.disabled = true;
-            btn.textContent = '✓ Applied';
-        }
-        // Reload page to show new state if it was create_task / run / replan
-        setTimeout(() => location.reload(), 1500);
-    } catch (e) {
-        const reason = e.name === 'AbortError' ? 'timed out' : e.message;
-        document.getElementById('chat-status').textContent = 'Error: ' + reason;
-        document.getElementById('chat-status').className = 'text-xs text-red-600 mt-1 h-4';
-    }
-}
-
-async function clearChat() {
-    if (!confirm('Clear all chat history for this project? This cannot be undone.')) return;
-    try {
-        const r = await _fetchWithTimeout(
-            `/api/projects/${PROJECT_ID}/chat/clear`,
-            {method: 'POST'},
-            10000,
-        );
-        if (r.ok) {
-            document.getElementById('chat-messages').innerHTML =
-                `<div class="text-center text-gray-400 italic py-8 text-xs">Chat cleared.</div>`;
-        } else {
-            const err = await r.json().catch(() => ({}));
-            alert('Clear failed: ' + _errDetailToString(err.detail, r.status));
-        }
-    } catch (e) {
-        alert('Error: ' + e.message);
-    }
-}
-</script>
+<script defer src="/static/chatbox.js?v=2026-07-29"></script>
 {# Bug fix 2026-07-28: the chat assistant <script> tag at L1436 was
    never closed. The browser kept consuming HTML into the script
    until it found the next </script> in base.html (the polling
