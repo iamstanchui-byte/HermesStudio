@@ -1647,6 +1647,8 @@ function appendChatElement(el) {
 }
 
 async function sendChatMessage() {
+    const input = document.getElementById('chat-input');
+    const text = input.value.trim();
     if (!text) return;
     const sendBtn = document.getElementById('chat-send-btn');
     const status = document.getElementById('chat-status');
