@@ -1404,31 +1404,43 @@ async function deletePreset(agentId, profileName, btn) {
         </div>
     </div>
     <div id="chat-input-area" class="border-t border-gray-200 p-3 shrink-0">
+        {# Shortcut chips row (2026-07-28): user feedback "丑 + add common
+           command shortcuts". One-click chip fills the textarea with a
+           starter prompt so the user can review + edit before sending.
+           Optimize chip auto-executes (the result is a structured
+           card, not free-text, so a review step doesn't make sense). #}
+        <div id="chat-shortcut-chips" class="flex flex-wrap gap-1 mb-2">
+            <button type="button" onclick="useChatShortcut('analyze')"
+                class="px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded border border-gray-300 text-gray-700"
+                title="Fill the input with: 分析呢個 project 嘅 state, 有冇 problem">
+                🔍 Analyze
+            </button>
+            <button type="button" onclick="useChatShortcut('suggest')"
+                class="px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded border border-gray-300 text-gray-700"
+                title="Fill the input with: 下一步應該做咩 task?">
+                🎯 Suggest next
+            </button>
+            <button type="button" onclick="useChatShortcut('plan')"
+                class="px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded border border-gray-300 text-gray-700"
+                title="Fill the input with: 幫我 plan 出呢個 goal 嘅 task list">
+                📋 Plan tasks
+            </button>
+            <button type="button" id="chat-optimize-btn" onclick="runOptimizeTasks()"
+                class="px-2 py-1 text-xs bg-emerald-50 hover:bg-emerald-100 rounded border border-emerald-300 text-emerald-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                title="🧠 Scan this project and find tasks that could be replaced by a deterministic script. Auto-executes; result is a click-to-apply card.">
+                🧠 Optimize
+            </button>
+        </div>
         <div id="chat-status" class="text-xs text-gray-500 h-4 mb-1"></div>
         <div class="flex items-stretch gap-2">
-            <textarea id="chat-input" rows="3"
+            <textarea id="chat-input" rows="2"
                 class="flex-1 border rounded px-2 py-1 text-sm resize-none"
-                placeholder="Ask something... (Enter to send, Shift+Enter for newline)"
+                placeholder="Ask something... (Enter to send, Shift+Enter for newline) — or click a chip above"
                 onkeydown="if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); sendChatMessage(); }"
                 oninput="document.getElementById('chat-send-btn').disabled = !this.value.trim();"></textarea>
-            <div class="flex flex-col gap-1 w-20">
-                <button id="chat-send-btn" onclick="sendChatMessage()" disabled
-                    class="flex-1 px-3 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                    title="Send (Enter)">Send</button>
-                {# Object Layer commit 3 (2026-07-27): code-gen flow entry.
-                   LLM analyzes the project and suggests which tasks are
-                   good candidates for being replaced by a deterministic
-                   script. Each suggestion is a click-to-create single
-                   task that will be dispatched to an agent. #}
-                <button id="chat-optimize-btn" onclick="runOptimizeTasks()"
-                    class="flex-1 px-3 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                    title="🧠 Analyze & optimize: ask the LLM which tasks could be replaced by deterministic scripts">
-                    🧠 Optimize
-                </button>
-                <button onclick="toggleChatPanel()"
-                    class="text-xs text-gray-500 hover:text-gray-800 px-2 py-1"
-                    title="Close panel">Close ✕</button>
-            </div>
+            <button id="chat-send-btn" onclick="sendChatMessage()" disabled
+                class="px-4 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Send (Enter)">Send</button>
         </div>
     </div>
 </div>
@@ -1493,6 +1505,11 @@ async function loadChatHistory() {
         }
         const data = await r.json();
         renderChatMessages(data.messages || []);
+        // After server history loads, re-render the cached optimize
+        // result if there's no fresh card on screen. This makes the
+        // optimize output survive the 30s auto-refresh page reload.
+        const cached = _loadOptimizeCache(PROJECT_ID);
+        if (cached) _renderCachedOptimize(cached);
     } catch (e) {
         if (e.name !== 'AbortError') {
             document.getElementById('chat-messages').innerHTML =
@@ -1654,9 +1671,12 @@ function renderSuggestion(s, idx, messageId) {
 // script and registers it as a new Skill in the Object Layer).
 async function runOptimizeTasks() {
     const btn = document.getElementById('chat-optimize-btn');
-    btn.disabled = true; btn.textContent = '... Analyzing';
+    btn.disabled = true; btn.innerHTML = '⏳ Analyzing...';
     const statusEl = document.getElementById('chat-status');
-    if (statusEl) statusEl.textContent = 'Analyzing project tasks...';
+    if (statusEl) {
+        statusEl.className = 'text-xs text-emerald-700 h-4 mb-1 font-medium';
+        statusEl.textContent = '🧠 Analyzing project tasks (LLM call, may take 5-15s)...';
+    }
     try {
         const r = await _fetchWithTimeout('/api/contracts/optimize-tasks', {
             method: 'POST',
@@ -1669,16 +1689,30 @@ async function runOptimizeTasks() {
             appendChatElement(renderChatMessage({role: 'assistant', content: '❌ Optimize failed: ' + errMsg}));
             return;
         }
+        // Save to localStorage so the result survives auto-refresh reload
+        // (the optimize endpoint doesn't write to project_chat_messages).
+        _saveOptimizeCache(PROJECT_ID, d);
         // Render suggestions
         if (!d.suggestions || d.suggestions.length === 0) {
-            appendChatElement(renderChatMessage({role: 'assistant',
-                content: `No deterministic candidates found. Analyzed ${d.task_count_analyzed} task(s). ${d.overall_notes || ''}`}));
+            // No-candidates path: render a small "done" card so the
+            // user sees a clear result (vs an assistant text bubble
+            // they might miss in a busy chat). Same visual language
+            // as the with-suggestions card.
+            const noCard = document.createElement('div');
+            noCard.setAttribute('data-optimize-cache', '1');
+            noCard.className = 'bg-emerald-50 border border-emerald-200 rounded p-3 text-sm space-y-2';
+            let noHtml = `<div class="font-semibold text-emerald-800">🧠 Optimize: no deterministic candidates (analyzed ${d.task_count_analyzed || 0} task${(d.task_count_analyzed || 0) === 1 ? '' : 's'})</div>`;
+            if (d.overall_notes) noHtml += `<div class="text-xs text-emerald-700">${escapeHtml(d.overall_notes)}</div>`;
+            noCard.innerHTML = noHtml;
+            appendChatElement(noCard);
+            if (statusEl) statusEl.textContent = '✓ Done — no candidates found';
             return;
         }
         // Append a special "optimize" message with suggestion cards
         const card = document.createElement('div');
+        card.setAttribute('data-optimize-cache', '1');
         card.className = 'bg-emerald-50 border border-emerald-200 rounded p-3 text-sm space-y-2';
-        let html = `<div class="font-semibold text-emerald-800">🧠 ${d.suggestions.length} deterministic candidate${d.suggestions.length === 1 ? '' : 's'}</div>`;
+        let html = `<div class="font-semibold text-emerald-800">🧠 ${d.suggestions.length} deterministic candidate${d.suggestions.length === 1 ? '' : 's'} (analyzed ${d.task_count_analyzed || 0})</div>`;
         if (d.overall_notes) {
             html += `<div class="text-xs text-emerald-700">${escapeHtml(d.overall_notes)}</div>`;
         }
@@ -1700,12 +1734,98 @@ async function runOptimizeTasks() {
         }
         card.innerHTML = html;
         appendChatElement(card);
+        if (statusEl) statusEl.textContent = `✓ Done — ${d.suggestions.length} candidate(s)`;
     } catch (e) {
-        appendChatElement(renderChatMessage({role: 'assistant', content: '❌ Network error: ' + e.message}));
+        appendChatElement(renderChatMessage({role: 'assistant', content: '❌ Optimize failed: ' + e.message + '. Check the browser console for details.'}));
+        if (statusEl) statusEl.textContent = '❌ ' + e.message;
     } finally {
-        btn.disabled = false; btn.textContent = '🧠 Optimize';
-        if (statusEl) statusEl.textContent = '';
+        btn.disabled = false; btn.innerHTML = '🧠 Optimize';
+        setTimeout(() => { if (statusEl && statusEl.textContent.startsWith('✓')) statusEl.textContent = ''; }, 5000);
     }
+}
+
+// Persist the latest optimize result to localStorage so it survives the
+// 30s auto-refresh page reload (the optimize endpoint is fire-and-forget
+// and doesn't write to project_chat_messages, so without this cache the
+// user sees a flash of "no output" then the message disappears). Keyed
+// per project so different projects don't bleed into each other.
+const _OPTIMIZE_KEY = (pid) => 'optimizeResult:' + pid;
+function _saveOptimizeCache(projectId, data) {
+    try { localStorage.setItem(_OPTIMIZE_KEY(projectId), JSON.stringify({data, savedAt: new Date().toISOString()})); } catch (e) {}
+}
+function _loadOptimizeCache(projectId) {
+    try {
+        const raw = localStorage.getItem(_OPTIMIZE_KEY(projectId));
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return parsed && parsed.data ? parsed.data : null;
+    } catch (e) { return null; }
+}
+function _clearOptimizeCache(projectId) {
+    try { localStorage.removeItem(_OPTIMIZE_KEY(projectId)); } catch (e) {}
+}
+
+// Re-render a cached optimize result (called on chat open and on history
+// load so the user always sees the last result across reloads).
+function _renderCachedOptimize(data) {
+    if (!data) return;
+    const wrap = document.getElementById('chat-messages');
+    if (!wrap) return;
+    // Skip if a fresh optimize card is already on screen (this run)
+    if (wrap.querySelector('[data-optimize-cache]')) return;
+    // Render as the same card layout runOptimizeTasks uses
+    const card = document.createElement('div');
+    card.setAttribute('data-optimize-cache', '1');
+    card.className = 'bg-emerald-50 border border-emerald-200 rounded p-3 text-sm space-y-2';
+    let html = `<div class="font-semibold text-emerald-800">🧠 Optimize ${data.task_count_analyzed || 0} task(s)${data.suggested_count ? ' · ' + data.suggested_count + ' suggestion(s)' : ''}</div>`;
+    html += `<div class="text-xs text-gray-500 -mt-1">cached from earlier run</div>`;
+    if (data.overall_notes) html += `<div class="text-xs text-emerald-700">${escapeHtml(data.overall_notes)}</div>`;
+    if (data.suggestions && data.suggestions.length) {
+        for (const s of data.suggestions) {
+            const sid = encodeURIComponent(s.task_id);
+            const skillName = encodeURIComponent(s.suggested_skill_name || ('auto-skill-' + s.task_id));
+            const conf = Math.round((s.confidence || 0) * 100);
+            html += `<div class="bg-white border border-emerald-200 rounded p-2 text-xs space-y-1">
+                <div class="font-medium text-gray-800">${escapeHtml(s.task_name)} <span class="text-emerald-600">(${conf}%)</span></div>
+                <div class="text-gray-600">${escapeHtml(s.rationale || '')}</div>
+                <div class="flex items-center justify-between gap-2">
+                    <span class="font-mono text-gray-500">→ ${escapeHtml(s.suggested_skill_name || '')}</span>
+                    <button onclick="createCodeGenTask('${sid}', '${skillName}', this)"
+                        class="px-2 py-0.5 bg-emerald-600 text-white rounded text-xs hover:bg-emerald-700 font-medium">
+                        Generate
+                    </button>
+                </div>
+            </div>`;
+        }
+    } else {
+        html += `<div class="text-xs text-gray-600 italic">No deterministic candidates.</div>`;
+    }
+    card.innerHTML = html;
+    // Remove the empty-state placeholder if it's still there
+    const placeholder = wrap.querySelector('.italic.py-8');
+    if (placeholder) placeholder.remove();
+    wrap.appendChild(card);
+    wrap.scrollTop = wrap.scrollHeight;
+}
+
+// Fill the input with a starter prompt and focus it. Used by the
+// shortcut chips above the textarea. The user can edit before sending
+// so this is a "fill, don't fire" pattern.
+const _CHAT_SHORTCUTS = {
+    analyze: "分析呢個 project 嘅 state, 有冇 problem? 邊啲 task 卡住或者失敗咗?",
+    suggest: "下一步應該做咩 task? 點解? (請參考現有 task list 嘅 status)",
+    plan: "幫我 plan 出呢個 goal 嘅 task list, 每個 step 要有 action + agent_role",
+};
+function useChatShortcut(kind) {
+    const prompt = _CHAT_SHORTCUTS[kind];
+    if (!prompt) return;
+    const input = document.getElementById('chat-input');
+    input.value = prompt;
+    input.focus();
+    input.setSelectionRange(prompt.length, prompt.length);
+    const sendBtn = document.getElementById('chat-send-btn');
+    sendBtn.disabled = false;
+    input.scrollTop = input.scrollHeight;
 }
 
 // Spawn a single task for code-gen based on a suggestion
@@ -1867,6 +1987,9 @@ async function clearChat() {
             10000,
         );
         if (r.ok) {
+            // Also wipe the localStorage optimize cache so the next
+            // optimize run starts clean.
+            _clearOptimizeCache(PROJECT_ID);
             document.getElementById('chat-messages').innerHTML =
                 `<div class="text-center text-gray-400 italic py-8 text-xs">Chat cleared.</div>`;
         } else {
