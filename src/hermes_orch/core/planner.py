@@ -60,7 +60,17 @@ Rules:
    do the work, prefer the one with more matching skills. If NO role has a
    matching skill, pick the most general role and have it improvise — don't
    invent a new role.
-10. TERSENESS: keep `name` and `action` to ≤ 5 words each. No prose in any
+10. STORAGE: if a step reads from or writes to a named location (e.g. a
+    folder, share, drive alias), pick the role whose storage aliases
+    (listed under "Storage aliases by role") match that location. The
+    agent reads/writes directly to those paths, so the task must run on
+    a machine that has the mount. Example: if the goal says
+    "analyze project_temp_folder" and only "win-agent01" has a
+    project_temp_folder alias, dispatch the analyze step to
+    "win-agent01", not to a Linux role. If no role owns the location,
+    pick the role with the most general storage and let the operator
+    route the file manually.
+11. TERSENESS: keep `name` and `action` to ≤ 5 words each. No prose in any
     field. params should be a small flat object (≤ 4 keys) with concrete
     values, not long strings. The model's output token budget is tight;
     verbose tasks get truncated and the plan fails. Stay terse.
@@ -84,6 +94,8 @@ Role skills (what each role has been taught how to do):
 {role_skills_block}
 
 {capabilities_block}
+
+{storage_block}
 
 {recent_block}
 
@@ -126,6 +138,7 @@ class Planner:
         available_roles: list[str],
         role_skills: dict[str, list[str]] | None = None,
         role_capabilities: dict[str, dict[str, bool]] | None = None,
+        role_storage: dict[str, list[dict]] | None = None,
     ) -> list[dict[str, Any]]:
         """Return list of task plans. Raises on error.
 
@@ -158,7 +171,7 @@ class Planner:
         if self.mock:
             return self._plan_mock(goal, available_roles, role_skills)
         try:
-            return await self._plan_llm(goal, available_roles, role_skills, role_capabilities)
+            return await self._plan_llm(goal, available_roles, role_skills, role_capabilities, role_storage)
         except Exception as e:
             # Distinguish truncation from other failures so operators can
             # tell at a glance whether the M3 cap was the cause. The
@@ -251,6 +264,60 @@ class Planner:
                 lines.append(f"- {r}: {', '.join(true_caps)}")
             else:
                 lines.append(f"- {r}: (no capabilities set)")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_storage_block(
+        available_roles: list[str],
+        role_storage: dict[str, list[dict]] | None,
+    ) -> str:
+        """Render a role->storage map for the prompt.
+
+        Storage refs (agent_profiles.storage_refs) are operator-curated
+        list of paths/URLs the agent can use to write large outputs
+        directly. Each entry has a `name` alias (e.g. "project_temp_folder",
+        "stanley") and a `ref` (path or URL). When a goal mentions a
+        folder name that matches a storage alias, the LLM should pick
+        the role that owns that alias.
+
+        Regression 2026-07-28: this block was missing from the plan
+        editor's planner call (Phase C extracted planner invocation
+        from supervisor.py to plans.py but dropped the storage_refs
+        loading). The LLM was picking the first role in alphabetical
+        order ("linux-a-01") even when win-agent01 had the folder the
+        goal named. This is the fix — see plans.py `generate_plan_from_llm`.
+
+        If no roles have storage configured, returns an empty string
+        (don't pollute the prompt with an empty block).
+        """
+        if not role_storage:
+            return ""
+        has_any = any(role_storage.get(r) for r in available_roles)
+        if not has_any:
+            return ""
+        lines = [
+            "Storage aliases by role (when the goal names a folder or "
+            "location, pick the role that owns it; the agent reads/writes "
+            "directly to these paths):"
+        ]
+        for r in available_roles:
+            refs = role_storage.get(r) or []
+            if refs:
+                # Format: "rolename: alias1 (kind: ref), alias2 (kind: ref)"
+                formatted = []
+                for s in refs:
+                    alias = s.get("name") or s.get("kind") or "ref"
+                    kind = s.get("kind", "")
+                    ref = s.get("ref", "")
+                    desc = s.get("description", "")
+                    short_ref = ref if len(ref) <= 60 else ref[:57] + "..."
+                    entry = f"{alias} ({kind}: {short_ref})" if kind else f"{alias} ({short_ref})"
+                    if desc:
+                        entry += f"  -- {desc}"
+                    formatted.append(entry)
+                lines.append(f"- {r}: {'; '.join(formatted)}")
+            else:
+                lines.append(f"- {r}: (no storage configured)")
         return "\n".join(lines)
 
     # ===== mock =====
@@ -399,6 +466,7 @@ class Planner:
         available_roles: list[str],
         role_skills: dict[str, list[str]] | None = None,
         role_capabilities: dict[str, dict[str, bool]] | None = None,
+        role_storage: dict[str, list[dict]] | None = None,
     ) -> list[dict[str, Any]]:
         """Call MiniMax (OpenAI-compatible) with strict JSON mode.
 
@@ -430,6 +498,7 @@ class Planner:
             roles=available_roles,
             role_skills_block=self._format_role_skills(available_roles, role_skills),
             capabilities_block=self._format_capabilities_block(available_roles, role_capabilities),
+            storage_block=self._format_storage_block(available_roles, role_storage),
             recent_block=self._format_recent_block(),
         )
         # Generous max_tokens because thinking models (MiniMax M3, DeepSeek R1)

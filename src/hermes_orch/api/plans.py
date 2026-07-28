@@ -761,28 +761,96 @@ async def generate_plan_from_llm(
             "no goal provided and project has no goal set; "
             "set a goal first or pass one in the request body",
         )
-    # Load agent roles (we just need their NAMES — the planner
-    # uses role names as the `agent_role` field in the task).
+    # Load agent roles. The agent_profiles table has TWO distinct id
+    # fields:
+    #   - agent_id  = the machine running the role (e.g. "linux-a-01",
+    #                 "win-local-1"). One machine can host multiple roles.
+    #   - name      = the role itself (e.g. "super", "win-agent01",
+    #                 "win-agent02"). This is what the supervisor uses
+    #                 to look up the agent_profile when dispatching a
+    #                 task. The task row's `agent_role` column is
+    #                 matched against `name`, NOT `agent_id`.
+    #
+    # So for the LLM planner, we MUST pass role NAMES (the "name"
+    # column) — not machine ids. Passing agent_ids was a regression:
+    # the LLM saw ["linux-a-01", "win-local-1"] as the available roles
+    # and dutifully picked "linux-a-01" as the agent_role for every
+    # step, even though no profile has that name (it would fail at
+    # dispatch). Regressed during the Phase C plan editor refactor
+    # (commit 85a87cd) when this code was extracted from supervisor.py
+    # to plans.py. supervisor.py still does the right thing
+    # (SELECT DISTINCT name) — see core/supervisor.py:157.
     role_rows = await db.fetchall(
-        "SELECT DISTINCT agent_id, name FROM agent_profiles ORDER BY agent_id, name"
+        "SELECT name, storage_refs, capabilities FROM agent_profiles "
+        "WHERE name IS NOT NULL AND name != ''"
     )
-    available_roles = sorted({r["agent_id"] for r in role_rows if r["agent_id"]})
+    # Distinct role names (multiple rows for the same name on
+    # different machines are deduped).
+    available_roles = sorted({r["name"] for r in role_rows if r["name"]})
     if not available_roles:
         raise HTTPException(
             400,
             "no agent roles registered; add an agent profile first",
         )
-    # Load role skills (planner uses this to pick the right role).
-    role_skill_rows = await db.fetchall(
-        "SELECT agent_id, name FROM agent_profiles WHERE name IS NOT NULL AND name != ''"
+    # Build role->skills map. Per supervisor.py:44, skills are
+    # derived from profile_configs (file_path LIKE 'skills/%').
+    # For the plan editor's LLM call, we don't need exact skills
+    # (those are runtime concerns) — but we DO want the LLM to know
+    # which role has which storage_refs so it can pick the role
+    # whose storage alias matches a folder named in the goal
+    # (e.g. "use project_temp_folder" → role that has
+    # storage_refs[].name == "project_temp_folder"). This is the
+    # regression the user noticed 2026-07-28: the LLM no longer
+    # saw that win-agent01 had the project_temp_folder alias and
+    # was dispatching to a different machine. Fix: include
+    # storage_refs in the planner context.
+    skill_rows = await db.fetchall(
+        "SELECT ap.name AS role, pc.file_path "
+        "FROM profile_configs pc "
+        "JOIN agent_profiles ap ON ap.id = pc.profile_id "
+        "WHERE pc.file_path LIKE 'skills/%' AND pc.status = 'applied' "
+        "ORDER BY ap.name ASC, pc.file_path ASC"
     )
     role_skills: dict[str, list[str]] = {}
-    for r in role_skill_rows:
-        role_skills.setdefault(r["agent_id"], []).append(r["name"])
-    # Call the planner. This is the same call that the OLD
-    # /api/projects/{id}/replan used to make, but we capture the
-    # returned list as a plan_json (design-time) instead of writing
-    # rows to the tasks table (run-time).
+    for r in skill_rows:
+        fp = r["file_path"]
+        # file_path is "skills/<name>.md" — strip prefix + suffix
+        if fp.startswith("skills/") and fp.endswith(".md"):
+            skill = fp[len("skills/"):-len(".md")]
+        else:
+            skill = fp
+        role_skills.setdefault(r["role"], []).append(skill)
+    # role_storage: {role_name: [{name, kind, ref, description}, ...]}
+    role_storage: dict[str, list[dict]] = {}
+    for r in role_rows:
+        sref_raw = r.get("storage_refs")
+        if not sref_raw:
+            continue
+        try:
+            import json as _json
+            srefs = _json.loads(sref_raw) if isinstance(sref_raw, str) else sref_raw
+        except (TypeError, ValueError):
+            srefs = []
+        if isinstance(srefs, list) and srefs:
+            role_storage.setdefault(r["name"], []).extend(srefs)
+    # role_capabilities: {role_name: {capability_key: true}}
+    role_capabilities: dict[str, dict[str, bool]] = {}
+    for r in role_rows:
+        cap_raw = r.get("capabilities")
+        if not cap_raw:
+            continue
+        try:
+            import json as _json
+            caps = _json.loads(cap_raw) if isinstance(cap_raw, str) else cap_raw
+        except (TypeError, ValueError):
+            caps = {}
+        if isinstance(caps, dict) and caps:
+            role_capabilities.setdefault(r["name"], {}).update(caps)
+    # Call the planner. The planner accepts a `role_storage` and
+    # `role_capabilities` block; if we pass them, the prompt will
+    # include an [AVAILABLE STORAGE BY ROLE] section that helps the
+    # LLM pick a role whose storage matches a folder name in the
+    # goal (the exact regression the user noticed).
     planner = getattr(request.app.state, "planner", None)
     if planner is None:
         raise HTTPException(500, "planner not initialized")
@@ -790,6 +858,8 @@ async def generate_plan_from_llm(
         goal=goal,
         available_roles=available_roles,
         role_skills=role_skills or None,
+        role_capabilities=role_capabilities or None,
+        role_storage=role_storage or None,
     )
     # Convert task dicts to PlanStep objects.
     import re as _re
