@@ -34,7 +34,7 @@ def _http_raw(method: str, path: str, body: dict | None = None) -> tuple[int, st
 
 def _create_test_project() -> str:
     name = f"chat-jsonl-ep-{uuid.uuid4().hex[:8]}"
-    s, body, _ = _http_raw("POST", "/api/projects/", {"name": name})
+    s, body, _ = _http_raw("POST", "/api/projects/", {"name": name, "action": "do_step"})
     if s == 201:
         return json.loads(body)["id"]
     if s == 200:

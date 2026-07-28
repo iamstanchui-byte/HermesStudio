@@ -97,7 +97,7 @@ def test_create_single_task_sets_is_single_task_flag():
 
 def test_create_single_task_minimal_body():
     """All optional fields can be omitted — only name is required."""
-    s, t = _http("POST", "/api/single-tasks", {"name": "minimal task"})
+    s, t = _http("POST", "/api/single-tasks", {"name": "minimal task", "action": "do_step"})
     assert s == 201
     assert t["name"] == "minimal task"
     assert t["goal"] == ""
@@ -108,7 +108,7 @@ def test_create_single_task_minimal_body():
 
 
 def test_create_single_task_rejects_empty_name():
-    s, body = _http("POST", "/api/single-tasks", {"name": ""})
+    s, body = _http("POST", "/api/single-tasks", {"name": "", "action": "do_step"})
     assert s == 422  # Pydantic validation
 
 
@@ -136,7 +136,7 @@ def test_list_single_tasks_returns_only_is_single():
 
 
 def test_get_single_task_by_id():
-    s, t = _http("POST", "/api/single-tasks", {"name": "get-by-id test"})
+    s, t = _http("POST", "/api/single-tasks", {"name": "get-by-id test", "action": "do_step"})
     assert s == 201
     s, g = _http("GET", f"/api/single-tasks/{t['id']}")
     assert s == 200
@@ -165,8 +165,8 @@ def test_get_single_task_404_for_project_task():
 
 
 def test_list_filters_by_status():
-    s, t1 = _http("POST", "/api/single-tasks", {"name": "filter-pending"})
-    s, t2 = _http("POST", "/api/single-tasks", {"name": "filter-completed"})
+    s, t1 = _http("POST", "/api/single-tasks", {"name": "filter-pending", "action": "do_step"})
+    s, t2 = _http("POST", "/api/single-tasks", {"name": "filter-completed", "action": "do_step"})
     # t1 stays pending; t2 we directly mark completed in the DB
     db_path = Path.home() / ".hermes-orchestrator" / "hermes-orch.db"
     with sqlite3.connect(str(db_path)) as conn:

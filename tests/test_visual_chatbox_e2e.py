@@ -40,7 +40,7 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, str]:
 def _create_test_project() -> str:
     import json
     name = f"visual-chat-test-{uuid.uuid4().hex[:8]}"
-    s, body = _http("POST", "/api/projects/", {"name": name})
+    s, body = _http("POST", "/api/projects/", {"name": name, "action": "do_step"})
     if s == 201:
         return json.loads(body)["id"]
     if s == 200:
@@ -168,9 +168,9 @@ def test_e2e_chat_apply_then_load_plan_via_plan_get():
             "trigger": "manual",
             "variables": [],
             "steps": [
-                {"name": "fetch", "agent_role": "super", "depends_on": []},
-                {"name": "parse", "agent_role": "super", "depends_on": ["fetch"]},
-                {"name": "report", "agent_role": "win-agent01",
+                {"name": "fetch", "agent_role": "super", "action": "do_step", "depends_on": []},
+                {"name": "parse", "agent_role": "super", "action": "do_step", "depends_on": ["fetch"]},
+                {"name": "report", "agent_role": "win-agent01", "action": "do_step",
                  "depends_on": ["parse"]},
             ],
         }

@@ -53,7 +53,7 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict |
 
 def _create_test_project() -> str:
     name = f"e2e-test-{uuid.uuid4().hex[:8]}"
-    s, body = _http("POST", "/api/projects/", {"name": name})
+    s, body = _http("POST", "/api/projects/", {"name": name, "action": "do_step"})
     if s == 201 and isinstance(body, dict) and "id" in body:
         return body["id"]
     if isinstance(body, dict) and "id" in body:
@@ -84,9 +84,9 @@ def test_e2e_chat_apply_persists_plan():
             "trigger": "manual",
             "variables": [],
             "steps": [
-                {"name": "fetch", "agent_role": "super",
+                {"name": "fetch", "agent_role": "super", "action": "do_step",
                  "action": "fetch", "depends_on": []},
-                {"name": "parse", "agent_role": "super",
+                {"name": "parse", "agent_role": "super", "action": "do_step",
                  "action": "parse", "depends_on": ["fetch"]},
             ],
         }
@@ -126,7 +126,7 @@ def test_e2e_chat_apply_then_apply_again_with_matching_if_match():
         plan_v1 = {
             "version": "1.0",
             "name": "v1",
-            "steps": [{"name": "a", "agent_role": "super", "depends_on": []}],
+            "steps": [{"name": "a", "agent_role": "super", "action": "do_step", "depends_on": []}],
         }
         s, body = _http("POST", f"/api/projects/{pid}/chat/apply", {
             "suggestion": {"type": "update_plan", "plan": plan_v1},
@@ -137,8 +137,8 @@ def test_e2e_chat_apply_then_apply_again_with_matching_if_match():
             "version": "1.0",
             "name": "v2",
             "steps": [
-                {"name": "a", "agent_role": "super", "depends_on": []},
-                {"name": "b", "agent_role": "super", "depends_on": ["a"]},
+                {"name": "a", "agent_role": "super", "action": "do_step", "depends_on": []},
+                {"name": "b", "agent_role": "super", "action": "do_step", "depends_on": ["a"]},
             ],
         }
         s, body = _http("POST", f"/api/projects/{pid}/chat/apply", {
@@ -168,7 +168,7 @@ def test_e2e_chat_apply_stale_if_match_returns_409_with_current_plan():
                 "type": "update_plan",
                 "plan": {
                     "version": "1.0", "name": "v1",
-                    "steps": [{"name": "a", "depends_on": []}],
+                    "steps": [{"name": "a", "depends_on": [], "action": "do_step"}],
                 },
             },
         })
@@ -179,7 +179,7 @@ def test_e2e_chat_apply_stale_if_match_returns_409_with_current_plan():
                 "type": "update_plan",
                 "plan": {
                     "version": "1.0", "name": "v2",
-                    "steps": [{"name": "b", "depends_on": []}],
+                    "steps": [{"name": "b", "depends_on": [], "action": "do_step"}],
                 },
             },
         })
@@ -190,7 +190,7 @@ def test_e2e_chat_apply_stale_if_match_returns_409_with_current_plan():
                 "type": "update_plan",
                 "plan": {
                     "version": "1.0", "name": "v3",
-                    "steps": [{"name": "c", "depends_on": []}],
+                    "steps": [{"name": "c", "depends_on": [], "action": "do_step"}],
                 },
                 "if_match": "2020-01-01T00:00:00+00:00",
             },
@@ -218,7 +218,7 @@ def test_e2e_chat_history_records_suggestion_metadata():
                 "type": "update_plan",
                 "plan": {
                     "version": "1.0", "name": "audit-check",
-                    "steps": [{"name": "x", "agent_role": "super", "depends_on": []}],
+                    "steps": [{"name": "x", "agent_role": "super", "action": "do_step", "depends_on": []}],
                 },
             },
         })

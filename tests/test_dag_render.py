@@ -20,7 +20,7 @@ def test_empty_returns_placeholder():
 
 
 def test_single_step_no_deps():
-    steps = [{"name": "only-step", "depends_on": []}]
+    steps = [{"name": "only-step", "depends_on": [], "action": "do_step"}]
     out = render_plan_dag(steps)
     assert out == "only-step"
 
@@ -30,9 +30,9 @@ def test_single_step_no_deps():
 
 def test_linear_chain_three_steps():
     steps = [
-        {"name": "fetch", "depends_on": []},
-        {"name": "parse", "depends_on": ["fetch"]},
-        {"name": "report", "depends_on": ["parse"]},
+        {"name": "fetch", "depends_on": [], "action": "do_step"},
+        {"name": "parse", "depends_on": ["fetch"], "action": "do_step"},
+        {"name": "report", "depends_on": ["parse"], "action": "do_step"},
     ]
     out = render_plan_dag(steps)
     expected = (
@@ -49,10 +49,10 @@ def test_linear_chain_three_steps():
 def test_branching_two_children():
     """1 step → 2 parallel children → 1 grandchild (diamond, expanded)."""
     steps = [
-        {"name": "load", "depends_on": []},
-        {"name": "fetch-a", "depends_on": ["load"]},
-        {"name": "fetch-b", "depends_on": ["load"]},
-        {"name": "combine", "depends_on": ["fetch-a", "fetch-b"]},
+        {"name": "load", "depends_on": [], "action": "do_step"},
+        {"name": "fetch-a", "depends_on": ["load"], "action": "do_step"},
+        {"name": "fetch-b", "depends_on": ["load"], "action": "do_step"},
+        {"name": "combine", "depends_on": ["fetch-a", "fetch-b"], "action": "do_step"},
     ]
     out = render_plan_dag(steps)
     expected = (
@@ -70,9 +70,9 @@ def test_branching_two_children():
 
 def test_two_roots_with_subtrees():
     steps = [
-        {"name": "alpha", "depends_on": []},
-        {"name": "alpha-child", "depends_on": ["alpha"]},
-        {"name": "beta", "depends_on": []},
+        {"name": "alpha", "depends_on": [], "action": "do_step"},
+        {"name": "alpha-child", "depends_on": ["alpha"], "action": "do_step"},
+        {"name": "beta", "depends_on": [], "action": "do_step"},
     ]
     out = render_plan_dag(steps)
     expected = (
@@ -89,10 +89,10 @@ def test_two_roots_with_subtrees():
 def test_children_rendered_in_alphabetical_order():
     """Children must be sorted so output is deterministic across runs."""
     steps = [
-        {"name": "root", "depends_on": []},
-        {"name": "z-child", "depends_on": ["root"]},
-        {"name": "a-child", "depends_on": ["root"]},
-        {"name": "m-child", "depends_on": ["root"]},
+        {"name": "root", "depends_on": [], "action": "do_step"},
+        {"name": "z-child", "depends_on": ["root"], "action": "do_step"},
+        {"name": "a-child", "depends_on": ["root"], "action": "do_step"},
+        {"name": "m-child", "depends_on": ["root"], "action": "do_step"},
     ]
     out = render_plan_dag(steps)
     expected = (
@@ -109,9 +109,9 @@ def test_children_rendered_in_alphabetical_order():
 
 def test_roots_rendered_in_alphabetical_order():
     steps = [
-        {"name": "zebra", "depends_on": []},
-        {"name": "alpha", "depends_on": []},
-        {"name": "middle", "depends_on": []},
+        {"name": "zebra", "depends_on": [], "action": "do_step"},
+        {"name": "alpha", "depends_on": [], "action": "do_step"},
+        {"name": "middle", "depends_on": [], "action": "do_step"},
     ]
     out = render_plan_dag(steps)
     assert out == "alpha\nmiddle\nzebra"
@@ -122,8 +122,8 @@ def test_roots_rendered_in_alphabetical_order():
 
 def test_warning_for_unknown_dep():
     steps = [
-        {"name": "a", "depends_on": []},
-        {"name": "b", "depends_on": ["nonexistent"]},
+        {"name": "a", "depends_on": [], "action": "do_step"},
+        {"name": "b", "depends_on": ["nonexistent"], "action": "do_step"},
     ]
     out = render_plan_dag(steps)
     # Unknown dep is flagged in the warning block, and 'b' has no
@@ -137,9 +137,9 @@ def test_warning_for_unknown_dep():
 
 def test_warning_for_duplicate_step_name():
     steps = [
-        {"name": "dup", "depends_on": []},
-        {"name": "dup", "depends_on": []},  # duplicate
-        {"name": "other", "depends_on": []},
+        {"name": "dup", "depends_on": [], "action": "do_step"},
+        {"name": "dup", "depends_on": [], "action": "do_step"},  # duplicate
+        {"name": "other", "depends_on": [], "action": "do_step"},
     ]
     out = render_plan_dag(steps)
     assert "⚠" in out
@@ -151,8 +151,8 @@ def test_warning_for_duplicate_step_name():
 def test_warning_for_cycle():
     """A → B → A: both are roots of cycles, render still produces output."""
     steps = [
-        {"name": "a", "depends_on": ["b"]},
-        {"name": "b", "depends_on": ["a"]},
+        {"name": "a", "depends_on": ["b"], "action": "do_step"},
+        {"name": "b", "depends_on": ["a"], "action": "do_step"},
     ]
     out = render_plan_dag(steps)
     assert "⚠" in out
@@ -167,8 +167,8 @@ def test_warning_for_cycle():
 
 def test_show_agent_role_appends_role_in_parens():
     steps = [
-        {"name": "fetch", "agent_role": "super", "depends_on": []},
-        {"name": "parse", "agent_role": "win-agent01", "depends_on": ["fetch"]},
+        {"name": "fetch", "agent_role": "super", "action": "do_step", "depends_on": []},
+        {"name": "parse", "agent_role": "win-agent01", "action": "do_step", "depends_on": ["fetch"]},
     ]
     out = render_plan_dag(steps, show_agent_role=True)
     expected = (
@@ -180,7 +180,7 @@ def test_show_agent_role_appends_role_in_parens():
 
 def test_show_agent_role_false_default():
     steps = [
-        {"name": "fetch", "agent_role": "super", "depends_on": []},
+        {"name": "fetch", "agent_role": "super", "action": "do_step", "depends_on": []},
     ]
     out = render_plan_dag(steps)  # default False
     assert "super" not in out

@@ -52,7 +52,7 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict |
 
 def _create_test_project() -> str:
     name = f"run-plan-test-{uuid.uuid4().hex[:8]}"
-    s, body = _http("POST", "/api/projects/", {"name": name})
+    s, body = _http("POST", "/api/projects/", {"name": name, "action": "do_step"})
     return body["id"]
 
 
@@ -120,9 +120,9 @@ def test_run_plan_resolves_plan_internal_depends_on():
             "version": "1.0",
             "name": "dep-test",
             "steps": [
-                {"name": "fetch", "agent_role": "super"},
-                {"name": "process", "agent_role": "super", "depends_on": ["fetch"]},
-                {"name": "summarize", "agent_role": "super", "depends_on": ["fetch", "process"]},
+                {"name": "fetch", "agent_role": "super", "action": "do_step"},
+                {"name": "process", "agent_role": "super", "action": "do_step", "depends_on": ["fetch"]},
+                {"name": "summarize", "agent_role": "super", "action": "do_step", "depends_on": ["fetch", "process"]},
             ],
         })
         s, body = _http("POST", f"/api/projects/{pid}/plan/run", {})
@@ -167,7 +167,7 @@ def test_run_plan_resolves_project_external_depends_on():
             "version": "1.0",
             "name": "ext-dep-test",
             "steps": [
-                {"name": "use-shared", "agent_role": "super", "depends_on": ["shared-fetch"]},
+                {"name": "use-shared", "agent_role": "super", "action": "do_step", "depends_on": ["shared-fetch"]},
             ],
         })
         # archive_existing=False so the pre-existing task stays
@@ -202,7 +202,7 @@ def test_run_plan_with_skill_param():
             "version": "1.0",
             "name": "skill-test",
             "steps": [
-                {"name": "weather", "agent_role": "super", "skill": "weather_api"},
+                {"name": "weather", "agent_role": "super", "action": "do_step", "skill": "weather_api"},
             ],
         })
         s, body = _http("POST", f"/api/projects/{pid}/plan/run", {})
@@ -231,14 +231,14 @@ def test_run_plan_archives_existing_tasks_by_default():
         # Pre-create some non-archived tasks
         for n in ["old-a", "old-b"]:
             s, _ = _http("POST", "/api/tasks/", {
-                "project_id": pid, "name": n, "agent_role": "super",
+                "project_id": pid, "name": n, "agent_role": "super", "action": "do_step",
                 "action": "noop",
             })
             assert s == 201
         # Set a plan with 1 step
         _put_plan(pid, {
             "version": "1.0", "name": "archive-test",
-            "steps": [{"name": "new-step", "agent_role": "super"}],
+            "steps": [{"name": "new-step", "agent_role": "super", "action": "do_step"}],
         })
         s, body = _http("POST", f"/api/projects/{pid}/plan/run", {})
         assert s == 200
@@ -267,13 +267,13 @@ def test_run_plan_keeps_old_tasks_when_archive_existing_false():
     pid = _create_test_project()
     try:
         s, _ = _http("POST", "/api/tasks/", {
-            "project_id": pid, "name": "keep-me", "agent_role": "super",
+            "project_id": pid, "name": "keep-me", "agent_role": "super", "action": "do_step",
             "action": "noop",
         })
         assert s == 201
         _put_plan(pid, {
             "version": "1.0", "name": "additive-test",
-            "steps": [{"name": "new-step", "agent_role": "super"}],
+            "steps": [{"name": "new-step", "agent_role": "super", "action": "do_step"}],
         })
         s, body = _http("POST", f"/api/projects/{pid}/plan/run",
                           {"archive_existing": False})
@@ -302,7 +302,7 @@ def test_run_plan_does_not_archive_running_tasks():
     try:
         # Create a task and force it to 'running' (bypass supervisor)
         s, body = _http("POST", "/api/tasks/", {
-            "project_id": pid, "name": "running-task", "agent_role": "super",
+            "project_id": pid, "name": "running-task", "agent_role": "super", "action": "do_step",
             "action": "noop",
         })
         assert s == 201
@@ -316,7 +316,7 @@ def test_run_plan_does_not_archive_running_tasks():
         # Put a plan + run
         _put_plan(pid, {
             "version": "1.0", "name": "running-test",
-            "steps": [{"name": "x", "agent_role": "super"}],
+            "steps": [{"name": "x", "agent_role": "super", "action": "do_step"}],
         })
         s, body = _http("POST", f"/api/projects/{pid}/plan/run", {})
         assert s == 200
@@ -374,7 +374,7 @@ def test_run_plan_400_for_terminal_state_project():
     try:
         _put_plan(pid, {
             "version": "1.0", "name": "terminal-test",
-            "steps": [{"name": "x", "agent_role": "super"}],
+            "steps": [{"name": "x", "agent_role": "super", "action": "do_step"}],
         })
         # Force project to 'completed'
         conn = sqlite3.connect(str(DB_PATH))
@@ -399,8 +399,8 @@ def test_run_plan_writes_audit_log():
         _put_plan(pid, {
             "version": "1.0", "name": "audit-run-test",
             "steps": [
-                {"name": "a", "agent_role": "super"},
-                {"name": "b", "agent_role": "super"},
+                {"name": "a", "agent_role": "super", "action": "do_step"},
+                {"name": "b", "agent_role": "super", "action": "do_step"},
             ],
         })
         s, _ = _http("POST", f"/api/projects/{pid}/plan/run", {})
@@ -436,7 +436,7 @@ def test_run_plan_sets_project_state_to_ready():
     try:
         _put_plan(pid, {
             "version": "1.0", "name": "state-test",
-            "steps": [{"name": "x", "agent_role": "super"}],
+            "steps": [{"name": "x", "agent_role": "super", "action": "do_step"}],
         })
         s, _ = _http("POST", f"/api/projects/{pid}/plan/run", {})
         assert s == 200

@@ -50,7 +50,7 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict |
 
 def _create_test_project() -> str:
     name = f"chat-apply-test-{uuid.uuid4().hex[:8]}"
-    s, body = _http("POST", "/api/projects/", {"name": name})
+    s, body = _http("POST", "/api/projects/", {"name": name, "action": "do_step"})
     if s == 201 and isinstance(body, dict) and "id" in body:
         return body["id"]
     if isinstance(body, dict) and "id" in body:
@@ -245,7 +245,7 @@ def test_apply_update_plan_invalid_plan_shape_returns_422():
             "version": "1.0",
             "name": "ok-name",
             "steps": [
-                {"name": "Not Kebab", "agent_role": "super"},  # invalid
+                {"name": "Not Kebab", "agent_role": "super", "action": "do_step"},  # invalid
             ],
         }
         s, body = _http("POST", f"/api/projects/{pid}/chat/apply", {

@@ -58,7 +58,7 @@ def _get_text(path: str) -> str:
 
 def _create_test_project() -> str:
     name = f"vp-test-{uuid.uuid4().hex[:8]}"
-    s, body = _http("POST", "/api/projects/", {"name": name})
+    s, body = _http("POST", "/api/projects/", {"name": name, "action": "do_step"})
     return body["id"]
 
 
@@ -149,8 +149,8 @@ def test_visual_plan_page_embeds_step_names_in_dom():
             "version": "1.0",
             "name": "embed-test",
             "steps": [
-                {"name": "alpha", "agent_role": "super"},
-                {"name": "beta", "agent_role": "super", "depends_on": ["alpha"]},
+                {"name": "alpha", "agent_role": "super", "action": "do_step"},
+                {"name": "beta", "agent_role": "super", "action": "do_step", "depends_on": ["alpha"]},
             ],
         })
         html = _get_text(f"/api/projects/{pid}/plan/visual")

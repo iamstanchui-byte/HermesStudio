@@ -61,10 +61,26 @@ class PlanStep(BaseModel):
     foundation, the step references Skills / Tools / Resources by
     canonical name, NOT by row id — keeps plans portable across
     agents (same skill name = same skill on any agent that has it).
+
+    Per 2026-07-29 (Phase 2.1, see test_known_bug_*.py): the
+    LLM used to leave `action` empty because the field was
+    optional and the system prompt didn't explain what to put
+    there. `action` is now REQUIRED (min_length=1) and the
+    chat system prompt documents the canonical examples
+    ("fetch_url", "navigate_to_folder", "summarize", etc.).
+    Without `action`, the agent has no idea what to do — the
+    step is unrunnable.
     """
     name: str = Field(..., min_length=1, max_length=50)
     agent_role: str = ""
-    action: str = ""
+    # Required: a short verb phrase describing what the agent does.
+    # The LLM is told to mirror workflow_packages.step_template
+    # actions: "fetch_url", "navigate_to_folder", "summarize",
+    # "send_telegram_message", "create_file", "read_file",
+    # "search_web", etc. — kebab/snake-case verbs that the agent
+    # can interpret. Free-form prose is also accepted but the
+    # canonical form is short and verb-first.
+    action: str = Field(..., min_length=1, max_length=200)
     skill: str = ""  # canonical skill name (not row id)
     tool: str = ""   # canonical tool name (not row id)
     required_capability: str = ""
@@ -81,6 +97,23 @@ class PlanStep(BaseModel):
             raise ValueError(
                 f"step name {v!r} must be kebab-case (lowercase letters, "
                 f"digits, and hyphens; start with letter or digit)"
+            )
+        return v
+
+    @field_validator("action")
+    @classmethod
+    def _action_nontrivial(cls, v: str) -> str:
+        # Defense in depth: catch "n/a", "-", ".", "todo" etc.
+        # that the LLM might put as a placeholder. Pydantic
+        # already enforces min_length=1, but allow meaningful
+        # short actions.
+        v = v.strip()
+        if not v:
+            raise ValueError("step action must not be whitespace-only")
+        if len(v) < 2:
+            raise ValueError(
+                f"step action {v!r} is too short — describe what the "
+                f"agent should do (e.g. 'fetch_url', 'summarize')"
             )
         return v
 

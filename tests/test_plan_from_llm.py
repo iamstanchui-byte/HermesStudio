@@ -57,7 +57,7 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict |
 def _create_test_project(name_suffix: str = "") -> str:
     """Create a fresh test project. Optionally pre-set a goal."""
     name = f"from-llm-test-{uuid.uuid4().hex[:8]}"
-    body = {"name": name}
+    body = {"name": name, "action": "do_step"}
     if name_suffix:
         body["goal"] = name_suffix
     s, resp = _http("POST", "/api/projects/", body)

@@ -45,7 +45,7 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict |
 
 def _create_test_project() -> str:
     name = f"merge-test-{uuid.uuid4().hex[:8]}"
-    s, body = _http("POST", "/api/projects/", {"name": name})
+    s, body = _http("POST", "/api/projects/", {"name": name, "action": "do_step"})
     if s == 201 and isinstance(body, dict) and "id" in body:
         return body["id"]
     if isinstance(body, dict) and "id" in body:
@@ -68,7 +68,7 @@ def _plan_v1(pid: str) -> dict:
         "trigger": "manual",
         "variables": [],
         "steps": [
-            {"name": "step-a", "agent_role": "super", "depends_on": []},
+            {"name": "step-a", "agent_role": "super", "action": "do_step", "depends_on": []},
         ],
     }
 
@@ -81,8 +81,8 @@ def _plan_v2(pid: str) -> dict:
         "trigger": "manual",
         "variables": [],
         "steps": [
-            {"name": "step-b", "agent_role": "super", "depends_on": []},
-            {"name": "step-c", "agent_role": "super", "depends_on": ["step-b"]},
+            {"name": "step-b", "agent_role": "super", "action": "do_step", "depends_on": []},
+            {"name": "step-c", "agent_role": "super", "action": "do_step", "depends_on": ["step-b"]},
         ],
     }
 
@@ -95,7 +95,7 @@ def _plan_v3(pid: str) -> dict:
         "trigger": "manual",
         "variables": [],
         "steps": [
-            {"name": "step-d", "agent_role": "super", "depends_on": []},
+            {"name": "step-d", "agent_role": "super", "action": "do_step", "depends_on": []},
         ],
     }
 

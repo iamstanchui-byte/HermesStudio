@@ -35,7 +35,7 @@ def test_update_plan_with_empty_steps_returns_empty():
 
 
 def test_update_plan_with_missing_steps_returns_empty():
-    suggestions = [{"type": "update_plan", "plan": {"name": "x"}}]
+    suggestions = [{"type": "update_plan", "plan": {"name": "x", "action": "do_step"}}]
     assert _render_dag_section(suggestions) == ""
 
 
@@ -53,8 +53,8 @@ def test_linear_chain_renders_as_dag():
         "type": "update_plan",
         "plan": {
             "steps": [
-                {"name": "fetch", "depends_on": []},
-                {"name": "parse", "depends_on": ["fetch"]},
+                {"name": "fetch", "depends_on": [], "action": "do_step"},
+                {"name": "parse", "depends_on": ["fetch"], "action": "do_step"},
             ],
         },
     }]
@@ -75,10 +75,10 @@ def test_branching_renders_full_dag():
         "type": "update_plan",
         "plan": {
             "steps": [
-                {"name": "load", "depends_on": []},
-                {"name": "fetch-a", "depends_on": ["load"]},
-                {"name": "fetch-b", "depends_on": ["load"]},
-                {"name": "combine", "depends_on": ["fetch-a", "fetch-b"]},
+                {"name": "load", "depends_on": [], "action": "do_step"},
+                {"name": "fetch-a", "depends_on": ["load"], "action": "do_step"},
+                {"name": "fetch-b", "depends_on": ["load"], "action": "do_step"},
+                {"name": "combine", "depends_on": ["fetch-a", "fetch-b"], "action": "do_step"},
             ],
         },
     }]
@@ -98,11 +98,11 @@ def test_multiple_update_plan_suggestions_each_rendered():
     suggestions = [
         {
             "type": "update_plan",
-            "plan": {"steps": [{"name": "a", "depends_on": []}]},
+            "plan": {"steps": [{"name": "a", "depends_on": []}], "action": "do_step"},
         },
         {
             "type": "update_plan",
-            "plan": {"steps": [{"name": "x", "depends_on": []}]},
+            "plan": {"steps": [{"name": "x", "depends_on": []}], "action": "do_step"},
         },
     ]
     out = _render_dag_section(suggestions)
@@ -119,7 +119,7 @@ def test_mixed_suggestion_types_only_renders_update_plan():
         {"type": "create_task", "name": "ignored"},
         {
             "type": "update_plan",
-            "plan": {"steps": [{"name": "shown", "depends_on": []}]},
+            "plan": {"steps": [{"name": "shown", "depends_on": []}], "action": "do_step"},
         },
         {"type": "some_other_type"},
     ]
@@ -137,7 +137,7 @@ def test_output_starts_with_newline_section_header():
     it doesn't run into the previous line."""
     suggestions = [{
         "type": "update_plan",
-        "plan": {"steps": [{"name": "a", "depends_on": []}]},
+        "plan": {"steps": [{"name": "a", "depends_on": []}], "action": "do_step"},
     }]
     out = _render_dag_section(suggestions)
     assert out.startswith("\n\nCurrent plan:")
@@ -146,7 +146,7 @@ def test_output_starts_with_newline_section_header():
 def test_output_ends_with_code_fence_close():
     suggestions = [{
         "type": "update_plan",
-        "plan": {"steps": [{"name": "a", "depends_on": []}]},
+        "plan": {"steps": [{"name": "a", "depends_on": []}], "action": "do_step"},
     }]
     out = _render_dag_section(suggestions)
     assert out.rstrip().endswith("```")

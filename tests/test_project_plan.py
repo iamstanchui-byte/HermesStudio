@@ -57,7 +57,7 @@ def _http(method: str, path: str, body: dict | None = None, headers: dict | None
 def _create_test_project() -> str:
     """Create a fresh test project (will have NULL plan_json by default)."""
     name = f"plan-test-{uuid.uuid4().hex[:8]}"
-    s, body = _http("POST", "/api/projects/", {"name": name})
+    s, body = _http("POST", "/api/projects/", {"name": name, "action": "do_step"})
     if s == 201:
         return body["id"]
     # POST returned the project directly (not wrapped)
@@ -108,7 +108,7 @@ def test_put_plan_creates_new_plan():
             "description": "test plan",
             "trigger": "manual",
             "variables": [
-                {"name": "report_date", "type": "date", "default": "today", "description": "report date"},
+                {"name": "report_date", "type": "date", "default": "today", "description": "report date", "action": "do_step"},
             ],
             "steps": [
                 {
@@ -174,8 +174,8 @@ def test_put_plan_rejects_duplicate_step_names():
             "version": "1.0",
             "name": "test",
             "steps": [
-                {"name": "fetch", "agent_role": "super"},
-                {"name": "fetch", "agent_role": "super-b"},  # duplicate
+                {"name": "fetch", "agent_role": "super", "action": "do_step"},
+                {"name": "fetch", "agent_role": "super-b", "action": "do_step"},  # duplicate
             ],
         }
         s, body = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
@@ -192,8 +192,8 @@ def test_put_plan_rejects_duplicate_variable_names():
             "version": "1.0",
             "name": "test",
             "variables": [
-                {"name": "report_date", "type": "date"},
-                {"name": "report_date", "type": "string"},  # duplicate
+                {"name": "report_date", "type": "date", "action": "do_step"},
+                {"name": "report_date", "type": "string", "action": "do_step"},  # duplicate
             ],
             "steps": [],
         }
@@ -248,7 +248,7 @@ def test_put_plan_is_idempotent():
         plan = {
             "version": "1.0",
             "name": "idempotent-test",
-            "steps": [{"name": "step-1", "agent_role": "super"}],
+            "steps": [{"name": "step-1", "agent_role": "super", "action": "do_step"}],
         }
         s1, _ = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
         s2, body2 = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
@@ -266,7 +266,7 @@ def test_delete_plan_clears_back_to_null():
     pid = _create_test_project()
     try:
         # First, set a plan
-        plan = {"version": "1.0", "name": "to-be-cleared", "steps": [{"name": "x"}]}
+        plan = {"version": "1.0", "name": "to-be-cleared", "steps": [{"name": "x", "action": "do_step"}]}
         s, _ = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
         assert s == 200
         # Verify has_plan=True
@@ -306,9 +306,9 @@ def test_put_plan_writes_audit_log():
     pid = _create_test_project()
     try:
         plan = {"version": "1.0", "name": "audit-test", "steps": [
-            {"name": "step-a"},
-            {"name": "step-b"},
-            {"name": "step-c"},
+            {"name": "step-a", "action": "do_step"},
+            {"name": "step-b", "action": "do_step"},
+            {"name": "step-c", "action": "do_step"},
         ]}
         s, _ = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
         assert s == 200
@@ -367,7 +367,7 @@ def test_first_put_without_if_match_succeeds():
     """First PUT (no plan yet) should succeed even without If-Match header."""
     pid = _create_test_project()
     try:
-        plan = {"version": "1.0", "name": "first", "steps": [{"name": "a"}]}
+        plan = {"version": "1.0", "name": "first", "steps": [{"name": "a", "action": "do_step"}]}
         s, body = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
         assert s == 200
         assert body["has_plan"] is True
@@ -381,11 +381,11 @@ def test_put_without_if_match_succeeds_when_plan_exists():
     The visual editor (Phase C) does not send If-Match; this must not break."""
     pid = _create_test_project()
     try:
-        plan = {"version": "1.0", "name": "first", "steps": [{"name": "a"}]}
+        plan = {"version": "1.0", "name": "first", "steps": [{"name": "a", "action": "do_step"}]}
         s, _ = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
         assert s == 200
         # Second PUT without If-Match should still succeed
-        plan2 = {"version": "1.0", "name": "second", "steps": [{"name": "b"}]}
+        plan2 = {"version": "1.0", "name": "second", "steps": [{"name": "b", "action": "do_step"}]}
         s, body = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan2})
         assert s == 200
         assert body["plan"]["name"] == "second"
@@ -397,12 +397,12 @@ def test_put_with_matching_if_match_succeeds():
     """PUT with correct If-Match (current updated_at) should succeed."""
     pid = _create_test_project()
     try:
-        plan = {"version": "1.0", "name": "v1", "steps": [{"name": "a"}]}
+        plan = {"version": "1.0", "name": "v1", "steps": [{"name": "a", "action": "do_step"}]}
         s, body = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
         assert s == 200
         current_uat = body["updated_at"]
         # Second PUT echoing the updated_at we just got
-        plan2 = {"version": "1.0", "name": "v2", "steps": [{"name": "a"}, {"name": "b"}]}
+        plan2 = {"version": "1.0", "name": "v2", "steps": [{"name": "a", "action": "do_step"}, {"name": "b", "action": "do_step"}]}
         s, body = _http(
             "PUT",
             f"/api/projects/{pid}/plan",
@@ -422,15 +422,15 @@ def test_put_with_stale_if_match_returns_409():
     pid = _create_test_project()
     try:
         # 1. First write
-        plan_v1 = {"version": "1.0", "name": "v1", "steps": [{"name": "a"}]}
+        plan_v1 = {"version": "1.0", "name": "v1", "steps": [{"name": "a", "action": "do_step"}]}
         s, body = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan_v1})
         assert s == 200
         # 2. Second write (changes the plan and updated_at)
-        plan_v2 = {"version": "1.0", "name": "v2", "steps": [{"name": "b"}]}
+        plan_v2 = {"version": "1.0", "name": "v2", "steps": [{"name": "b", "action": "do_step"}]}
         s, _ = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan_v2})
         assert s == 200
         # 3. Third write with STALE If-Match (the v1 updated_at)
-        plan_v3 = {"version": "1.0", "name": "v3", "steps": [{"name": "c"}]}
+        plan_v3 = {"version": "1.0", "name": "v3", "steps": [{"name": "c", "action": "do_step"}]}
         s, body = _http(
             "PUT",
             f"/api/projects/{pid}/plan",
@@ -456,7 +456,7 @@ def test_put_with_if_match_ignored_when_plan_is_null():
     """If-Match on a project with no plan yet is ignored (no prior state to lock)."""
     pid = _create_test_project()
     try:
-        plan = {"version": "1.0", "name": "first", "steps": [{"name": "a"}]}
+        plan = {"version": "1.0", "name": "first", "steps": [{"name": "a", "action": "do_step"}]}
         # Send a stale If-Match on a fresh project — should still succeed
         s, body = _http(
             "PUT",

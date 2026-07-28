@@ -2231,6 +2231,43 @@ materialized into tasks when they click Run on the dashboard.
     PUT /api/projects/{id}/plan will 422
   - `audit_tail`: last 5 audit events for context
 
+# Step fields — what each one means (REQUIRED vs optional)
+  Per 2026-07-29: the previous chat version left `action` empty
+  and the user had no way to know what each step actually does.
+  Every step MUST have a non-empty `action`. Use the canonical
+  verb-phrase form, matching workflow_packages.step_template:
+    - `name` (REQUIRED, kebab-case, unique): identifier. e.g.
+      "fetch-bus-93k-info", "send-telegram-message"
+    - `action` (REQUIRED, 2-200 chars, non-whitespace): short
+      verb phrase describing what the agent does. Canonical
+      examples: "fetch_url", "fetch_data", "navigate_to_folder",
+      "summarize", "send_telegram_message", "create_file",
+      "read_file", "search_web", "generate_report",
+      "extract_data", "transform_json". Either kebab-case OR
+      snake_case verbs work. The agent uses this as the
+      primary instruction; without it, the step is unrunnable.
+    - `agent_role` (REQUIRED if your `agents_info.agent_roles`
+      is non-empty): pick one. Or "" to let supervisor pick.
+    - `depends_on` (optional, list of step names): upstream
+      steps. Empty list = no upstream.
+    - `skill` (optional, "" if N/A): canonical skill name from
+      `agents_info.skills`. Leave "" if the step uses a generic
+      action, not a specific skill.
+    - `tool` (optional, "" if N/A): canonical tool name from
+      `agents_info.tools`. Leave "" if no specific tool.
+    - `required_capability` (optional, "" if N/A): e.g.
+      "summarize", "search_web". The supervisor dispatches
+      based on this.
+    - `params_template` (optional dict): variables the agent
+      should fill in. Use {{var}} placeholders for plan vars.
+    - `output_path` (optional, "" if N/A): where the agent
+      writes its result.
+
+  **CRITICAL**: do NOT leave `action` empty. Even a simple step
+  like "fetch bus 93K info and post to Slack" needs a
+  non-empty action like "fetch_bus_info_and_post". The action
+  is the agent's primary instruction.
+
 # Workflow per user turn
   1. Read the snapshot (provided below)
   2. Apply the user's edit to your in-memory draft of the plan
@@ -2248,8 +2285,12 @@ materialized into tasks when they click Run on the dashboard.
        The apply endpoint replaces the whole plan.
 
 # Validation rules (your draft must pass)
-  - Every step `name` is kebab-case (lowercase letters, digits,
-    hyphens; no spaces, no underscores, no uppercase)
+  - Every step has a non-empty `name` (kebab-case, lowercase
+    letters, digits, hyphens; no spaces, no underscores, no
+    uppercase)
+  - Every step has a non-empty `action` (≥2 chars, not
+    whitespace, ≤200 chars) — see "Step fields" above for
+    what to put there. Put a short verb phrase.
   - Step names are unique within the plan
   - `depends_on` is a list of OTHER STEP NAMES (never IDs)
   - All `depends_on` names resolve to steps in the plan (no

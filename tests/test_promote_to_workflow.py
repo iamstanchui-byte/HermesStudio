@@ -65,7 +65,7 @@ def _create_terminal_single_task(name: str, status: str = "completed") -> str:
     (which would set it to 'assigned' / 'running' before we can mark
     it complete)."""
     s, body = _http("POST", "/api/single-tasks", {
-        "name": name, "agent_role": "super",
+        "name": name, "agent_role": "super", "action": "do_step",
     })
     assert s == 201, f"create failed: {s} {body}"
     tid = body["id"]
@@ -140,11 +140,11 @@ def test_promote_duplicate_name_returns_409():
     the existing one)."""
     tid1 = _create_terminal_single_task(f"dup-test-1-{uuid.uuid4().hex[:6]}")
     wf_name = f"dup-wf-{uuid.uuid4().hex[:8]}"
-    s, _ = _http("POST", f"/api/tasks/{tid1}/promote-to-workflow", {"name": wf_name})
+    s, _ = _http("POST", f"/api/tasks/{tid1}/promote-to-workflow", {"name": wf_name, "action": "do_step"})
     assert s == 200
     # Second promote with same name
     tid2 = _create_terminal_single_task(f"dup-test-2-{uuid.uuid4().hex[:6]}")
-    s, body = _http("POST", f"/api/tasks/{tid2}/promote-to-workflow", {"name": wf_name})
+    s, body = _http("POST", f"/api/tasks/{tid2}/promote-to-workflow", {"name": wf_name, "action": "do_step"})
     assert s == 409, f"expected 409, got {s} {body}"
     assert "already exists" in str(body).lower()
 
@@ -236,5 +236,5 @@ def test_promote_failed_task_is_allowed():
         f"failed-promote-{uuid.uuid4().hex[:6]}", status="failed",
     )
     wf_name = f"failed-wf-{uuid.uuid4().hex[:8]}"
-    s, body = _http("POST", f"/api/tasks/{tid}/promote-to-workflow", {"name": wf_name})
+    s, body = _http("POST", f"/api/tasks/{tid}/promote-to-workflow", {"name": wf_name, "action": "do_step"})
     assert s == 200, f"failed task should be promotable: {s} {body}"

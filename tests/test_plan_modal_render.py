@@ -55,7 +55,7 @@ def _get_text(path: str) -> str:
 
 def _create_test_project() -> str:
     name = f"plan-modal-test-{uuid.uuid4().hex[:8]}"
-    s, body = _http("POST", "/api/projects/", {"name": name})
+    s, body = _http("POST", "/api/projects/", {"name": name, "action": "do_step"})
     return body["id"]
 
 

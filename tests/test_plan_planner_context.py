@@ -51,10 +51,10 @@ def test_format_storage_block_renders_aliases():
         "win-agent01": [
             {"name": "project_temp_folder", "kind": "smb",
              "ref": "\\\\HERMES-WIN\\project_temp_folder",
-             "description": "Shared reports (SMB)"},
+             "description": "Shared reports (SMB)", "action": "do_step"},
             {"name": "stanley", "kind": "gdrive",
              "ref": "https://drive.google.com/drive/folders/ABC",
-             "description": "stanley/ folder"},
+             "description": "stanley/ folder", "action": "do_step"},
         ],
         "super": [],  # no storage
     }
@@ -127,7 +127,7 @@ def _http(method, path, body=None):
 
 def _create_test_project(name_suffix=""):
     name = f"planner-ctx-{uuid.uuid4().hex[:8]}"
-    body = {"name": name}
+    body = {"name": name, "action": "do_step"}
     if name_suffix:
         body["goal"] = name_suffix
     s, resp = _http("POST", "/api/projects/", body)
