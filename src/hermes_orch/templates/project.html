@@ -1394,6 +1394,9 @@ async function deletePreset(agentId, profileName, btn) {
             <div id="chat-subtitle" class="text-xs text-gray-500">Plan editor. Describe your goal; refine; click Apply. Run is human-only.</div>
         </div>
         <div class="flex items-center gap-1 shrink-0">
+            <a href="/api/projects/{{ project.id }}/chat.jsonl" target="_blank" rel="noopener"
+                class="text-xs text-gray-500 hover:text-blue-600 px-2 py-1"
+                title="Open the chat.jsonl log file in a new tab (newline-delimited JSON)">📄 Log</a>
             <button onclick="window.chatbox.clearChat()" class="text-xs text-gray-500 hover:text-red-600 px-2 py-1" title="Clear chat history">Clear</button>
             <button onclick="window.chatbox.toggleChatPanel()"
                 class="text-gray-500 hover:text-gray-800 px-2 py-1 text-base leading-none"

@@ -118,6 +118,53 @@ def _project_dir(request: Request, project_id: str) -> Path:
     return pdir
 
 
+def _append_chat_jsonl(
+    request: Request,
+    project_id: str,
+    message_id: int | None,
+    role: str,
+    content: str,
+    suggestions: list | None,
+    created_at: str,
+) -> None:
+    """Append a single chat message to projects/{id}/chat.jsonl.
+
+    Added 2026-07-29 (Phase 2 of docs/chatbox-plan-editor.md). The
+    DB table `project_chat_messages` remains the source of truth for
+    the UI; this file is a parallel append-only log for operator
+    inspection (cat / tail / grep), audit, and easy backup.
+
+    Format: one JSON object per line, with a trailing newline.
+    Fields:
+      id, project_id, role, content, suggestions, created_at
+
+    Defensive: any I/O error is logged but does NOT fail the chat
+    call. The DB row is the canonical record; this file is best-effort.
+    """
+    try:
+        pdir = _project_dir(request, project_id)
+        path = pdir / "chat.jsonl"
+        record = {
+            "id": message_id,
+            "project_id": project_id,
+            "role": role,
+            "content": content,
+            "suggestions": suggestions or [],
+            "created_at": created_at,
+        }
+        # Use ensure_ascii=False for friendlier display of
+        # multilingual content (Cantonese / Mandarin / mixed).
+        # newline-terminate each line so the file is line-oriented.
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            f"failed to append chat.jsonl for {project_id}: {e}"
+        )
+
+
 def _validate_relpath(path: str) -> str:
     """Validate relative path — reject absolute, .., etc."""
     if not path:
@@ -2562,13 +2609,17 @@ async def chat_with_project(
         history = history[-30:]
     # Persist user message
     now = _now_iso()
-    await db.insert("project_chat_messages", {
+    user_msg_id = await db.insert("project_chat_messages", {
         "project_id": project_id,
         "role": "user",
         "content": body.message,
         "suggestions_json": None,
         "created_at": now,
     })
+    # Phase 2 (2026-07-29): also append to chat.jsonl for inspection
+    _append_chat_jsonl(
+        request, project_id, user_msg_id, "user", body.message, None, now,
+    )
     # Build LLM messages
     # Fill the {available_profiles_inline} placeholder in the
     # system prompt with the comma-separated profile names from
@@ -2576,9 +2627,10 @@ async def chat_with_project(
     # names like 'google-drive-uploader' or 'script-runner' in
     # plan.steps[*].agent_role (the Pydantic validator on PUT
     # /plan 422s on unknown names, so the LLM MUST use a real one).
-    # Snapshot uses 'agents_info' (2026-07-28) — same data shape
-    # as the old 'available_profiles' list (list of {name, agent_id}).
-    profile_names = [p["name"] for p in ctx.get("agents_info", {}).get("agent_roles", [])]
+    # Snapshot uses 'agents_info' (2026-07-28). Note: agents_info
+    # has the same shape as the /plan/agents endpoint response —
+    # agent_roles is a flat list of strings, not a list of dicts.
+    profile_names = list(ctx.get("agents_info", {}).get("agent_roles", []))
     if profile_names:
         inline = ", ".join(f"`{n}`" for n in profile_names)
     else:
@@ -2659,6 +2711,10 @@ async def chat_with_project(
         (project_id, "assistant", display_text, sugg_json, assistant_now),
     )
     msg_id = cursor.lastrowid if hasattr(cursor, "lastrowid") else None
+    # Phase 2 (2026-07-29): also append to chat.jsonl for inspection
+    _append_chat_jsonl(
+        request, project_id, msg_id, "assistant", display_text, suggestions, assistant_now,
+    )
     await audit_log(
         db, "project.chat_message",
         actor="operator",
@@ -2693,6 +2749,50 @@ async def clear_chat(project_id: str, request: Request) -> dict:
         payload={"removed_count": removed},
     )
     return {"project_id": project_id, "removed": removed}
+
+
+@router.get("/{project_id}/chat.jsonl")
+async def get_chat_jsonl(project_id: str, request: Request):
+    """Return the project's chat.jsonl file as plain text.
+
+    Added 2026-07-29 (Phase 2). The chat history is also written
+    to `projects/{id}/chat.jsonl` for operator inspection
+    (cat / tail / grep) and easy backup. This endpoint exposes
+    the same content over HTTP so the dashboard's "View chat log"
+    button can open it in a new tab.
+
+    Returns 404 if the file does not exist (no chat messages yet
+    for this project). Streams the file as plain text.
+    """
+    from fastapi.responses import PlainTextResponse
+    pdir = _project_dir(request, project_id)
+    path = pdir / "chat.jsonl"
+    if not path.exists():
+        raise HTTPException(404, f"No chat log yet for {project_id}")
+    # Read up to a sane cap (1MB) to avoid OOM on huge logs.
+    MAX_BYTES = 1 * 1024 * 1024
+    size = path.stat().st_size
+    if size > MAX_BYTES:
+        # Return only the last 1MB; tell the client via header.
+        # After seeking back 1MB from the end, the position is
+        # likely in the middle of a JSONL record — advance to the
+        # next newline so the first returned line is complete.
+        with open(path, "rb") as f:
+            f.seek(-MAX_BYTES, 2)
+            data = f.read()
+        nl = data.find(b"\n")
+        if nl >= 0:
+            data = data[nl + 1:]
+        return PlainTextResponse(
+            data.decode("utf-8", errors="replace"),
+            media_type="text/plain; charset=utf-8",
+            headers={"X-Chat-Log-Truncated": "1", "X-Chat-Log-Original-Size": str(size)},
+        )
+    data = path.read_bytes()
+    return PlainTextResponse(
+        data.decode("utf-8", errors="replace"),
+        media_type="text/plain; charset=utf-8",
+    )
 
 
 @router.post("/{project_id}/chat/reformat")
@@ -2852,6 +2952,10 @@ characters before or after the JSON.
         (project_id, "assistant", message, sugg_json, now),
     )
     msg_id = cursor.lastrowid if hasattr(cursor, "lastrowid") else None
+    # Phase 2 (2026-07-29): also append to chat.jsonl
+    _append_chat_jsonl(
+        request, project_id, msg_id, "assistant", message, valid, now,
+    )
     await audit_log(
         db, "project.chat_reformatted",
         actor="operator",

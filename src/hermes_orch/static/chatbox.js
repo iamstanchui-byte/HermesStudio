@@ -371,9 +371,11 @@
             const adata = await ar.json().catch(() => {});
             // 409 = optimistic lock conflict. The plan was
             // modified by someone/something else between the LLM
-            // reading it and you applying. Offer a Reload option.
+            // reading it and you applying. Show a 3-way merge UI
+            // (Phase 2, 2026-07-29): the server's current plan +
+            // your draft, with two resolution paths.
             if (ar.status === 409) {
-                status.textContent = '⚠ Plan was modified externally';
+                status.textContent = '⚠ Plan was modified externally — choose resolution';
                 status.className = 'text-xs text-amber-700 mt-1 h-4';
                 if (btn) {
                     btn.disabled = true;
@@ -381,18 +383,49 @@
                     btn.classList.remove('bg-green-600', 'hover:bg-green-700');
                     btn.classList.add('bg-amber-500', 'cursor-not-allowed');
                 }
-                const conflictMsg = adata && adata.detail && adata.detail.error
-                    ? adata.detail.error
-                    : 'plan was modified since the assistant read it';
-                const hint = document.createElement('div');
-                hint.className = 'text-xs text-amber-700 mt-1 p-2 bg-amber-50 border border-amber-200 rounded';
-                hint.innerHTML = `<div>${escapeHtml(conflictMsg)}</div>
-                    <button onclick="location.reload()"
-                        class="mt-1 px-2 py-0.5 bg-amber-600 text-white rounded text-xs hover:bg-amber-700">
-                        Reload page to see current plan
-                    </button>`;
+                const detail = (adata && adata.detail) || {};
+                const serverPlan = detail.current_plan || null;
+                const conflictMsg = detail.error
+                    || 'plan was modified since the assistant read it';
+                // Build the merge UI inline next to the Apply button
+                const mergeBox = document.createElement('div');
+                mergeBox.className = 'text-xs mt-2 p-2 bg-amber-50 border border-amber-300 rounded space-y-2';
+                mergeBox.innerHTML = `
+                    <div class="font-semibold text-amber-800">⚠ Conflict: ${escapeHtml(conflictMsg)}</div>
+                    <div class="grid grid-cols-2 gap-2 mt-2">
+                        <div class="bg-white border border-gray-300 rounded p-2">
+                            <div class="font-medium text-gray-700 mb-1">📥 Server's current plan</div>
+                            ${_summarizePlan(serverPlan)}
+                        </div>
+                        <div class="bg-white border border-gray-300 rounded p-2">
+                            <div class="font-medium text-gray-700 mb-1">📤 Your draft</div>
+                            ${_summarizePlan(suggestion.plan)}
+                        </div>
+                    </div>
+                    <div class="flex gap-2 mt-2">
+                        <button data-action="use-server"
+                            class="flex-1 px-2 py-1 bg-amber-600 text-white rounded text-xs hover:bg-amber-700"
+                            title="Discard your draft; the chat will use the server's current plan as the new starting point">
+                            Use server's plan
+                        </button>
+                        <button data-action="force-apply"
+                            class="flex-1 px-2 py-1 bg-red-600 text-white rounded text-xs hover:bg-red-700"
+                            title="Ignore the conflict; overwrite the server's plan with your draft (no merge)">
+                            Force my draft
+                        </button>
+                    </div>
+                `;
+                // Wire up the buttons
+                mergeBox.querySelector('button[data-action="use-server"]')
+                    .addEventListener('click', () => {
+                        _resolveConflictUseServer(msg, serverPlan, status);
+                    });
+                mergeBox.querySelector('button[data-action="force-apply"]')
+                    .addEventListener('click', () => {
+                        _resolveConflictForceApply(suggestion, msg.id, status, btn);
+                    });
                 if (btn && btn.parentElement && btn.parentElement.parentElement) {
-                    btn.parentElement.parentElement.appendChild(hint);
+                    btn.parentElement.parentElement.appendChild(mergeBox);
                 }
                 return;
             }
@@ -470,6 +503,126 @@
         renderChatContent,
         renderSuggestion,
         renderChatMessages,
+        // Phase 2 (2026-07-29): 3-way merge helpers. Exposed for tests
+        // and for the embedder to call directly if needed.
+        _summarizePlan,
+        _resolveConflictUseServer,
+        _resolveConflictForceApply,
     };
 
+    // ========== 3-way merge helpers (Phase 2, 2026-07-29) ==========
+
+    // Render a brief summary of a plan: name, step count, top step
+    // names. Used in the conflict resolution box (small, scannable).
+    function _summarizePlan(plan) {
+        if (!plan || typeof plan !== 'object') {
+            return '<div class="text-gray-400 italic">(no plan)</div>';
+        }
+        const steps = Array.isArray(plan.steps) ? plan.steps : [];
+        const name = plan.name || '(unnamed)';
+        const html = [];
+        html.push(`<div class="font-mono text-xs text-gray-600">${escapeHtml(name)}</div>`);
+        html.push(`<div class="text-gray-500 text-xs mb-1">${steps.length} step${steps.length === 1 ? '' : 's'}</div>`);
+        if (steps.length > 0) {
+            const preview = steps.slice(0, 5).map(s => {
+                const n = (typeof s === 'object' && s.name) || '?';
+                return `<li class="font-mono text-xs">${escapeHtml(n)}</li>`;
+            }).join('');
+            const more = steps.length > 5
+                ? `<li class="text-gray-400 italic text-xs">+ ${steps.length - 5} more...</li>`
+                : '';
+            html.push(`<ul class="list-disc list-inside pl-1 space-y-0.5">${preview}${more}</ul>`);
+        }
+        return html.join('');
+    }
+
+    // Conflict resolution: "Use server's plan" — discard the user's
+    // draft. The chat's in-memory view of the plan (if any host
+    // page maintains one) is updated via the ChatboxHooks.onPlanLoaded
+    // hook so the UI reflects the server's state. The user can then
+    // ask the LLM to redo the edit on top of the server's plan.
+    function _resolveConflictUseServer(originalMsg, serverPlan, status) {
+        // Call the onPlanLoaded hook if set (host page can refresh
+        // its in-memory state). The hook is optional — if not set,
+        // we just inform the user.
+        const hooks = _getHooks();
+        if (serverPlan && typeof hooks.onPlanLoaded === 'function') {
+            try { hooks.onPlanLoaded(serverPlan); } catch (e) {
+                console.warn('onPlanLoaded hook failed:', e);
+            }
+        }
+        if (status) {
+            status.textContent = '✓ Discarded your draft; chat will use server\u2019s plan';
+            status.className = 'text-xs text-green-600 mt-1 h-4';
+        }
+        // Close the merge box and replace it with a system-style
+        // note that the user can act on next.
+        const mergeBox = document.querySelector('[data-action="use-server"]')?.closest('.bg-amber-50');
+        if (mergeBox) {
+            mergeBox.innerHTML = `<div class="text-amber-800">
+                <div class="font-semibold mb-1">✓ Using server's plan</div>
+                <div class="text-xs">Your draft was discarded. The assistant's view of the plan is now in sync with the server. Ask the LLM to redo the edit on top if needed.</div>
+            </div>`;
+        }
+    }
+
+    // Conflict resolution: "Force my draft" — re-apply with if_match
+    // omitted (the server treats null if_match as "no prior state"
+    // and skips the lock check, effectively overwriting).
+    async function _resolveConflictForceApply(suggestion, messageId, status, btn) {
+        if (status) {
+            status.textContent = 'Force-applying...';
+            status.className = 'text-xs text-gray-500 mt-1 h-4';
+        }
+        // Build a new suggestion with no if_match
+        const force = {
+            type: 'update_plan',
+            plan: suggestion.plan,
+            if_match: null,
+        };
+        try {
+            const ar2 = await _fetchWithTimeout(
+                `/api/projects/${PROJECT_ID}/chat/apply`,
+                {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({suggestion: force, message_id: messageId}),
+                },
+                30000,
+            );
+            const adata2 = await ar2.json().catch(() => {});
+            if (!ar2.ok) {
+                if (status) {
+                    status.textContent = 'Force apply failed: '
+                        + _errDetailToString(adata2.detail, ar2.status);
+                    status.className = 'text-xs text-red-600 mt-1 h-4';
+                }
+                return;
+            }
+            if (status) {
+                status.textContent = '✓ Forced — your plan overwrote the server\u2019s';
+                status.className = 'text-xs text-green-600 mt-1 h-4';
+            }
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = '✓ Forced';
+            }
+            // Trigger hook for host page (visual editor refresh)
+            if (suggestion.plan) {
+                const hooks = _getHooks();
+                if (typeof hooks.onPlanApplied === 'function') {
+                    try { hooks.onPlanApplied(suggestion.plan); }
+                    catch (e) { console.warn('onPlanApplied hook failed:', e); }
+                } else {
+                    setTimeout(() => location.reload(), 1500);
+                }
+            }
+        } catch (e) {
+            if (status) {
+                status.textContent = 'Force apply error: '
+                    + (e.name === 'AbortError' ? 'timed out' : e.message);
+                status.className = 'text-xs text-red-600 mt-1 h-4';
+            }
+        }
+    }
 })();
