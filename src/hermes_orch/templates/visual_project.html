@@ -1660,38 +1660,4 @@ _vpBindEditDirtyTracking();
    the apply-workflow confirm() dialog can show the blast radius. #}
 {% include "_workflow_actions.html" %}
 
-{# v1.4: cross-page Task Progress Monitor. The FAB lives in the
-   bottom-right (no toolbar to put it in on this canvas-only page);
-   the panel HTML is the same partial project.html uses. The init
-   script reads data-project-id from #vp-wrap (set on the wrapper
-   above) so the panel pulls the right project's running tasks. #}
-<button id="task-progress-toggle-btn"
-    class="fixed bottom-4 right-4 z-50 px-3 py-2 text-sm font-medium rounded-full shadow-lg border-2 border-blue-500 bg-white text-blue-700 hover:bg-blue-50"
-    title="Toggle the Task Progress side panel — live loop status for all running tasks in this project">
-    📊
-</button>
-<script defer src="/static/task_progress.js?v=2026-07-29"></script>
-{% include "_task_progress_panel.html" %}
-<script>
-(function() {
-    function boot() {
-        var pid = (document.getElementById('vp-wrap') || {}).getAttribute
-            ? document.getElementById('vp-wrap').getAttribute('data-project-id')
-            : null;
-        if (window.taskProgress && typeof window.taskProgress.init === 'function' && pid) {
-            window.taskProgress.init(pid);
-        } else if (!pid) {
-            // no project on this page — skip
-        } else {
-            setTimeout(boot, 50);
-        }
-    }
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', boot);
-    } else {
-        boot();
-    }
-})();
-</script>
-
 {% endblock %}
