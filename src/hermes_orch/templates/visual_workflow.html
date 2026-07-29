@@ -405,37 +405,4 @@
 {# Save status banner — top right. #}
 <div class="vf-save-banner" id="vf-save-banner"></div>
 
-{# v1.5: cross-page Task Progress Monitor on the workflow builder.
-   The workflow page has no single project to scope to (the workflow
-   can reference tasks from many projects), so we init taskProgress
-   with NO project id — the panel shows running tasks across all
-   projects (the operator's whole fleet). Same partial + FAB as
-   the other project-level pages. #}
-<button id="task-progress-toggle-btn"
-    class="fixed bottom-4 right-4 z-50 px-3 py-2 text-sm font-medium rounded-full shadow-lg border-2 border-blue-500 bg-white text-blue-700 hover:bg-blue-50"
-    title="Toggle the Task Progress side panel — running tasks across all projects">
-    📊
-</button>
-<script defer src="/static/task_progress.js?v=2026-07-29"></script>
-{% include "_task_progress_panel.html" %}
-<script>
-(function() {
-    function boot() {
-        if (window.taskProgress && typeof window.taskProgress.init === 'function') {
-            // null projectId → cross-project mode (uses
-            // /api/tasks/?status=running instead of
-            // /api/projects/{id}/tasks/state)
-            window.taskProgress.init(null);
-        } else {
-            setTimeout(boot, 50);
-        }
-    }
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', boot);
-    } else {
-        boot();
-    }
-})();
-</script>
-
 {% endblock %}
