@@ -18,6 +18,7 @@ Coverage:
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -686,3 +687,242 @@ def test_looping_threshold_constant():
     )
     assert LOOP_WINDOW_S == 60
     assert LOOP_MIN_REPEATS == 5
+
+
+# ===== v1.7 per-tool thresholds =====
+# Some tools fire much more often than others during normal
+# operation. A real agent can legitimately read 10+ different files
+# in a row, but running the same shell command 6+ times is a real
+# loop. The v1.7 TOOL_LOOP_THRESHOLDS dict captures this — see
+# docs/loop-detection-v1.7.md for the rationale.
+
+
+def test_per_tool_thresholds_dict():
+    """The thresholds dict has the expected tools + sane values."""
+    from hermes_orch.core.loop_status import (
+        TOOL_LOOP_THRESHOLDS, DEFAULT_LOOP_THRESHOLD,
+    )
+    # Must have entries for the common tools
+    assert "shell" in TOOL_LOOP_THRESHOLDS
+    assert "read" in TOOL_LOOP_THRESHOLDS
+    assert "edit" in TOOL_LOOP_THRESHOLDS
+    assert "search" in TOOL_LOOP_THRESHOLDS
+    # read has a higher threshold than shell (more common during
+    # normal operation; we don't want false positives)
+    assert TOOL_LOOP_THRESHOLDS["read"] > TOOL_LOOP_THRESHOLDS["shell"]
+    # All thresholds are positive
+    for tool, n in TOOL_LOOP_THRESHOLDS.items():
+        assert n >= 3, f"threshold for {tool!r} too low: {n}"
+    assert DEFAULT_LOOP_THRESHOLD >= 3
+
+
+def _seed_tool_calls(
+    db_path: Path,
+    task_id: str,
+    tool: str,
+    signature: str,
+    count: int,
+    now: float,
+    *,
+    seconds_ago_start: float = 30.0,
+) -> None:
+    """Insert `count` audit_log rows for the same (tool, signature)
+    pair, spaced 1s apart starting `seconds_ago_start` ago.
+
+    All rows stay inside LOOP_WINDOW_S (60s).
+    """
+    for i in range(count):
+        _insert_audit(
+            db_path,
+            task_id,
+            "agent.tool_call",
+            now - seconds_ago_start + i,
+            payload=json.dumps({"tool": tool, "signature": signature}),
+        )
+
+
+def test_shell_loop_threshold_5(db_path: Path):
+    """shell: 5+ identical calls in 60s → looping."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-shell",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    _seed_tool_calls(db_path, "t-shell", "shell", "sigA", 5, now)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "looping"
+    assert s.tool == "shell"
+    assert s.repeat_count == 5
+
+
+def test_shell_below_threshold(db_path: Path):
+    """shell: 4 calls is NOT a loop (threshold 5)."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-shell4",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    _seed_tool_calls(db_path, "t-shell4", "shell", "sigA", 4, now)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "ok"
+
+
+def test_read_loop_threshold_15(db_path: Path):
+    """read: 6+ identical reads is NOT a loop (threshold 15)."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-read6",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    # 6 calls of the same read_file — typical "exploring the codebase"
+    # behavior, NOT a loop
+    _seed_tool_calls(db_path, "t-read6", "read", "sigA", 6, now)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "ok", f"read x6 should not be looping: {s}"
+
+
+def test_read_loop_threshold_15_at_threshold(db_path: Path):
+    """read: 15 calls hits the threshold (boundary check)."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-read15",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    _seed_tool_calls(db_path, "t-read15", "read", "sigA", 15, now)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "looping"
+    assert s.tool == "read"
+
+
+def test_edit_loop_threshold_5(db_path: Path):
+    """edit (patch): 5+ identical patches is a loop."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-edit",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    _seed_tool_calls(db_path, "t-edit", "edit", "sigA", 5, now)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "looping"
+    assert s.tool == "edit"
+
+
+def test_search_loop_threshold_8(db_path: Path):
+    """search: 8+ identical searches is a loop (threshold 8)."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-search",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    _seed_tool_calls(db_path, "t-search", "search", "sigA", 8, now)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "looping"
+    assert s.tool == "search"
+
+
+def test_search_below_threshold(db_path: Path):
+    """search: 7 calls is NOT a loop (threshold 8)."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-search7",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    _seed_tool_calls(db_path, "t-search7", "search", "sigA", 7, now)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "ok"
+
+
+def test_unknown_tool_falls_back_to_default(db_path: Path):
+    """Tool names not in TOOL_LOOP_THRESHOLDS use the fallback
+    (LOOP_MIN_REPEATS=5). This covers new hermes tools we haven't
+    categorized yet — be safe-by-default."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-future",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    _seed_tool_calls(db_path, "t-future", "future_tool_xyz", "sigA", 5, now)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    # Falls back to LOOP_MIN_REPEATS=5, so 5 fires
+    assert s.status == "looping"
+    assert s.tool == "future_tool_xyz"
+
+
+def test_unknown_tool_4_does_not_loop(db_path: Path):
+    """Same as above: 4 < 5 default threshold, so no loop."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-future4",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    _seed_tool_calls(db_path, "t-future4", "future_tool_xyz", "sigA", 4, now)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "ok"
+
+
+def test_per_tool_picks_worst_offender(db_path: Path):
+    """When multiple tools are looping, the one with the highest count
+    wins (regardless of which has the higher threshold). Same as
+    the v1.2 single-threshold behavior."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-multi",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    # 5 read calls (below threshold=15)
+    _seed_tool_calls(db_path, "t-multi", "read", "sigR", 5, now)
+    # 8 edit calls (at threshold=5) — should win
+    _seed_tool_calls(db_path, "t-multi", "edit", "sigE", 8, now, seconds_ago_start=50.0)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "looping"
+    assert s.tool == "edit"
+    assert s.repeat_count == 8
+
+
+def test_per_tool_read_at_15_but_shell_at_5(db_path: Path):
+    """Realistic scenario: agent reads 15 different files (loop!)
+    AND has run 5 shell commands (also loop). Both should be
+    detected but the higher-count one wins."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-mix",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    _seed_tool_calls(db_path, "t-mix", "shell", "sigS", 5, now)
+    _seed_tool_calls(db_path, "t-mix", "read", "sigR", 15, now, seconds_ago_start=50.0)
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "looping"
+    # ORDER BY n DESC: read (15) > shell (5), so read wins
+    assert s.tool == "read"
+    assert s.repeat_count == 15
+
+
+def test_loop_status_dataclass_has_tool_field():
+    """LoopStatus.tool is exposed in the dataclass so the UI can
+    show the tool name in the badge (v1.7)."""
+    s = LoopStatus(status="ok", reason="liveness OK", tool=None, repeat_count=0)
+    assert s.tool is None
+    s2 = LoopStatus(status="looping", reason="looped 5x: shell", tool="shell", repeat_count=5)
+    assert s2.tool == "shell"

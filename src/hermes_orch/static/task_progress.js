@@ -367,7 +367,15 @@
     badge.className =
       'ml-1 inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded ' +
       meta.cls;
-    badge.textContent = `${meta.glyph} ${meta.label}`;
+    // v1.7: when looping, append the tool name + count to the badge
+    // so the user sees "🟣 looping read x15" instead of just "🟣 looping".
+    // The full reason (path/command) is in the tooltip on hover.
+    if (t.loop_status === 'looping' && t.tool) {
+      const count = t.repeat_count != null ? ` x${t.repeat_count}` : '';
+      badge.textContent = `${meta.glyph} ${meta.label} ${t.tool}${count}`;
+    } else {
+      badge.textContent = `${meta.glyph} ${meta.label}`;
+    }
     badge.title = t.loop_reason || meta.label;
   }
 

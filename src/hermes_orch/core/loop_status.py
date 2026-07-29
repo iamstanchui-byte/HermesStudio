@@ -43,7 +43,40 @@ LOOKBACK_FOR_STUCK_WRAPPER_S = 300  # 5 min
 # a loop. Conservative defaults — a real agent rarely calls the same
 # tool with identical args 5+ times in 60s.
 LOOP_WINDOW_S = 60
-LOOP_MIN_REPEATS = 5
+LOOP_MIN_REPEATS = 5  # legacy fallback for tools not in TOOL_LOOP_THRESHOLDS
+
+# v1.7 (2026-07-29): per-tool loop thresholds. Some tools fire
+# much more often than others during normal operation:
+#   - read_file / search_files / browser_*: agent often reads 10+
+#     files in a row; we'd false-positive with the old LOOP_MIN_REPEATS=5
+#   - memory / plan: writing todos and memory is normal at high rate
+#   - shell / patch / write / skill: same call repeated is a real loop
+# The wrapper emits `tool="<name>"` in the audit_log payload. The
+# threshold for each tool is the count of same-(tool, signature)
+# calls in LOOP_WINDOW_S. Tunable; see docs/loop-detection-v1.7.md.
+TOOL_LOOP_THRESHOLDS = {
+    "shell":      5,   # same command 5x = real loop
+    "edit":       5,   # same patch repeated = real loop
+    "write":      5,   # same write repeated = real loop
+    "search":     8,   # some search iteration is normal
+    "web_search": 8,
+    "web_fetch":  10,  # polling a slow page is normal
+    "read":       15,  # reading 10+ different files is normal
+    "browser":    10,
+    "skill":      5,
+    "process":    8,
+    "memory":     12,  # memory writes are normal
+    "plan":       15,  # todo planning is normal
+    "image":      5,
+    "tts":        5,
+    "vision":     5,
+    "send":       10,
+    "cronjob":    5,
+    "exec":       5,
+    "delegate":   5,
+    "misc":       5,
+}
+DEFAULT_LOOP_THRESHOLD = 5  # used for tool names not in the dict
 
 
 @dataclass
@@ -226,8 +259,14 @@ def _detect_loop(
     db_path: Path, task_id: str, now_ts: float
 ) -> tuple[str, int] | None:
     """Detect a tool-call loop: if any (tool, signature) pair has
-    fired LOOP_MIN_REPEATS times in the last LOOP_WINDOW_S seconds,
-    return (tool, count). Otherwise return None.
+    fired TOOL_LOOP_THRESHOLDS[tool] times in the last LOOP_WINDOW_S
+    seconds, return (tool, count). Otherwise return None.
+
+    v1.7 (2026-07-29): per-tool thresholds. Some tools (read, search,
+    memory, plan) fire much more often than others during normal
+    operation; a single threshold would false-positive. The
+    TOOL_LOOP_THRESHOLDS dict captures the natural call rate per
+    tool. Falls back to LOOP_MIN_REPEATS for tools not in the dict.
 
     Defensive: returns None on any DB error so a corrupt audit_log
     can't crash the dashboard.
@@ -261,7 +300,13 @@ def _detect_loop(
             if not row:
                 return None
             tool, count = row
-            if count is None or count < LOOP_MIN_REPEATS:
+            if count is None:
+                return None
+            # v1.7: per-tool threshold. Falls back to LOOP_MIN_REPEATS
+            # (5) for tools not in the dict — covers future hermes
+            # tool names we haven't seen yet.
+            threshold = TOOL_LOOP_THRESHOLDS.get(str(tool), LOOP_MIN_REPEATS)
+            if int(count) < threshold:
                 return None
             return (str(tool), int(count))
         finally:

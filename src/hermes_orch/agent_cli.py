@@ -2195,29 +2195,29 @@ def start(
             t.start()
             stream_threads.append(t)
 
-        # ===== Looping detection (v1.2, 2026-07-29) =====
+        # ===== Looping detection (v1.2, v1.7) =====
         # Watch the stdout file for tool-call rows and POST one
         # event per call to the orchestrator. The server's
         # compute_loop_status() then queries these events to flag
         # the task as "looping" if the same (tool, signature)
-        # pair fires >= LOOP_MIN_REPEATS times in LOOP_WINDOW_S.
+        # pair fires >= per-tool threshold times in LOOP_WINDOW_S.
         #
-        # Pattern (heuristic on hermes stdout):
-        #   ┊ 💻 $         curl https://example.com -o file.json
-        #   ┊ 💻 preparing terminal…
-        #   ┊ 📚 skill     <name>  <duration>
-        # The first form is a shell command being run. We emit a
-        # tool_call event with tool="shell" and signature=SHA1(command
-        # body)[:16]. We do NOT emit for "preparing" or skill rows
-        # (they're not actual tool invocations). Other tool names
-        # (e.g. read_file, write_file) are not currently detected —
-        # the wrapper would need hermes's structured transcript for
-        # those. Shell is the most common repeat-offender in our
-        # observed failure modes (curl polling a broken URL, ls'ing
-        # a missing dir, etc).
+        # v1.7 (2026-07-29): expanded from shell-only to cover
+        # every tool hermes emits. The pattern list is in
+        # hermes_orch.core.tool_call_patterns (sourced from
+        # agent/display.py:_get_cute_tool_message in the hermes
+        # repo). First match wins. The signature is the args
+        # portion with trailing duration stripped, SHA1'd.
+        #
+        # Per-tool thresholds (server-side) are tuned to natural
+        # call rates: shell=5, read=15 (reading 20 files is normal),
+        # memory=12 (memory writes are normal), etc. See
+        # docs/loop-detection-v1.7.md.
         import hashlib as _hashlib
-        import re as _re
-        _TOOL_CALL_PATTERN = _re.compile(r"┊\s*💻\s+\$\s+(.+)")
+        from hermes_orch.core.tool_call_patterns import (
+            TOOL_PATTERNS as _TOOL_PATTERNS,
+            strip_duration_suffix as _strip_duration,
+        )
         def _post_tool_call(tool: str, signature: str) -> None:
             try:
                 _tool_body = json.dumps(
@@ -2249,16 +2249,21 @@ def start(
                         pos += len(new)
                         text = new.decode("utf-8", errors="replace")
                         for line in text.splitlines():
-                            m = _TOOL_CALL_PATTERN.search(line)
-                            if not m:
-                                continue
-                            body = m.group(1).strip()
-                            if not body:
-                                continue
-                            sig = _hashlib.sha1(
-                                body.encode("utf-8")
-                            ).hexdigest()[:16]
-                            _post_tool_call("shell", sig)
+                            # First matching tool pattern wins.
+                            for pat in _TOOL_PATTERNS:
+                                m = pat.regex.search(line)
+                                if m:
+                                    raw = m.group(pat.sig_group)
+                                    body = _strip_duration(raw)
+                                    if not body:
+                                        # Matched a tool but args is empty
+                                        # (e.g. `┊ 💻 $  done`). Skip.
+                                        break
+                                    sig = _hashlib.sha1(
+                                        body.encode("utf-8")
+                                    ).hexdigest()[:16]
+                                    _post_tool_call(pat.tool, sig)
+                                    break  # one event per line
                 except FileNotFoundError:
                     pass
                 stop_stream.wait(0.5)
