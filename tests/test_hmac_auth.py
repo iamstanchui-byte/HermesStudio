@@ -218,3 +218,69 @@ def test_endpoint_rejects_missing_headers():
     except urllib.error.HTTPError as e:
         status = e.code
     assert status == 401, f"expected 401, got {status}"
+
+
+# ===== v1.9 regression: cleanup-ack signature must use interpolated path =====
+#
+# v1.9 fix: the wrapper's cleanup-ack call was signing the LITERAL
+# path string `/api/agents/{agent_id}/sessions/{sid}/cleanup-ack`
+# instead of the f-string-interpolated actual path. The signature
+# bound to the wrong path → server 401 → wrapper retry loop at
+# 6+ req/sec. Caught when flipping HERMES_HMAC_REQUIRED=true
+# exposed the audit log noise at full volume. This test pins the
+# fix so we never regress.
+def test_cleanup_ack_signature_must_match_actual_path():
+    """A cleanup-ack signed with the interpolated path must be
+    accepted; signed with the literal `{...}` template must be
+    rejected. Same call site, two path strings — only the right
+    one is accepted.
+    """
+    import json
+    import socket
+    import sqlite3
+    import time as _t
+    import urllib.error
+    import urllib.request
+    import uuid
+    from pathlib import Path
+
+    # Skip if server not running
+    try:
+        with socket.create_connection(("127.0.0.1", 8765), timeout=1):
+            pass
+    except OSError:
+        pytest.skip("server not running on 8765")
+
+    # Set up: a real test agent (so HMAC verification has a row to check)
+    import secrets as _secrets
+    from tests._hmac_util import register_test_agent, unregister_test_agent, signed_request
+
+    agent_id = f"test-agent-{uuid.uuid4().hex[:8]}"
+    secret = _secrets.token_urlsafe(24)
+    register_test_agent(agent_id, secret)
+    try:
+        # The cleanup-ack endpoint is idempotent — if no matching
+        # project_sessions row exists, it returns 200 already_deleted=true.
+        # So we don't need to seed a session; the HMAC check fires first
+        # and is what we actually care about.
+
+        # Sign with the FIXED (interpolated) path
+        sid = "fake-session-id-for-hmac-test"
+        good_path = f"/api/agents/{agent_id}/sessions/{sid}/cleanup-ack"
+        good_status, _, _ = signed_request(
+            "POST", good_path, agent_id=agent_id, secret=secret, body=None
+        )
+        assert good_status == 200, (
+            f"interpolated path should be accepted, got {good_status}"
+        )
+
+        # Sign with the BUGGY (literal template) path — server must 401
+        bad_path = "/api/agents/{agent_id}/sessions/{sid}/cleanup-ack"
+        bad_status, _, _ = signed_request(
+            "POST", bad_path, agent_id=agent_id, secret=secret, body=None
+        )
+        assert bad_status == 401, (
+            f"literal template path should be rejected, got {bad_status}"
+        )
+    finally:
+        unregister_test_agent(agent_id)

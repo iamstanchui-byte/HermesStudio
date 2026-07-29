@@ -1610,9 +1610,16 @@ def start(
             # in pending_cleanup. The audit log retains the failure
             # context via the stdout/stderr we just printed.
             try:
+                # v1.9 fix: path was a literal `{}` template (not f-string)
+                # which produced a signature bound to the WRONG path —
+                # the server would 401 every cleanup-ack. Caught when
+                # flipping HERMES_HMAC_REQUIRED=true exposed the
+                # hmac_auth_failed events at full volume. Now the path
+                # matches the actual URL.
+                _ck_path = f"/api/agents/{agent_id}/sessions/{sid}/cleanup-ack"
                 httpx.post(
-                    f"{orchestrator_url}/api/agents/{agent_id}/sessions/{sid}/cleanup-ack",
-                    headers=_auth_headers('POST', '/api/agents/{agent_id}/sessions/{sid}/cleanup-ack'),
+                    f"{orchestrator_url}{_ck_path}",
+                    headers=_auth_headers('POST', _ck_path),
                     timeout=10,
                 )
             except Exception as e:
