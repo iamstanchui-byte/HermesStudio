@@ -124,7 +124,11 @@
         // nodes' x/y attributes. drawflow renders nodes at the
         // position given in their `data` object, so this is a one-
         // line write per step.
-        _applyPlanVisualLayout();
+        // v1.5.3.2: _applyPlanVisualLayout was called here but the
+        // data map is empty at init time (no nodes added yet). The
+        // actual position restoration now happens in renderAllSteps
+        // (each step's x/y is passed to addNode from visual_layout).
+        // Keeping the helper around as a safety net / future use.
         // v1.5.3: when the user drags a card, update _plan.visual_layout
         // so the next savePlan() persists the new position. The PUT
         // happens in savePlan() — we don't auto-save on every drag.
@@ -422,15 +426,29 @@
         // Reset our step name -> internal id map; rebuild as we
         // add nodes (each addNodeToCanvas populates it)
         _internalIdByStepName.clear();
-        // Add each step at a default position (later, Phase C+
-        // will use the visual_layout field for persisted positions)
+        // v1.5.3.2 (2026-07-29): was placing every step on a hardcoded
+        // grid (baseX + col*dx, baseY + row*dy) regardless of the
+        // persisted visual_layout. That meant save + reload always
+        // snapped the cards back to the default grid — the user
+        // observed this as "drag -> save -> reload -> positions reset".
+        // The fix: read _plan.visual_layout[step.name] first; fall back
+        // to the default grid for steps added since the last save
+        // (no entry in the layout). Capture side already writes the
+        // new pos to _plan.visual_layout on every nodeMoved, so the
+        // very next savePlan() persists it.
+        const layout = _plan.visual_layout || {};
         const baseX = 100, baseY = 100;
         const dx = 280, dy = 130;
         for (let i = 0; i < _plan.steps.length; i++) {
             const step = _plan.steps[i];
-            const col = i % 3;
-            const row = Math.floor(i / 3);
-            addNodeToCanvas(step, baseX + col * dx, baseY + row * dy);
+            const saved = layout[step.name];
+            if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
+                addNodeToCanvas(step, saved.x, saved.y);
+            } else {
+                const col = i % 3;
+                const row = Math.floor(i / 3);
+                addNodeToCanvas(step, baseX + col * dx, baseY + row * dy);
+            }
         }
         // Wire deps. We retry once after a tick to handle forward
         // refs (a step depending on a step that hasn't been added
@@ -959,7 +977,10 @@
             for (const nodeId of Object.keys(mod.data)) {
                 const node = mod.data[nodeId];
                 if (!node || !node.data) continue;
-                const stepName = node.data.name;
+                // step name: visual_plan stores it in `data.stepName`,
+                // visual_workflow stores it in `data.name`. Accept
+                // either (defensive against future consolidation).
+                const stepName = node.data.stepName || node.data.name;
                 if (!stepName || !stepNames.has(stepName)) continue;
                 if (typeof node.pos_x === 'number'
                     && typeof node.pos_y === 'number') {
@@ -992,7 +1013,8 @@
             for (const nodeId of Object.keys(mod.data)) {
                 const node = mod.data[nodeId];
                 if (!node || !node.data) continue;
-                const stepName = node.data.name;
+                // Same step-name field fallback as capture above
+                const stepName = node.data.stepName || node.data.name;
                 const pos = layout[stepName];
                 if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
                     node.pos_x = pos.x;
