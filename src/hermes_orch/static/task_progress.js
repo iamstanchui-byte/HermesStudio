@@ -114,7 +114,13 @@
   }
 
   async function _pollOnce() {
-    if (!projectId) return;
+    // v1.5: null projectId means workflow-level page (no
+    // single project to scope to). Side panel shows running
+    // tasks across ALL projects via /api/tasks/?status=running.
+    const isCrossProject = !projectId;
+    const _url = isCrossProject
+      ? '/api/tasks/?status=running&exclude_archived_tasks=1'
+      : `/api/projects/${encodeURIComponent(projectId)}/tasks/state`;
     // v1.3 hot-fix: poll /tasks/state (light shape covering all
     // statuses), not just /tasks/running. /tasks/running excludes
     // non-running tasks by definition, so a finished task's row
@@ -122,7 +128,7 @@
     // "running" forever. /tasks/state fixes that by returning
     // every visible task with its current status.
     const r = await _fetchWithTimeout(
-      `/api/projects/${encodeURIComponent(projectId)}/tasks/state`,
+      _url,
       {},
       4000,
     );
@@ -131,7 +137,10 @@
       return;
     }
     const body = await r.json();
-    const allStates = body.tasks || [];
+    const rawTasks = body.tasks || [];
+    const allStates = isCrossProject
+      ? rawTasks.map(_normalizeTaskToStateShape)
+      : rawTasks;
     runningCache = new Map(allStates.map((t) => [t.task_id, t]));
     // Side panel: filter to running only (matches the old
     // /tasks/running endpoint behavior; non-running tasks are
@@ -142,6 +151,34 @@
     // currently-running and just-finished tasks so the row pill
     // text + class stays in sync with the server).
     _updateAllBadges();
+  }
+
+
+  // v1.5: normalize a /api/tasks/?status=running row (full Task
+  // pydantic model dump) to the light shape used by the rest of
+  // task_progress.js. Same shape as the per-project /tasks/state
+  // endpoint so the downstream pipeline doesn't care which
+  // source the data came from. loop_status / loop_reason are
+  // not pre-computed for the cross-project list (that would
+  // require N compute_loop_status calls server-side for every
+  // poll) — the side panel doesn't use them and there's no row
+  // on the workflow page to badge.
+  function _normalizeTaskToStateShape(t) {
+    return {
+      task_id: t.id,
+      project_id: t.project_id,
+      name: t.name || '',
+      status: t.status || '',
+      agent_role: t.agent_role || '',
+      loop_status: 'ok',
+      loop_reason: t.status === 'running'
+        ? 'liveness OK'
+        : 'task is ' + (t.status || '?'),
+      duration_s: 0,
+      last_event_age_s: null,
+      started_at: t.started_at,
+      last_liveness_at: t.last_liveness_at,
+    };
   }
 
   function _seedFromDom() {
