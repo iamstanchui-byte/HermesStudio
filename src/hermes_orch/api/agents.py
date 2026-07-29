@@ -6,6 +6,7 @@ Endpoints:
 - GET    /api/agents/{id}                  — get one agent + profiles
 - PUT    /api/agents/{id}                  — update agent metadata (ip, os_type)
 - DELETE /api/agents/{id}                  — delete agent
+- POST   /api/agents/{id}/secret           — set/push the HMAC shared secret (v1.6 bootstrap)
 - POST   /api/agents/{id}/heartbeat        — agent heartbeat (HMAC-authed)
 - POST   /api/agents/{id}/rotate-key        — rotate secret
 - POST   /api/agents/{id}/profiles         — add new profile
@@ -20,8 +21,11 @@ Endpoints:
 - POST   /api/agents/{id}/profiles/{name}/skills            — create or update a skill
 - DELETE /api/agents/{id}/profiles/{name}/skills/{name}     — delete a skill (via empty-content config)
 
-Auth (per §6.1): HMAC-SHA256 with X-Agent-Id, X-Timestamp, X-Signature.
-For MVP, heartbeat verifies presence of headers (real HMAC check TODO).
+Auth (per §6.1, v1.6 enforced): HMAC-SHA256 with X-Agent-Id, X-Timestamp, X-Signature.
+The signature binds (method, path, body_sha256, timestamp) so captured
+requests can't be replayed. See src/hermes_orch/auth/hmac.py for the
+full scheme. The legacy "X-Signature = SHA256(secret)" placeholder
+was removed; all wrapper endpoints now require real HMAC.
 """
 from __future__ import annotations
 
@@ -33,8 +37,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
+
+from hermes_orch.auth import require_hmac_auth
 
 from hermes_orch.core.audit import audit_log
 from hermes_orch.utils import now_iso as _now_iso
@@ -349,6 +355,7 @@ async def register_agent(body: AgentRegister, request: Request) -> AgentRegistra
         {
             "id": body.agent_id,
             "secret_hash": secret_hash,
+            "hmac_secret": secret,  # v1.6: plaintext for HMAC verify
             "ip": body.ip,
             "os_type": body.os_type,
             "status": "verifying",
@@ -385,6 +392,92 @@ async def register_agent(body: AgentRegister, request: Request) -> AgentRegistra
     )
 
 
+class AgentSecretSetBody(BaseModel):
+    """Body for POST /api/agents/{id}/secret (v1.6 HMAC bootstrap).
+
+    Wrappers (or admins) call this once per agent to push the
+    shared HMAC secret into the DB. After this, the agent's
+    hmac_secret column is set and all subsequent wrapper requests
+    are HMAC-verified.
+    """
+    secret: str = Field(min_length=16, max_length=256)
+
+
+@router.post("/{agent_id}/secret")
+async def set_agent_secret(
+    agent_id: str, body: AgentSecretSetBody, request: Request
+) -> dict:
+    """One-shot HMAC secret bootstrap (v1.6, 2026-07-29).
+
+    Pushes the wrapper's shared secret into the DB so the server
+    can verify HMAC signatures on subsequent requests. This
+    endpoint is the ONLY one that doesn't itself require HMAC —
+    it's the bootstrap call.
+
+    Behavior:
+      - 404 if agent doesn't exist
+      - 201 {"status": "set"} if hmac_secret was NULL (first call)
+      - 200 {"status": "already_set", "match": true} if hmac_secret
+        was already set AND matches the provided secret (idempotent
+        retry; safe for the wrapper to call on every start)
+      - 409 {"status": "conflict"} if hmac_secret was set AND
+        doesn't match (someone else has a different secret; the
+        wrapper's local secret is out of sync; operator must fix)
+
+    This endpoint is intentionally unauthenticated for the local
+    network threat model: any caller on the network can claim to
+    be agent X and push a secret. The protection is the one-shot
+    nature — the first valid call wins, subsequent calls are
+    rejected unless the secret matches. Audit log records the
+    caller's IP and any X-Agent-Id header.
+    """
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT id, hmac_secret FROM agents WHERE id = ?", (agent_id,)
+    )
+    if not row:
+        raise HTTPException(404, f"Agent not found: {agent_id}")
+
+    existing = row.get("hmac_secret")
+    now = _now_iso()
+    caller_agent_id = request.headers.get("X-Agent-Id", "")
+
+    if existing is None:
+        await db.execute(
+            "UPDATE agents SET hmac_secret = ? WHERE id = ?",
+            (body.secret, agent_id),
+        )
+        await audit_log(
+            db, "agent.hmac_secret_set",
+            actor=f"bootstrap:{caller_agent_id or 'unknown'}",
+            agent_id=agent_id,
+            payload={"first_set": True, "remote_addr": request.client.host if request.client else None},
+        )
+        return {"status": "set", "agent_id": agent_id}
+
+    if existing == body.secret:
+        await audit_log(
+            db, "agent.hmac_secret_reverify",
+            actor=f"bootstrap:{caller_agent_id or 'unknown'}",
+            agent_id=agent_id,
+            payload={"match": True, "remote_addr": request.client.host if request.client else None},
+        )
+        return {"status": "already_set", "match": True, "agent_id": agent_id}
+
+    # Conflict: someone else has a different secret.
+    await audit_log(
+        db, "agent.hmac_secret_conflict",
+        actor=f"bootstrap:{caller_agent_id or 'unknown'}",
+        agent_id=agent_id,
+        payload={"remote_addr": request.client.host if request.client else None},
+    )
+    raise HTTPException(
+        409,
+        f"Agent {agent_id} already has a different hmac_secret. "
+        "Use POST /api/agents/{id}/rotate-key to change it (v1.6.1+).",
+    )
+
+
 @router.get("/")
 async def list_agents(request: Request) -> dict:
     """List all agents (with profiles)."""
@@ -411,8 +504,16 @@ async def list_agents(request: Request) -> dict:
 
 
 @router.get("/{agent_id}", response_model=Agent)
-async def get_agent(agent_id: str, request: Request) -> Agent:
-    """Get agent + profiles."""
+async def get_agent(
+    agent_id: str,
+    request: Request,
+    x_agent_id: str = Depends(require_hmac_auth),
+) -> Agent:
+    """Get agent + profiles (v1.6: HMAC-authed)."""
+    if x_agent_id != agent_id:
+        raise HTTPException(
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+        )
     db = request.app.state.db
     return await _agent_with_profiles(db, agent_id)
 
@@ -446,30 +547,33 @@ async def update_agent(agent_id: str, body: AgentUpdate, request: Request) -> Ag
 async def heartbeat(
     agent_id: str,
     request: Request,
-    x_agent_id: str | None = Header(default=None, alias="X-Agent-Id"),
-    x_timestamp: str | None = Header(default=None, alias="X-Timestamp"),
-    x_signature: str | None = Header(default=None, alias="X-Signature"),
+    x_agent_id: str = Depends(require_hmac_auth),
 ) -> dict:
-    """Agent heartbeat. HMAC-authed (per §6.1).
+    """Agent heartbeat. HMAC-authed (v1.6).
 
-    For MVP: verifies presence of X-Agent-Id/X-Timestamp/X-Signature headers.
-    Real HMAC signature verification TODO (when wrapper sends real requests).
+    Verifies the X-Agent-Id / X-Timestamp / X-Signature headers via
+    require_hmac_auth, and that X-Agent-Id matches the URL path
+    agent_id (so a wrapper can't heartbeat on behalf of another
+    agent even with a valid signature).
 
     Returns list of tasks currently assigned to this agent.
     """
-    if not x_agent_id or not x_timestamp or not x_signature:
+    if x_agent_id != agent_id:
         raise HTTPException(
-            401, "Missing auth headers (X-Agent-Id, X-Timestamp, X-Signature)"
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
         )
 
     db = request.app.state.db
     agent = await db.fetchone("SELECT * FROM agents WHERE id = ?", (agent_id,))
     if not agent:
         raise HTTPException(404, f"Agent not found: {agent_id}")
-    if agent["id"] != x_agent_id:
-        raise HTTPException(401, "X-Agent-Id does not match URL")
 
-    # Optional body
+    # Optional body. Note: the HMAC dep already read request.body()
+    # to verify the signature. We need to parse the JSON from the
+    # raw bytes — but request.body() can only be read once. Use
+    # json.loads on the bytes we already read; OR re-read if needed.
+    # Simpler: parse from a fresh await request.body() — the cache
+    # means subsequent calls return the same bytes.
     body_data: dict[str, Any] = {}
     try:
         body_bytes = await request.body()
@@ -1024,12 +1128,20 @@ async def create_config(
     response_model=ProfileConfig | None,
 )
 async def claim_pending_config(
-    agent_id: str, profile_name: str, request: Request
+    agent_id: str,
+    profile_name: str,
+    request: Request,
+    x_agent_id: str = Depends(require_hmac_auth),
 ) -> ProfileConfig | None:
     """Wrapper poll: atomically claim the oldest pending config.
 
     Marks status='applying' so other polls don't grab it. Returns None if none.
+    v1.6: HMAC-authed.
     """
+    if x_agent_id != agent_id:
+        raise HTTPException(
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+        )
     db = request.app.state.db
     profile = await _find_profile(db, agent_id, profile_name)
 
@@ -1075,8 +1187,16 @@ async def ack_config(
     cfg_id: str,
     body: ProfileConfigAck,
     request: Request,
+    x_agent_id: str = Depends(require_hmac_auth),
 ) -> ProfileConfig:
-    """Wrapper ack after attempting to write the file. status=applied|failed."""
+    """Wrapper ack after attempting to write the file. status=applied|failed.
+
+    v1.6: HMAC-authed.
+    """
+    if x_agent_id != agent_id:
+        raise HTTPException(
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+        )
     db = request.app.state.db
     profile = await _find_profile(db, agent_id, profile_name)
 
@@ -1124,8 +1244,11 @@ async def session_cleanup_ack(
     agent_id: str,
     session_id: str,
     request: Request,
+    x_agent_id: str = Depends(require_hmac_auth),
 ) -> dict:
     """Wrapper called this after deleting the hermes session locally.
+
+    v1.6: HMAC-authed. X-Agent-Id must match the URL agent_id.
 
     Flips the matching project_sessions row from `pending_cleanup` to
     `deleted`. Idempotent: if the row is already `deleted` (e.g. another
@@ -1136,6 +1259,10 @@ async def session_cleanup_ack(
     the wrapper's own, but the wrapper's role is the one that owned the
     hermes session in its local backend).
     """
+    if x_agent_id != agent_id:
+        raise HTTPException(
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+        )
     db = request.app.state.db
     # Match against project_sessions rows where the session_id is owned
     # by a profile belonging to this agent.
@@ -1289,20 +1416,14 @@ def _row_to_skill(row: dict[str, Any], include_content: bool = False) -> SkillIn
     response_model=list[SkillInfo],
 )
 async def list_skills(
-    agent_id: str, profile_name: str, request: Request
+    agent_id: str, profile_name: str, request: Request,
+    x_agent_id: str = Depends(require_hmac_auth),
 ) -> list[SkillInfo]:
-    """List all skills known for this profile, with their latest status.
-
-    Iterates profile_configs rows with file_path LIKE 'skills/%', groups by
-    skill name, and returns the newest version of each. The returned status
-    reflects what the wrapper last did (applied/deleted/pending/etc).
-
-    Skills that have been deleted (applied with empty content) are filtered
-    out — there's no point showing them in the dashboard. The raw delete
-    config row is still in profile_configs for audit purposes; get_skill
-    by name still returns it (handy for debugging "why is this gone?").
-    Pass `?include_deleted=1` to include them.
-    """
+    """List all skills known for this profile, with their latest status (v1.6: HMAC)."""
+    if x_agent_id != agent_id:
+        raise HTTPException(
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+        )
     db = request.app.state.db
     profile = await _find_profile(db, agent_id, profile_name)
     # Sort: flat skills first (alphabetical), then subfolder skills
@@ -1350,9 +1471,14 @@ async def list_skills(
     response_model=SkillInfo,
 )
 async def get_skill(
-    agent_id: str, profile_name: str, skill_name: str, request: Request
+    agent_id: str, profile_name: str, skill_name: str, request: Request,
+    x_agent_id: str = Depends(require_hmac_auth),
 ) -> SkillInfo:
-    """Get the latest version of a single skill, including its content."""
+    """Get the latest version of a single skill, including its content (v1.6: HMAC)."""
+    if x_agent_id != agent_id:
+        raise HTTPException(
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+        )
     db = request.app.state.db
     profile = await _find_profile(db, agent_id, profile_name)
     name = _validate_skill_name(skill_name)
@@ -1368,33 +1494,14 @@ async def get_skill(
     status_code=201,
 )
 async def create_or_update_skill(
-    agent_id: str, profile_name: str, body: SkillCreate, request: Request, response: Response
+    agent_id: str, profile_name: str, body: SkillCreate, request: Request, response: Response,
+    x_agent_id: str = Depends(require_hmac_auth),
 ) -> ProfileConfig:
-    """Create or update a skill (UPSERT by content SHA).
-
-    If the latest row for (profile_id, file_path) already has the same
-    `desired_sha256` as the new submission, return that row with HTTP 200
-    and skip the INSERT. This is defense-in-depth against runaway
-    re-upload loops (2026-07-25: list_skills SQL bug caused 35k duplicate
-    rows because the wrapper's SHA cache was stale). Now even if the
-    SHA cache is wrong, the server will not let duplicates pile up.
-
-    On a real change (different SHA), insert a new profile_configs row
-    with status=pending. The wrapper picks it up on its next tick,
-    writes the file to `<profile_root>/skills/<name>.md`, and acks.
-    Use empty content to mark a skill for deletion (wrapper removes
-    the file from the agent host).
-
-    Status codes:
-      - 201 Created: new row inserted (content differs from latest).
-      - 200 OK:      no-op, content matches latest row's SHA.
-
-    When the caller is the wrapper pushing a self-taught skill (e.g. agent
-    just learned a new capability and wrote `skills/foo.md` on its own host),
-    set header `X-Skill-Source: self-taught` to mark the audit log as
-    wrapper-initiated rather than operator-initiated.
-    """
-    db = request.app.state.db
+    """Create or update a skill (UPSERT by content SHA, v1.6: HMAC)."""
+    if x_agent_id != agent_id:
+        raise HTTPException(
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+        )
     profile = await _find_profile(db, agent_id, profile_name)
     name = _validate_skill_name(body.name)
     content = body.content or ""
@@ -1510,16 +1617,14 @@ async def request_skill_sync(
     status_code=201,
 )
 async def delete_skill(
-    agent_id: str, profile_name: str, skill_name: str, request: Request
+    agent_id: str, profile_name: str, skill_name: str, request: Request,
+    x_agent_id: str = Depends(require_hmac_auth),
 ) -> ProfileConfig:
-    """Delete a skill.
-
-    Implementation note: instead of mutating history, we append a new
-    profile_configs entry with empty content. The wrapper treats empty
-    content for a skills/ path as a delete-on-host (file is removed).
-    This keeps the wrapper-mediated sync pattern uniform: the dashboard
-    just writes intent, and the wrapper reconciles.
-    """
+    """Delete a skill (v1.6: HMAC)."""
+    if x_agent_id != agent_id:
+        raise HTTPException(
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+        )
     db = request.app.state.db
     profile = await _find_profile(db, agent_id, profile_name)
     name = _validate_skill_name(skill_name)
@@ -1566,25 +1671,13 @@ async def copy_skill_to_profile(
     skill_name: str,
     to_profile: str,
     request: Request,
+    x_agent_id: str = Depends(require_hmac_auth),
 ) -> ProfileConfig:
-    """Copy a skill from one profile to another (same agent).
-
-    Reads the source skill's desired_content from profile_configs and
-    writes a new pending row for the target profile with the same
-    content. The wrapper on the target host will pick up the pending
-    row and write the file to disk. The source profile is unchanged
-    (copy, not move).
-
-    Optional body: { "overwrite": false } — if true, allows overwriting
-    an existing skill with the same name on the target profile. Default
-    false (returns 409 if target already has this skill).
-
-    Path layout: the source skill's file_path is preserved (e.g.
-    `skills/productivity/xlsx/SKILL.md` → target gets the SAME
-    file_path). The target wrapper will create the subfolder on disk
-    if it doesn't exist.
-    """
-    db = request.app.state.db
+    """Copy a skill from one profile to another (same agent, v1.6: HMAC)."""
+    if x_agent_id != agent_id:
+        raise HTTPException(
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+        )
     # Read source
     src_profile = await _find_profile(db, agent_id, profile_name)
     src_cfg = await _latest_skill_config(db, src_profile["id"], skill_name)

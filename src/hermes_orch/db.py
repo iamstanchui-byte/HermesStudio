@@ -27,7 +27,16 @@ CREATE TABLE IF NOT EXISTS agents (
     os_type TEXT,
     status TEXT NOT NULL DEFAULT 'verifying',
     last_heartbeat_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- Real HMAC shared secret (v1.6, 2026-07-29). Plaintext; needed
+    -- server-side to recompute the signature for each request. NULL
+    -- for agents that haven't been bootstrapped yet (legacy mode).
+    -- Populated by either:
+    --   - register_agent (for new agents; stored alongside the hash)
+    --   - POST /api/agents/{id}/secret (admin-side, one-shot migration
+    --     of an existing agent from its .secret-<id> file)
+    -- See src/hermes_orch/auth/hmac.py for the verification scheme.
+    hmac_secret TEXT
 );
 
 CREATE TABLE IF NOT EXISTS agent_profiles (
@@ -512,6 +521,14 @@ MIGRATIONS = [
     # a thing. The 'duplicate column' error is caught silently in
     # connect() so the migration is idempotent.
     "ALTER TABLE projects ADD COLUMN plan_json TEXT DEFAULT NULL",
+    # ===== HMAC agent auth (v1.6, 2026-07-29) =====
+    # Per-agent shared secret stored plaintext (needed for HMAC verify
+    # on the server side). See src/hermes_orch/auth/hmac.py for the
+    # full scheme. Populated by register_agent (new agents) or
+    # POST /api/agents/{id}/secret (admin migration). NULL for
+    # legacy agents that haven't bootstrapped yet — those are still
+    # accepted if HERMES_HMAC_REQUIRED is unset.
+    "ALTER TABLE agents ADD COLUMN hmac_secret TEXT",
 ]
 
 

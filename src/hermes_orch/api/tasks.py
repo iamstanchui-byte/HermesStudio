@@ -27,7 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from hermes_orch.auth import require_hmac_auth
 from pydantic import BaseModel, Field
 
 
@@ -442,14 +443,27 @@ async def assign_task(task_id: str, body: TaskAssign, request: Request) -> Task:
 
 
 @router.post("/{task_id}/start", response_model=Task)
-async def start_task(task_id: str, request: Request) -> Task:
-    """Agent acks the task and starts running (assigned → running)."""
+async def start_task(
+    task_id: str,
+    request: Request,
+    agent_id: str = Depends(require_hmac_auth),
+) -> Task:
+    """Agent acks the task and starts running (assigned → running).
+
+    v1.6: HMAC-authed. The X-Agent-Id (verified via require_hmac_auth)
+    must match task.assigned_agent_id.
+    """
     db = request.app.state.db
     task = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
     if not task:
         raise HTTPException(404, f"Task not found: {task_id}")
     if task["status"] != "assigned":
         raise HTTPException(400, f"Task not in assigned state: {task['status']}")
+    if task.get("assigned_agent_id") != agent_id:
+        raise HTTPException(
+            403,
+            f"X-Agent-Id ({agent_id}) is not the owner of task {task_id}",
+        )
 
     now = _now_iso()
     # started_at is set the first time the task flips to 'running' and
@@ -481,12 +495,24 @@ async def start_task(task_id: str, request: Request) -> Task:
 # primary path the wrapper uses.
 @router.get("/{task_id}/poll")
 @router.post("/{task_id}/poll")
-async def poll_task(task_id: str, request: Request) -> dict:
-    """Agent polls for liveness. Updates last_liveness_at."""
+async def poll_task(
+    task_id: str,
+    request: Request,
+    agent_id: str = Depends(require_hmac_auth),
+) -> dict:
+    """Agent polls for liveness. Updates last_liveness_at.
+
+    v1.6: HMAC-authed. The X-Agent-Id must match task.assigned_agent_id.
+    """
     db = request.app.state.db
     task = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
     if not task:
         raise HTTPException(404, f"Task not found: {task_id}")
+    if task.get("assigned_agent_id") != agent_id:
+        raise HTTPException(
+            403,
+            f"X-Agent-Id ({agent_id}) is not the owner of task {task_id}",
+        )
     if task["status"] != "running":
         return {"status": task["status"], "should_stop": True}
 
@@ -499,8 +525,16 @@ async def poll_task(task_id: str, request: Request) -> dict:
 
 
 @router.post("/{task_id}/result", response_model=Task)
-async def submit_result(task_id: str, body: TaskResult, request: Request) -> Task:
-    """Agent submits task result (running → completed | failed)."""
+async def submit_result(
+    task_id: str,
+    body: TaskResult,
+    request: Request,
+    agent_id: str = Depends(require_hmac_auth),
+) -> Task:
+    """Agent submits task result (running → completed | failed).
+
+    v1.6: HMAC-authed. The X-Agent-Id must match task.assigned_agent_id.
+    """
     db = request.app.state.db
     if body.status not in ("completed", "failed"):
         raise HTTPException(400, f"Invalid result status: {body.status}")
@@ -511,6 +545,11 @@ async def submit_result(task_id: str, body: TaskResult, request: Request) -> Tas
         raise HTTPException(404, f"Task not found: {task_id}")
     if task["status"] != "running":
         raise HTTPException(400, f"Task not in running state: {task['status']}")
+    if task.get("assigned_agent_id") != agent_id:
+        raise HTTPException(
+            403,
+            f"X-Agent-Id ({agent_id}) is not the owner of task {task_id}",
+        )
 
     # Store result as JSON
     import json

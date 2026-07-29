@@ -345,14 +345,95 @@ def _atomic_write(target: Path, content: str) -> None:
 # local filesystem doesn't have the projects_root path. Going through HTTP
 # works regardless of where the wrapper is running.
 
-def _hmac_headers(agent_id: str, secret: str) -> dict:
+def _hmac_headers(
+    agent_id: str, secret: str, *, method: str = "GET", path: str = "", body: bytes = b""
+) -> dict:
+    """Build HMAC-signed headers for a wrapper request (v1.6+).
+
+    The signature binds (method, path, sha256(body), timestamp) so
+    captured requests can't be replayed against a different endpoint
+    or with a different body. The server-side verify is in
+    src/hermes_orch/auth/hmac.py (the same `string_to_sign` format).
+
+    Used by:
+      - _fetch_project_state_http / _fetch_user_recent_http /
+        _fetch_project_facts_http (GET, no body) — these pass defaults
+      - heartbeat (POST with optional JSON body) — call site passes
+        method="POST" + path + body
+      - all other wrapper endpoints — call site passes method/path/body
+
+    Args:
+      agent_id: the agent id (goes into X-Agent-Id)
+      secret: the shared secret (read from .secret-<id> file)
+      method: HTTP method (default GET for backwards compat with
+        the 3 fetch helpers that don't pass it)
+      path: request path including query string (default "" for
+        helpers that don't need it — but the server's verify will
+        still pass because empty path matches empty path)
+      body: raw request body bytes (default b"")
+    """
     import time as _t
-    import hashlib as _h
+    from hermes_orch.auth import compute_signature
+    ts = str(int(_t.time()))
+    sig = compute_signature(secret, method, path, body, ts)
     return {
         "X-Agent-Id": agent_id,
-        "X-Timestamp": str(int(_t.time())),
-        "X-Signature": _h.sha256(secret.encode()).hexdigest(),
+        "X-Timestamp": ts,
+        "X-Signature": sig,
     }
+
+
+def _bootstrap_hmac_secret(orchestrator_url: str, agent_id: str, secret: str) -> None:
+    """Push the local secret to the orchestrator's hmac_secret column.
+
+    Called from start() on every wrapper start. The endpoint is
+    one-shot:
+      - 201 {"status": "set"}        -> first call, secret stored
+      - 200 {"status": "already_set", "match": true} -> same secret, no-op
+      - 409 {"status": "conflict"}   -> different secret, loud error
+
+    We log success quietly and surface 409s as a hard failure
+    (the operator must reconcile before the wrapper can do useful
+    work; without matching secrets, every signed request 401s).
+    """
+    import time as _t
+    path = f"/api/agents/{agent_id}/secret"
+    body = json.dumps({"secret": secret}).encode("utf-8")
+    # The bootstrap endpoint isn't HMAC-authed (it IS the bootstrap),
+    # so we sign it with a dummy value. But the server doesn't
+    # check HMAC on this endpoint — it just reads the body. So we
+    # can omit the signature header (the server doesn't require it).
+    try:
+        r = httpx.post(
+            f"{orchestrator_url}{path}",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                # X-Agent-Id is required (the endpoint reads it for
+                # audit logging, not for auth).
+                "X-Agent-Id": agent_id,
+            },
+            timeout=10,
+        )
+        if r.status_code in (200, 201):
+            click.echo(f"  [hmac] secret synced to orchestrator ({r.json().get('status')})")
+        elif r.status_code == 409:
+            raise click.ClickException(
+                f"HMAC secret conflict: orchestrator has a different hmac_secret for "
+                f"agent {agent_id} than the local file. The local .secret-{agent_id} "
+                f"was likely rotated without telling the orchestrator. Fix with "
+                f"POST /api/agents/{agent_id}/rotate-key (v1.6.1+ — manual DB update "
+                f"for now: DELETE from agents where id='{agent_id}' then re-register)."
+            )
+        else:
+            click.echo(
+                f"  [hmac] WARNING: bootstrap returned {r.status_code} {r.text[:200]}"
+            )
+    except httpx.HTTPError as e:
+        # Network errors are non-fatal — the wrapper will still try
+        # to heartbeat, and if HMAC is required the heartbeat will
+        # 401 with a clearer error.
+        click.echo(f"  [hmac] bootstrap network error (non-fatal): {e}")
 
 
 def _stream_throttle_loop(
@@ -442,7 +523,11 @@ def _fetch_project_state_http(
     try:
         r = httpx.get(
             f"{orchestrator_url}/api/projects/{project_id}/memory/state",
-            headers=_hmac_headers(agent_id, secret),
+            headers=_hmac_headers(
+                agent_id, secret,
+                method="GET",
+                path=f"/api/projects/{project_id}/memory/state",
+            ),
             timeout=10,
         )
     except Exception as e:
@@ -474,7 +559,11 @@ def _fetch_user_recent_http(
     try:
         r = httpx.get(
             f"{orchestrator_url}/api/projects/memory/recent",
-            headers=_hmac_headers(agent_id, secret),
+            headers=_hmac_headers(
+                agent_id, secret,
+                method="GET",
+                path="/api/projects/memory/recent",
+            ),
             timeout=10,
         )
     except Exception as e:
@@ -506,7 +595,11 @@ def _fetch_project_facts_http(
     try:
         r = httpx.get(
             f"{orchestrator_url}/api/projects/{project_id}/memory/facts",
-            headers=_hmac_headers(agent_id, secret),
+            headers=_hmac_headers(
+                agent_id, secret,
+                method="GET",
+                path=f"/api/projects/{project_id}/memory/facts",
+            ),
             timeout=10,
         )
     except Exception as e:
@@ -1296,6 +1389,14 @@ def start(
     if not secret:
         raise click.ClickException(f"Secret file {secret_path} is empty")
 
+    # v1.6 HMAC bootstrap: on every start, push the local secret to
+    # the orchestrator so it can verify our signatures. The
+    # endpoint is one-shot: first call sets hmac_secret, subsequent
+    # calls with the same value are no-ops, mismatched values get
+    # 409 (the operator must rotate to change secrets). This means
+    # the wrapper self-heals if the orchestrator's DB was wiped.
+    _bootstrap_hmac_secret(orchestrator_url, agent_id, secret)
+
     # Auto-sync config from orchestrator (picks up newly added roles)
     if not no_sync:
         click.echo("[daemon] syncing config from orchestrator...")
@@ -1303,11 +1404,11 @@ def start(
         try:
             r = httpx.get(
                 f"{orchestrator_url}/api/agents/{agent_id}",
-                headers={
-                    "X-Agent-Id": agent_id,
-                    "X-Timestamp": str(int(time_mod.time())),
-                    "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-                },
+                headers=_hmac_headers(
+                    agent_id, secret,
+                    method="GET",
+                    path=f"/api/agents/{agent_id}",
+                ),
                 timeout=10,
             )
             if r.status_code == 200:
@@ -1355,12 +1456,19 @@ def start(
     except (AttributeError, ValueError):
         pass  # Windows quirks
 
-    def _auth_headers() -> dict:
+    def _auth_headers(method: str, path: str, body: bytes = b"") -> dict:
+        """Sign a request with the agent's HMAC secret (v1.6+).
+
+        The signature binds (method, path, body, timestamp) so captured
+        requests can't be replayed against a different endpoint.
+        """
+        from hermes_orch.auth import compute_signature
+        ts = str(int(time_mod.time()))
+        sig = compute_signature(secret, method, path, body, ts)
         return {
             "X-Agent-Id": agent_id,
-            "X-Timestamp": str(int(time_mod.time())),
-            # Real HMAC TODO; this is the placeholder the orchestrator accepts
-            "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
+            "X-Timestamp": ts,
+            "X-Signature": sig,
         }
 
     def _heartbeat() -> tuple[list[dict], list[str]]:
@@ -1407,13 +1515,18 @@ def start(
                 "mcp_servers": meta["mcp_servers"],
             })
         try:
+            _heartbeat_body = json.dumps({
+                "status": "idle",
+                "profiles": profile_meta,
+            }).encode("utf-8")
             r = httpx.post(
                 f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
-                headers=_auth_headers(),
-                json={
-                    "status": "idle",
-                    "profiles": profile_meta,
-                },
+                headers=_auth_headers(
+                    "POST",
+                    f"/api/agents/{agent_id}/heartbeat",
+                    _heartbeat_body,
+                ),
+                content=_heartbeat_body,
                 timeout=10,
             )
             if r.status_code != 200:
@@ -1499,7 +1612,7 @@ def start(
             try:
                 httpx.post(
                     f"{orchestrator_url}/api/agents/{agent_id}/sessions/{sid}/cleanup-ack",
-                    headers=_auth_headers(),
+                    headers=_auth_headers('POST', '/api/agents/{agent_id}/sessions/{sid}/cleanup-ack'),
                     timeout=10,
                 )
             except Exception as e:
@@ -1510,7 +1623,7 @@ def start(
         try:
             r = httpx.post(
                 f"{orchestrator_url}/api/tasks/{task_id}/start",
-                headers=_auth_headers(),
+                headers=_auth_headers('POST', '/api/tasks/{task_id}/start'),
                 timeout=10,
             )
             if r.status_code != 200:
@@ -1525,7 +1638,7 @@ def start(
         try:
             r = httpx.post(
                 f"{orchestrator_url}/api/tasks/{task_id}/result",
-                headers=_auth_headers(),
+                headers=_auth_headers('POST', '/api/tasks/{task_id}/result'),
                 json=result,
                 timeout=10,
             )
@@ -1612,13 +1725,13 @@ def start(
                 continue
             try:
                 rel = parent_output.lstrip("/").replace("\\", "/")
+                _file_path_p = f"/api/projects/{project_id}/files/{rel}"
                 r = httpx.get(
-                    f"{orchestrator_url}/api/projects/{project_id}/files/{rel}",
-                    headers={
-                        "X-Agent-Id": agent_id,
-                        "X-Timestamp": str(int(time_mod.time())),
-                        "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-                    },
+                    f"{orchestrator_url}{_file_path_p}",
+                    headers=_hmac_headers(
+                        agent_id, secret,
+                        method="GET", path=_file_path_p,
+                    ),
                     timeout=30,
                 )
                 if r.status_code == 200:
@@ -1690,11 +1803,11 @@ def start(
                 try:
                     r = httpx.get(
                         f"{orchestrator_url}/api/tasks/{parent_id}",
-                        headers={
-                            "X-Agent-Id": agent_id,
-                            "X-Timestamp": str(int(time_mod.time())),
-                            "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-                        },
+                        headers=_hmac_headers(
+                            agent_id, secret,
+                            method="GET",
+                            path=f"/api/tasks/{parent_id}",
+                        ),
                         timeout=10,
                     )
                     if r.status_code == 200:
@@ -1876,11 +1989,11 @@ def start(
                 r = httpx.get(
                     f"{orchestrator_url}/api/projects/{project_id}/session",
                     params={"role": role},
-                    headers={
-                        "X-Agent-Id": agent_id,
-                        "X-Timestamp": str(int(time_mod.time())),
-                        "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-                    },
+                    headers=_hmac_headers(
+                        agent_id, secret,
+                        method="GET",
+                        path=f"/api/projects/{project_id}/session?role={role}",
+                    ),
                     timeout=10,
                 )
                 if r.status_code == 200:
@@ -1974,11 +2087,11 @@ def start(
                 try:
                     r = httpx.post(
                         f"{orchestrator_url}/api/tasks/{tid}/poll",
-                        headers={
-                            "X-Agent-Id": agent_id,
-                            "X-Timestamp": str(int(time_mod.time())),
-                            "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-                        },
+                        headers=_hmac_headers(
+                            agent_id, secret,
+                            method="POST",
+                            path=f"/api/tasks/{tid}/poll",
+                        ),
                         timeout=5,
                     )
                     if r.status_code == 200:
@@ -2030,15 +2143,20 @@ def start(
                 return
             _seq[stream] += 1
             try:
+                _output_body = json.dumps({
+                    "seq": _seq[stream],
+                    "text": text,
+                    "stream": stream,
+                }).encode("utf-8")
                 httpx.post(
                     f"{orchestrator_url}/api/projects/{project_id}"
                     f"/tasks/{tid}/output-chunk",
-                    headers=_auth_headers(),
-                    json={
-                        "seq": _seq[stream],
-                        "text": text,
-                        "stream": stream,
-                    },
+                    headers=_auth_headers(
+                        "POST",
+                        f"/api/projects/{project_id}/tasks/{tid}/output-chunk",
+                        _output_body,
+                    ),
+                    content=_output_body,
                     timeout=5,
                 )
             except Exception as e:
@@ -2102,11 +2220,18 @@ def start(
         _TOOL_CALL_PATTERN = _re.compile(r"┊\s*💻\s+\$\s+(.+)")
         def _post_tool_call(tool: str, signature: str) -> None:
             try:
+                _tool_body = json.dumps(
+                    {"tool": tool, "signature": signature}
+                ).encode("utf-8")
                 httpx.post(
                     f"{orchestrator_url}/api/projects/{project_id}"
                     f"/tasks/{tid}/tool-call",
-                    headers=_auth_headers(),
-                    json={"tool": tool, "signature": signature},
+                    headers=_auth_headers(
+                        "POST",
+                        f"/api/projects/{project_id}/tasks/{tid}/tool-call",
+                        _tool_body,
+                    ),
+                    content=_tool_body,
                     timeout=5,
                 )
             except Exception as e:
@@ -2232,14 +2357,18 @@ def start(
                     new_sid = m.group(1).rstrip(".,;:")
                     if new_sid and not new_sid.startswith("-"):
                         try:
+                            _session_body = json.dumps(
+                                {"session_id": new_sid, "role": role}
+                            ).encode("utf-8")
                             httpx.post(
                                 f"{orchestrator_url}/api/projects/{project_id}/session",
-                                headers={
-                                    "X-Agent-Id": agent_id,
-                                    "X-Timestamp": str(int(time_mod.time())),
-                                    "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-                                },
-                                json={"session_id": new_sid, "role": role},
+                                headers=_hmac_headers(
+                                    agent_id, secret,
+                                    method="POST",
+                                    path=f"/api/projects/{project_id}/session",
+                                    body=_session_body,
+                                ),
+                                content=_session_body,
                                 timeout=10,
                             )
                             click.echo(f"  saved session: {new_sid}")
@@ -2283,14 +2412,15 @@ def start(
                             # Upload to orchestrator (relative path)
                             rel = output_path.lstrip("/").replace("\\", "/")
                             try:
+                                _file_path = f"/api/projects/{project_id}/files/{rel}"
                                 r = httpx.put(
-                                    f"{orchestrator_url}/api/projects/{project_id}/files/{rel}",
+                                    f"{orchestrator_url}{_file_path}",
                                     content=file_bytes,
-                                    headers={
-                                        "X-Agent-Id": agent_id,
-                                        "X-Timestamp": str(int(time_mod.time())),
-                                        "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-                                    },
+                                    headers=_hmac_headers(
+                                        agent_id, secret,
+                                        method="PUT", path=_file_path,
+                                        body=file_bytes,
+                                    ),
                                     timeout=60,
                                 )
                                 if r.status_code == 200:
@@ -2431,14 +2561,15 @@ def start(
                                 continue
                             file_sha = hashlib.sha256(file_bytes).hexdigest()
                             try:
+                                _file_path2 = f"/api/projects/{project_id}/files/{rel}"
                                 r2 = httpx.put(
-                                    f"{orchestrator_url}/api/projects/{project_id}/files/{rel}",
+                                    f"{orchestrator_url}{_file_path2}",
                                     content=file_bytes,
-                                    headers={
-                                        "X-Agent-Id": agent_id,
-                                        "X-Timestamp": str(int(time_mod.time())),
-                                        "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-                                    },
+                                    headers=_hmac_headers(
+                                        agent_id, secret,
+                                        method="PUT", path=_file_path2,
+                                        body=file_bytes,
+                                    ),
                                     timeout=60,
                                 )
                                 if r2.status_code == 200:
@@ -2594,7 +2725,10 @@ def start(
         try:
             r = client.get(
                 f"{orchestrator_url}/api/agents/{agent_id}/profiles/{pname}/skills?include_deleted=1",
-                headers=_auth_headers(),
+                headers=_auth_headers(
+                    "GET",
+                    f"/api/agents/{agent_id}/profiles/{pname}/skills?include_deleted=1",
+                ),
                 timeout=10,
             )
             r.raise_for_status()
@@ -2685,23 +2819,37 @@ def start(
                     content_text = file_bytes.decode("utf-8", errors="replace")
                 except Exception:
                     content_text = file_bytes.decode("cp1252", errors="replace")
+                _skill_body = json.dumps(
+                    {"name": name, "content": content_text}
+                ).encode("utf-8")
                 r = client.post(
                     f"{orchestrator_url}/api/agents/{agent_id}/profiles/{pname}/skills",
                     headers={
-                        **_auth_headers(),
+                        **_auth_headers(
+                            "POST",
+                            f"/api/agents/{agent_id}/profiles/{pname}/skills",
+                            _skill_body,
+                        ),
                         "X-Skill-Source": "self-taught",
                     },
-                    json={"name": name, "content": content_text},
+                    content=_skill_body,
                     timeout=15,
                 )
                 if r.status_code == 201:
                     cfg_row = r.json()
                     # Immediately ack as applied
                     try:
+                        _ack_body = json.dumps(
+                            {"status": "applied", "actual_sha256": sha}
+                        ).encode("utf-8")
                         client.post(
                             f"{orchestrator_url}/api/agents/{agent_id}/profiles/{pname}/configs/{cfg_row['id']}/ack",
-                            headers=_auth_headers(),
-                            json={"status": "applied", "actual_sha256": sha},
+                            headers=_auth_headers(
+                                "POST",
+                                f"/api/agents/{agent_id}/profiles/{pname}/configs/{cfg_row['id']}/ack",
+                                _ack_body,
+                            ),
+                            content=_ack_body,
                             timeout=10,
                         )
                     except Exception as e:
@@ -2748,7 +2896,10 @@ def start(
                             r = client.get(
                                 f"{orchestrator_url}/api/agents/{agent_id}"
                                 f"/profiles/{pname}/configs/pending",
-                                headers=_auth_headers(),
+                                headers=_auth_headers(
+                                    "GET",
+                                    f"/api/agents/{agent_id}/profiles/{pname}/configs/pending",
+                                ),
                             )
                             r.raise_for_status()
                             if not r.content or r.json() is None:
@@ -2773,11 +2924,18 @@ def start(
                                 actual_sha = hashlib.sha256(
                                     f"sync:{n}".encode()
                                 ).hexdigest()
+                                _ack_body2 = json.dumps(
+                                    {"status": "applied", "actual_sha256": actual_sha}
+                                ).encode("utf-8")
                                 ack = client.post(
                                     f"{orchestrator_url}/api/agents/{agent_id}"
                                     f"/profiles/{pname}/configs/{cfg_row['id']}/ack",
-                                    headers=_auth_headers(),
-                                    json={"status": "applied", "actual_sha256": actual_sha},
+                                    headers=_auth_headers(
+                                        "POST",
+                                        f"/api/agents/{agent_id}/profiles/{pname}/configs/{cfg_row['id']}/ack",
+                                        _ack_body2,
+                                    ),
+                                    content=_ack_body2,
                                     timeout=10,
                                 )
                                 ack.raise_for_status()
@@ -2828,11 +2986,18 @@ def start(
                                     f"[daemon] applied {cfg_row['file_path']} "
                                     f"to {pname} (sha={actual_sha[:12]}...)"
                                 )
+                            _ack_body3 = json.dumps(
+                                {"status": "applied", "actual_sha256": actual_sha}
+                            ).encode("utf-8")
                             ack = client.post(
                                 f"{orchestrator_url}/api/agents/{agent_id}"
                                 f"/profiles/{pname}/configs/{cfg_row['id']}/ack",
-                                headers=_auth_headers(),
-                                json={"status": "applied", "actual_sha256": actual_sha},
+                                headers=_auth_headers(
+                                    "POST",
+                                    f"/api/agents/{agent_id}/profiles/{pname}/configs/{cfg_row['id']}/ack",
+                                    _ack_body3,
+                                ),
+                                content=_ack_body3,
                                 timeout=10,
                             )
                             ack.raise_for_status()
@@ -2840,11 +3005,18 @@ def start(
                         except Exception as e:
                             click.echo(f"[daemon] config apply error: {e}")
                             try:
+                                _ack_body4 = json.dumps(
+                                    {"status": "failed", "error": str(e)}
+                                ).encode("utf-8")
                                 client.post(
                                     f"{orchestrator_url}/api/agents/{agent_id}"
                                     f"/profiles/{pname}/configs/{cfg_row['id']}/ack",
-                                    headers=_auth_headers(),
-                                    json={"status": "failed", "error": str(e)},
+                                    headers=_auth_headers(
+                                        "POST",
+                                        f"/api/agents/{agent_id}/profiles/{pname}/configs/{cfg_row['id']}/ack",
+                                        _ack_body4,
+                                    ),
+                                    content=_ack_body4,
                                     timeout=10,
                                 )
                             except Exception:
@@ -3059,11 +3231,11 @@ def sync_config(config_file: str) -> None:
     try:
         r = httpx.get(
             f"{orchestrator_url}/api/agents/{agent_id}",
-            headers={
-                "X-Agent-Id": agent_id,
-                "X-Timestamp": str(int(time_mod.time())),
-                "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-            },
+            headers=_hmac_headers(
+                agent_id, secret,
+                method="GET",
+                path=f"/api/agents/{agent_id}",
+            ),
             timeout=10,
         )
         if r.status_code != 200:
@@ -3162,14 +3334,16 @@ def status() -> None:
     if secret_path.exists() and orchestrator_url:
         secret = secret_path.read_text(encoding="utf-8").strip()
         try:
+            _hb_body = json.dumps({"status": "idle"}).encode("utf-8")
             r = httpx.post(
                 f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
-                headers={
-                    "X-Agent-Id": agent_id,
-                    "X-Timestamp": str(int(time_mod.time())),
-                    "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-                },
-                json={"status": "idle"},
+                headers=_hmac_headers(
+                    agent_id, secret,
+                    method="POST",
+                    path=f"/api/agents/{agent_id}/heartbeat",
+                    body=_hb_body,
+                ),
+                content=_hb_body,
                 timeout=5,
             )
             if r.status_code == 200:
@@ -3207,7 +3381,7 @@ def apply_configs(config_path: str, profile_filter: str | None) -> None:
     """
     cfg = _load_wrapper_config(Path(config_path).expanduser())
     secret = _read_secret(Path(cfg["secret_file"]))
-    headers = _auth_headers(secret)
+    agent_id_for_apply = cfg["agent_id"]
     base = cfg["orchestrator_url"].rstrip("/")
     profiles = cfg.get("profiles", {})
 
@@ -3228,7 +3402,7 @@ def apply_configs(config_path: str, profile_filter: str | None) -> None:
             # Drain all pending for this profile (in case multiple are queued)
             while True:
                 try:
-                    cfg_row = _claim_one(client, base, cfg["agent_id"], pname, headers)
+                    cfg_row = _claim_one(client, base, agent_id_for_apply, pname, secret)
                 except Exception as e:
                     click.echo(f"  poll error: {e}", err=True)
                     break
@@ -3264,14 +3438,14 @@ def apply_configs(config_path: str, profile_filter: str | None) -> None:
                         _atomic_write(target, content)
                         actual_sha = hashlib.sha256(content.encode()).hexdigest()
                         click.echo(f"  wrote {target} (sha={actual_sha[:12]}...)")
-                    _ack(client, base, cfg["agent_id"], pname, cfg_row["id"],
-                         "applied", actual_sha=actual_sha, headers=headers)
+                    _ack(client, base, agent_id_for_apply, pname, cfg_row["id"],
+                         "applied", actual_sha=actual_sha, secret=secret)
                     applied_count += 1
                 except Exception as e:
                     click.echo(f"  write failed: {e}", err=True)
                     try:
-                        _ack(client, base, cfg["agent_id"], pname, cfg_row["id"],
-                             "failed", error=str(e), headers=headers)
+                        _ack(client, base, agent_id_for_apply, pname, cfg_row["id"],
+                             "failed", error=str(e), secret=secret)
                     except Exception as ee:
                         click.echo(f"  ack-failed also failed: {ee}", err=True)
                     break  # don't keep trying if writes are failing
@@ -3298,24 +3472,13 @@ def apply_configs_loop(config_path: str, interval: int) -> None:
         time.sleep(interval)
 
 
-def _auth_headers(secret: str) -> dict[str, str]:
-    """HMAC-style headers (per REVIEW §6.1).
-
-    For MVP, just stamp the headers so the orchestrator accepts the request.
-    Real HMAC verification TODO.
-    """
-    return {
-        "X-Agent-Id": "wrapper",
-        "X-Timestamp": str(int(time.time())),
-        "X-Signature": hashlib.sha256(secret.encode()).hexdigest(),
-    }
-
-
 def _claim_one(
-    client: httpx.Client, base: str, agent_id: str, profile: str, headers: dict
+    client: httpx.Client, base: str, agent_id: str, profile: str, secret: str
 ) -> dict | None:
+    path = f"/api/agents/{agent_id}/profiles/{profile}/configs/pending"
+    headers = _hmac_headers(agent_id, secret, method="GET", path=path)
     r = client.get(
-        f"{base}/api/agents/{agent_id}/profiles/{profile}/configs/pending",
+        f"{base}{path}",
         headers=headers,
     )
     r.raise_for_status()
@@ -3334,16 +3497,19 @@ def _ack(
     *,
     actual_sha: str | None = None,
     error: str | None = None,
-    headers: dict,
+    secret: str,
 ) -> None:
     body: dict = {"status": status}
     if actual_sha:
         body["actual_sha256"] = actual_sha
     if error:
         body["error"] = error
+    body_bytes = json.dumps(body).encode("utf-8")
+    path = f"/api/agents/{agent_id}/profiles/{profile}/configs/{cfg_id}/ack"
+    headers = _hmac_headers(agent_id, secret, method="POST", path=path, body=body_bytes)
     r = client.post(
-        f"{base}/api/agents/{agent_id}/profiles/{profile}/configs/{cfg_id}/ack",
-        json=body,
+        f"{base}{path}",
+        content=body_bytes,
         headers=headers,
     )
     r.raise_for_status()
