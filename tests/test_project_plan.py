@@ -468,3 +468,134 @@ def test_put_with_if_match_ignored_when_plan_is_null():
         assert body["plan"]["name"] == "first"
     finally:
         _delete_project(pid)
+
+
+# ===== v1.5.3 (2026-07-29): server-side visual_layout =====
+
+
+def test_plan_visual_layout_roundtrips():
+    """PUT a plan with a visual_layout, then GET it back and confirm
+    the {step_name: {x, y}} map survives. Mirrors the
+    workflow_packages.visual_layout field so visual_plan.js can
+    persist canvas positions server-side."""
+    pid = _create_test_project()
+    try:
+        layout = {
+            "fetch-data": {"x": 120, "y": 80},
+            "summarize": {"x": 380, "y": 220},
+        }
+        plan = {
+            "version": "1.0",
+            "name": "layout-test",
+            "description": "",
+            "trigger": "manual",
+            "variables": [],
+            "steps": [
+                {
+                    "name": "fetch-data",
+                    "agent_role": "super",
+                    "action": "fetch",
+                    "depends_on": [],
+                    "params_template": {},
+                },
+                {
+                    "name": "summarize",
+                    "agent_role": "super",
+                    "action": "summarize",
+                    "depends_on": ["fetch-data"],
+                    "params_template": {},
+                },
+            ],
+            "visual_layout": layout,
+        }
+        s, _ = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
+        assert s == 200
+        s, body = _http("GET", f"/api/projects/{pid}/plan")
+        assert s == 200
+        assert body["plan"]["visual_layout"] == layout
+    finally:
+        _delete_project(pid)
+
+
+def test_plan_without_visual_layout_defaults_to_empty_dict():
+    """An old plan written before v1.5.3 has no visual_layout field.
+    The Pydantic model should default to {} so visual_plan.js can
+    always read plan.visual_layout without checking for None."""
+    pid = _create_test_project()
+    try:
+        plan = {
+            "version": "1.0",
+            "name": "no-layout",
+            "description": "",
+            "trigger": "manual",
+            "variables": [],
+            "steps": [
+                {
+                    "name": "only-step",
+                    "agent_role": "super",
+                    "action": "do_step",
+                    "depends_on": [],
+                    "params_template": {},
+                },
+            ],
+            # No visual_layout key — simulates a pre-v1.5.3 plan
+        }
+        s, _ = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan})
+        assert s == 200
+        s, body = _http("GET", f"/api/projects/{pid}/plan")
+        assert s == 200
+        # Round-trip: missing field comes back as an empty dict,
+        # not None and not missing. The frontend relies on this so
+        # the "load persisted layout" code can do
+        # `const layout = plan.visual_layout || {}`.
+        assert body["plan"]["visual_layout"] == {}
+    finally:
+        _delete_project(pid)
+
+
+def test_plan_visual_layout_survives_step_changes():
+    """If the user adds/removes steps, the visual_layout should
+    only contain entries for steps that still exist. (drawflow
+    ignores layout entries for unknown step names anyway, so
+    server-side the behavior is "set whatever the client sent".)
+    This test just confirms no server-side filtering happens."""
+    pid = _create_test_project()
+    try:
+        # First write: one step with one position
+        plan1 = {
+            "version": "1.0",
+            "name": "p1",
+            "description": "",
+            "trigger": "manual",
+            "variables": [],
+            "steps": [{
+                "name": "old-step",
+                "agent_role": "super",
+                "action": "do_step",
+                "depends_on": [],
+                "params_template": {},
+            }],
+            "visual_layout": {"old-step": {"x": 50, "y": 50}},
+        }
+        _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan1})
+        # Second write: rename the step + keep the position
+        plan2 = {
+            "version": "1.0",
+            "name": "p2",
+            "description": "",
+            "trigger": "manual",
+            "variables": [],
+            "steps": [{
+                "name": "new-step",
+                "agent_role": "super",
+                "action": "do_step",
+                "depends_on": [],
+                "params_template": {},
+            }],
+            "visual_layout": {"new-step": {"x": 200, "y": 300}},
+        }
+        s, body = _http("PUT", f"/api/projects/{pid}/plan", {"plan": plan2})
+        assert s == 200
+        assert body["plan"]["visual_layout"] == {"new-step": {"x": 200, "y": 300}}
+    finally:
+        _delete_project(pid)

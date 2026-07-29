@@ -148,6 +148,15 @@ class ProjectPlan(BaseModel):
     trigger: str = "manual"  # manual | schedule:<schedule_id>
     variables: list[PlanVariable] = Field(default_factory=list)
     steps: list[PlanStep] = Field(default_factory=list)
+    # v1.5.3 (2026-07-29): server-side visual_layout, mirrors the
+    # workflow_packages.visual_layout field. Persists the
+    # drawflow canvas node positions so they survive reloads
+    # AND cross-device (localStorage in the previous v1.5 was
+    # client-only). Shape: {step_name: {"x": <float>, "y": <float>}}.
+    # Missing entries fall back to drawflow's default layout.
+    visual_layout: dict[str, dict[str, float]] = Field(
+        default_factory=dict
+    )
 
     @field_validator("name")
     @classmethod

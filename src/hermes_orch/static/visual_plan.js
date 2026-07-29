@@ -28,76 +28,19 @@
 
     // ===== Module-level state =====
     let _editor = null;             // drawflow instance
-    // === v1.5: localStorage canvas persistence ===
-    // We mirror the drawflow canvas to localStorage so a page
-    // reload (manual F5 OR the 10s auto-refresh if the user
-    // re-enabled it) doesn't wipe the user's nodes + connections.
-    // The key is per-project so multiple projects don't collide.
-    // The local copy is cleared after a successful savePlan() —
-    // the server's persisted plan is then the source of truth and
-    // the next reload reads from there (via the existing
-    // plan_json init path).
-    const VP_LOCALSTORAGE_KEY_PREFIX = 'vp.canvas.';
-    const VP_LOCALSTORAGE_VERSION = 1;
-    const VP_LOCALSTORAGE_DEBOUNCE_MS = 1000;
-    let _vpSaveTimer = null;
-    function _vpLocalStorageKey() {
-        return VP_LOCALSTORAGE_KEY_PREFIX + (_projectId || 'unknown');
-    }
-    function _vpScheduleSave() {
-        if (_vpSaveTimer) clearTimeout(_vpSaveTimer);
-        _vpSaveTimer = setTimeout(() => {
-            _vpSaveTimer = null;
-            if (!_editor) return;
-            try {
-                const data = _editor.exportData();
-                localStorage.setItem(
-                    _vpLocalStorageKey(),
-                    JSON.stringify({
-                        v: VP_LOCALSTORAGE_VERSION,
-                        ts: Date.now(),
-                        data: data,
-                    })
-                );
-            } catch (e) {
-                // localStorage may be full (5MB cap) or disabled
-                // (private-browsing mode). Silent fail — server-side
-                // savePlan() still works, we just lose the reload
-                // recovery for that session.
-                console.debug('vp canvas localStorage save failed:', e);
-            }
-        }, VP_LOCALSTORAGE_DEBOUNCE_MS);
-    }
-    function _vpLoadCanvasFromLocal() {
-        if (!_editor) return false;
-        let raw;
-        try {
-            raw = localStorage.getItem(_vpLocalStorageKey());
-        } catch (e) {
-            return false;
-        }
-        if (!raw) return false;
-        try {
-            const payload = JSON.parse(raw);
-            if (!payload || payload.v !== VP_LOCALSTORAGE_VERSION) return false;
-            // Import the canvas. The connection listeners we
-            // registered in init() don't fire for the restored
-            // nodes, so we also re-sync _plan.steps[i].depends_on
-            // from the canvas state (in case the local snapshot has
-            // edges that the in-memory _plan doesn't know about).
-            _editor.importData(payload.data);
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-    function _vpClearCanvasFromLocal() {
-        try {
-            localStorage.removeItem(_vpLocalStorageKey());
-        } catch (e) {
-            // ignore
-        }
-    }
+    // === v1.5.3: server-side visual_layout (2026-07-29) ===
+    // Replaces v1.5's localStorage-based canvas persistence.
+    // Matches the workflow_packages.visual_layout pattern: drawflow
+    // node positions are stored on the plan document server-side
+    // (so they survive reloads AND cross-device / cross-browser).
+    // _plan.visual_layout is {step_name: {"x": <float>, "y": <float>}}.
+    // Missing entries fall back to drawflow's default vertical
+    // stack (50, 50 + i*120). The 1s debounce collapses drag bursts
+    // into one PUT. We don't try to keep any client-side cache —
+    // localStorage's only benefit was "reload recovery", and the
+    // server now provides that for everyone.
+    const VP_LAYOUT_DEBOUNCE_MS = 1000;
+    let _vpLayoutSaveTimer = null;
     let _plan = {                   // the current plan (source of truth)
         version: '1.0',
         name: '',
@@ -176,22 +119,16 @@
             zoom_min: 0.5,
         });
         _editor.start();
-        // === v1.5: localStorage canvas persistence (2026-07-29) ===
-        // Without this, a full page reload (or the 10s auto-refresh
-        // if the user re-enabled it) wipes the drawflow canvas — the
-        // user has to re-add every node and rewire every connection.
-        // We mirror the canvas state into localStorage and restore
-        // it on init. Server-side is still the source of truth
-        // (after a successful savePlan() we clear the local copy so
-        // the next reload reads from the server's persisted plan).
-        _vpLoadCanvasFromLocal();
-        // Schedule a debounced save on any drawflow mutation. The
-        // debounce collapses a burst of drag/connect events into one
-        // localStorage write so we're not thrashing the disk.
-        ['nodeCreated', 'nodeRemoved', 'nodeMoved',
-         'connectionCreated', 'connectionRemoved'].forEach((ev) => {
-            _editor.on(ev, _vpScheduleSave);
-        });
+        // v1.5.3: apply any persisted visual_layout from the server
+        // (set in the previous savePlan() call) onto the drawflow
+        // nodes' x/y attributes. drawflow renders nodes at the
+        // position given in their `data` object, so this is a one-
+        // line write per step.
+        _applyPlanVisualLayout();
+        // v1.5.3: when the user drags a card, update _plan.visual_layout
+        // so the next savePlan() persists the new position. The PUT
+        // happens in savePlan() — we don't auto-save on every drag.
+        _editor.on('nodeMoved', _onNodeMovedPersistLayout);
         // Wire the connection lifecycle to _plan.steps[i].depends_on
         // (mirrors visual_workflow.js's pattern). Without this, the
         // user drags a wire on the canvas, drawflow stores it in its
@@ -720,12 +657,6 @@
                 return;
             }
             showBanner('Plan saved (' + _plan.steps.length + ' step(s))', 'success');
-            // v1.5: clear the local canvas snapshot — the server's
-            // persisted plan is now the source of truth. Without
-            // this, a stale local snapshot could be restored on
-            // the next reload, hiding changes another operator
-            // saved from the server in the meantime.
-            _vpClearCanvasFromLocal();
         } catch (e) {
             showBanner('Network error: ' + e.message, 'error');
         }
@@ -1003,6 +934,48 @@
                 status.className = 'text-sm text-red-600 ml-2';
             }
         }
+    }
+
+    // v1.5.3: write _plan.visual_layout[step_name] = {x, y} when
+    // a drawflow node is moved. The actual server PUT happens
+    // in savePlan() — we just update the in-memory plan here.
+    function _onNodeMovedPersistLayout(node) {
+        if (!_plan.visual_layout) _plan.visual_layout = {};
+        const stepName = (node && node.data && node.data.name) || null;
+        if (!stepName) return;
+        _plan.visual_layout[stepName] = {
+            x: node.pos_x,
+            y: node.pos_y,
+        };
+    }
+    // v1.5.3: on init, walk the current plan and apply the persisted
+    // x/y onto each drawflow node's data so the canvas renders the
+    // saved layout. We mutate _plan.steps in place (the drawflow
+    // nodes read x/y from the step's data when re-rendered).
+    function _applyPlanVisualLayout() {
+        if (!_editor || !_plan || !_plan.steps) return;
+        const layout = _plan.visual_layout || {};
+        _plan.steps.forEach((step) => {
+            const pos = layout[step.name];
+            if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
+                // drawflow nodes are keyed by step name; we set the
+                // data on the existing node rather than re-creating
+                // it. The next drawflow render() will pick up the
+                // new x/y. Missing entries (steps added since the
+                // last save) keep their default position.
+                try {
+                    const node = _editor.getNodeFromId(step.name);
+                    if (node) {
+                        node.pos_x = pos.x;
+                        node.pos_y = pos.y;
+                    }
+                } catch (e) {
+                    // Node not in canvas yet (init order) — skip;
+                    // the next savePlan() will pick up the position
+                    // anyway.
+                }
+            }
+        });
     }
 
     // ===== Public API (window.vp) =====
