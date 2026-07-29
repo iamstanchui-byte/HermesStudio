@@ -526,5 +526,44 @@
 })();
 </script>
 <script defer src="/static/chatbox.js?v=2026-07-29"></script>
+<script defer src="/static/task_progress.js?v=2026-07-29"></script>
+
+{# v1.4: cross-page Task Progress Monitor — include the same side
+   panel partial that project.html uses, plus a floating toggle
+   button in the bottom-right so the operator can open it
+   without taking layout space from the drawflow canvas. #}
+<button id="task-progress-toggle-btn"
+    class="fixed bottom-4 right-4 z-50 px-3 py-2 text-sm font-medium rounded-full shadow-lg border-2 border-blue-500 bg-white text-blue-700 hover:bg-blue-50"
+    title="Toggle the Task Progress side panel — live loop status for all running tasks in this project">
+    📊
+</button>
+{% include "_task_progress_panel.html" %}
+
+<script>
+{# v1.4: init the Task Progress Monitor after the DOM is ready.
+   We pass the project id from the data attribute on #vp-wrap
+   (set in the content block above) so the panel pulls the
+   right project's running tasks. #}
+(function() {
+    function boot() {
+        var pid = (document.getElementById('vp-wrap') || {}).getAttribute
+            ? document.getElementById('vp-wrap').getAttribute('data-project-id')
+            : null;
+        if (window.taskProgress && typeof window.taskProgress.init === 'function' && pid) {
+            window.taskProgress.init(pid);
+        } else if (!pid) {
+            // no project on this page (shouldn't happen on visual_plan
+            // but defensive) — skip
+        } else {
+            setTimeout(boot, 50);
+        }
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot);
+    } else {
+        boot();
+    }
+})();
+</script>
 
 {% endblock %}

@@ -1,0 +1,32 @@
+{# v1.4 — partial template for the Task Progress Monitor slide-out
+   side panel. Used by:
+     - project.html
+     - visual_plan.html
+     - visual_project.html
+   The panel is hidden by default; click the page's "Live status"
+   button (or the in-page FAB) to toggle it. task_progress.js
+   populates the list and the count, then refreshes every 5s.
+   `project` must be in the parent context (this partial assumes the
+   caller has loaded the project — visual_workflow.html is the
+   one page that doesn't, so it doesn't include this partial). #}
+<div id="task-progress-side-panel"
+     style="display: none;"
+     class="fixed top-12 right-0 bottom-0 w-80 bg-white border-l-2 border-blue-300 shadow-lg z-40 flex flex-col">
+    <div class="px-3 py-2 bg-blue-50 border-b border-blue-200 flex items-center justify-between">
+        <div class="text-sm font-semibold text-blue-900">
+            🟢 Running tasks (<span id="task-progress-side-panel-count">0</span>)
+        </div>
+        <button onclick="document.getElementById('task-progress-side-panel').style.display='none'"
+            class="text-blue-700 hover:text-blue-900 text-sm"
+            title="Close panel">✕</button>
+    </div>
+    <div id="task-progress-side-panel-empty"
+         class="px-3 py-4 text-sm text-gray-500 italic">
+        No running tasks — all clear.
+    </div>
+    <div id="task-progress-side-panel-list" class="flex-1 overflow-y-auto px-3 py-2">
+    </div>
+    <div class="px-3 py-2 border-t border-gray-200 text-xs text-gray-500">
+        Polled every 5s. Stuck tasks are sorted to the top.
+    </div>
+</div>

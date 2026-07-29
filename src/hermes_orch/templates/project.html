@@ -1456,31 +1456,13 @@ async function deletePreset(agentId, profileName, btn) {
 <script defer src="/static/chatbox.js?v=2026-07-29"></script>
 <script defer src="/static/task_progress.js?v=2026-07-29"></script>
 
-{# Task Progress Monitor side panel (T4, 2026-07-29). Hidden by
-   default; toggled via #task-progress-toggle-btn. The panel
-   slides in from the right edge of the viewport. task_progress.js
-   populates the list and the count, then refreshes every 5s. #}
-<div id="task-progress-side-panel"
-     style="display: none;"
-     class="fixed top-12 right-0 bottom-0 w-80 bg-white border-l-2 border-blue-300 shadow-lg z-40 flex flex-col">
-    <div class="px-3 py-2 bg-blue-50 border-b border-blue-200 flex items-center justify-between">
-        <div class="text-sm font-semibold text-blue-900">
-            🟢 Running tasks (<span id="task-progress-side-panel-count">0</span>)
-        </div>
-        <button onclick="document.getElementById('task-progress-side-panel').style.display='none'"
-            class="text-blue-700 hover:text-blue-900 text-sm"
-            title="Close panel">✕</button>
-    </div>
-    <div id="task-progress-side-panel-empty"
-         class="px-3 py-4 text-sm text-gray-500 italic">
-        No running tasks — all clear.
-    </div>
-    <div id="task-progress-side-panel-list" class="flex-1 overflow-y-auto px-3 py-2">
-    </div>
-    <div class="px-3 py-2 border-t border-gray-200 text-xs text-gray-500">
-        Polled every 5s. Stuck tasks are sorted to the top.
-    </div>
-</div>
+{# Task Progress Monitor side panel (T4, 2026-07-29, v1.4 partial).
+   The panel HTML lives in _task_progress_panel.html so we can
+   include it on visual_plan.html + visual_project.html too
+   (cross-page panel follow). The panel is hidden by default;
+   toggled via #task-progress-toggle-btn on this page (other
+   pages use a floating action button in the bottom-right). #}
+{% include "_task_progress_panel.html" %}
 
 <script>
 {# Wire up the Task Progress Monitor after the DOM is ready.

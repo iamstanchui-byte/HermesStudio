@@ -437,3 +437,78 @@ def test_get_output_500_chunk_cap():
         assert body["next_since"] == body["chunks"][-1]["id"]
     finally:
         _delete_project(pid)
+
+
+# ===== ANSI strip (v1.4, 2026-07-29) =====
+
+
+def test_ansi_color_codes_stripped_in_get_output():
+    """Hermes writes colored output to its stdout (e.g.
+    `\x1b[1;38;2;255;215;0m╺─━━━━ Hermes ━━━━╸\x1b[0m`). The GET
+    endpoint must strip these CSI sequences so the dashboard's
+    <pre> block shows clean text instead of raw escape bytes."""
+    pid = _create_project()
+    tid, agent_id = _insert_task(pid)
+    try:
+        # Submit a chunk with real ANSI escape bytes (the 0x1b ESC
+        # byte + '[' introduces a CSI sequence; the trailing letter
+        # is the command). Common hermes examples:
+        raw = (
+            "\x1b[1;38;2;255;215;0m╺─━━━━ Hermes ━━━━╸\x1b[0m\n"
+            "\x1b[38;2;248;220mThe previous batch had a ls issue.\x1b[0m\n"
+            "\x1b[2J\x1b[3A"  # clear screen + cursor up — cursor move codes
+        )
+        _http(
+            "POST",
+            f"/api/projects/{pid}/tasks/{tid}/output-chunk",
+            body={"seq": 1, "text": raw, "stream": "stdout"},
+            headers={"X-Agent-Id": agent_id},
+        )
+        s, body, _ = _http("GET", f"/api/projects/{pid}/tasks/{tid}/output")
+        assert s == 200
+        text = body["chunks"][0]["text"]
+        # All the CSI escape sequences (color, cursor moves) are gone
+        assert "\x1b" not in text
+        assert "[1;38;2;255;215;0m" not in text
+        assert "[0m" not in text
+        assert "[2J" not in text
+        assert "[3A" not in text
+        # The actual text content survives intact
+        assert "╺─━━━━ Hermes ━━━━╸" in text
+        assert "The previous batch had a ls issue." in text
+    finally:
+        _delete_project(pid)
+
+
+def test_ansi_strip_does_not_touch_audit_log():
+    """The strip happens on the way OUT (GET), not on the way IN
+    (POST). The audit_log keeps the raw chunk for debugging —
+    if we ever need to reproduce an agent issue, the color codes
+    are still in the DB."""
+    pid = _create_project()
+    tid, agent_id = _insert_task(pid)
+    try:
+        raw = "[1;38;2;255;215;0mraw chunk[0m"
+        _http(
+            "POST",
+            f"/api/projects/{pid}/tasks/{tid}/output-chunk",
+            body={"seq": 1, "text": raw, "stream": "stdout"},
+            headers={"X-Agent-Id": agent_id},
+        )
+        # Read directly from the DB to confirm the raw value is
+        # still there (we don't have a GET endpoint that returns
+        # raw text, so we go to the source of truth).
+        import sqlite3
+        conn = sqlite3.connect(str(DB_PATH))
+        cur = conn.execute(
+            "SELECT payload FROM audit_log "
+            "WHERE task_id = ? AND event_type = 'agent.output_chunk' "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        )
+        payload = cur.fetchone()[0]
+        conn.close()
+        # The DB row contains the raw ANSI bytes
+        assert raw in payload
+    finally:
+        _delete_project(pid)

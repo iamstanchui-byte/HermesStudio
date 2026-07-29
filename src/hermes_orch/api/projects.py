@@ -13,6 +13,26 @@ from __future__ import annotations
 
 import json
 import re
+
+# v1.4 (2026-07-29): strip common ANSI escape codes (CSI sequences
+# ending in a letter — covers SGR color/style codes, cursor moves,
+# erase, etc.). We strip on the way OUT (GET /output) rather than
+# on the way IN (POST /output-chunk) so the audit_log keeps the
+# raw chunk for any future debugging needs.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes from a string.
+
+    Hermes writes colored output to its stdout (e.g.
+    ``[1;38;2;255;215;0m╺─━━━━ Hermes ━━━━╸[0m``). The terminal
+    renders those as colors, but in the dashboard's <pre> block
+    they show up as raw bytes and make the text hard to read.
+    Stripping them server-side is cheaper + simpler than running
+    a JS-side terminal emulator.
+    """
+    return _ANSI_ESCAPE_RE.sub("", text)
 import secrets
 import shutil
 from datetime import datetime, timezone
@@ -3388,10 +3408,15 @@ async def get_task_output(
             p = json.loads(r["payload"]) if r["payload"] else {}
         except (json.JSONDecodeError, TypeError):
             p = {}
+        # Strip ANSI escape codes (color, cursor moves) from the text
+        # before returning. The audit_log keeps the raw chunk for
+        # debugging; the dashboard only needs the human-readable
+        # text. Without this, every line starts with sequences like
+        # [1;38;2;255;215;0m that hermes emits for terminal colors.
         chunks.append({
             "id": r["id"],
             "seq": p.get("seq"),
-            "text": p.get("text", ""),
+            "text": _strip_ansi(p.get("text", "")),
             "stream": p.get("stream", "stdout"),
             "created_at": r["created_at"],
         })
