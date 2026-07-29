@@ -59,6 +59,17 @@
       // HTML already shows. The polling loop below will keep them
       // fresh; this just avoids a 5s blank window on initial load.
       _seedFromDom();
+      // Take over from base.html's 10s page-reload poller. We do
+      // our own 5s polling for status updates and a 2s poller for
+      // the live output of any expanded task. A full page reload
+      // would wipe the user's expanded panels + scroll position +
+      // any in-progress cancellations, so we ask base.html to
+      // stand down via the public hook. The user can still hit the
+      // auto-refresh toggle in the nav to force-reload if they
+      // want a full refresh.
+      if (typeof window.__orchPausePageRefresh === 'function') {
+        window.__orchPausePageRefresh();
+      }
       // Wire side-panel toggle (injected into base.html)
       const btn = document.getElementById('task-progress-toggle-btn');
       if (btn) btn.addEventListener('click', _toggleSidePanel);
@@ -104,10 +115,14 @@
 
   async function _pollOnce() {
     if (!projectId) return;
-    // 1. /tasks/running — drives the side panel AND updates all
-    //    running-task badges in one round trip.
+    // v1.3 hot-fix: poll /tasks/state (light shape covering all
+    // statuses), not just /tasks/running. /tasks/running excludes
+    // non-running tasks by definition, so a finished task's row
+    // would never get a status update — its pill would say
+    // "running" forever. /tasks/state fixes that by returning
+    // every visible task with its current status.
     const r = await _fetchWithTimeout(
-      `/api/projects/${encodeURIComponent(projectId)}/tasks/running`,
+      `/api/projects/${encodeURIComponent(projectId)}/tasks/state`,
       {},
       4000,
     );
@@ -116,11 +131,16 @@
       return;
     }
     const body = await r.json();
-    runningCache = new Map((body.tasks || []).map((t) => [t.task_id, t]));
-    _renderSidePanel(body.tasks || []);
-    // 2. Update every badge on the page (covers both task rows
-    //    currently status=running in the DOM and any new ones the
-    //    user has added since the last poll).
+    const allStates = body.tasks || [];
+    runningCache = new Map(allStates.map((t) => [t.task_id, t]));
+    // Side panel: filter to running only (matches the old
+    // /tasks/running endpoint behavior; non-running tasks are
+    // not shown in the panel — their status appears in the row
+    // pill via _applyTaskState).
+    _renderSidePanel(allStates.filter((t) => t.status === 'running'));
+    // Update every visible row on the page (covers both
+    // currently-running and just-finished tasks so the row pill
+    // text + class stays in sync with the server).
     _updateAllBadges();
   }
 
@@ -129,7 +149,7 @@
     // set (project.html renders t.loop_status as |default('ok')).
     document.querySelectorAll('[data-task-id][data-loop-status]').forEach((row) => {
       const ls = row.getAttribute('data-loop-status');
-      _applyBadge(row, {
+      _applyTaskState(row, {
         status: row.getAttribute('data-task-status') || '',
         loop_status: ls,
         loop_reason: row.getAttribute('data-loop-reason') || '',
@@ -157,20 +177,139 @@
     if (initial.length) _renderSidePanel(initial);
   }
 
-  // === Badge rendering ===
+  // === State rendering ===
+  //
+  // v1.3 hot-fix: we now update BOTH the loop_status badge AND the
+  // status pill (text + class). Pre-v1.3, the pill's text and color
+  // stayed frozen on the initial server-render value forever — so
+  // a task that transitioned running → done would visually still
+  // look running. The status pill CSS classes match what
+  // project.html renders server-side, so the in-place updates
+  // look identical to a fresh page load.
+
+  // Mirror of project.html's status-pill color map. Keep these in
+  // sync with the Jinja template at templates/project.html.
+  const STATUS_PILL_CLASS = {
+    pending:  'bg-gray-100 text-gray-800',
+    assigned: 'bg-gray-100 text-gray-800',
+    running:  'bg-blue-100 text-blue-800',
+    completed:'bg-green-100 text-green-800',
+    failed:   'bg-red-100 text-red-800',
+    skipped:  'bg-yellow-100 text-yellow-800',
+    cancelled:'bg-gray-100 text-gray-800',
+  };
 
   function _updateAllBadges() {
     document.querySelectorAll('[data-task-id]').forEach((row) => {
       const tid = row.getAttribute('data-task-id');
       const cached = runningCache.get(tid);
-      if (cached) _applyBadge(row, cached);
+      if (cached) {
+        _applyTaskState(row, cached);
+        _updateExpandPanel(tid, cached);
+      }
     });
   }
 
-  function _applyBadge(row, t) {
-    // Only running tasks get a meaningful loop_status badge; done /
-    // failed / etc. show the existing status badge unchanged.
-    if (t.status !== 'running' && t.loop_status === 'ok') {
+  // v1.3 hot-fix: keep the inline expand panel in sync with the
+  // current task state. Without this, a task that transitions
+  // running → done while the panel is open would visually still
+  // show "Status: running" + the live streaming block, even
+  // though the row pill above has already updated to "done".
+  function _updateExpandPanel(tid, t) {
+    const panel = document.querySelector(
+      `[data-expand-for="${tid}"]`
+    );
+    if (!panel) return;
+    // Update the four text fields. Skip the ones that don't
+    // exist (e.g. the loop_status badge header is hidden for
+    // terminal tasks, but the row updates handled that).
+    const setText = (sel, val) => {
+      const el = panel.querySelector(sel);
+      if (el) el.textContent = val;
+    };
+    setText('[data-detail-status]', t.status || '?');
+    setText(
+      '[data-detail-reason]', t.loop_reason || ''
+    );
+    setText(
+      '[data-detail-duration]',
+      t.duration_s ? `${t.duration_s}s` : '—'
+    );
+    setText(
+      '[data-detail-age]',
+      t.last_event_age_s == null
+        ? '—'
+        : `${t.last_event_age_s}s ago`
+    );
+    // Update the loop_status badge in the panel header
+    const loopBadge = panel.querySelector(
+      '[data-detail-loop-badge]'
+    );
+    if (loopBadge) {
+      const meta = STATUS_BADGE[t.loop_status] || STATUS_BADGE.unknown;
+      loopBadge.className =
+        'inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded ' +
+        meta.cls;
+      loopBadge.textContent = `${meta.glyph} ${meta.label}`;
+    }
+    // v1.3 hot-fix: if the task transitioned running → terminal
+    // while the panel is open, replace the live streaming block
+    // with a static "no streaming" note. The reverse transition
+    // (terminal → running) is unusual but we handle it for
+    // symmetry: rebuild the streaming block.
+    const isTerminal = !['pending', 'assigned', 'running']
+      .includes(t.status);
+    const streamHost = panel.querySelector('[data-stream-host]');
+    const terminalNote = panel.querySelector('[data-terminal-note]');
+    if (isTerminal && streamHost && !terminalNote) {
+      const note = document.createElement('div');
+      note.setAttribute('data-terminal-note', '1');
+      note.className = 'mt-3 text-xs text-gray-600 italic';
+      note.textContent =
+        `Task is ${t.status} — no streaming output will arrive. ` +
+        `Final result is in the task row's "View result" link above.`;
+      streamHost.replaceWith(note);
+    } else if (!isTerminal && terminalNote && !streamHost) {
+      // Rebuild a minimal streaming block. We don't try to
+      // restore the previous chunks (those are lost when the
+      // node is removed); the user can re-click the row to get
+      // a fresh stream.
+      const host = document.createElement('div');
+      host.setAttribute('data-stream-host', tid);
+      host.className = 'mt-3';
+      host.innerHTML =
+        `<div class="flex items-center justify-between mb-1">
+          <div class="text-xs font-semibold text-gray-700">
+            📺 Live output
+            <span data-stream-status="${_escape(tid)}" class="text-gray-500 font-normal">starting…</span>
+          </div>
+        </div>
+        <pre data-stream-stdout="${_escape(tid)}"
+             class="bg-white border border-gray-200 rounded p-2 text-xs font-mono whitespace-pre-wrap max-h-64 overflow-y-auto"
+             style="min-height: 2.5rem;">(waiting for output…)</pre>`;
+      terminalNote.replaceWith(host);
+      _startStreaming(tid, host);
+    }
+  }
+
+  function _applyTaskState(row, t) {
+    // 1. Update the status pill (text + class). This was the
+    //    missing piece in v1 — the pill would stay frozen on the
+    //    server-render value (usually "running") forever.
+    const pill = row.querySelector('[data-status-pill]');
+    if (pill) {
+      const newCls = STATUS_PILL_CLASS[t.status] || STATUS_PILL_CLASS.pending;
+      // Reset to a clean base, then add the per-status color.
+      // Drop every status-* class so the new one takes effect
+      // even when the row transitioned (e.g. running → done).
+      const baseCls = 'px-2 py-0.5 text-xs rounded font-mono';
+      pill.className = `${baseCls} ${newCls}`;
+      pill.textContent = t.status || '?';
+    }
+    // 2. Update the loop_status badge. Only running tasks get
+    //    one (a finished task's loop_status is "ok" + reason
+    //    "task is X" — not interesting to badge).
+    if (t.status !== 'running') {
       _removeLoopBadge(row);
       return;
     }
@@ -225,9 +364,14 @@
     const detail = _renderDetail(t);
     row.insertAdjacentElement('afterend', detail);
     // v1.1: start streaming the live output for this task. We poll
-    // the /output endpoint every 2s; the poller stops itself when
-    // the task reaches a terminal state.
-    _startStreaming(tid, detail);
+    // the /output endpoint every 2s. Skip the poller for terminal
+    // tasks (v1.3 hot-fix) — the rendered panel already says "no
+    // streaming output will arrive", so polling would just
+    // return 0 chunks forever and waste cycles.
+    const isTerminal = !['pending', 'assigned', 'running'].includes(t.status);
+    if (!isTerminal) {
+      _startStreaming(tid, detail);
+    }
   }
 
   function _readRowData(row) {
@@ -253,27 +397,17 @@
     const durStr = t.duration_s ? `${t.duration_s}s` : '—';
     const meta = STATUS_BADGE[t.loop_status] || STATUS_BADGE.unknown;
     const cancellable = ['pending', 'assigned', 'running'].includes(t.status);
-    wrap.innerHTML = `
-      <div class="flex items-center gap-2 mb-1">
-        <span class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded ${meta.cls}">
-          ${meta.glyph} ${meta.label}
-        </span>
-        <span class="text-gray-600">${_escape(t.loop_reason || '')}</span>
+    const isTerminal = !cancellable;
+    // v1.3 hot-fix: a finished task will never get new streaming
+    // output, so the "Live output" panel with "(waiting for
+    // output…)" was misleading. For terminal states we render a
+    // static note instead and don't start a streaming poller.
+    const liveSection = isTerminal ? `
+      <div class="mt-3 text-xs text-gray-600 italic">
+        Task is ${_escape(t.status)} — no streaming output will arrive.
+        Final result is in the task row's "View result" link above.
       </div>
-      <div class="grid grid-cols-2 gap-2 text-xs text-gray-700">
-        <div>Status: <span class="font-mono">${_escape(t.status || '?')}</span></div>
-        <div>Duration: <span class="font-mono">${durStr}</span></div>
-        <div>Last liveness: <span class="font-mono">${ageStr}</span></div>
-        <div>Task: <span class="font-mono">${_escape(t.task_id || '')}</span></div>
-      </div>
-      ${cancellable ? `
-        <div class="mt-2">
-          <button data-cancel-task="${_escape(t.task_id)}"
-            class="px-2 py-1 text-xs bg-yellow-100 text-yellow-800 rounded hover:bg-yellow-200"
-            title="Cancel this task (frees the assigned profile, marks task as cancelled)">
-            Cancel task
-          </button>
-        </div>` : ''}
+    ` : `
       <div class="mt-3" data-stream-host="${_escape(t.task_id)}">
         <div class="flex items-center justify-between mb-1">
           <div class="text-xs font-semibold text-gray-700">
@@ -295,6 +429,30 @@
                class="bg-yellow-50 border border-yellow-200 rounded p-2 text-xs font-mono whitespace-pre-wrap max-h-48 overflow-y-auto mt-1"></pre>
         </details>
       </div>
+    `;
+    wrap.innerHTML = `
+      <div class="flex items-center gap-2 mb-1">
+        <span data-detail-loop-badge
+          class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded ${meta.cls}">
+          ${meta.glyph} ${meta.label}
+        </span>
+        <span data-detail-reason class="text-gray-600">${_escape(t.loop_reason || '')}</span>
+      </div>
+      <div class="grid grid-cols-2 gap-2 text-xs text-gray-700">
+        <div>Status: <span data-detail-status class="font-mono">${_escape(t.status || '?')}</span></div>
+        <div>Duration: <span data-detail-duration class="font-mono">${durStr}</span></div>
+        <div>Last liveness: <span data-detail-age class="font-mono">${ageStr}</span></div>
+        <div>Task: <span class="font-mono">${_escape(t.task_id || '')}</span></div>
+      </div>
+      ${cancellable ? `
+        <div class="mt-2">
+          <button data-cancel-task="${_escape(t.task_id)}"
+            class="px-2 py-1 text-xs bg-yellow-100 text-yellow-800 rounded hover:bg-yellow-200"
+            title="Cancel this task (frees the assigned profile, marks task as cancelled)">
+            Cancel task
+          </button>
+        </div>` : ''}
+      ${liveSection}
     `;
     return wrap;
   }

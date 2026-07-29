@@ -374,6 +374,17 @@
     document.addEventListener('focusout', (e) => {
         if (e.target.matches('input, textarea, select')) startPolling();
     });
+    // Public hook for page-specific scripts (e.g. task_progress.js
+    // on the project page) that want to take over the polling
+    // themselves. Calling this pauses the 10s page reload so the
+    // script can do in-place updates without nuking the user's
+    // expanded panels. The user can still hit the auto-refresh
+    // toggle to re-enable full reloads at any time.
+    window.__orchPausePageRefresh = function() {
+        userPaused = true;
+        stopPolling();
+        setAutoRefreshUI(true);
+    };
     </script>
 </body>
 </html>

@@ -3404,6 +3404,52 @@ async def get_task_output(
     }
 
 
+# ===== Bulk task state endpoint (v1.3 hot-fix, 2026-07-29) =====
+#
+# Powers the dashboard's 5s polling so the UI can update not just
+# the loop_status badge (v1) but ALSO the status pill text/class
+# (running → done / failed / cancelled). Without this, the row
+# stays visually "running" forever after the task finishes,
+# because v1 only polled /tasks/running (which excludes non-
+# running tasks by definition).
+#
+# Returns a light shape — only the fields the UI needs to update
+# one row. Capped at the project_id-scoped visible tasks (no
+# archive=1, no pagination — projects in this orchestrator are
+# typically tens to low-hundreds of tasks).
+
+
+@router.get("/{project_id}/tasks/state")
+async def get_project_task_states(project_id: str, request: Request) -> dict:
+    """Light shape of all visible tasks in a project, for the
+    dashboard's 5s polling loop.
+
+    Returns each task's current status (running / done / failed /
+    cancelled / pending / assigned), loop_status (ok / slow /
+    stuck / looping / unknown), and the liveness info needed for
+    the inline expand panel. Computed per-task (status-aware:
+    non-running tasks get loop_status="ok" with reason="task is X"
+    per compute_loop_status semantics).
+    """
+    db = request.app.state.db
+    proj = await db.fetchone(
+        "SELECT id FROM projects WHERE id = ?", (project_id,)
+    )
+    if not proj:
+        raise HTTPException(404, f"project {project_id} not found")
+    rows = await db.fetchall(
+        "SELECT * FROM tasks WHERE project_id = ? AND archived = 0 "
+        "ORDER BY created_at DESC",
+        (project_id,),
+    )
+    states = [_task_status_to_dict(r, db.db_path) for r in rows]
+    return {
+        "project_id": project_id,
+        "tasks": states,
+        "count": len(states),
+    }
+
+
 # ===== Tool-call events for looping detection (v1.2, 2026-07-29) =====
 #
 # The wrapper emits one event per tool call (e.g. each row of the
