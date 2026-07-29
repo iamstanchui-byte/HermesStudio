@@ -2077,6 +2077,71 @@ def start(
             t.start()
             stream_threads.append(t)
 
+        # ===== Looping detection (v1.2, 2026-07-29) =====
+        # Watch the stdout file for tool-call rows and POST one
+        # event per call to the orchestrator. The server's
+        # compute_loop_status() then queries these events to flag
+        # the task as "looping" if the same (tool, signature)
+        # pair fires >= LOOP_MIN_REPEATS times in LOOP_WINDOW_S.
+        #
+        # Pattern (heuristic on hermes stdout):
+        #   ┊ 💻 $         curl https://example.com -o file.json
+        #   ┊ 💻 preparing terminal…
+        #   ┊ 📚 skill     <name>  <duration>
+        # The first form is a shell command being run. We emit a
+        # tool_call event with tool="shell" and signature=SHA1(command
+        # body)[:16]. We do NOT emit for "preparing" or skill rows
+        # (they're not actual tool invocations). Other tool names
+        # (e.g. read_file, write_file) are not currently detected —
+        # the wrapper would need hermes's structured transcript for
+        # those. Shell is the most common repeat-offender in our
+        # observed failure modes (curl polling a broken URL, ls'ing
+        # a missing dir, etc).
+        import hashlib as _hashlib
+        import re as _re
+        _TOOL_CALL_PATTERN = _re.compile(r"┊\s*💻\s+\$\s+(.+)")
+        def _post_tool_call(tool: str, signature: str) -> None:
+            try:
+                httpx.post(
+                    f"{orchestrator_url}/api/projects/{project_id}"
+                    f"/tasks/{tid}/tool-call",
+                    headers=_auth_headers(),
+                    json={"tool": tool, "signature": signature},
+                    timeout=5,
+                )
+            except Exception as e:
+                # Same posture as _post_chunk: best-effort, never
+                # crash the main loop on a stream error.
+                click.echo(f"  WARN: tool-call POST failed: {e}")
+        def _tail_tool_calls() -> None:
+            pos = 0
+            while not stop_stream.is_set():
+                try:
+                    with open(stdout_log, "rb") as f:
+                        f.seek(pos)
+                        new = f.read()
+                    if new:
+                        pos += len(new)
+                        text = new.decode("utf-8", errors="replace")
+                        for line in text.splitlines():
+                            m = _TOOL_CALL_PATTERN.search(line)
+                            if not m:
+                                continue
+                            body = m.group(1).strip()
+                            if not body:
+                                continue
+                            sig = _hashlib.sha1(
+                                body.encode("utf-8")
+                            ).hexdigest()[:16]
+                            _post_tool_call("shell", sig)
+                except FileNotFoundError:
+                    pass
+                stop_stream.wait(0.5)
+        tool_call_thread = threading.Thread(
+            target=_tail_tool_calls, daemon=True
+        )
+        tool_call_thread.start()
+        stream_threads.append(tool_call_thread)
         try:
             try:
                 # proc.wait() does NOT touch stdout/stderr (those go to

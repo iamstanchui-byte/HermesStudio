@@ -3403,3 +3403,77 @@ async def get_task_output(
         "next_since": chunks[-1]["id"] if chunks else int(since),
     }
 
+
+# ===== Tool-call events for looping detection (v1.2, 2026-07-29) =====
+#
+# The wrapper emits one event per tool call (e.g. each row of the
+# form `┊ 💻 $ <command>` that hermes writes). compute_loop_status
+# queries these to detect when the agent is making the same call
+# over and over — a real "loop" that v1 couldn't see (it only had
+# heartbeat liveness, not content-level repetition).
+
+
+@router.post("/{project_id}/tasks/{task_id}/tool-call")
+async def post_tool_call(
+    project_id: str,
+    task_id: str,
+    request: Request,
+    x_agent_id: str | None = Header(default=None, alias="X-Agent-Id"),
+) -> dict:
+    """Wrapper → server: emit one tool-call event for looping analysis.
+
+    Body: {tool: str, signature: str}
+      - tool:      short human-readable name (e.g. "shell", "read_file")
+      - signature: stable hash of the call's args. We use this (not the
+                   raw args) to keep audit_log small + avoid leaking
+                   potentially-sensitive data into the DB. The same
+                   call with the same args produces the same signature.
+
+    The server writes an audit_log row (event_type="agent.tool_call")
+    and returns the new row's id. No GET endpoint — compute_loop_status
+    queries audit_log directly when it runs.
+    """
+    db = request.app.state.db
+    if not x_agent_id:
+        raise HTTPException(401, "Missing X-Agent-Id header")
+    task = await db.fetchone(
+        "SELECT id, project_id, assigned_agent_id FROM tasks "
+        "WHERE id = ? AND project_id = ?",
+        (task_id, project_id),
+    )
+    if not task:
+        raise HTTPException(
+            404, f"task {task_id} not found in project {project_id}"
+        )
+    if task.get("assigned_agent_id") != x_agent_id:
+        raise HTTPException(
+            403, f"X-Agent-Id ({x_agent_id}) is not the owner of task {task_id}"
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON body")
+    tool = body.get("tool", "")
+    signature = body.get("signature", "")
+    if not isinstance(tool, str) or not tool:
+        raise HTTPException(400, "tool is required and must be a non-empty string")
+    if not isinstance(signature, str) or not signature:
+        raise HTTPException(
+            400, "signature is required and must be a non-empty string"
+        )
+    # Defensive caps: tool name (256 chars), signature (64 chars — usually
+    # 8-16 hex of a SHA256 prefix). Bigger means a misbehaving wrapper.
+    tool = tool[:256]
+    signature = signature[:64]
+    await audit_log(
+        db,
+        "agent.tool_call",
+        actor=f"agent:{x_agent_id}",
+        project_id=project_id,
+        task_id=task_id,
+        agent_id=x_agent_id,
+        payload={"tool": tool, "signature": signature},
+    )
+    last = await db.fetchone("SELECT last_insert_rowid() AS id")
+    return {"ok": True, "id": last["id"]}
+

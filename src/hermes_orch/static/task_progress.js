@@ -41,6 +41,7 @@
     ok:      { glyph: '🟢', cls: 'bg-green-100 text-green-800',   label: 'ok' },
     slow:    { glyph: '🟡', cls: 'bg-yellow-100 text-yellow-800', label: 'slow' },
     stuck:   { glyph: '🔴', cls: 'bg-red-100 text-red-800',       label: 'stuck' },
+    looping: { glyph: '🟣', cls: 'bg-purple-100 text-purple-800', label: 'looping' },
     unknown: { glyph: '⚪', cls: 'bg-gray-100 text-gray-700',      label: 'no signal' },
   };
 
@@ -319,7 +320,9 @@
     }
     if (empty) empty.style.display = 'none';
     // Sort: stuck first (most concerning), then slow, unknown, ok
-    const order = { stuck: 0, slow: 1, unknown: 2, ok: 3 };
+    // Sort: most concerning first. Looping > stuck > slow > unknown > ok
+    // (a stuck wrapper is dead; a looping one is wasting tokens RIGHT NOW).
+    const order = { looping: 0, stuck: 1, slow: 2, unknown: 3, ok: 4 };
     const sorted = [...tasks].sort(
       (a, b) => (order[a.loop_status] ?? 9) - (order[b.loop_status] ?? 9)
     );

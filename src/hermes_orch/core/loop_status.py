@@ -38,6 +38,12 @@ from pathlib import Path
 SLOW_THRESHOLD_S = 30
 STUCK_THRESHOLD_S = 120
 LOOKBACK_FOR_STUCK_WRAPPER_S = 300  # 5 min
+# Looping detection (v1.2, 2026-07-29): if the same (tool, signature)
+# pair fires LOOP_MIN_REPEATS times within LOOP_WINDOW_S, we call it
+# a loop. Conservative defaults — a real agent rarely calls the same
+# tool with identical args 5+ times in 60s.
+LOOP_WINDOW_S = 60
+LOOP_MIN_REPEATS = 5
 
 
 @dataclass
@@ -105,6 +111,23 @@ def compute_loop_status(
             reason="agent wrapper not responding (supervisor flagged)",
             duration_s=duration_s,
             last_event_age_s=last_event_age_s,
+        )
+
+    # 1b. LOOPING: v1.2 (2026-07-29) — the agent is calling the same
+    #     tool with the same args over and over. We can detect this
+    #     now because the wrapper emits agent.tool_call events for
+    #     each invocation. Highest priority after stuck_wrapper (a
+    #     stuck wrapper isn't looping, it's dead).
+    loop_info = _detect_loop(db_path, task["id"], now_ts)
+    if loop_info is not None:
+        tool, count = loop_info
+        return LoopStatus(
+            status="looping",
+            reason=f"looped {count} times: {tool}",
+            duration_s=duration_s,
+            last_event_age_s=last_event_age_s,
+            tool=tool,
+            repeat_count=count,
         )
 
     # 2. STUCK: no liveness for > 2 min (independent of supervisor)
@@ -197,3 +220,51 @@ def _has_recent_stuck_wrapper_event(
         # Defensive: if the DB is locked or the schema changes,
         # don't crash the dashboard — just return False.
         return False
+
+
+def _detect_loop(
+    db_path: Path, task_id: str, now_ts: float
+) -> tuple[str, int] | None:
+    """Detect a tool-call loop: if any (tool, signature) pair has
+    fired LOOP_MIN_REPEATS times in the last LOOP_WINDOW_S seconds,
+    return (tool, count). Otherwise return None.
+
+    Defensive: returns None on any DB error so a corrupt audit_log
+    can't crash the dashboard.
+    """
+    try:
+        from datetime import datetime, timezone
+        cutoff = datetime.fromtimestamp(
+            now_ts - LOOP_WINDOW_S, tz=timezone.utc
+        ).isoformat()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cur = conn.cursor()
+            # Use json_extract to pull the tool/signature out of the
+            # payload column (stored as JSON text). GROUP BY the pair
+            # to find repeated calls. LIMIT 1 + ORDER BY DESC picks
+            # the worst offender.
+            cur.execute(
+                "SELECT json_extract(payload, '$.tool') AS tool, "
+                "       COUNT(*) AS n "
+                "FROM audit_log "
+                "WHERE task_id = ? AND event_type = 'agent.tool_call' "
+                "AND created_at >= ? "
+                "AND json_extract(payload, '$.tool') IS NOT NULL "
+                "AND json_extract(payload, '$.signature') IS NOT NULL "
+                "GROUP BY json_extract(payload, '$.tool'), "
+                "         json_extract(payload, '$.signature') "
+                "ORDER BY n DESC LIMIT 1",
+                (task_id, cutoff),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            tool, count = row
+            if count is None or count < LOOP_MIN_REPEATS:
+                return None
+            return (str(tool), int(count))
+        finally:
+            conn.close()
+    except Exception:
+        return None

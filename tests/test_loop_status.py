@@ -82,14 +82,16 @@ def _insert_audit(
     task_id: str,
     event_type: str,
     ts: float,
+    payload: str | None = None,
 ) -> None:
     """Insert an audit_log row with a controlled created_at."""
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(
             "INSERT INTO audit_log "
-            "(event_type, task_id, created_at) VALUES (?, ?, ?)",
-            (event_type, task_id, _iso(ts)),
+            "(event_type, task_id, created_at, payload) "
+            "VALUES (?, ?, ?, ?)",
+            (event_type, task_id, _iso(ts), payload),
         )
         conn.commit()
     finally:
@@ -479,3 +481,208 @@ def test_thresholds_match_design_doc():
     assert SLOW_THRESHOLD_S == 30
     assert STUCK_THRESHOLD_S == 120
     assert LOOKBACK_FOR_STUCK_WRAPPER_S == 300
+
+
+# ===== Looping detection (v1.2, 2026-07-29) =====
+
+
+def test_looping_detected_when_5_repeats_in_60s(db_path: Path):
+    """5+ identical (tool, signature) pairs in 60s → looping."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-loop",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),  # healthy otherwise
+    }
+    # 5 tool calls, same tool+sig, all within the last 60s
+    for i in range(5):
+        _insert_audit(
+            db_path,
+            "t-loop",
+            "agent.tool_call",
+            now - (i * 2),  # 10s, 8s, 6s, 4s, 2s ago
+            payload='{"tool": "shell", "signature": "abc123"}',
+        )
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "looping"
+    assert "shell" in s.reason
+    assert s.tool == "shell"
+    assert s.repeat_count == 5
+
+
+def test_looping_not_detected_below_threshold(db_path: Path):
+    """Only 4 repeats → NOT looping. The threshold is 5."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-loop",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    for i in range(4):
+        _insert_audit(
+            db_path,
+            "t-loop",
+            "agent.tool_call",
+            now - (i * 2),
+            payload='{"tool": "shell", "signature": "abc"}',
+        )
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "ok"
+
+
+def test_looping_not_detected_outside_window(db_path: Path):
+    """Old repeats (>60s ago) don't count toward the loop."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-loop",
+        "status": "running",
+        "started_at": _iso(now - 200),
+        "last_liveness_at": _iso(now - 1),
+    }
+    for i in range(5):
+        _insert_audit(
+            db_path,
+            "t-loop",
+            "agent.tool_call",
+            now - 120 - (i * 2),  # all > 60s old
+            payload='{"tool": "shell", "signature": "abc"}',
+        )
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "ok"
+
+
+def test_looping_picks_worst_offender(db_path: Path):
+    """If multiple (tool, sig) pairs repeat, we flag the one with
+    the highest count."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-loop",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    # shell+sig_a x 6, shell+sig_b x 3
+    for i in range(6):
+        _insert_audit(
+            db_path, "t-loop", "agent.tool_call", now - i,
+            payload='{"tool": "shell", "signature": "sig_a"}',
+        )
+    for i in range(3):
+        _insert_audit(
+            db_path, "t-loop", "agent.tool_call", now - 30 - i,
+            payload='{"tool": "shell", "signature": "sig_b"}',
+        )
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "looping"
+    assert s.tool == "shell"
+    assert s.repeat_count == 6  # sig_a, the worst offender
+
+
+def test_looping_higher_priority_than_slow(db_path: Path):
+    """A task that's BOTH slow AND looping → looping wins."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-loop",
+        "status": "running",
+        "started_at": _iso(now - 200),
+        "last_liveness_at": _iso(now - 60),  # 60s → slow
+    }
+    for i in range(5):
+        _insert_audit(
+            db_path, "t-loop", "agent.tool_call", now - i,
+            payload='{"tool": "shell", "signature": "abc"}',
+        )
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "looping"
+
+
+def test_looping_lower_priority_than_stuck_wrapper(db_path: Path):
+    """A task with a stuck_wrapper event AND tool loops → stuck wins
+    (the wrapper is dead, so the loop is moot)."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-loop",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    _insert_audit(
+        db_path, "t-loop", "task.stuck_wrapper", now - 30,
+    )
+    for i in range(5):
+        _insert_audit(
+            db_path, "t-loop", "agent.tool_call", now - i,
+            payload='{"tool": "shell", "signature": "abc"}',
+        )
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "stuck"  # stuck_wrapper > looping
+
+
+def test_looping_other_event_types_dont_count(db_path: Path):
+    """Only agent.tool_call events feed the loop detector. Other
+    audit_log rows (e.g. output_chunk) don't."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-loop",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    for i in range(5):
+        _insert_audit(
+            db_path, "t-loop", "agent.output_chunk", now - i,
+            payload='{"seq": 1, "text": "x", "stream": "stdout"}',
+        )
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "ok"
+
+
+def test_looping_scoped_to_task(db_path: Path):
+    """Loops on task A don't affect task B."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-this",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    # 5 tool calls on a DIFFERENT task
+    for i in range(5):
+        _insert_audit(
+            db_path, "t-other", "agent.tool_call", now - i,
+            payload='{"tool": "shell", "signature": "abc"}',
+        )
+    s = compute_loop_status(task, db_path, now_ts=now)
+    assert s.status == "ok"
+
+
+def test_looping_with_corrupt_payload_doesnt_crash(db_path: Path):
+    """A tool_call row with invalid JSON payload should be ignored
+    (json_extract returns NULL, so the row doesn't match the
+    WHERE clause)."""
+    now = 1_000_000.0
+    task = {
+        "id": "t-loop",
+        "status": "running",
+        "started_at": _iso(now - 60),
+        "last_liveness_at": _iso(now - 1),
+    }
+    for i in range(5):
+        _insert_audit(
+            db_path, "t-loop", "agent.tool_call", now - i,
+            payload="not json",
+        )
+    s = compute_loop_status(task, db_path, now_ts=now)
+    # The corrupt rows don't count as tool calls, so no loop
+    assert s.status == "ok"
+
+
+def test_looping_threshold_constant():
+    """Sanity check on the v1.2 constants."""
+    from hermes_orch.core.loop_status import (
+        LOOP_WINDOW_S, LOOP_MIN_REPEATS,
+    )
+    assert LOOP_WINDOW_S == 60
+    assert LOOP_MIN_REPEATS == 5
