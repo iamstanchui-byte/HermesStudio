@@ -1454,7 +1454,11 @@ async function deletePreset(agentId, profileName, btn) {
 </div>
 
 <script defer src="/static/chatbox.js?v=2026-07-29"></script>
-<script defer src="/static/task_progress.js?v=2026-07-29"></script>
+{# v1.8: SSE event stream. Must load BEFORE task_progress.js
+   because task_progress.js's `_openEventStream()` calls
+   `new window.orch.TaskEventStream(...)`. #}
+<script defer src="/static/task_events.js?v=2026-07-29-v1.8"></script>
+<script defer src="/static/task_progress.js?v=2026-07-29-v1.8"></script>
 
 {# Task Progress Monitor side panel (T4, 2026-07-29, v1.4 partial).
    The panel HTML lives in _task_progress_panel.html so we can

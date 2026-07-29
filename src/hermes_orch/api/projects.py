@@ -39,14 +39,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import asyncio
+import json
 import httpx
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from hermes_orch.auth import require_hmac_auth
 from pydantic import BaseModel, Field
 
 from hermes_orch.core.audit import audit_log
 from hermes_orch.core.loop_status import compute_loop_status
+from hermes_orch.core.sse import publish_event, subscribe
 from hermes_orch.utils import now_iso as _now_iso
 
 # Imported here (not at module top) to avoid circular imports
@@ -3270,6 +3274,20 @@ async def cancel_project_task(
     row = await _do_cancel_task(
         db, task_id, actor="operator:ui"
     )
+    # v1.8: SSE notify — the dashboard's task_progress.js calls
+    # THIS endpoint (project-scoped), not the unscoped one in
+    # tasks.py. Without this, the status pill wouldn't update
+    # instantly via SSE — the 30s reconcile poll would eventually
+    # catch it, but real-time is the point of v1.8.
+    await publish_event(
+        project_id,
+        "task.state_changed",
+        {
+            "task_id": task_id,
+            "status": "cancelled",
+            "agent_id": row.get("assigned_agent_id"),
+        },
+    )
     return {
         "task": _row_to_task_dict(row),
         "was_running": was_running,
@@ -3388,8 +3406,22 @@ async def post_output_chunk(
         agent_id=agent_id,
         payload={"seq": seq, "text": text, "stream": stream},
     )
-    # Return the new row's id so the wrapper can confirm the write
+    # v1.8: notify SSE subscribers (browser dashboard). We send
+    # the full chunk (capped at 64KB by the truncation above).
+    # Slow clients (e.g. background tabs) get dropped events; they
+    # resync via /tasks/{id}/output?since=N.
     last = await db.fetchone("SELECT last_insert_rowid() AS id")
+    await publish_event(
+        project_id,
+        "output.chunk",
+        {
+            "task_id": task_id,
+            "seq": seq,
+            "stream": stream,
+            "text": text,
+            "id": last["id"],
+        },
+    )
     return {"ok": True, "id": last["id"], "seq": seq}
 
 
@@ -3503,6 +3535,141 @@ async def get_project_task_states(project_id: str, request: Request) -> dict:
     }
 
 
+# ===== SSE: real-time event stream (v1.8, 2026-07-29) =====
+#
+# Browsers open a long-lived /events connection (text/event-stream).
+# Server emits:
+#   1. An initial "snapshot" event with the current task states
+#      (so the UI doesn't need a separate /tasks/state fetch).
+#   2. "task.state_changed" when a task transitions (running -> done,
+#      etc.) — fired by the /result, /start, /cancel endpoints.
+#   3. "task.loop_status_changed" when compute_loop_status sees a new
+#      state (ok -> slow / stuck / looping).
+#   4. "output.chunk" when a new agent.output_chunk is written.
+#   5. "tool.call" when a new agent.tool_call is written.
+#   6. Heartbeat every 30s (`: keepalive` SSE comment) to keep
+#      proxies from closing the connection.
+#
+# No auth: like other dashboard reads, the URL itself is the
+# capability (you have to know the project_id). For productize, add
+# session-cookie auth before exposing this past local network.
+#
+# Why not /api/projects/{id}/tasks/{task_id}/events? — that would
+# require a new connection per task. The dashboard usually watches
+# 1-10 tasks, so one per-project connection is enough; the
+# browser filters by task_id in the JS handler.
+
+# Heartbeat interval: keep the connection alive through proxies
+# that idle-close after 60s. Also lets the client detect a dead
+# connection (no event for >2*heartbeat means reconnect).
+_SSE_HEARTBEAT_S = 30
+
+
+def _sse_format(event_type: str, data: Any, event_id: int | None = None) -> bytes:
+    """Encode one SSE message in the wire format.
+
+    Format (per https://html.spec.whatwg.org/multipage/server-sent-events.html):
+      event: <type>
+      id: <seq>            (optional)
+      data: <json>
+
+    Each line is terminated by \\n, the whole message by \\n\\n.
+    """
+    lines = [f"event: {event_type}"]
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    payload = json.dumps(data, ensure_ascii=False, default=str)
+    # SSE splits data on \n; if our JSON has newlines, split them
+    for ln in payload.split("\n"):
+        lines.append(f"data: {ln}")
+    return ("\n".join(lines) + "\n\n").encode("utf-8")
+
+
+@router.get("/{project_id}/events")
+async def stream_project_events(
+    project_id: str, request: Request
+) -> StreamingResponse:
+    """SSE stream of project events (v1.8).
+
+    Browser usage:
+        new EventSource('/api/projects/<id>/events')
+
+    Returns a `text/event-stream` response that:
+      1. Sends an immediate "snapshot" event with current task states.
+      2. Subscribes to the in-process event bus.
+      3. Pushes events as they arrive.
+      4. Heartbeats every 30s with `: keepalive` (SSE comment).
+      5. Cleans up the subscription on client disconnect
+         (browser tab close, network drop, server shutdown).
+    """
+    db = request.app.state.db
+    proj = await db.fetchone(
+        "SELECT id FROM projects WHERE id = ?", (project_id,)
+    )
+    if not proj:
+        raise HTTPException(404, f"project {project_id} not found")
+
+    async def event_stream():
+        # 1. Initial snapshot — same shape as /tasks/state but in an
+        #    event envelope so the JS handler can use one path.
+        rows = await db.fetchall(
+            "SELECT * FROM tasks WHERE project_id = ? AND archived = 0 "
+            "ORDER BY created_at DESC",
+            (project_id,),
+        )
+        states = [_task_status_to_dict(r, db.db_path) for r in rows]
+        yield _sse_format(
+            "snapshot",
+            {
+                "project_id": project_id,
+                "tasks": states,
+                "count": len(states),
+            },
+            event_id=0,
+        )
+        # Yield control so the client sees the snapshot before any
+        # follow-up events (otherwise FastAPI may buffer the first
+        # chunk in a single send).
+        await asyncio.sleep(0)
+
+        # 2. Live event stream
+        async with subscribe(project_id) as queue:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(
+                        queue.get(), timeout=_SSE_HEARTBEAT_S
+                    )
+                except asyncio.TimeoutError:
+                    # Heartbeat: SSE comment line. Keeps proxies
+                    # alive AND lets the client detect a dead
+                    # connection (no event for >2*heartbeat).
+                    yield b": keepalive\n\n"
+                    continue
+                yield _sse_format(
+                    event["type"],
+                    event["data"],
+                )
+                # Tiny yield so the client sees events as they come
+                await asyncio.sleep(0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            # Don't let any cache or proxy buffer the stream
+            "Cache-Control": "no-cache, no-transform",
+            # Disable Nginx response buffering (defensive; we run
+            # behind uvicorn directly, but a future reverse proxy
+            # would need this)
+            "X-Accel-Buffering": "no",
+            # Keep the connection open
+            "Connection": "keep-alive",
+        },
+    )
+
+
 # ===== Tool-call events for looping detection (v1.2, 2026-07-29) =====
 #
 # The wrapper emits one event per tool call (e.g. each row of the
@@ -3571,6 +3738,18 @@ async def post_tool_call(
         agent_id=agent_id,
         payload={"tool": tool, "signature": signature},
     )
+    # v1.8: notify SSE subscribers. The dashboard's loop_status
+    # badge updates incrementally as new tool calls arrive.
     last = await db.fetchone("SELECT last_insert_rowid() AS id")
+    await publish_event(
+        project_id,
+        "tool.call",
+        {
+            "task_id": task_id,
+            "tool": tool,
+            "signature": signature,
+            "id": last["id"],
+        },
+    )
     return {"ok": True, "id": last["id"]}
 

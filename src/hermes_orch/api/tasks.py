@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+
+from hermes_orch.core.sse import publish_event
 from hermes_orch.auth import require_hmac_auth
 from pydantic import BaseModel, Field
 
@@ -485,6 +487,18 @@ async def start_task(
         task_id=task_id,
         agent_id=task["assigned_agent_id"],
     )
+    # v1.8: SSE notify. The dashboard's status pill + loop_status
+    # badge update instantly when a task flips assigned -> running.
+    await publish_event(
+        task["project_id"],
+        "task.state_changed",
+        {
+            "task_id": task_id,
+            "status": "running",
+            "agent_id": task["assigned_agent_id"],
+            "started_at": now,
+        },
+    )
     return _row_to_task(row)
 
 
@@ -780,6 +794,21 @@ async def submit_result(
                 "token_usage record failed for task %s: %s", task_id, e
             )
 
+    # v1.8: SSE notify. When a task transitions running → completed
+    # or running → failed, the dashboard's status pill + loop_status
+    # badge update instantly (no waiting for the next 5s poll tick).
+    # The browser re-evaluates the loop_status from audit_log data
+    # on its next refresh; for now we just notify the state change.
+    await publish_event(
+        updated.get("project_id", task.get("project_id", "")),
+        "task.state_changed",
+        {
+            "task_id": task_id,
+            "status": body.status,  # "completed" or "failed"
+            "agent_id": task.get("assigned_agent_id"),
+            "ended_at": _now_iso(),
+        },
+    )
     return updated
 
 
@@ -787,6 +816,18 @@ async def submit_result(
 async def cancel_task(task_id: str, request: Request) -> Task:
     """Operator cancels a task (any non-terminal state → cancelled)."""
     row = await _do_cancel_task(request.app.state.db, task_id, actor="operator")
+    # v1.8: SSE notify. Cancel button in the dashboard now updates
+    # the status pill instantly instead of waiting for the next
+    # 5s poll tick.
+    await publish_event(
+        row.get("project_id", ""),
+        "task.state_changed",
+        {
+            "task_id": task_id,
+            "status": "cancelled",
+            "agent_id": row.get("assigned_agent_id"),
+        },
+    )
     return _row_to_task(row)
 
 

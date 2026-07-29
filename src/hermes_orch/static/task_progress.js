@@ -1,27 +1,26 @@
-/* Task Progress Monitor — frontend (T4, 2026-07-29).
+/* Task Progress Monitor — frontend (T4, 2026-07-29-v1.8, SSE v1.8).
  *
  * Powers real-time status badges + inline expand + side panel.
- * Polls /api/projects/{id}/tasks/{id}/status every 5s for each
- * running task, and /api/projects/{id}/tasks/running every 5s to
- * keep the side panel + task-row badges in sync.
+ * v1.8 (2026-07-29): replaced the 5s polling with an SSE event
+ * stream (window.orch.TaskEventStream) plus a slow 30s reconcile
+ * poll as a drift-correction safety net. Status changes appear
+ * in <100ms instead of up to 5s.
  *
  * v1.1 (2026-07-29): added live output streaming. When the user
  * expands a running task, we start a 2s poller on
  * /api/projects/{id}/tasks/{id}/output?since=<id> and append
- * new chunks to a per-task <pre> block. Stderr is rendered in
- * a collapsible <details> section so the main view stays clean.
+ * new chunks to a per-task <pre> block. The SSE output.chunk
+ * event ALSO appends to the active streamer for sub-2s
+ * freshness (no more waiting for the next poll).
  *
  * API surface (window.taskProgress):
  *   init(projectId)         — call once after page load
  *   refreshAll()            — force-poll now (debug button)
  *
- * Data flow per tick (5s):
- *   1. fetch /tasks/running  → update side panel + per-row badges
- *   2. for each row currently visible with status=running, ALSO fetch
- *      /tasks/{id}/status  → update its badge with finer loop_status
- *      (slow / stuck / unknown) that the /running endpoint also
- *      returns, but we re-fetch the explicit per-task endpoint to
- *      keep things simple and resilient to ordering bugs.
+ * Data flow:
+ *   - SSE: snapshot on connect, then live events as state changes
+ *   - Polling: 30s reconcile (drift correction)
+ *   - Inline output: 2s poll + immediate push from output.chunk SSE
  *
  * Inline expand:
  *   Click a task row → toggle a detail panel below it.
@@ -36,7 +35,10 @@
 (function () {
   'use strict';
 
-  const POLL_MS = 5000;
+  // v1.8: 30s reconcile poll (was 5s in v1.0-v1.7). SSE handles the
+  // realtime updates; this is just a "did we miss anything?"
+  // safety net. 6x lower server load than the old 5s polling.
+  const POLL_MS = 30000;
   const STATUS_BADGE = {
     ok:      { glyph: '🟢', cls: 'bg-green-100 text-green-800',   label: 'ok' },
     slow:    { glyph: '🟡', cls: 'bg-yellow-100 text-yellow-800', label: 'slow' },
@@ -49,6 +51,7 @@
   let projectId = null;
   let runningCache = new Map();  // task_id → status dict
   let pollTimer = null;
+  let sseStream = null;          // v1.8: TaskEventStream instance
   let sidePanelOpen = false;
 
   // === Public API ===
@@ -60,7 +63,7 @@
       // fresh; this just avoids a 5s blank window on initial load.
       _seedFromDom();
       // Take over from base.html's 10s page-reload poller. We do
-      // our own 5s polling for status updates and a 2s poller for
+      // our own polling for status updates and a 2s poller for
       // the live output of any expanded task. A full page reload
       // would wipe the user's expanded panels + scroll position +
       // any in-progress cancellations, so we ask base.html to
@@ -89,7 +92,13 @@
         if (e.target.closest('button, a, input, select, textarea')) return;
         _toggleExpand(row);
       });
-      // Kick off polling
+      // v1.8: open the SSE event stream. The snapshot event
+      // provides the initial state (replaces the first /tasks/state
+      // fetch), and live events keep the UI in sync. The slow
+      // reconcile poll (every 30s) is the safety net for events
+      // the browser missed (background tab, network blip).
+      _openEventStream();
+      // Kick off the slow polling loop
       _scheduleNext();
     },
     refreshAll() {
@@ -151,6 +160,125 @@
     // currently-running and just-finished tasks so the row pill
     // text + class stays in sync with the server).
     _updateAllBadges();
+  }
+
+  // === v1.8: SSE event stream ===
+  //
+  // The server pushes events as they happen (see
+  // src/hermes_orch/core/sse.py + api/projects.py). We use SSE
+  // for realtime updates and keep the 30s polling loop as a
+  // safety net (in case the browser dropped an event — common
+  // in background tabs, network blips, server restarts).
+  //
+  // Snapshot replaces the first /tasks/state fetch: when the
+  // browser connects, the server sends the current task list
+  // immediately, so we don't need to do an HTTP roundtrip just
+  // to render the initial state.
+  //
+  // Live events:
+  //   task.state_changed  — one task transitioned (rare, status pill)
+  //   output.chunk        — agent output arrived (high freq, append to streamer)
+  //   tool.call           — tool invocation (mid freq, refresh loop_status badge)
+  //
+  // For the high-frequency events (output.chunk), we update
+  // locally without polling. For state-changed and tool.call
+  // we trigger a poll to refresh the authoritative loop_status
+  // (we don't recompute that client-side — server is the source
+  // of truth).
+
+  function _openEventStream() {
+    // Defensive: no projectId means cross-project page (workflow
+    // level) — SSE is per-project so we just don't subscribe.
+    // The 30s reconcile poll still works for the side panel.
+    if (!projectId) return;
+    // Defensive: if task_events.js didn't load (e.g. build
+    // error or someone removed the <script> tag), fall back
+    // to polling-only. The 30s tick still works.
+    if (!window.orch || !window.orch.TaskEventStream) {
+      console.warn(
+        '[task_progress] TaskEventStream unavailable; running in poll-only mode'
+      );
+      return;
+    }
+    sseStream = new window.orch.TaskEventStream(projectId, {
+      onSnapshot: (data) => {
+        // Authoritative initial state. Each task here has the
+        // same shape as /tasks/state returns (via
+        // _task_status_to_dict server-side), so we can populate
+        // runningCache + re-render directly.
+        const tasks = (data && data.tasks) || [];
+        runningCache = new Map(tasks.map((t) => [t.task_id, t]));
+        // Side panel: show only running tasks (matches old
+        // /tasks/running endpoint behavior).
+        _renderSidePanel(tasks.filter((t) => t.status === 'running'));
+        // Re-render every visible row with the fresh state
+        // (overwrites whatever _seedFromDom put in based on
+        // server-render data-attributes, which may be seconds
+        // stale by the time SSE connects).
+        _updateAllBadges();
+      },
+      onTaskStateChanged: (_data) => {
+        // A task transitioned. Just re-poll — the new status
+        // (and possibly a freshly-removed loop_status badge) is
+        // server-computed and the poll is cheap. Doing a poll
+        // also keeps things consistent if multiple events
+        // arrive back-to-back.
+        _pollOnce();
+      },
+      onOutputChunk: (data) => {
+        // High-frequency event: agent stdout/stderr arrived.
+        // If the user has the inline expand panel open for
+        // this task, append the chunk to the active streamer
+        // immediately. No poll needed.
+        const s = _streamers.get(data.task_id);
+        if (!s) return;
+        _renderStreamChunk(s, data.task_id, {
+          stream: data.stream,
+          text: data.text,
+        });
+        // Bump s.since so the 2s poller doesn't re-fetch
+        // this chunk on its next tick.
+        if (data.id != null && data.id > s.since) {
+          s.since = data.id;
+        }
+        // Update the streaming status label so the user sees
+        // "(streaming via SSE)" — useful for confirming the
+        // event path is working.
+        const status = s.host && s.host.querySelector(
+          `[data-stream-status="${data.task_id}"]`
+        );
+        if (status) {
+          // Don't override the pause indicator
+          if (!s.paused) status.textContent = 'streaming (sse)';
+        }
+      },
+      onToolCall: (_data) => {
+        // A new tool invocation arrived. The loop_status badge
+        // depends on the server's compute_loop_status (which
+        // counts repeated tool calls in a 60s window), so we
+        // re-poll to pick up any change. Tool-call rate is
+        // bounded by hermes itself (~1/sec at peak during
+        // active work), so a few extra polls are fine.
+        _pollOnce();
+      },
+      onReconcile: () => {
+        // 30s safety net (drift correction). The TaskEventStream
+        // already runs this on its own timer; we just hook it
+        // to our existing poll path.
+        _pollOnce();
+      },
+      onConnected: () => {
+        // Optional: visible indicator. Skip console noise in
+        // production; uncomment for debugging.
+        // console.log('[orch-events] SSE connected for', projectId);
+      },
+      onDisconnected: (_e) => {
+        // EventSource auto-reconnects with backoff. We don't
+        // need to do anything — the 30s reconcile poll keeps
+        // the UI in sync during the gap.
+      },
+    });
+    sseStream.start();
   }
 
 
