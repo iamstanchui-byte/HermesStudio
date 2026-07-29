@@ -128,7 +128,7 @@
         // v1.5.3: when the user drags a card, update _plan.visual_layout
         // so the next savePlan() persists the new position. The PUT
         // happens in savePlan() — we don't auto-save on every drag.
-        _editor.on('nodeMoved', _onNodeMovedPersistLayout);
+        _editor.on('nodeMoved', _capturePlanVisualLayout);
         // Wire the connection lifecycle to _plan.steps[i].depends_on
         // (mirrors visual_workflow.js's pattern). Without this, the
         // user drags a wire on the canvas, drawflow stores it in its
@@ -936,46 +936,70 @@
         }
     }
 
-    // v1.5.3: write _plan.visual_layout[step_name] = {x, y} when
-    // a drawflow node is moved. The actual server PUT happens
-    // in savePlan() — we just update the in-memory plan here.
-    function _onNodeMovedPersistLayout(node) {
-        if (!_plan.visual_layout) _plan.visual_layout = {};
-        const stepName = (node && node.data && node.data.name) || null;
-        if (!stepName) return;
-        _plan.visual_layout[stepName] = {
-            x: node.pos_x,
-            y: node.pos_y,
-        };
-    }
-    // v1.5.3: on init, walk the current plan and apply the persisted
-    // x/y onto each drawflow node's data so the canvas renders the
-    // saved layout. We mutate _plan.steps in place (the drawflow
-    // nodes read x/y from the step's data when re-rendered).
-    function _applyPlanVisualLayout() {
+    // v1.5.3 + v1.5.3.1: write _plan.visual_layout[step_name] =
+    // {x, y} when a drawflow node is moved. v1.5.3 originally
+    // tried to read the moved node from the callback arg, but
+    // drawflow 0.0.59's `nodeMoved` event does NOT pass a node
+    // arg — the callback is just `() => void`. We now walk
+    // drawflow's internal node map (same pattern as
+    // visual_workflow.js's _captureAllNodePositions at
+    // src/hermes_orch/static/visual_workflow.js:605) to read
+    // each node's current pos_x / pos_y. The actual server PUT
+    // happens in savePlan() — this just updates the in-memory
+    // _plan.
+    function _capturePlanVisualLayout() {
         if (!_editor || !_plan || !_plan.steps) return;
-        const layout = _plan.visual_layout || {};
-        _plan.steps.forEach((step) => {
-            const pos = layout[step.name];
-            if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
-                // drawflow nodes are keyed by step name; we set the
-                // data on the existing node rather than re-creating
-                // it. The next drawflow render() will pick up the
-                // new x/y. Missing entries (steps added since the
-                // last save) keep their default position.
-                try {
-                    const node = _editor.getNodeFromId(step.name);
-                    if (node) {
-                        node.pos_x = pos.x;
-                        node.pos_y = pos.y;
-                    }
-                } catch (e) {
-                    // Node not in canvas yet (init order) — skip;
-                    // the next savePlan() will pick up the position
-                    // anyway.
+        if (!_editor.drawflow || !_editor.drawflow.drawflow) return;
+        const stepNames = new Set(_plan.steps.map((s) => s.name));
+        if (!_plan.visual_layout) _plan.visual_layout = {};
+        const modules = Object.keys(_editor.drawflow.drawflow);
+        for (const modName of modules) {
+            const mod = _editor.drawflow.drawflow[modName];
+            if (!mod || !mod.data) continue;
+            for (const nodeId of Object.keys(mod.data)) {
+                const node = mod.data[nodeId];
+                if (!node || !node.data) continue;
+                const stepName = node.data.name;
+                if (!stepName || !stepNames.has(stepName)) continue;
+                if (typeof node.pos_x === 'number'
+                    && typeof node.pos_y === 'number') {
+                    _plan.visual_layout[stepName] = {
+                        x: node.pos_x,
+                        y: node.pos_y,
+                    };
                 }
             }
-        });
+        }
+    }
+    // v1.5.3 + v1.5.3.1: on init, walk the current plan and apply
+    // the persisted x/y onto each drawflow node's pos_x / pos_y
+    // so the canvas renders the saved layout. (The first version
+    // of this tried _editor.getNodeFromId(step.name) but the
+    // arg there is drawflow's INTERNAL numeric id, not the
+    // step name — so it always threw and silently skipped. We
+    // now walk the node map the same way _capturePlanVisualLayout
+    // does, which works because drawflow stores each node's
+    // data.name = step name.) Missing entries (steps added
+    // since the last save) keep their default drawflow position.
+    function _applyPlanVisualLayout() {
+        if (!_editor || !_plan || !_plan.steps) return;
+        if (!_editor.drawflow || !_editor.drawflow.drawflow) return;
+        const layout = _plan.visual_layout || {};
+        const modules = Object.keys(_editor.drawflow.drawflow);
+        for (const modName of modules) {
+            const mod = _editor.drawflow.drawflow[modName];
+            if (!mod || !mod.data) continue;
+            for (const nodeId of Object.keys(mod.data)) {
+                const node = mod.data[nodeId];
+                if (!node || !node.data) continue;
+                const stepName = node.data.name;
+                const pos = layout[stepName];
+                if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
+                    node.pos_x = pos.x;
+                    node.pos_y = pos.y;
+                }
+            }
+        }
     }
 
     // ===== Public API (window.vp) =====
