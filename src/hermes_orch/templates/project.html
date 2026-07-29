@@ -160,6 +160,16 @@
                         Archive
                     </button>
                     {% endif %}
+                    {# Task Progress Monitor toggle (T4, 2026-07-29).
+                       Opens the slide-out side panel listing this
+                       project's running tasks with their live loop
+                       status. The panel polls /api/projects/{id}/tasks/running
+                       every 5s. #}
+                    <button id="task-progress-toggle-btn"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-blue-300 text-blue-700 hover:bg-blue-50"
+                        title="Toggle the Task Progress side panel — live loop status for all running tasks in this project">
+                        📊 Live status
+                    </button>
                     {% if project.state != 'deleted' %}
                     <button onclick="deleteProject('{{ project.id }}')"
                         class="px-3 py-1.5 text-xs font-medium rounded border border-red-300 text-red-700 hover:bg-red-50">
@@ -461,7 +471,19 @@ they target different agent profiles. -->
     {% endif %}
     <div class="space-y-2">
         {% for t in tasks %}
-        <div class="border-l-4 pl-3 py-2
+        {# Task Progress Monitor (T4, 2026-07-29): the data-*
+           attributes below are read by static/task_progress.js to
+           drive the live status badge + inline expand. The server
+           pre-computes loop status at render time so the first paint
+           already shows the correct badge (no 5s blank window). #}
+        <div data-task-id="{{ t.id }}"
+             data-task-status="{{ t.status }}"
+             data-task-name="{{ t.name or '' }}"
+             data-loop-status="{{ t.loop.status }}"
+             data-loop-reason="{{ t.loop.reason }}"
+             data-duration-s="{{ t.loop.duration_s }}"
+             data-last-age="{{ '' if t.loop.last_event_age_s is none else t.loop.last_event_age_s }}"
+             class="border-l-4 pl-3 py-2
             {% if t.status == 'completed' %}border-green-500
             {% elif t.status == 'failed' %}border-red-500
             {% elif t.status == 'running' %}border-blue-500
@@ -469,7 +491,8 @@ they target different agent profiles. -->
             {% else %}border-gray-300{% endif %}">
             <div class="flex items-center justify-between">
                 <div class="flex items-center gap-2">
-                    <span class="px-2 py-0.5 text-xs rounded font-mono
+                    <span data-status-pill
+                        class="px-2 py-0.5 text-xs rounded font-mono
                         {% if t.status == 'completed' %}bg-green-100 text-green-800
                         {% elif t.status == 'failed' %}bg-red-100 text-red-800
                         {% elif t.status == 'running' %}bg-blue-100 text-blue-800
@@ -1431,6 +1454,55 @@ async function deletePreset(agentId, profileName, btn) {
 </div>
 
 <script defer src="/static/chatbox.js?v=2026-07-29"></script>
+<script defer src="/static/task_progress.js?v=2026-07-29"></script>
+
+{# Task Progress Monitor side panel (T4, 2026-07-29). Hidden by
+   default; toggled via #task-progress-toggle-btn. The panel
+   slides in from the right edge of the viewport. task_progress.js
+   populates the list and the count, then refreshes every 5s. #}
+<div id="task-progress-side-panel"
+     style="display: none;"
+     class="fixed top-12 right-0 bottom-0 w-80 bg-white border-l-2 border-blue-300 shadow-lg z-40 flex flex-col">
+    <div class="px-3 py-2 bg-blue-50 border-b border-blue-200 flex items-center justify-between">
+        <div class="text-sm font-semibold text-blue-900">
+            🟢 Running tasks (<span id="task-progress-side-panel-count">0</span>)
+        </div>
+        <button onclick="document.getElementById('task-progress-side-panel').style.display='none'"
+            class="text-blue-700 hover:text-blue-900 text-sm"
+            title="Close panel">✕</button>
+    </div>
+    <div id="task-progress-side-panel-empty"
+         class="px-3 py-4 text-sm text-gray-500 italic">
+        No running tasks — all clear.
+    </div>
+    <div id="task-progress-side-panel-list" class="flex-1 overflow-y-auto px-3 py-2">
+    </div>
+    <div class="px-3 py-2 border-t border-gray-200 text-xs text-gray-500">
+        Polled every 5s. Stuck tasks are sorted to the top.
+    </div>
+</div>
+
+<script>
+{# Wire up the Task Progress Monitor after the DOM is ready.
+   We pass the project id explicitly (it's already in the page
+   template context as project.id). #}
+(function() {
+    function boot() {
+        if (window.taskProgress && typeof window.taskProgress.init === 'function') {
+            window.taskProgress.init({{ project.id|tojson }});
+        } else {
+            // task_progress.js hasn't loaded yet — retry once.
+            setTimeout(boot, 50);
+        }
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot);
+    } else {
+        boot();
+    }
+})();
+</script>
+
 {# Bug fix 2026-07-28: the chat assistant <script> tag at L1436 was
    never closed. The browser kept consuming HTML into the script
    until it found the next </script> in base.html (the polling

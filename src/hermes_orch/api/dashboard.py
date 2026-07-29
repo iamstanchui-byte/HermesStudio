@@ -1012,6 +1012,21 @@ async def project_page(
     for t in project_tasks:
         _annotate_artifact_exists(t, projects_root_p)
 
+    # Live loop status for the Task Progress Monitor (T4, 2026-07-29).
+    # Compute on the server at page-render time so the initial paint
+    # already shows accurate slow/stuck/ok badges. The frontend
+    # (static/task_progress.js) then re-polls every 5s and overrides
+    # the badge text via the data-loop-status attribute.
+    from hermes_orch.core.loop_status import compute_loop_status
+    for t in project_tasks:
+        ls = compute_loop_status(t, db.db_path)
+        t["loop"] = {
+            "status": ls.status,
+            "reason": ls.reason,
+            "duration_s": ls.duration_s,
+            "last_event_age_s": ls.last_event_age_s,
+        }
+
     # All profiles for role dropdown
     profile_rows = await db.fetchall(
         "SELECT ap.id, ap.name, a.id AS agent_id, a.ip, a.os_type, a.secret_hash "

@@ -25,7 +25,12 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from hermes_orch.core.audit import audit_log
+from hermes_orch.core.loop_status import compute_loop_status
 from hermes_orch.utils import now_iso as _now_iso
+
+# Imported here (not at module top) to avoid circular imports
+# (tasks.py imports from api.projects for some types).
+from hermes_orch.api.tasks import _do_cancel_task  # noqa: E402
 
 router = APIRouter()
 
@@ -3085,5 +3090,161 @@ async def apply_chat_suggestion(
         "project_id": result.project_id,
         "updated_at": result.updated_at,
         "step_count": len(result.plan.steps) if result.plan else 0,
+    }
+
+
+# ===== Task Progress Monitor (T2, 2026-07-29) =====
+#
+# Powers the dashboard's real-time status badges + side panel.
+# Polled by the frontend every 5s (per design doc §4).
+#
+# Endpoints:
+#   GET /api/projects/{id}/tasks/{task_id}/status
+#     → single task's loop_status + liveness info
+#   GET /api/projects/{id}/tasks/running
+#     → all running tasks' loop_status (for initial load + polling)
+#
+# `loop_status` is one of ok / slow / stuck / unknown (see
+# src/hermes_orch/core/loop_status.py for semantics). 404 is
+# returned if the project or task does not exist, or if the
+# task does not belong to the project (multi-tenant guard).
+
+
+def _task_status_to_dict(task_row: dict, db_path: Path) -> dict:
+    """Compute loop_status for a task row and return a JSON-friendly
+    dict. The DB row comes from a SELECT * FROM tasks query."""
+    ls = compute_loop_status(task_row, db_path)
+    return {
+        "task_id": task_row["id"],
+        "project_id": task_row["project_id"],
+        "name": task_row.get("name", ""),
+        "agent_role": task_row.get("agent_role", ""),
+        "status": task_row.get("status", ""),
+        "loop_status": ls.status,
+        "loop_reason": ls.reason,
+        "duration_s": ls.duration_s,
+        "last_event_age_s": ls.last_event_age_s,
+        "started_at": task_row.get("started_at"),
+        "last_liveness_at": task_row.get("last_liveness_at"),
+    }
+
+
+@router.get("/{project_id}/tasks/{task_id}/status")
+async def get_task_status(
+    project_id: str, task_id: str, request: Request
+) -> dict:
+    """Live progress status for a single task.
+
+    Returns 404 if the project or task does not exist, or if the
+    task is not part of the project. Used by the dashboard's
+    inline-expand detail + side panel (T4)."""
+    db = request.app.state.db
+    # Verify project exists (404 vs 200-with-empty is ambiguous;
+    # we want a hard 404 so the frontend can show a clear error)
+    proj = await db.fetchone(
+        "SELECT id FROM projects WHERE id = ?", (project_id,)
+    )
+    if not proj:
+        raise HTTPException(404, f"project {project_id} not found")
+    # Fetch the task and scope-check it
+    task = await db.fetchone(
+        "SELECT * FROM tasks WHERE id = ? AND project_id = ?",
+        (task_id, project_id),
+    )
+    if not task:
+        raise HTTPException(
+            404,
+            f"task {task_id} not found in project {project_id}",
+        )
+    return _task_status_to_dict(task, db.db_path)
+
+
+@router.get("/{project_id}/tasks/running")
+async def list_running_tasks(project_id: str, request: Request) -> dict:
+    """Live progress status for all running tasks in a project.
+
+    Returns a list of status dicts (same shape as the single-task
+    endpoint). Used by the dashboard on initial load and for 5s
+    polling refresh."""
+    db = request.app.state.db
+    proj = await db.fetchone(
+        "SELECT id FROM projects WHERE id = ?", (project_id,)
+    )
+    if not proj:
+        raise HTTPException(404, f"project {project_id} not found")
+    rows = await db.fetchall(
+        "SELECT * FROM tasks "
+        "WHERE project_id = ? AND status = 'running' "
+        "ORDER BY started_at ASC NULLS LAST, id ASC",
+        (project_id,),
+    )
+    return {
+        "project_id": project_id,
+        "tasks": [_task_status_to_dict(r, db.db_path) for r in rows],
+        "count": len(rows),
+    }
+
+
+@router.post("/{project_id}/tasks/{task_id}/cancel")
+async def cancel_project_task(
+    project_id: str, task_id: str, request: Request
+) -> dict:
+    """Cancel a task with project-scope guard (IDOR-safe).
+
+    The wrapper around /api/tasks/{id}/cancel that also verifies
+    the task belongs to the given project. Returns the full
+    updated task (same shape as the original endpoint) plus a
+    `was_running` flag so the UI can show a clear "cancelled"
+    confirmation without re-fetching.
+
+    Used by the Task Progress Monitor side panel (T4) — the
+    "Cancel" button calls this endpoint instead of the unscoped
+    one so a misclick on the wrong project can never cancel
+    someone else's task."""
+    db = request.app.state.db
+    # Verify project + task ownership in one query (IDOR guard)
+    task = await db.fetchone(
+        "SELECT * FROM tasks WHERE id = ? AND project_id = ?",
+        (task_id, project_id),
+    )
+    if not task:
+        raise HTTPException(
+            404,
+            f"task {task_id} not found in project {project_id}",
+        )
+    was_running = task["status"] == "running"
+    # Delegate to the core cancel helper. It re-checks state,
+    # updates the row, frees the profile, and writes audit log.
+    # actor="operator:ui" distinguishes UI-driven cancels from
+    # CLI / API ones for later analytics.
+    row = await _do_cancel_task(
+        db, task_id, actor="operator:ui"
+    )
+    return {
+        "task": _row_to_task_dict(row),
+        "was_running": was_running,
+        "cancelled_at": row.get("ended_at"),
+    }
+
+
+def _row_to_task_dict(row: dict) -> dict:
+    """Convert a tasks-table row to a JSON-friendly dict.
+
+    Local reimplementation (vs importing the original
+    _row_to_task from tasks.py) because that helper returns a
+    pydantic Task model with strict field validation; for the
+    cancel response we want a permissive dict that includes
+    ended_at and any other cancel-relevant fields even if the
+    schema evolves."""
+    return {
+        "id": row.get("id"),
+        "project_id": row.get("project_id"),
+        "name": row.get("name", ""),
+        "status": row.get("status", ""),
+        "agent_role": row.get("agent_role", ""),
+        "started_at": row.get("started_at"),
+        "last_liveness_at": row.get("last_liveness_at"),
+        "ended_at": row.get("ended_at"),
+        "error": row.get("error"),
     }
 

@@ -747,7 +747,19 @@ async def submit_result(task_id: str, body: TaskResult, request: Request) -> Tas
 @router.post("/{task_id}/cancel", response_model=Task)
 async def cancel_task(task_id: str, request: Request) -> Task:
     """Operator cancels a task (any non-terminal state → cancelled)."""
-    db = request.app.state.db
+    row = await _do_cancel_task(request.app.state.db, task_id, actor="operator")
+    return _row_to_task(row)
+
+
+async def _do_cancel_task(
+    db: Any, task_id: str, *, actor: str = "operator"
+) -> dict[str, Any]:
+    """Core cancel-task logic, extracted so other endpoints (e.g. the
+    project-scoped wrapper at /api/projects/{id}/tasks/{id}/cancel)
+    can call it without re-implementing the state-machine checks.
+
+    Raises HTTPException(404/400) on bad input. Returns the updated
+    task row dict (not yet mapped to the Task pydantic model)."""
     task = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
     if not task:
         raise HTTPException(404, f"Task not found: {task_id}")
@@ -773,12 +785,12 @@ async def cancel_task(task_id: str, request: Request) -> Task:
     row = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
     await audit_log(
         db, "task.cancelled",
-        actor="operator",
+        actor=actor,
         project_id=task["project_id"],
         task_id=task_id,
         agent_id=task.get("assigned_agent_id"),
     )
-    return _row_to_task(row)
+    return row
 
 
 @router.post("/{task_id}/interrupt", response_model=Task)
