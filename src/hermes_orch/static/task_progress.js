@@ -5,6 +5,12 @@
  * running task, and /api/projects/{id}/tasks/running every 5s to
  * keep the side panel + task-row badges in sync.
  *
+ * v1.1 (2026-07-29): added live output streaming. When the user
+ * expands a running task, we start a 2s poller on
+ * /api/projects/{id}/tasks/{id}/output?since=<id> and append
+ * new chunks to a per-task <pre> block. Stderr is rendered in
+ * a collapsible <details> section so the main view stays clean.
+ *
  * API surface (window.taskProgress):
  *   init(projectId)         — call once after page load
  *   refreshAll()            — force-poll now (debug button)
@@ -199,6 +205,9 @@
     const tid = row.getAttribute('data-task-id');
     const existing = row.nextElementSibling;
     if (existing && existing.getAttribute('data-expand-for') === tid) {
+      // Collapsing: stop the streaming poller first so we don't leak
+      // timers in the background
+      _stopStreaming(tid);
       existing.remove();
       return;
     }
@@ -206,12 +215,18 @@
     // at a time — keeps the page tidy)
     let sib = row.nextElementSibling;
     while (sib && sib.hasAttribute('data-expand-for')) {
+      const sibTid = sib.getAttribute('data-expand-for');
+      if (sibTid) _stopStreaming(sibTid);
       sib.remove();
       sib = row.nextElementSibling;
     }
     const t = runningCache.get(tid) || _readRowData(row);
     const detail = _renderDetail(t);
     row.insertAdjacentElement('afterend', detail);
+    // v1.1: start streaming the live output for this task. We poll
+    // the /output endpoint every 2s; the poller stops itself when
+    // the task reaches a terminal state.
+    _startStreaming(tid, detail);
   }
 
   function _readRowData(row) {
@@ -258,6 +273,27 @@
             Cancel task
           </button>
         </div>` : ''}
+      <div class="mt-3" data-stream-host="${_escape(t.task_id)}">
+        <div class="flex items-center justify-between mb-1">
+          <div class="text-xs font-semibold text-gray-700">
+            📺 Live output
+            <span data-stream-status="${_escape(t.task_id)}" class="text-gray-500 font-normal">starting…</span>
+          </div>
+          <button data-stream-toggle="${_escape(t.task_id)}"
+            class="text-xs text-blue-700 hover:text-blue-900"
+            title="Pause / resume the 2s polling">⏸</button>
+        </div>
+        <pre data-stream-stdout="${_escape(t.task_id)}"
+             class="bg-white border border-gray-200 rounded p-2 text-xs font-mono whitespace-pre-wrap max-h-64 overflow-y-auto"
+             style="min-height: 2.5rem;">(waiting for output…)</pre>
+        <details data-stream-stderr-wrap="${_escape(t.task_id)}" class="mt-1" hidden>
+          <summary class="text-xs text-yellow-700 cursor-pointer">
+            ⚠ stderr <span data-stream-stderr-count="${_escape(t.task_id)}">(0)</span>
+          </summary>
+          <pre data-stream-stderr="${_escape(t.task_id)}"
+               class="bg-yellow-50 border border-yellow-200 rounded p-2 text-xs font-mono whitespace-pre-wrap max-h-48 overflow-y-auto mt-1"></pre>
+        </details>
+      </div>
     `;
     return wrap;
   }
@@ -333,6 +369,164 @@
   }
 
   // === Helpers ===
+
+  // === v1.1: Live output streaming ===
+
+  // Per-task streaming state. Keyed by task_id.
+  //   {since: last audit_log id seen, stdoutSeq: highest seq rendered,
+  //    stderrSeq: highest seq rendered, paused: bool,
+  //    timer: setTimeout handle, host: parent <div> element}
+  const _streamers = new Map();
+  const STREAM_POLL_MS = 2000;
+
+  function _startStreaming(tid, hostEl) {
+    // Idempotent: if a poller is already running for this task, just
+    // make sure it's pointing at the (possibly new) host element
+    let s = _streamers.get(tid);
+    if (s) {
+      s.host = hostEl;
+      return;
+    }
+    s = {
+      since: 0,
+      stdoutSeq: 0,
+      stderrCount: 0,
+      paused: false,
+      timer: null,
+      host: hostEl,
+    };
+    _streamers.set(tid, s);
+    // Wire pause toggle (delegated, in case the host is replaced)
+    const toggle = hostEl.querySelector(`[data-stream-toggle="${tid}"]`);
+    if (toggle) {
+      toggle.addEventListener('click', () => {
+        s.paused = !s.paused;
+        toggle.textContent = s.paused ? '▶' : '⏸';
+        toggle.title = s.paused ? 'Resume polling' : 'Pause polling';
+        const status = hostEl.querySelector(`[data-stream-status="${tid}"]`);
+        if (status) status.textContent = s.paused ? 'paused' : 'resumed';
+      });
+    }
+    _scheduleNextStream(s, tid);
+  }
+
+  function _stopStreaming(tid) {
+    const s = _streamers.get(tid);
+    if (!s) return;
+    if (s.timer) clearTimeout(s.timer);
+    _streamers.delete(tid);
+  }
+
+  function _scheduleNextStream(s, tid) {
+    s.timer = setTimeout(async () => {
+      try {
+        if (!s.paused) await _streamTick(s, tid);
+      } catch (err) {
+        const status = s.host && s.host.querySelector(
+          `[data-stream-status="${tid}"]`
+        );
+        if (status) status.textContent = 'error: ' + (err && err.message || err);
+      } finally {
+        // Only reschedule if the streamer is still active (user may
+        // have collapsed the panel while a tick was in flight).
+        if (_streamers.get(tid) === s) _scheduleNextStream(s, tid);
+      }
+    }, STREAM_POLL_MS);
+  }
+
+  async function _streamTick(s, tid) {
+    const r = await _fetchWithTimeout(
+      `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(tid)}/output?since=${s.since}`,
+      {},
+      STREAM_POLL_MS - 200,
+    );
+    if (!r.ok) {
+      // 404 = task gone. Stop polling.
+      if (r.status === 404) {
+        _stopStreaming(tid);
+        const status = s.host && s.host.querySelector(
+          `[data-stream-status="${tid}"]`
+        );
+        if (status) status.textContent = 'task gone';
+      }
+      return;
+    }
+    const body = await r.json();
+    const chunks = body.chunks || [];
+    if (chunks.length) {
+      for (const c of chunks) {
+        _renderStreamChunk(s, tid, c);
+      }
+      s.since = body.next_since || s.since;
+    }
+    // Update status text (idle / streaming / stopped)
+    const status = s.host && s.host.querySelector(
+      `[data-stream-status="${tid}"]`
+    );
+    if (status) {
+      if (chunks.length === 0) {
+        status.textContent = 'idle (no new output)';
+      } else {
+        status.textContent = `+${chunks.length} chunk${chunks.length > 1 ? 's' : ''}`;
+      }
+    }
+    // Auto-stop on terminal state: if the task is no longer running
+    // and the server has nothing more to say, drop the poller so we
+    // don't keep pinging a finished task.
+    if (chunks.length === 0) {
+      const t = runningCache.get(tid);
+      if (t && !['pending', 'assigned', 'running'].includes(t.status)) {
+        const totalAfterSince = s.stdoutSeq + s.stderrCount;
+        if (status) status.textContent = `done (${totalAfterSince} chunks)`;
+        // Keep polling for ~10s in case of late tail flush, then stop
+        if (!s._stopAfter) s._stopAfter = Date.now() + 10000;
+        if (Date.now() >= s._stopAfter) _stopStreaming(tid);
+      } else {
+        s._stopAfter = null;
+      }
+    } else {
+      s._stopAfter = null;
+    }
+  }
+
+  function _renderStreamChunk(s, tid, c) {
+    if (c.stream === 'stderr') {
+      // Per design: stderr is collapsed under a <details>. Increment
+      // both the per-stream seq tracker (for ordering) and the count
+      // (for the summary badge).
+      s.stderrCount += 1;
+      const pre = s.host && s.host.querySelector(
+        `[data-stream-stderr="${tid}"]`
+      );
+      const wrap = s.host && s.host.querySelector(
+        `[data-stream-stderr-wrap="${tid}"]`
+      );
+      const count = s.host && s.host.querySelector(
+        `[data-stream-stderr-count="${tid}"]`
+      );
+      if (wrap) wrap.hidden = false;
+      if (count) count.textContent = `(${s.stderrCount})`;
+      if (pre) {
+        // Replace the leading placeholder if this is the first chunk
+        if (!pre.textContent && s.stderrCount === 1) pre.textContent = '';
+        pre.textContent += c.text;
+        // Auto-scroll to bottom
+        pre.scrollTop = pre.scrollHeight;
+      }
+    } else {
+      // Default to stdout
+      s.stdoutSeq += 1;
+      const pre = s.host && s.host.querySelector(
+        `[data-stream-stdout="${tid}"]`
+      );
+      if (pre) {
+        // First chunk: drop the "(waiting for output…)" placeholder
+        if (pre.textContent === '(waiting for output…)') pre.textContent = '';
+        pre.textContent += c.text;
+        pre.scrollTop = pre.scrollHeight;
+      }
+    }
+  }
 
   function _escape(s) {
     return String(s == null ? '' : s)

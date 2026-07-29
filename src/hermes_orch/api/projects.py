@@ -3248,3 +3248,158 @@ def _row_to_task_dict(row: dict) -> dict:
         "error": row.get("error"),
     }
 
+
+# ===== Live Output Streaming (v1.1, 2026-07-29) =====
+#
+# Powers the "see the agent's live output" feature in the Task
+# Progress Monitor side panel. The wrapper (hermes-agent) tails
+# hermes's stdout/stderr file in a background thread and POSTs
+# chunks here as it appears. The frontend (task_progress.js)
+# polls the GET endpoint every 2s and appends new chunks to
+# the per-task streaming view.
+#
+# Two endpoints, both project-scoped (IDOR-safe) and
+# task-scoped (a wrapper can only push for a task it owns):
+#
+#   POST /api/projects/{id}/tasks/{task_id}/output-chunk
+#     Body: {seq: int, text: str, stream: "stdout"|"stderr"}
+#     Headers: X-Agent-Id (must match task.assigned_agent_id)
+#     Action: write audit_log row (event_type="agent.output_chunk")
+#     Returns: {ok, id} where id is audit_log.id (wrapper uses it
+#              to detect gaps on retry)
+#
+#   GET /api/projects/{id}/tasks/{task_id}/output?since=N
+#     Returns: list of chunks with id > N, ordered by id ASC
+#     Capped at 500 chunks per request (defensive — a misbehaving
+#     wrapper could spam millions of rows; pagination via since=).
+
+
+from fastapi import Header
+
+
+@router.post("/{project_id}/tasks/{task_id}/output-chunk")
+async def post_output_chunk(
+    project_id: str,
+    task_id: str,
+    request: Request,
+    x_agent_id: str | None = Header(default=None, alias="X-Agent-Id"),
+) -> dict:
+    """Wrapper → server: push a live output chunk for a running task.
+
+    The wrapper's tailing thread (in hermes-orch-agent) watches
+    hermes's stdout/stderr file and POSTs each chunk here. We
+    write an audit_log row (event_type="agent.output_chunk") and
+    return the new row's id so the wrapper can detect dropped
+    writes on retry (e.g. if the POST times out, the wrapper
+    can re-send with the same seq; the frontend de-dupes by seq).
+
+    Auth: minimal — the agent must be the one currently assigned
+    to the task. Real HMAC verification is TODO (matches the
+    /api/agents/{id}/heartbeat MVP per the auth design doc §6.1).
+    """
+    db = request.app.state.db
+    if not x_agent_id:
+        raise HTTPException(401, "Missing X-Agent-Id header")
+    task = await db.fetchone(
+        "SELECT id, project_id, assigned_agent_id FROM tasks "
+        "WHERE id = ? AND project_id = ?",
+        (task_id, project_id),
+    )
+    if not task:
+        raise HTTPException(
+            404, f"task {task_id} not found in project {project_id}"
+        )
+    if task.get("assigned_agent_id") != x_agent_id:
+        raise HTTPException(
+            403,
+            f"X-Agent-Id ({x_agent_id}) is not the owner of task {task_id}",
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON body")
+    seq = body.get("seq")
+    text = body.get("text", "")
+    stream = body.get("stream", "stdout")
+    if seq is None or not isinstance(seq, int):
+        raise HTTPException(400, "seq is required and must be int")
+    if not isinstance(text, str):
+        raise HTTPException(400, "text must be a string")
+    if stream not in ("stdout", "stderr"):
+        raise HTTPException(400, "stream must be 'stdout' or 'stderr'")
+    # Defensive cap: 64KB per chunk. A misbehaving wrapper trying
+    # to push 100MB in one go shouldn't OOM the server.
+    if len(text) > 65536:
+        text = text[:65536]
+    await audit_log(
+        db,
+        "agent.output_chunk",
+        actor=f"agent:{x_agent_id}",
+        project_id=project_id,
+        task_id=task_id,
+        agent_id=x_agent_id,
+        payload={"seq": seq, "text": text, "stream": stream},
+    )
+    # Return the new row's id so the wrapper can confirm the write
+    last = await db.fetchone("SELECT last_insert_rowid() AS id")
+    return {"ok": True, "id": last["id"], "seq": seq}
+
+
+@router.get("/{project_id}/tasks/{task_id}/output")
+async def get_task_output(
+    project_id: str,
+    task_id: str,
+    request: Request,
+    since: int = 0,
+) -> dict:
+    """Frontend → server: pull live output chunks for a task.
+
+    Returns all audit_log rows of type agent.output_chunk for this
+    task with id > `since` (caller passes the last id they saw;
+    default 0 returns everything). Capped at 500 rows per request
+    — if there are more, the client should retry with the
+    returned `next_since` until empty.
+
+    No agent-auth: the dashboard is already inside the trusted
+    network; the project-scope guard (WHERE project_id=?) prevents
+    IDOR. We do enforce the task exists (404 otherwise) so callers
+    get a clear error instead of an empty list for a typo.
+    """
+    db = request.app.state.db
+    task = await db.fetchone(
+        "SELECT id FROM tasks WHERE id = ? AND project_id = ?",
+        (task_id, project_id),
+    )
+    if not task:
+        raise HTTPException(
+            404, f"task {task_id} not found in project {project_id}"
+        )
+    rows = await db.fetchall(
+        "SELECT id, agent_id, payload, created_at "
+        "FROM audit_log "
+        "WHERE task_id = ? AND event_type = 'agent.output_chunk' "
+        "AND id > ? "
+        "ORDER BY id ASC LIMIT 500",
+        (task_id, int(since)),
+    )
+    chunks = []
+    for r in rows:
+        try:
+            p = json.loads(r["payload"]) if r["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            p = {}
+        chunks.append({
+            "id": r["id"],
+            "seq": p.get("seq"),
+            "text": p.get("text", ""),
+            "stream": p.get("stream", "stdout"),
+            "created_at": r["created_at"],
+        })
+    return {
+        "project_id": project_id,
+        "task_id": task_id,
+        "chunks": chunks,
+        "count": len(chunks),
+        "next_since": chunks[-1]["id"] if chunks else int(since),
+    }
+

@@ -355,6 +355,81 @@ def _hmac_headers(agent_id: str, secret: str) -> dict:
     }
 
 
+def _stream_throttle_loop(
+    path: "Path",
+    should_stop: "Callable[[], bool]",
+    flush: "Callable[[str], None]",
+    *,
+    throttle_s: float = 2.0,
+    buf_max: int = 8192,
+    sleep_fn: "Callable[[float], None] | None" = None,
+    time_fn: "Callable[[], float] | None" = None,
+) -> None:
+    """Tail `path` in a loop, throttling `flush` calls so we don't
+    spam the network on every byte of agent output.
+
+    Flushes when EITHER:
+      - the buffer has accumulated buf_max bytes, OR
+      - throttle_s seconds have elapsed since the last flush.
+
+    Always does a final flush on exit (so we don't lose the tail
+    of the transcript when the subprocess finishes).
+
+    Args:
+        path: file to tail (the wrapper writes hermes's stdout/stderr
+            here).
+        should_stop: callable returning True when the loop should
+            exit (e.g. threading.Event.is_set).
+        flush: callable invoked with the buffered text each time
+            the throttle trips. Errors are swallowed by the caller.
+        throttle_s: minimum seconds between flushes (default 2s).
+        buf_max: maximum bytes before a forced flush (default 8KB).
+        sleep_fn: how to sleep between iterations (default
+            time.sleep). Pass a threading.Event.wait() to make the
+            loop interruptible.
+        time_fn: how to read the current time (default time.time).
+            Injectable for unit tests that want deterministic timing.
+
+    The function is extracted (not inlined into _tail_stream) so
+    unit tests can exercise the throttling algorithm without
+    spinning up a real hermes subprocess.
+    """
+    import time as _t
+    if sleep_fn is None:
+        sleep_fn = _t.sleep
+    if time_fn is None:
+        time_fn = _t.time
+
+    pos = 0
+    buf = ""
+    last_flush = time_fn()
+    while not should_stop():
+        try:
+            with open(path, "rb") as f:
+                f.seek(pos)
+                new = f.read()
+            if new:
+                pos += len(new)
+                buf += new.decode("utf-8", errors="replace")
+        except FileNotFoundError:
+            pass
+        now = time_fn()
+        if buf and (
+            len(buf) >= buf_max
+            or now - last_flush >= throttle_s
+        ):
+            flush(buf)
+            buf = ""
+            last_flush = now
+        if should_stop():
+            break
+        sleep_fn(0.25)
+    # Final flush on shutdown so the user sees the last few lines
+    # even if the buffer hadn't filled yet
+    if buf:
+        flush(buf)
+
+
 def _fetch_project_state_http(
     orchestrator_url: str, agent_id: str, secret: str, project_id: str
 ) -> str | None:
@@ -1929,6 +2004,79 @@ def start(
         poll_thread = threading.Thread(target=_poll_liveness, daemon=True)
         poll_thread.start()
 
+        # ===== Live output streaming (v1.1, 2026-07-29) =====
+        # Tail hermes's per-task stdout/stderr files in background
+        # threads and POST each chunk to the orchestrator so the
+        # dashboard can render the agent's progress in real time.
+        #
+        # Throttle (matches the Task Progress Monitor v1.1 design):
+        #   - 2s timer (so idle output still flushes promptly)
+        #   - OR 8KB buffer (so burst output batches up)
+        # whichever comes first. Without this, a slow LLM streaming
+        # token-by-token would spam one POST per token.
+        #
+        # Each stream (stdout / stderr) gets its own seq counter
+        # starting at 1. The frontend de-dupes by (stream, seq) and
+        # renders stderr in a collapsed section (per design).
+        stop_stream = threading.Event()
+        # Per-stream seq counters (stdout / stderr). Restart at 1
+        # for each task so a new task starts fresh.
+        _seq = {"stdout": 0, "stderr": 0}
+        STREAM_THROTTLE_S = 2
+        STREAM_BUF_MAX = 8192
+
+        def _post_chunk(text: str, stream: str) -> None:
+            if not text:
+                return
+            _seq[stream] += 1
+            try:
+                httpx.post(
+                    f"{orchestrator_url}/api/projects/{project_id}"
+                    f"/tasks/{tid}/output-chunk",
+                    headers=_auth_headers(),
+                    json={
+                        "seq": _seq[stream],
+                        "text": text,
+                        "stream": stream,
+                    },
+                    timeout=5,
+                )
+            except Exception as e:
+                # Don't let a stream POST failure break the main loop.
+                # The dashboard will see a gap; the agent keeps running.
+                # We log so operators can debug network issues.
+                click.echo(f"  WARN: output-chunk POST failed: {e}")
+
+        def _tail_stream(path: Path, stream: str) -> None:
+            """Tail `path` in a loop. Buffers bytes; flushes when the
+            buffer hits STREAM_BUF_MAX OR STREAM_THROTTLE_S seconds
+            have elapsed since the last flush. Always does a final
+            flush on exit (so we don't lose the tail of the transcript
+            when hermes exits)."""
+            def _flush(text: str) -> None:
+                _post_chunk(text, stream)
+            _stream_throttle_loop(
+                path,
+                should_stop=lambda: stop_stream.is_set(),
+                flush=_flush,
+                throttle_s=STREAM_THROTTLE_S,
+                buf_max=STREAM_BUF_MAX,
+                sleep_fn=lambda s: stop_stream.wait(s),
+            )
+
+        stream_threads = []
+        for _path, _stream in (
+            (stdout_log, "stdout"),
+            (stderr_log, "stderr"),
+        ):
+            t = threading.Thread(
+                target=_tail_stream,
+                args=(_path, _stream),
+                daemon=True,
+            )
+            t.start()
+            stream_threads.append(t)
+
         try:
             try:
                 # proc.wait() does NOT touch stdout/stderr (those go to
@@ -1943,6 +2091,14 @@ def start(
                     pass
                 # stop the liveness poller before any other handling
                 stop_poll.set()
+                # Live output streaming (v1.1): stop the tail threads
+                # BEFORE closing the file handles so they can do a
+                # final flush of any buffered output. join() with a
+                # small timeout — if a thread is stuck, the main loop
+                # still proceeds (the tail is best-effort).
+                stop_stream.set()
+                for t in stream_threads:
+                    t.join(timeout=3)
                 # Close file handles so the buffered output is flushed
                 try:
                     stdout_fh.close()
@@ -1950,6 +2106,12 @@ def start(
                 except Exception:
                     pass
                 return {"status": "failed", "error": f"hermes timeout after {timeout}s. See {stdout_log.name} for full transcript."}
+            # Live output streaming (v1.1): stop tail threads so they
+            # do a final flush of any buffered chunks before we close
+            # the file handles and read the full transcript.
+            stop_stream.set()
+            for t in stream_threads:
+                t.join(timeout=3)
             # Close file handles — Python flushes its userspace buffer
             # on close, so we get the complete transcript on disk.
             stdout_fh.close()
