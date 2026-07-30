@@ -40,6 +40,38 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.auto_reload = True
 
 
+def _format_tokens(n) -> str:
+    """Compact human-friendly token count.
+
+    Examples:
+      0       -> "0"
+      999     -> "999"
+      1.2K    -> "1.2K"
+      45.2K   -> "45.2K"
+      12.45M  -> "12.45M"
+      1.23B   -> "1.23B"
+
+    Used by the new v3.0 dashboard pages (agents / token-usage)
+    instead of duplicating this 4-line conditional in every template.
+    """
+    if n is None:
+        return "0"
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1_000:.1f}K"
+    if n < 1_000_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    return f"{n / 1_000_000_000:.2f}B"
+
+
+templates.env.filters["format_tokens"] = _format_tokens
+
+
 def _llm_configured(cfg: dict[str, Any] | None) -> bool:
     if not cfg:
         return False
@@ -483,8 +515,14 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
         "by_model": [],
         "by_agent": [],
         "by_project": [],
+        "by_provider": [],
         "top_tasks": [],
         "sparkline": [],
+        # v3.0: per-day breakdown with prompt/completion split, used by
+        # the standalone Token Usage page for the stacked bar chart.
+        # 7 entries, oldest first, e.g. [{date: "Jul 24", prompt: 1.2M,
+        # completion: 0.5M, total: 1.7M, calls: 312}, ...]
+        "daily_breakdown": [],
     }
     # Totals for each window
     for window, cutoff in cutoffs.items():
@@ -540,6 +578,72 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
          "total": int(r["total"] or 0), "calls": int(r["calls"] or 0)}
         for r in by_proj_rows
     ]
+    # v3.0: by_provider (7d) — group by base_url. The base_url column
+    # holds the LLM API endpoint (e.g. https://api.openai.com/v1, or a
+    # local vLLM URL). We collapse the full URL to a friendly label by
+    # taking the hostname minus "www." — enough for humans to know
+    # "OpenAI" vs "Anthropic" vs "Local vLLM" without showing the
+    # full path. A NULL base_url becomes "(unknown)" so we still count
+    # it rather than dropping on the floor.
+    def _provider_label(base_url: str | None) -> str:
+        if not base_url:
+            return "(unknown)"
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(base_url).hostname or base_url
+        except Exception:
+            host = base_url
+        if host.startswith("www."):
+            host = host[4:]
+        return host or "(unknown)"
+
+    provider_rows = await db.fetchall(
+        "SELECT base_url, SUM(total_tokens) as total, COUNT(*) as calls "
+        "FROM token_usage WHERE created_at >= ? "
+        "GROUP BY base_url ORDER BY total DESC LIMIT 10",
+        (cutoff_7d,),
+    )
+    out["by_provider"] = [
+        {
+            "provider": _provider_label(r["base_url"]),
+            "total": int(r["total"] or 0),
+            "calls": int(r["calls"] or 0),
+        }
+        for r in provider_rows
+    ]
+    # v3.0: per-day breakdown (7d) with prompt/completion split. We
+    # bucket by created_at date and use the local-time string format
+    # already in the DB. The LEFT of the date string ("YYYY-MM-DD")
+    # gives us a sortable, comparable bucket key. 7 entries, oldest
+    # first, with zero-filled gaps so the chart x-axis stays even.
+    # Use datetime.timedelta / datetime.date (not `from ... import
+    # timedelta`) to avoid the UnboundLocalError that hits when a
+    # function-local `from X import Y` shadows an outer Y binding.
+    import datetime as _dt
+    today = now_aware().date()
+    days = [today - _dt.timedelta(days=i) for i in range(6, -1, -1)]  # 7 days, oldest first
+    day_rows = await db.fetchall(
+        "SELECT SUBSTR(created_at, 1, 10) as day, "
+        "COALESCE(SUM(prompt_tokens),0) as prompt, "
+        "COALESCE(SUM(completion_tokens),0) as completion, "
+        "COALESCE(SUM(total_tokens),0) as total, "
+        "COUNT(*) as calls "
+        "FROM token_usage WHERE created_at >= ? "
+        "GROUP BY day ORDER BY day ASC",
+        (cutoff_7d,),
+    )
+    by_day = {r["day"]: r for r in day_rows}
+    out["daily_breakdown"] = [
+        {
+            "date": d.isoformat(),
+            "label": d.strftime("%b %d"),
+            "prompt": int((by_day.get(d.isoformat()) or {}).get("prompt") or 0),
+            "completion": int((by_day.get(d.isoformat()) or {}).get("completion") or 0),
+            "total": int((by_day.get(d.isoformat()) or {}).get("total") or 0),
+            "calls": int((by_day.get(d.isoformat()) or {}).get("calls") or 0),
+        }
+        for d in days
+    ]
     # top_tasks (7d) — top 5
     out["top_tasks"] = [
         {
@@ -590,6 +694,28 @@ async def agents_page(request: Request) -> HTMLResponse:
             **_base_context(request, "agents"),
             "agents": agents,
             "overview": overview,
+            "token_usage": token_usage,
+        },
+    )
+
+
+@router.get("/token-usage", response_class=HTMLResponse)
+async def token_usage_page(request: Request) -> HTMLResponse:
+    """Standalone Token Usage analytics page (v3.0).
+
+    Reachable directly via /token-usage URL. Surfaced in the
+    Settings expandable nav in base.html. Uses the same
+    _load_token_usage_overview() helper the agents page uses
+    (now extended with by_provider + daily_breakdown for the
+    stacked bar chart).
+    """
+    db = request.app.state.db
+    token_usage = await _load_token_usage_overview(db)
+    return templates.TemplateResponse(
+        request=request,
+        name="token_usage.html",
+        context={
+            **_base_context(request, "token_usage"),
             "token_usage": token_usage,
         },
     )

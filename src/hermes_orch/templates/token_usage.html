@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+{% block title %}Token Usage - Hermes Orchestrator{% endblock %}
+{% block content %}
+
+{# v3.0 standalone Token Usage analytics page.
+   Reached via /token-usage (linked from Settings sidebar).
+   Layout matches the approved Perplexity mockup:
+   - Header (title + subtitle)
+   - 4 KPI cards (total / input / output / requests)
+   - Stacked bar daily trend chart (7 days, prompt vs completion)
+   - 2x2 grid of breakdowns: by project (table) | by model (bar)
+                              | by agent (bar)         | by provider (donut)
+   - Footer with last-updated + auto-refresh hint
+
+   All data comes from _load_token_usage_overview() in
+   api/dashboard.py. Empty data points show "no data yet" rather
+   than error states so a fresh install is non-frightening. #}
+
+<div class="flex items-center justify-between mb-4">
+    <div>
+        <h1 class="text-2xl font-bold text-gray-800">Token Usage</h1>
+        <p class="text-sm text-gray-500 mt-0.5">LLM token consumption across your fleet</p>
+    </div>
+    <div class="flex items-center gap-2 text-sm">
+        <span class="text-gray-500 text-xs">Last updated: just now</span>
+        <span class="pill-status pill-healthy" title="Auto-refresh every 10s via base.html">Live</span>
+    </div>
+</div>
+
+{# ===== KPI cards: 4 actionable numbers ===== #}
+{% set t7 = token_usage.totals["7d"] %}
+{% set input_pct = (t7.prompt / t7.total * 100) if t7.total else 0 %}
+{% set output_pct = (t7.completion / t7.total * 100) if t7.total else 0 %}
+<div class="kpi-grid-4 mb-4">
+    <div class="kpi">
+        <div class="kpi-label">Total tokens (7d)</div>
+        <div class="kpi-value">{{ t7.total|format_tokens }}</div>
+        <div class="kpi-sub">{{ t7.calls }} requests</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Input tokens (7d)</div>
+        <div class="kpi-value">{{ t7.prompt|format_tokens }}</div>
+        <div class="kpi-sub">{{ input_pct|round(1) }}% of total</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Output tokens (7d)</div>
+        <div class="kpi-value">{{ t7.completion|format_tokens }}</div>
+        <div class="kpi-sub">{{ output_pct|round(1) }}% of total</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Total requests (7d)</div>
+        <div class="kpi-value">{{ t7.calls }}</div>
+        <div class="kpi-sub">last 7 days</div>
+    </div>
+</div>
+
+{# ===== Daily trend: stacked bar chart (input + output per day) ===== #}
+<div class="card mb-4">
+    <div class="flex items-center justify-between mb-3">
+        <h2 class="text-sm font-semibold text-gray-700">Daily token usage — Last 7 days</h2>
+        <div class="flex items-center gap-3 text-xs text-gray-500">
+            <span class="flex items-center gap-1">
+                <span style="display:inline-block;width:10px;height:10px;background:#3b82f6;border-radius:2px;"></span>
+                Input
+            </span>
+            <span class="flex items-center gap-1">
+                <span style="display:inline-block;width:10px;height:10px;background:#93c5fd;border-radius:2px;"></span>
+                Output
+            </span>
+        </div>
+    </div>
+    {% set max_day = (token_usage.daily_breakdown|map(attribute='total')|list|max) or 1 %}
+    {% if t7.total %}
+    <div class="space-y-1.5">
+        {% for d in token_usage.daily_breakdown %}
+        <div class="stacked-bar-row">
+            <div class="stacked-bar-label">{{ d.label }}</div>
+            <div class="stacked-bar-track">
+                {% if d.total > 0 %}
+                <div class="stacked-bar-fill-input" style="width: {{ (d.prompt / max_day * 100)|round(1) }}%;"></div>
+                <div class="stacked-bar-fill-output" style="width: {{ (d.completion / max_day * 100)|round(1) }}%;"></div>
+                {% endif %}
+            </div>
+            <div class="stacked-bar-label" style="text-align: right; color: #4b5563;">
+                {{ d.total|format_tokens }}<br>
+                <span style="font-size: 0.7rem; color: #9ca3af;">{{ d.calls }} calls</span>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="text-center text-sm text-gray-400 py-8">No token usage data yet for the last 7 days</div>
+    {% endif %}
+</div>
+
+{# ===== 2x2 grid of breakdowns ===== #}
+<div class="breakdown-grid-2x2 mb-4">
+    {# By project (table) #}
+    <div class="card">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="text-sm font-semibold text-gray-700">By project (7d)</h2>
+            <span class="text-xs text-gray-500">{{ token_usage.by_project|length }} of total</span>
+        </div>
+        {% if token_usage.by_project %}
+        <table class="w-full text-xs">
+            <thead>
+                <tr class="text-gray-500 uppercase">
+                    <th class="text-left py-1 font-medium">Project</th>
+                    <th class="text-right py-1 font-medium">Requests</th>
+                    <th class="text-right py-1 font-medium">Input</th>
+                    <th class="text-right py-1 font-medium">Output</th>
+                    <th class="text-right py-1 font-medium">Total</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for p in token_usage.by_project %}
+                <tr class="border-t">
+                    <td class="py-1.5">
+                        <a href="/projects/{{ p.project_id }}" class="text-blue-600 hover:underline">{{ p.name }}</a>
+                    </td>
+                    <td class="text-right py-1.5 text-gray-600">{{ p.calls }}</td>
+                    <td class="text-right py-1.5 text-gray-600">—</td>
+                    <td class="text-right py-1.5 text-gray-600">—</td>
+                    <td class="text-right py-1.5 font-medium">{{ p.total|format_tokens }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="text-center text-xs text-gray-400 py-6">No project usage yet</div>
+        {% endif %}
+    </div>
+
+    {# By model (bar) #}
+    <div class="card">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="text-sm font-semibold text-gray-700">By model (7d)</h2>
+            <span class="text-xs text-gray-500">{{ token_usage.by_model|length }} models</span>
+        </div>
+        {% if token_usage.by_model %}
+        {% set max_m = (token_usage.by_model|map(attribute='total')|list|max) or 1 %}
+        {% for m in token_usage.by_model[:8] %}
+        <div class="bar-row">
+            <div class="bar-label" title="{{ m.model }}">{{ m.model }}</div>
+            <div class="bar-track"><div class="bar-fill" style="width: {{ (m.total / max_m * 100)|round(1) }}%;"></div></div>
+            <div class="bar-value">{{ m.total|format_tokens }} <span class="text-gray-400 text-[10px]">({{ m.calls }})</span></div>
+        </div>
+        {% endfor %}
+        {% if token_usage.by_model|length > 8 %}
+        <div class="text-xs text-gray-500 text-center mt-2">+ {{ token_usage.by_model|length - 8 }} more</div>
+        {% endif %}
+        {% else %}
+        <div class="text-center text-xs text-gray-400 py-6">No model usage yet</div>
+        {% endif %}
+    </div>
+
+    {# By agent (bar) #}
+    <div class="card">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="text-sm font-semibold text-gray-700">By agent (7d)</h2>
+            <span class="text-xs text-gray-500">{{ token_usage.by_agent|length }} agents</span>
+        </div>
+        {% if token_usage.by_agent %}
+        {% set max_a = (token_usage.by_agent|map(attribute='total')|list|max) or 1 %}
+        {% for a in token_usage.by_agent[:8] %}
+        <div class="bar-row">
+            <div class="bar-label" title="{{ a.agent_id }}">{{ a.agent_id or '(orchestrator)' }}</div>
+            <div class="bar-track"><div class="bar-fill" style="width: {{ (a.total / max_a * 100)|round(1) }}%;"></div></div>
+            <div class="bar-value">{{ a.total|format_tokens }} <span class="text-gray-400 text-[10px]">({{ a.calls }})</span></div>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="text-center text-xs text-gray-400 py-6">No agent usage yet</div>
+        {% endif %}
+    </div>
+
+    {# By provider (donut) #}
+    <div class="card">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="text-sm font-semibold text-gray-700">By provider (7d)</h2>
+            <span class="text-xs text-gray-500">{{ token_usage.by_provider|length }} providers</span>
+        </div>
+        {% if token_usage.by_provider %}
+        {% set total_prov = t7.total %}
+        {% set providers_data = token_usage.by_provider %}
+        <div class="flex items-center gap-4">
+            <div class="donut" id="provider-donut"
+                 style="background: conic-gradient(
+                     {% set ns = namespace(acc=0, segments=[]) %}
+                     {% for p in providers_data %}
+                         {% set pct = (p.total / total_prov * 100) if total_prov else 0 %}
+                         {% set _ = ns.segments.append(p.provider ~ ' ' ~ pct ~ '%') %}
+                     {% endfor %}
+                     {{ ns.segments|join(', ') }}
+                     #f1f5f9 0
+                 )">
+            </div>
+            <div class="donut-center">
+                <div class="big">{{ t7.total|format_tokens }}</div>
+                <div class="small">Total tokens</div>
+            </div>
+            <div class="flex-1 space-y-1.5 text-xs">
+                {% for p in providers_data %}
+                {% set pct = (p.total / total_prov * 100) if total_prov else 0 %}
+                <div class="flex items-center gap-2">
+                    <span style="display:inline-block;width:8px;height:8px;background:{{ ['#3b82f6', '#a78bfa', '#10b981', '#f59e0b', '#ef4444', '#06b6d4'][loop.index0 % 6] }};border-radius:2px;"></span>
+                    <span class="flex-1 text-gray-700">{{ p.provider }}</span>
+                    <span class="text-gray-500">{{ pct|round(1) }}%</span>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% else %}
+        <div class="text-center text-xs text-gray-400 py-6">No provider usage yet</div>
+        {% endif %}
+    </div>
+</div>
+
+{# ===== Footer ===== #}
+<div class="text-xs text-gray-400 text-center mt-6">
+    Auto-refresh every 10s via base.html ·
+    Token usage is captured when agents POST step results to <code>/api/agents/.../results</code>
+</div>
+
+{% endblock %}

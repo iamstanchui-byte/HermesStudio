@@ -2,1040 +2,284 @@
 {% block title %}Agents - Hermes Orchestrator{% endblock %}
 {% block content %}
 
+{# v3.0 pre-compute: agents with no profile = actionable signal
+   for the admin. We compute it once at the top so the KPI card
+   below doesn't need a complex inline expression. #}
+{% set agents_no_profile = agents|selectattr('profiles', 'equalto', [])|list|length %}
+
+{# v3.0 agents page — fleet summary + master-detail + collapsed analytics.
+   Layout (top to bottom):
+   1) Page header
+   2) Fleet summary: 4 actionable KPI cards
+   3) Master-detail: left = agent list, right = selected agent's profiles
+   4) Collapsed "Token usage" row with quick stats + link to /token-usage
+
+   The right panel updates client-side when the user clicks an agent
+   row. Each row carries data-* attributes (id, name, os, ip, etc.)
+   so the JS doesn't need to re-fetch. Profile data for every agent
+   is pre-rendered as <template> blocks to keep the data on the page. #}
+
 <div class="flex items-center justify-between mb-4">
-    <h1 class="text-2xl font-bold text-gray-800">Agents</h1>
-    <div class="text-sm text-gray-500">{{ agents|length }} registered</div>
+    <div>
+        <h1 class="text-2xl font-bold text-gray-800">Agents</h1>
+        <p class="text-sm text-gray-500 mt-0.5">Discover, manage, and monitor your agent fleet.</p>
+    </div>
+    <button onclick="alert('Register agent — TODO: not implemented in v3.0 (see /agents POST /api/agents).')"
+            class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700">
+        + Register agent
+    </button>
 </div>
 
-<!-- ===== Overview (left=agent-level, middle=donut, right=profile-level) ===== -->
-<div class="mb-4 bg-white border rounded-lg p-4 shadow-sm">
-    <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">Overview</h2>
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
-        <!-- LEFT: Agent-level (4 cards: TOTAL / ONLINE / WINDOWS / LINUX) -->
-        <div class="grid grid-cols-2 gap-3">
-            <div class="bg-gray-50 border rounded p-3">
-                <div class="text-xs text-gray-500 uppercase">Total</div>
-                <div class="text-2xl font-bold text-gray-800">{{ overview.total_agents }}</div>
-                <div class="text-xs text-gray-400">agents</div>
-            </div>
-            <div class="bg-green-50 border border-green-200 rounded p-3">
-                <div class="text-xs text-green-700 uppercase">Online</div>
-                <div class="text-2xl font-bold text-green-800">{{ overview.online }}</div>
-                <div class="text-xs text-green-600">heartbeat &lt; 90s</div>
-            </div>
-            <div class="bg-gray-50 border rounded p-3">
-                <div class="text-xs text-gray-500 uppercase">Windows</div>
-                <div class="text-2xl font-bold text-gray-800">{{ overview.windows_online }}</div>
-                <div class="text-xs text-gray-400">online</div>
-            </div>
-            <div class="bg-gray-50 border rounded p-3">
-                <div class="text-xs text-gray-500 uppercase">Linux</div>
-                <div class="text-2xl font-bold text-gray-800">{{ overview.linux_online }}</div>
-                <div class="text-xs text-gray-400">online</div>
-            </div>
-        </div>
-        <!-- Middle: donut SVG (idle / busy / offline) -->
-        <div class="flex justify-center">
-            <svg id="overview-donut" width="160" height="160" viewBox="0 0 160 160" aria-label="Profile status donut">
-                <circle cx="80" cy="80" r="60" fill="none" stroke="#e5e7eb" stroke-width="24" />
-            </svg>
-        </div>
-        <!-- RIGHT: Profile-level (3 cards: IDLE / BUSY / PROFILES with online subtext) -->
-        <div class="grid grid-cols-2 gap-3">
-            <div class="bg-blue-50 border border-blue-200 rounded p-3">
-                <div class="text-xs text-blue-700 uppercase">Idle</div>
-                <div class="text-2xl font-bold text-blue-800">{{ overview.idle }}</div>
-                <div class="text-xs text-blue-600">profiles ready</div>
-            </div>
-            <div class="bg-amber-50 border border-amber-200 rounded p-3">
-                <div class="text-xs text-amber-700 uppercase">Busy</div>
-                <div class="text-2xl font-bold text-amber-800">{{ overview.busy }}</div>
-                <div class="text-xs text-amber-600">profiles working</div>
-            </div>
-            <div class="bg-indigo-50 border border-indigo-200 rounded p-3 col-span-2">
-                <div class="text-xs text-indigo-700 uppercase">Profiles</div>
-                <div class="text-2xl font-bold text-indigo-800">{{ overview.profiles_total }}</div>
-                <div class="text-xs text-indigo-600">{{ overview.subagents_online }} online · {{ overview.profiles_total - overview.subagents_online }} offline</div>
-            </div>
-        </div>
+{# ===== Fleet summary: 4 actionable KPI cards ===== #}
+<div class="kpi-grid-4 mb-4">
+    <div class="kpi">
+        <div class="kpi-label">Online agents</div>
+        <div class="kpi-value">{{ overview.online }}</div>
+        <div class="kpi-sub">heartbeat &lt; 90s</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Active jobs</div>
+        <div class="kpi-value">{{ overview.busy }}</div>
+        <div class="kpi-sub">profiles working</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Agents with no profile</div>
+        <div class="kpi-value" style="color: #b45309;">{{ agents_no_profile }}</div>
+        <div class="kpi-sub">actionable signal</div>
+    </div>
+    <div class="kpi">
+        <div class="kpi-label">Offline / unhealthy</div>
+        <div class="kpi-value" style="color: #b91c1c;">{{ overview.total_agents - overview.online }}</div>
+        <div class="kpi-sub">needs attention</div>
     </div>
 </div>
 
-<!-- ===== Token usage (4h / 24h / 7d + breakdowns + sparkline) ===== -->
-<div class="mb-4 bg-white border rounded-lg p-4 shadow-sm">
-    <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-3">
-        Token usage
-        <span class="text-xs text-gray-400 font-normal normal-case ml-1">(LLM calls across all profiles + orchestrator-side)</span>
-    </h2>
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
-        <div class="bg-gray-50 border rounded p-3">
-            <div class="text-xs text-gray-500 uppercase">4h</div>
-            <div class="text-xl font-bold text-gray-800" id="tu-total-4h">0</div>
-            <div class="text-xs text-gray-400" id="tu-detail-4h">0 calls</div>
+{# ===== Master-detail: agent list (left) + selected agent (right) ===== #}
+<div class="master-detail cols-60-40 mb-4">
+    <div class="card" style="padding: 0; overflow: hidden;">
+        <div class="px-4 py-3 border-b flex items-center gap-3">
+            <h2 class="text-sm font-semibold text-gray-700 flex-1">Agent registry ({{ agents|length }})</h2>
+            <input type="text" placeholder="Search agents..." class="text-xs border rounded px-2 py-1 w-40">
         </div>
-        <div class="bg-indigo-50 border border-indigo-200 rounded p-3">
-            <div class="text-xs text-indigo-700 uppercase">24h</div>
-            <div class="text-xl font-bold text-indigo-800" id="tu-total-24h">0</div>
-            <div class="text-xs text-indigo-600" id="tu-detail-24h">0 calls</div>
-        </div>
-        <div class="bg-purple-50 border border-purple-200 rounded p-3">
-            <div class="text-xs text-purple-700 uppercase">7d</div>
-            <div class="text-xl font-bold text-purple-800" id="tu-total-7d">0</div>
-            <div class="text-xs text-purple-600" id="tu-detail-7d">0 calls</div>
-        </div>
-    </div>
-    {# By-model + by-agent + sparkline (3-col grid) #}
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <div>
-            <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">By model (7d)</div>
-            <table class="w-full text-xs">
-                <tbody id="tu-by-model">
-                    <tr><td class="text-gray-400 italic py-1" colspan="2">No data yet</td></tr>
-                </tbody>
-            </table>
-        </div>
-        <div>
-            <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">By agent (7d)</div>
-            <table class="w-full text-xs">
-                <tbody id="tu-by-agent">
-                    <tr><td class="text-gray-400 italic py-1" colspan="2">No data yet</td></tr>
-                </tbody>
-            </table>
-        </div>
-        <div>
-            <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Daily totals (7d)</div>
-            <svg id="tu-sparkline" width="100%" height="80" viewBox="0 0 280 80" preserveAspectRatio="none" aria-label="Daily token usage 7-day sparkline">
-                <line x1="0" y1="40" x2="280" y2="40" stroke="#e5e7eb" stroke-width="1" stroke-dasharray="2 2" />
-            </svg>
-        </div>
-    </div>
-    {# By-project (collapsible) + top-5 tasks #}
-    <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
-        <details class="border rounded p-2">
-            <summary class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide cursor-pointer">
-                By project (7d, top 5)
-            </summary>
-            <table class="w-full text-xs mt-2">
-                <tbody id="tu-by-project">
-                    <tr><td class="text-gray-400 italic py-1" colspan="2">No data yet</td></tr>
-                </tbody>
-            </table>
-        </details>
-        <details class="border rounded p-2">
-            <summary class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide cursor-pointer">
-                Top-5 tasks (7d)
-            </summary>
-            <table class="w-full text-xs mt-2">
-                <tbody id="tu-top-tasks">
-                    <tr><td class="text-gray-400 italic py-1" colspan="2">No data yet</td></tr>
-                </tbody>
-            </table>
-        </details>
-    </div>
-</div>
-<script>
-// Populate token usage panel from the page context (set by template).
-(function renderTokenUsage() {
-    const t = {{ token_usage | tojson }};
-    function fmt(n) {
-        if (n == null) return '0';
-        if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-        if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-        return String(n);
-    }
-    // Total cards
-    for (const w of ['4h', '24h', '7d']) {
-        const tot = (t.totals && t.totals[w]) || { total: 0, calls: 0 };
-        const totEl = document.getElementById('tu-total-' + w);
-        const detEl = document.getElementById('tu-detail-' + w);
-        if (totEl) totEl.textContent = fmt(tot.total);
-        if (detEl) detEl.textContent = tot.calls + ' call' + (tot.calls === 1 ? '' : 's');
-    }
-    // By-model
-    const bm = document.getElementById('tu-by-model');
-    if (bm && t.by_model && t.by_model.length) {
-        bm.innerHTML = t.by_model.map(m =>
-            '<tr><td class="font-mono py-0.5 pr-2">' + m.model + '</td>' +
-            '<td class="text-right py-0.5">' + fmt(m.total) + ' <span class="text-gray-400">(' + m.calls + ')</span></td></tr>'
-        ).join('');
-    }
-    // By-agent
-    const ba = document.getElementById('tu-by-agent');
-    if (ba && t.by_agent && t.by_agent.length) {
-        ba.innerHTML = t.by_agent.map(a =>
-            '<tr><td class="font-mono py-0.5 pr-2">' + a.agent_id + '</td>' +
-            '<td class="text-right py-0.5">' + fmt(a.total) + ' <span class="text-gray-400">(' + a.calls + ')</span></td></tr>'
-        ).join('');
-    }
-    // By-project
-    const bp = document.getElementById('tu-by-project');
-    if (bp && t.by_project && t.by_project.length) {
-        bp.innerHTML = t.by_project.map(p =>
-            '<tr><td class="py-0.5 pr-2"><a href="/projects/' + p.project_id + '" class="text-blue-600 hover:underline">' +
-            p.name + '</a></td>' +
-            '<td class="text-right py-0.5">' + fmt(p.total) + ' <span class="text-gray-400">(' + p.calls + ')</span></td></tr>'
-        ).join('');
-    }
-    // Top tasks
-    const tt = document.getElementById('tu-top-tasks');
-    if (tt && t.top_tasks && t.top_tasks.length) {
-        tt.innerHTML = t.top_tasks.map(x =>
-            '<tr><td class="py-0.5 pr-2"><a href="/tasks?status=completed" class="font-mono text-blue-600 hover:underline">' +
-            x.task_id.slice(0, 16) + '</a> ' +
-            '<span class="text-gray-500">' + (x.role || '-') + ' / ' + (x.model || '-') + '</span></td>' +
-            '<td class="text-right py-0.5">' + fmt(x.total) + ' <span class="text-gray-400">(' + x.calls + ')</span></td></tr>'
-        ).join('');
-    }
-    // Sparkline: 7 daily bars
-    const svg = document.getElementById('tu-sparkline');
-    if (svg && t.sparkline && t.sparkline.length) {
-        const W = 280, H = 80, P = 8;
-        const max = Math.max(1, ...t.sparkline.map(d => d.total));
-        const bw = (W - P * 2) / t.sparkline.length;
-        t.sparkline.forEach((d, i) => {
-            const h = d.total > 0 ? Math.max(2, (d.total / max) * (H - P * 2)) : 1;
-            const x = P + i * bw;
-            const y = H - P - h;
-            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-            rect.setAttribute('x', x.toFixed(1));
-            rect.setAttribute('y', y.toFixed(1));
-            rect.setAttribute('width', (bw - 2).toFixed(1));
-            rect.setAttribute('height', h.toFixed(1));
-            rect.setAttribute('fill', d.total > 0 ? '#6366f1' : '#e5e7eb');  // indigo-500 / gray-200
-            const t1 = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-            t1.textContent = d.date + ': ' + d.total + ' tokens';
-            rect.appendChild(t1);
-            svg.appendChild(rect);
-            // Date label below bar
-            const tx = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-            tx.setAttribute('x', (x + (bw - 2) / 2).toFixed(1));
-            tx.setAttribute('y', (H - 1).toFixed(1));
-            tx.setAttribute('text-anchor', 'middle');
-            tx.setAttribute('font-size', '8');
-            tx.setAttribute('fill', 'var(--text-muted, #9ca3af)');
-            tx.textContent = d.date;
-            svg.appendChild(tx);
-        });
-    }
-})();
-</script>
-
-<!-- Register Agent (collapsed by default) -->
-{% if not agents %}
-<div class="bg-blue-50 border border-blue-200 rounded p-4 mb-3 text-sm text-blue-800">
-    <strong>No agents yet.</strong> Click "+ Register new agent" below to add your first one.
-</div>
-{% endif %}
-
-<button onclick="toggleForm('register-form')" class="mb-3 text-sm text-blue-600 hover:underline">
-    + Register new agent
-</button>
-
-<form id="register-form" class="hidden bg-white border rounded-lg p-4 mb-4 shadow-sm">
-    <h3 class="text-lg font-semibold mb-3 text-gray-800">Register new agent</h3>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-        <div>
-            <label class="block text-xs font-medium text-gray-700">Agent ID</label>
-            <input name="agent_id" type="text" required class="mt-1 block w-full border rounded px-2 py-1 text-sm font-mono" placeholder="e.g. linux-a-01">
-        </div>
-        <div>
-            <label class="block text-xs font-medium text-gray-700">IP</label>
-            <input name="ip" type="text" class="mt-1 block w-full border rounded px-2 py-1 text-sm" placeholder="192.168.1.30">
-        </div>
-        <div>
-            <label class="block text-xs font-medium text-gray-700">OS</label>
-            <select name="os_type" class="mt-1 block w-full border rounded px-2 py-1 text-sm">
-                <option value="linux">linux</option>
-                <option value="windows">windows</option>
-            </select>
-        </div>
-    </div>
-    <p class="mt-2 text-xs text-gray-500">
-        Tip: profiles (agent roles) are added separately after register —
-        either via the dashboard's "Add profile" button on each agent card,
-        or auto-detected by the wrapper on first heartbeat from
-        <code>~/.hermes/profiles/&lt;name&gt;/</code>.
-    </p>
-    <div class="mt-3 flex items-center gap-2">
-        <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Register</button>
-        <span id="form-status" class="text-sm text-gray-500"></span>
-    </div>
-    <div id="setup-output" class="mt-3 hidden bg-gray-50 border rounded p-3 text-sm font-mono whitespace-pre-wrap"></div>
-</form>
-
-{% if not agents %}
-<div class="text-gray-500 text-center py-4 text-sm">No agents registered yet.</div>
-{% endif %}
-
-<div class="space-y-3" id="agents-list">
-    {% for agent in agents %}
-    <div class="bg-white border rounded-lg p-4 shadow-sm">
-        <div class="flex items-center justify-between">
-            <div class="flex items-center gap-3">
-                <span class="status-dot dot-{{ agent.status }}"></span>
-                <span class="text-lg font-semibold font-mono">{{ agent.id }}</span>
-                <span class="px-2 py-0.5 text-xs rounded-full
-                    {% if agent.status == 'verified' %}bg-green-100 text-green-800
-                    {% elif agent.status == 'verifying' %}bg-yellow-100 text-yellow-800
-                    {% elif agent.status == 'stale' %}bg-amber-100 text-amber-800
-                    {% else %}bg-gray-100 text-gray-800{% endif %}">
-                    {{ agent.status }}
-                </span>
-                <span class="text-xs text-gray-500">
-                    {{ agent.os_type or 'unknown OS' }} - {{ agent.ip or 'no IP' }}
-                </span>
-            </div>
-            <div class="text-xs text-gray-500">
-                last seen: {{ agent.last_heartbeat_at or 'never' }}
-            </div>
-        </div>
-
-        <div class="mt-3">
-            <div class="flex items-center justify-between">
-                <div class="text-xs font-medium text-gray-500 uppercase tracking-wide">
-                    Profiles ({{ agent.profiles|length }})
-                </div>
+        <div id="agent-list" style="max-height: 540px; overflow-y: auto;">
+            {% for a in agents %}
+            <div class="agent-row px-4 py-3 border-b cursor-pointer hover:bg-gray-50"
+                 data-agent-id="{{ a.id }}"
+                 onclick="selectAgent('{{ a.id }}')"
+                 style="border-left: 3px solid transparent;">
                 <div class="flex items-center gap-3">
-                    <button onclick="toggleAddProfile('{{ agent.id }}')" class="text-xs text-blue-600 hover:underline">+ Add profile</button>
-                    <button onclick="deleteAgent('{{ agent.id }}')" class="text-xs text-red-600 hover:underline">Delete agent</button>
+                    <span class="status-dot {{ 'dot-running' if a.status == 'verified' else 'dot-idle' if a.status == 'idle' else 'dot-error' }}"></span>
+                    <div class="flex-1 min-w-0">
+                        <div class="font-medium text-sm text-gray-800 truncate">{{ a.id }}</div>
+                        <div class="text-xs text-gray-500 mt-0.5 flex items-center gap-2 flex-wrap">
+                            <span>OS: {{ a.os_type or '—' }}</span>
+                            <span>IP: {{ a.ip or '—' }}</span>
+                            <span>Heartbeat: {{ a.last_heartbeat_at or 'never' }}</span>
+                        </div>
+                    </div>
+                    <div class="text-xs text-gray-500">
+                        {{ a.profiles|length }} profile{{ '' if a.profiles|length == 1 else 's' }}
+                    </div>
                 </div>
             </div>
+            {% else %}
+            <div class="px-4 py-8 text-center text-sm text-gray-500">
+                No agents registered yet. <code class="text-xs">hermes-agent</code> must POST to <code>/api/agents</code> with a shared HMAC secret.
+            </div>
+            {% endfor %}
+        </div>
+    </div>
 
-            <!-- Add profile form (hidden by default) -->
-            <form id="add-profile-{{ agent.id }}" class="hidden mt-2 p-2 bg-gray-50 border rounded" onsubmit="addProfile(event, '{{ agent.id }}')">
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
-                    <input name="name" type="text" required class="border rounded px-2 py-1 text-sm" placeholder="profile name (e.g. mt5-automation)">
-                    <input name="description" type="text" class="border rounded px-2 py-1 text-sm" placeholder="description (optional)">
+    <div class="card" id="agent-detail-panel">
+        <div class="text-sm text-gray-500" id="agent-detail-empty">
+            Select an agent on the left to view its profiles.
+        </div>
+        <div id="agent-detail-content" style="display: none;">
+            <div class="flex items-start justify-between mb-3">
+                <div>
+                    <div class="text-xs text-gray-500 uppercase tracking-wide">Agent</div>
+                    <h2 id="detail-agent-name" class="text-lg font-bold text-gray-800"></h2>
+                    <div id="detail-agent-meta" class="text-xs text-gray-500 mt-1"></div>
                 </div>
-                <div class="mt-2 flex items-center gap-2">
-                    <button type="submit" class="px-3 py-1 bg-blue-600 text-white rounded text-xs">Add</button>
-                    <button type="button" onclick="toggleAddProfile('{{ agent.id }}')" class="px-3 py-1 bg-gray-200 text-gray-700 rounded text-xs">Cancel</button>
-                    <span class="status text-xs text-gray-500"></span>
-                </div>
-            </form>
+                <span id="detail-status-pill"></span>
+            </div>
+            <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">Profiles</div>
+            <div id="detail-profile-list"></div>
+            <div class="mt-3 text-xs text-gray-400 italic">Full edit UI (add profile / delete profile) is part of v3.1.</div>
+        </div>
+    </div>
+</div>
 
-            <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;">
-                {% for p in agent.profiles %}
-                <div class="border rounded p-3 bg-gray-50" style="flex:1 1 320px; max-width:32rem; min-width:0;" id="profile-card-{{ agent.id }}-{{ p.name }}">
-                    {# Row 1: name + status + LLM model (left) | × close (right) #}
-                    <div class="flex items-center justify-between gap-2">
-                        <div class="flex items-center gap-2 min-w-0 flex-wrap">
-                            <span class="font-mono text-sm font-semibold">{{ p.name }}</span>
-                            <span class="px-1.5 py-0.5 text-[10px] rounded
-                                {% if p.status == 'busy' %}bg-amber-100 text-amber-800
-                                {% elif p.status == 'idle' %}bg-gray-200 text-gray-700
-                                {% elif p.status == 'stale' %}bg-red-100 text-red-800
-                                {% else %}bg-yellow-100 text-yellow-800{% endif %}"
-                                {% if p.status == 'stale' %}title="Wrapper is offline (agent heartbeat > 90s old). Profile was reset to idle; current task will be re-detected as stuck on next supervisor tick."{% endif %}">
-                                {{ p.status }}
-                            </span>
-                            {# LLM model badge — wrapper-reported via heartbeat #}
-                            {% if p.llm_model_default %}
-                            <span class="px-1.5 py-0.5 text-[10px] rounded bg-indigo-50 text-indigo-700 font-mono"
-                                title="LLM model: {{ p.llm_model_provider|default('?') }} &#10;Endpoint: {{ p.llm_model_base_url|default('?') }}">
-                                model: {{ p.llm_model_default }}{% if p.llm_model_provider %} ({{ p.llm_model_provider }}){% endif %}
-                            </span>
-                            {% else %}
-                            <span class="px-1.5 py-0.5 text-[10px] rounded bg-gray-100 text-gray-500 italic"
-                                title="LLM not yet reported by wrapper. The wrapper reads <profile>/config.yaml (model.default) and pushes it on the next heartbeat.">
-                                LLM: not reported
-                            </span>
-                            {% endif %}
-                        </div>
-                        <button onclick="removeProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-red-600 hover:underline flex-shrink-0" title="Remove profile">&times;</button>
-                    </div>
-                    {# Row 2: capability badges (left) | edit + SOUL.md (right). Always a
-                       separate row so the layout is identical regardless of how
-                       many capability badges the profile has (avoids flex-wrap
-                       pushing SOUL.md to a 2nd line on cards with more caps). #}
-                    <div class="mt-1.5 flex items-center justify-between gap-2">
-                        <div class="flex items-center gap-1 flex-wrap min-w-0">
-                            {% for k, v in p.capabilities.items() %}{% if v %}<span class="px-1 bg-indigo-50 text-indigo-700 rounded text-[10px]" title="capability">{{ k }}</span>{% endif %}{% endfor %}
-                        </div>
-                        <div class="flex items-center gap-2 flex-shrink-0">
-                            <button onclick="editProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-blue-600 hover:underline" title="Edit description">&#9998;</button>
-                            <button onclick="toggleSoulEditor('{{ agent.id }}', '{{ p.name }}')" class="text-xs text-purple-600 hover:underline" title="Edit SOUL.md (wrapper-mediated). On Linux, the file is SOUL.md (uppercase) — match the case for the agent to pick it up.">SOUL.md</button>
-                        </div>
-                    </div>
-                    {% if p.description %}
-                    <div class="text-xs text-gray-600 mt-1">{{ p.description }}</div>
-                    {% endif %}
-                    {# MCP servers list (always collapsed — user preference;
-                       open it explicitly to see which servers are configured) #}
-                    <details class="mt-2">
-                        <summary class="text-[10px] font-medium text-gray-500 uppercase tracking-wide cursor-pointer select-none hover:text-gray-700">
-                            MCP servers ({{ (p.mcp_servers|selectattr('enabled')|list|length) if p.mcp_servers else 0 }}/{{ p.mcp_servers|length if p.mcp_servers else 0 }})
-                        </summary>
-                        {% if p.mcp_servers %}
-                        <div class="mt-1 space-y-0.5">
-                            {% for m in p.mcp_servers %}
-                            <div class="text-xs flex items-center gap-1.5">
-                                <span class="inline-block w-2 h-2 rounded-full {% if m.enabled %}bg-emerald-500{% else %}bg-gray-400{% endif %}"
-                                    title="{% if m.enabled %}enabled{% else %}disabled{% endif %}"></span>
-                                <span class="font-mono">{{ m.name }}</span>
-                                {% if not m.enabled %}<span class="text-gray-400 italic">(disabled)</span>{% endif %}
-                            </div>
-                            {% endfor %}
-                        </div>
-                        {% else %}
-                        <div class="mt-1 text-xs text-gray-400">No MCP servers configured</div>
-                        {% endif %}
-                    </details>
-                    {# Storage refs (per-profile list of large-output destinations).
-                       Operator-curated, injected into task prompts as
-                       [AVAILABLE STORAGE] block by the wrapper. Each entry is
-                       {name?, kind, ref, description} where kind ∈ {smb, local,
-                       gdrive, s3, url} and `name` (optional) is a short alias
-                       tasks reference via params.output_to. Name shown first
-                       (bold), then kind chip, then ref, then description.
-                       Always collapsed — same UX as MCP servers. #}
-                    <details class="mt-2">
-                        <summary class="text-[10px] font-medium text-gray-500 uppercase tracking-wide cursor-pointer select-none hover:text-gray-700">
-                            Storage refs ({{ p.storage_refs|length if p.storage_refs else 0 }})
-                        </summary>
-                        {% if p.storage_refs %}
-                        <div class="mt-1 space-y-0.5">
-                            {% for s in p.storage_refs %}
-                            <div class="text-xs flex items-center gap-1.5 min-w-0">
-                                {% if s.name %}
-                                <span class="font-semibold text-gray-800 flex-shrink-0" title="alias (use as params.output_to)">{{ s.name }}</span>
-                                <span class="text-gray-400 flex-shrink-0">·</span>
-                                {% endif %}
-                                <span class="px-1 rounded text-[10px] font-mono flex-shrink-0
-                                    {%- if s.kind == 'smb' %} bg-blue-50 text-blue-700
-                                    {%- elif s.kind == 'local' %} bg-gray-100 text-gray-700
-                                    {%- elif s.kind == 'gdrive' %} bg-emerald-50 text-emerald-700
-                                    {%- elif s.kind == 's3' %} bg-orange-50 text-orange-700
-                                    {%- else %} bg-purple-50 text-purple-700
-                                    {%- endif %}"
-                                    title="kind: {{ s.kind }}">[{{ s.kind }}]</span>
-                                <span class="font-mono truncate" title="{{ s.ref }}">{{ s.ref }}</span>
-                                {% if s.description %}<span class="text-gray-500 italic truncate" title="{{ s.description }}">— {{ s.description }}</span>{% endif %}
-                            </div>
-                            {% endfor %}
-                        </div>
-                        {% else %}
-                        <div class="mt-1 text-xs text-gray-400">No storage refs configured — wrapper will not inject an [AVAILABLE STORAGE] block. Add one via the edit form (✎).</div>
-                        {% endif %}
-                    </details>
-                    <form id="edit-profile-{{ agent.id }}-{{ p.name }}" class="hidden mt-2 p-2 bg-white border rounded" onsubmit="saveProfileEdit(event, '{{ agent.id }}', '{{ p.name }}')">
-                        <textarea name="description" class="w-full text-xs border rounded p-1" rows="2" placeholder="description (optional)">{{ p.description or '' }}</textarea>
-                        <label class="block text-[10px] text-gray-500 mt-1 mb-0.5">Capabilities (JSON, e.g. <code>{"mt5": true, "xauusd_feed": true}</code>):</label>
-                        <textarea name="capabilities" class="w-full text-xs border rounded p-1 font-mono" rows="2" placeholder='{"mt5": true, "xauusd_feed": false}'>{{ p.capabilities | tojson(indent=2) if p.capabilities else '{}' }}</textarea>
-                        <label class="block text-[10px] text-gray-500 mt-1 mb-0.5">Storage refs (JSON, e.g. <code>[{"name":"stanley","kind":"gdrive","ref":"https://...","description":"..."}]</code>):</label>
-                        <textarea name="storage_refs" class="w-full text-xs border rounded p-1 font-mono" rows="3" placeholder='[{"name": "stanley", "kind": "gdrive", "ref": "https://drive.google.com/drive/folders/<id>", "description": "user main GDrive"}]'>{{ p.storage_refs | tojson(indent=2) if p.storage_refs else '[]' }}</textarea>
-                        <div class="mt-1 text-[10px] text-gray-500">
-                            <span class="font-medium">kinds:</span>
-                            <code class="bg-blue-50 text-blue-700 px-1 rounded">smb</code>
-                            <code class="bg-gray-100 text-gray-700 px-1 rounded">local</code>
-                            <code class="bg-emerald-50 text-emerald-700 px-1 rounded">gdrive</code>
-                            <code class="bg-orange-50 text-orange-700 px-1 rounded">s3</code>
-                            <code class="bg-purple-50 text-purple-700 px-1 rounded">url</code>
-                            &nbsp;·&nbsp;<span class="font-medium">name</span> is an optional short alias (e.g. <code>"stanley"</code>) that tasks reference via <code>params.output_to: "stanley"</code>. Without a name, pass the full <code>ref</code> string in <code>params.output_to</code>. &nbsp;·&nbsp;changes propagate to wrapper within ~5s (next heartbeat).
-                        </div>
-                        <div class="mt-1 flex gap-1">
-                            <button type="submit" class="text-xs px-2 py-0.5 bg-blue-600 text-white rounded">Save</button>
-                            <button type="button" onclick="editProfile('{{ agent.id }}', '{{ p.name }}')" class="text-xs px-2 py-0.5 bg-gray-200 rounded">Cancel</button>
-                        </div>
-                    </form>
+{# Per-agent templates (data rendered as <template> blocks, JS clones the
+   right one when the user clicks a row). Avoids re-fetching. #}
+{% for a in agents %}
+<template id="agent-tpl-{{ a.id }}">
+    <div class="agent-template-data"
+         data-os="{{ a.os_type or '—' }}"
+         data-ip="{{ a.ip or '—' }}"
+         data-heartbeat="{{ a.last_heartbeat_at or 'never' }}"
+         data-status="{{ a.status }}"
+         data-profiles='{{ a.profiles|tojson }}'>
+    </div>
+</template>
+{% endfor %}
 
-                    <!-- soul.md editor (wrapper-mediated) -->
-                    <div id="soul-editor-{{ agent.id }}-{{ p.name }}" class="hidden mt-2 p-2 bg-white border rounded">
-                        <div class="text-xs text-gray-500 mb-1">
-                            Edit <code>SOUL.md</code> (applied by wrapper on agent host). Note: case-sensitive on Linux.
-                        </div>
-                        <textarea id="soul-text-{{ agent.id }}-{{ p.name }}" class="w-full text-xs border rounded p-1 font-mono" rows="6" placeholder="# Profile soul / system prompt..."></textarea>
-                        <div class="mt-1 flex items-center gap-2">
-                            <button onclick="submitSoulConfig('{{ agent.id }}', '{{ p.name }}')" class="text-xs px-2 py-0.5 bg-purple-600 text-white rounded">Apply</button>
-                            <button onclick="toggleSoulEditor('{{ agent.id }}', '{{ p.name }}')" class="text-xs px-2 py-0.5 bg-gray-200 rounded">Cancel</button>
-                            <span id="soul-status-{{ agent.id }}-{{ p.name }}" class="text-xs text-gray-500"></span>
-                        </div>
-                        <div id="soul-history-{{ agent.id }}-{{ p.name }}" class="mt-2 text-xs text-gray-500"></div>
-                    </div>
-
-                    <!-- Skills section (wrapper-mediated, like SOUL.md but per file under skills/) -->
-                    <div class="mt-2 pt-2 border-t border-gray-200">
-                        <div class="flex items-center justify-between">
-                            <div class="text-xs font-medium text-gray-500 uppercase tracking-wide">
-                                Skills ({{ p.skills|length }})
-                            </div>
-                            <div class="flex items-center gap-3">
-                                <button onclick="syncSkillsFromDisk('{{ agent.id }}', '{{ p.name }}', this)" class="text-xs text-green-700 hover:underline" title="Trigger the wrapper to scan &lt;profile&gt;/skills/ on the agent host and register any files the orchestrator doesn't know about yet (e.g. skills you copied in via the file manager, or skills the agent taught itself).">&#x21bb; Sync from disk</button>
-                            </div>
-                        </div>
-                        {% if p.skills %}
-                        <div class="mt-1">
-                            <button id="skills-toggle-{{ agent.id }}-{{ p.name }}" onclick="toggleSkillsList('{{ agent.id }}-{{ p.name }}', {{ p.skills|length }})" class="text-xs text-blue-600 hover:underline">
-                                Show {{ p.skills|length }} skill{{ '' if p.skills|length == 1 else 's' }} &#x25BC;
-                            </button>
-                            <div class="mt-1 space-y-1 hidden" id="skills-list-{{ agent.id }}-{{ p.name }}">
-                                {% for s in p.skills %}
-                                <div class="flex items-center justify-between text-xs bg-white border rounded px-2 py-1">
-                                    <div class="flex items-center gap-2 flex-1 min-w-0">
-                                        <span class="font-mono text-gray-700 truncate" title="{{ s.file_path }}">{{ s.name }}</span>
-                                        <span class="px-1 rounded text-[10px]
-                                            {% if s.status == 'applied' %}bg-green-100 text-green-800
-                                            {% elif s.status == 'pending' or s.status == 'applying' %}bg-yellow-100 text-yellow-800
-                                            {% elif s.status == 'failed' %}bg-red-100 text-red-800
-                                            {% else %}bg-gray-100 text-gray-700{% endif %}">
-                                            {{ s.status }}
-                                        </span>
-                                        <span class="text-gray-400">{{ s.size }}b</span>
-                                    </div>
-                                    <div class="flex items-center gap-1 flex-shrink-0">
-                                        {# NOTE: onclick attribute uses single quotes so the tojson
-                                           output (which contains double quotes) doesn't terminate
-                                           the HTML attribute prematurely. Without this the
-                                           page's inline JS would fail to parse with
-                                           "Uncaught SyntaxError: Unexpected end of input"
-                                           and the copy button would do nothing. #}
-                                        <button onclick='copySkillTo("{{ agent.id }}", "{{ p.name }}", "{{ s.name }}", {{ agent.profiles|map(attribute="name")|list|tojson }})' class="text-blue-600 hover:underline px-1" title="Copy this skill to another profile on the same agent">Copy</button>
-                                        <button onclick="deleteSkill('{{ agent.id }}', '{{ p.name }}', '{{ s.name }}')" class="text-red-600 hover:underline" title="Delete this skill (wrapper will remove the folder)">&times;</button>
-                                    </div>
-                                </div>
-                                {% endfor %}
-                            </div>
-                        </div>
-                        {% else %}
-                        <div class="mt-1 text-xs text-gray-400">No skills yet. Skills are created by agents (via task → write SKILL.md to the agent's skills folder); this list shows what's been synced. Use "Sync from disk" to pull in new ones.</div>
-                        {% endif %}
-                    </div>
+{# ===== Collapsed analytics section (v3.0) ===== #}
+<div class="card" id="analytics-card" style="padding: 0;">
+    <button type="button" class="w-full px-4 py-3 flex items-center gap-3 hover:bg-gray-50"
+            onclick="toggleAnalytics()">
+        <span class="text-base">📊</span>
+        <div class="flex-1 text-left">
+            <div class="font-medium text-sm text-gray-800">Analytics (token usage, last 7 days)</div>
+            <div class="text-xs text-gray-500 mt-0.5">
+                {{ token_usage.totals["7d"].total|format_tokens }} tokens ·
+                {{ token_usage.totals["7d"].calls }} calls ·
+                {{ token_usage.by_model|length }} model{{ '' if token_usage.by_model|length == 1 else 's' }} ·
+                {{ token_usage.by_provider|length }} provider{{ '' if token_usage.by_provider|length == 1 else 's' }}
+            </div>
+        </div>
+        <span id="analytics-chevron" class="text-gray-400 text-xs">▶</span>
+    </button>
+    <div id="analytics-body" style="display: none;" class="border-t p-4">
+        <div class="kpi-grid-4 mb-4">
+            <div class="kpi">
+                <div class="kpi-label">Total (7d)</div>
+                <div class="kpi-value">{{ token_usage.totals["7d"].total|format_tokens }}</div>
+                <div class="kpi-sub">{{ token_usage.totals["7d"].calls }} calls</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">Input (7d)</div>
+                <div class="kpi-value">{{ token_usage.totals["7d"].prompt|format_tokens }}</div>
+                <div class="kpi-sub">{{ ((token_usage.totals["7d"].prompt / token_usage.totals["7d"].total * 100) if token_usage.totals["7d"].total else 0)|round(1) }}% of total</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">Output (7d)</div>
+                <div class="kpi-value">{{ token_usage.totals["7d"].completion|format_tokens }}</div>
+                <div class="kpi-sub">{{ ((token_usage.totals["7d"].completion / token_usage.totals["7d"].total * 100) if token_usage.totals["7d"].total else 0)|round(1) }}% of total</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">24h</div>
+                <div class="kpi-value">{{ token_usage.totals["24h"].total|format_tokens }}</div>
+                <div class="kpi-sub">{{ token_usage.totals["24h"].calls }} calls</div>
+            </div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div>
+                <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">By model</div>
+                {% if token_usage.by_model %}
+                {% set max_model = (token_usage.by_model|map(attribute='total')|list|sort|last) or 1 %}
+                {% for m in token_usage.by_model[:6] %}
+                <div class="bar-row">
+                    <div class="bar-label" title="{{ m.model }}">{{ m.model }}</div>
+                    <div class="bar-track"><div class="bar-fill" style="width: {{ (m.total / max_model * 100)|round(1) }}%;"></div></div>
+                    <div class="bar-value">{{ m.total|format_tokens }}</div>
                 </div>
                 {% endfor %}
+                {% else %}
+                <div class="text-xs text-gray-400 italic">No data yet</div>
+                {% endif %}
             </div>
-            <div class="mt-1 text-xs text-gray-400">
-                Profile name cannot be changed. Delete + re-add to rename.
+            <div>
+                <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">By agent</div>
+                {% if token_usage.by_agent %}
+                {% set max_agent = (token_usage.by_agent|map(attribute='total')|list|sort|last) or 1 %}
+                {% for a in token_usage.by_agent[:6] %}
+                <div class="bar-row">
+                    <div class="bar-label" title="{{ a.agent_id }}">{{ a.agent_id or '(orchestrator)' }}</div>
+                    <div class="bar-track"><div class="bar-fill" style="width: {{ (a.total / max_agent * 100)|round(1) }}%;"></div></div>
+                    <div class="bar-value">{{ a.total|format_tokens }}</div>
+                </div>
+                {% endfor %}
+                {% else %}
+                <div class="text-xs text-gray-400 italic">No data yet</div>
+                {% endif %}
+            </div>
+            <div>
+                <div class="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">By provider</div>
+                {% if token_usage.by_provider %}
+                {% set max_provider = (token_usage.by_provider|map(attribute='total')|list|sort|last) or 1 %}
+                {% for p in token_usage.by_provider[:6] %}
+                <div class="bar-row">
+                    <div class="bar-label" title="{{ p.provider }}">{{ p.provider }}</div>
+                    <div class="bar-track"><div class="bar-fill" style="width: {{ (p.total / max_provider * 100)|round(1) }}%;"></div></div>
+                    <div class="bar-value">{{ p.total|format_tokens }}</div>
+                </div>
+                {% endfor %}
+                {% else %}
+                <div class="text-xs text-gray-400 italic">No data yet</div>
+                {% endif %}
             </div>
         </div>
+        <div class="mt-4 text-right">
+            <a href="/token-usage" class="text-sm text-blue-600 hover:underline">View full analytics →</a>
+        </div>
     </div>
-    {% endfor %}
 </div>
 
 <script>
-document.getElementById('register-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const form = e.target;
-    const status = document.getElementById('form-status');
-    const output = document.getElementById('setup-output');
-    status.textContent = 'Registering...';
-    status.className = 'text-sm text-gray-500';
-    output.classList.add('hidden');
-
-    const body = {
-        agent_id: form.agent_id.value,
-    };
-    if (form.ip.value) body.ip = form.ip.value;
-    if (form.os_type.value) body.os_type = form.os_type.value;
-
-    try {
-        const r = await fetch('/api/agents/', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(body),
-        });
-        const data = await r.json();
-        if (r.ok) {
-            status.textContent = 'Registered ' + data.agent.id;
-            status.className = 'text-sm text-green-600';
-            output.textContent = data.setup_instructions;
-            output.classList.remove('hidden');
-            if (document.activeElement) document.activeElement.blur();
-            setTimeout(() => location.reload(), 1500);
-        } else {
-            status.textContent = 'Error: ' + (data.detail || r.status);
-            status.className = 'text-sm text-red-600';
-        }
-    } catch (err) {
-        status.textContent = 'Network error';
-        status.className = 'text-sm text-red-600';
+// ===== Master-detail: switch the right panel when the user clicks a row =====
+function selectAgent(agentId) {
+    // Highlight the chosen row, un-highlight others
+    document.querySelectorAll('.agent-row').forEach(r => {
+        r.style.borderLeftColor = 'transparent';
+        r.style.background = '';
+    });
+    const row = document.querySelector(`.agent-row[data-agent-id="${agentId}"]`);
+    if (row) {
+        row.style.borderLeftColor = '#3b82f6';
+        row.style.background = '#eff6ff';
     }
-});
-
-function toggleAddProfile(agentId) {
-    const f = document.getElementById('add-profile-' + agentId);
-    f.classList.toggle('hidden');
+    // Pull the pre-rendered template for this agent
+    const tpl = document.getElementById('agent-tpl-' + agentId);
+    if (!tpl) return;
+    const data = tpl.content.querySelector('.agent-template-data');
+    if (!data) return;
+    const profiles = JSON.parse(data.dataset.profiles || '[]');
+    // Update the right panel
+    document.getElementById('agent-detail-empty').style.display = 'none';
+    document.getElementById('agent-detail-content').style.display = 'block';
+    document.getElementById('detail-agent-name').textContent = agentId;
+    document.getElementById('detail-agent-meta').textContent =
+        'OS: ' + data.dataset.os + ' · IP: ' + data.dataset.ip + ' · Heartbeat: ' + data.dataset.heartbeat;
+    const pill = document.getElementById('detail-status-pill');
+    const status = data.dataset.status;
+    pill.className = 'pill-status ' + (status === 'verified' ? 'pill-online' : status === 'idle' ? 'pill-offline' : 'pill-degraded');
+    pill.textContent = status;
+    // Render profile list
+    const list = document.getElementById('detail-profile-list');
+    list.innerHTML = profiles.map(p => `
+        <div class="card mb-2" style="padding: 0.75rem;">
+            <div class="flex items-center gap-2">
+                <div class="font-medium text-sm flex-1">${escapeHtml(p.name || '(unnamed)')}</div>
+                <span class="pill-status ${p.status === 'busy' ? 'pill-busy' : 'pill-healthy'}">${p.status || 'unknown'}</span>
+            </div>
+            <div class="text-xs text-gray-500 mt-1">
+                Model: ${p.llm_model_default ? escapeHtml(p.llm_model_default) : '(not reported)'}
+                ${p.llm_model_provider ? ' · Provider: ' + escapeHtml(p.llm_model_provider) : ''}
+            </div>
+        </div>
+    `).join('') || '<div class="text-xs text-gray-400 italic">No profiles configured</div>';
 }
 
-function toggleForm(id) {
-    document.getElementById(id).classList.toggle('hidden');
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-async function addProfile(event, agentId) {
-    event.preventDefault();
-    const form = event.target;
-    const status = form.querySelector('.status');
-    status.textContent = 'Adding...';
-    const body = {
-        name: form.name.value,
-    };
-    if (form.description.value) body.description = form.description.value;
-
-    try {
-        const r = await fetch('/api/agents/' + agentId + '/profiles', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(body),
-        });
-        if (r.ok) {
-            status.textContent = 'Added!';
-            status.className = 'text-xs text-green-600';
-            setTimeout(() => location.reload(), 500);
-        } else {
-            const err = await r.json().catch(() => ({}));
-            status.textContent = 'Error: ' + (err.detail || r.status);
-            status.className = 'text-xs text-red-600';
-        }
-    } catch (err) {
-        status.textContent = 'Error';
-        status.className = 'text-xs text-red-600';
-    }
-}
-
-async function deleteAgent(agentId) {
-    if (!confirm('Delete agent ' + agentId + '? In-flight tasks will be marked as failed. This CANNOT be undone.')) return;
-    try {
-        const r = await fetch('/api/agents/' + agentId, {method: 'DELETE'});
-        if (r.ok || r.status === 204) location.reload();
-        else {
-            const err = await r.json().catch(() => ({}));
-            alert('Failed: ' + (err.detail || r.status));
-        }
-    } catch (err) {
-        alert('Error: ' + err.message);
-    }
-}
-
-function editProfile(agentId, profileName) {
-    const f = document.getElementById(`edit-profile-${agentId}-${profileName}`);
-    if (f) f.classList.toggle('hidden');
-}
-
-async function saveProfileEdit(event, agentId, profileName) {
-    event.preventDefault();
-    const form = event.target;
-    const desc = form.description.value;
-    // Parse capabilities JSON. If empty or `{}`, send as `{}` (permissive
-    // default = "can do anything"). If malformed, surface a friendly error
-    // before the API call so the user doesn't get a generic 500.
-    const capsRaw = (form.capabilities.value || '').trim() || '{}';
-    let caps;
-    try {
-        caps = JSON.parse(capsRaw);
-        if (typeof caps !== 'object' || Array.isArray(caps)) {
-            throw new Error('capabilities must be a JSON object');
-        }
-    } catch (e) {
-        alert('Capabilities JSON invalid: ' + e.message);
-        return;
-    }
-    // Parse storage_refs JSON. If empty, send as []. Each entry must be
-    // {kind, ref, description?} with kind non-empty and ref non-empty.
-    // The server's PATCH handler silently drops malformed entries
-    // (operators can fix from the UI), but a friendly client-side
-    // check avoids the silent-drop surprise.
-    const srefsRaw = (form.storage_refs.value || '').trim() || '[]';
-    let srefs;
-    try {
-        srefs = JSON.parse(srefsRaw);
-        if (!Array.isArray(srefs)) {
-            throw new Error('storage_refs must be a JSON array');
-        }
-        for (let i = 0; i < srefs.length; i++) {
-            const s = srefs[i];
-            if (typeof s !== 'object' || !s) {
-                throw new Error(`entry ${i} is not an object`);
-            }
-            if (!s.kind || !String(s.kind).trim()) {
-                throw new Error(`entry ${i} missing non-empty "kind"`);
-            }
-            if (!s.ref || !String(s.ref).trim()) {
-                throw new Error(`entry ${i} missing non-empty "ref"`);
-            }
-        }
-    } catch (e) {
-        alert('Storage refs JSON invalid: ' + e.message);
-        return;
-    }
-    try {
-        const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}`, {
-            method: 'PATCH',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({description: desc, capabilities: caps, storage_refs: srefs}),
-        });
-        if (r.ok) location.reload();
-        else {
-            const err = await r.json().catch(() => ({}));
-            alert('Failed: ' + (err.detail || r.status));
-        }
-    } catch (err) {
-        alert('Error: ' + err.message);
-    }
-}
-
-async function removeProfile(agentId, profileName) {
-    if (!confirm('Remove profile "' + profileName + '"? Tasks using this role will be affected.')) return;
-    try {
-        const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}`, {method: 'DELETE'});
-        if (r.ok || r.status === 204) location.reload();
-        else {
-            const err = await r.json().catch(() => ({}));
-            alert('Failed: ' + (err.detail || r.status));
-        }
-    } catch (err) {
-        alert('Error: ' + err.message);
-    }
-}
-
-// ===== soul.md editor (wrapper-mediated) =====
-
-function soulKey(agentId, profileName) {
-    return agentId + '::' + profileName;
-}
-
-const soulPollers = {};
-
-function toggleSoulEditor(agentId, profileName) {
-    const ed = document.getElementById(`soul-editor-${agentId}-${profileName}`);
-    if (ed.classList.contains('hidden')) {
-        ed.classList.remove('hidden');
-        loadSoulHistory(agentId, profileName);
-    } else {
-        ed.classList.add('hidden');
-    }
-}
-
-async function loadSoulHistory(agentId, profileName) {
-    const ta = document.getElementById(`soul-text-${agentId}-${profileName}`);
-    const hist = document.getElementById(`soul-history-${agentId}-${profileName}`);
-    try {
-        const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}/configs`);
-        if (!r.ok) return;
-        const cfgs = await r.json();
-        // Prefill textarea with the most recent APPLIED SOUL.md content
-        // (NOT skills — those have their own editor; the SOUL editor
-        // must always reflect the current SOUL.md, which may be
-        // 'applied' empty content if the file has been deleted, or the
-        // most recent non-empty applied content if it exists).
-        const soulCfgs = cfgs.filter(c => c.file_path === 'SOUL.md' || c.file_path === 'soul.md');
-        const soulApplied = soulCfgs.find(c => c.status === 'applied');
-        if (soulApplied && !ta.value) ta.value = soulApplied.desired_content;
-        // History — show all SOUL.md-related entries (most recent first)
-        if (cfgs.length === 0) {
-            hist.innerHTML = '<div class="text-gray-400">No config history yet.</div>';
-            return;
-        }
-        // History filtered to SOUL.md only (skills have their own editor)
-        const recent = cfgs.filter(c => c.file_path === 'SOUL.md' || c.file_path === 'soul.md').slice(0, 5).map(c => {
-            const when = (c.applied_at || c.created_at || '').slice(0, 19).replace('T', ' ');
-            const badge =
-                c.status === 'applied' ? '<span class="px-1 bg-green-100 text-green-800 rounded">applied</span>' :
-                c.status === 'failed'  ? '<span class="px-1 bg-red-100 text-red-800 rounded">failed</span>' :
-                c.status === 'applying' ? '<span class="px-1 bg-blue-100 text-blue-800 rounded">applying</span>' :
-                '<span class="px-1 bg-yellow-100 text-yellow-800 rounded">pending</span>';
-            return `<div class="flex items-center gap-2"><span class="font-mono text-gray-400">${when}</span>${badge}<span class="text-gray-500">sha=${c.desired_sha256.slice(0,8)}</span>${c.error ? '<span class="text-red-600">' + c.error + '</span>' : ''}</div>`;
-        }).join('');
-        hist.innerHTML = '<div class="mb-1 font-semibold text-gray-600">Recent:</div>' + recent;
-    } catch (err) {
-        hist.innerHTML = '<div class="text-red-500">load failed: ' + err.message + '</div>';
-    }
-}
-
-async function submitSoulConfig(agentId, profileName) {
-    const ta = document.getElementById(`soul-text-${agentId}-${profileName}`);
-    const status = document.getElementById(`soul-status-${agentId}-${profileName}`);
-    const content = ta.value;
-    if (!content.trim()) {
-        status.textContent = 'content is empty';
-        status.className = 'text-xs text-red-600';
-        return;
-    }
-    status.textContent = 'submitting...';
-    status.className = 'text-xs text-gray-500';
-    try {
-        const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}/configs`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({file_path: 'SOUL.md', content: content}),
-        });
-        if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            status.textContent = 'Error: ' + (err.detail || r.status);
-            status.className = 'text-xs text-red-600';
-            return;
-        }
-        const cfg = await r.json();
-        status.textContent = 'pending; waiting for wrapper...';
-        status.className = 'text-xs text-yellow-700';
-        startSoulPolling(agentId, profileName, cfg.id);
-    } catch (err) {
-        status.textContent = 'Network error: ' + err.message;
-        status.className = 'text-xs text-red-600';
-    }
-}
-
-function startSoulPolling(agentId, profileName, cfgId) {
-    const key = soulKey(agentId, profileName);
-    if (soulPollers[key]) clearInterval(soulPollers[key]);
-    const status = document.getElementById(`soul-status-${agentId}-${profileName}`);
-    soulPollers[key] = setInterval(async () => {
-        try {
-            const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}/configs`);
-            if (!r.ok) return;
-            const cfgs = await r.json();
-            const cfg = cfgs.find(c => c.id === cfgId);
-            if (!cfg) return;
-            if (cfg.status === 'applied') {
-                status.textContent = 'applied!';
-                status.className = 'text-xs text-green-600';
-                clearInterval(soulPollers[key]);
-                soulPollers[key] = null;
-                loadSoulHistory(agentId, profileName);
-            } else if (cfg.status === 'failed') {
-                status.textContent = 'failed: ' + (cfg.error || 'unknown');
-                status.className = 'text-xs text-red-600';
-                clearInterval(soulPollers[key]);
-                soulPollers[key] = null;
-                loadSoulHistory(agentId, profileName);
-            } else {
-                status.textContent = cfg.status + '...';
-            }
-        } catch (err) {
-            // keep polling
-        }
-    }, 3000);
-}
-
-// ===== Skills editor (wrapper-mediated) =====
-//
-// Skills are markdown files under <profile>/skills/<name>.md on the agent
-// host. The dashboard lists, edits, and deletes them via dedicated skill
-// endpoints, which under the hood write profile_configs rows that the
-// wrapper applies on its next tick. The planner reads the same list so it
-// can pick the right role for each task.
-
-function toggleSkillsList(key, total) {
-    // The skills list is one hidden div, not a "first 5 + extras" pattern.
-    // Default: list collapsed, button reads "Show N skills ▼".
-    // Click:   list expanded, button reads "Hide N skills ▲".
-    const list = document.getElementById('skills-list-' + key);
-    const btn = document.getElementById('skills-toggle-' + key);
-    if (!list || !btn) return;
-    const isHidden = list.classList.contains('hidden');
-    if (isHidden) {
-        list.classList.remove('hidden');
-        btn.innerHTML = 'Hide ' + total + ' skill' + (total === 1 ? '' : 's') + ' &#x25B2;';
-    } else {
-        list.classList.add('hidden');
-        btn.innerHTML = 'Show ' + total + ' skill' + (total === 1 ? '' : 's') + ' &#x25BC;';
-    }
-}
-
-async function deleteSkill(agentId, profileName, skillName) {
-    if (!confirm(`Delete skill "${skillName}"? The folder skills/${skillName}/ will be removed from the agent host.`)) return;
-    try {
-        const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}/skills/${encodeURIComponent(skillName)}`, {
-            method: 'DELETE',
-        });
-        if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            alert('Failed: ' + (err.detail || r.status));
-            return;
-        }
-        // Reload (skip if user is mid-typing)
-        if (!document.activeElement || document.activeElement === document.body) {
-            setTimeout(() => location.reload(), 800);
-        }
-    } catch (err) {
-        alert('Error: ' + err.message);
-    }
-}
-
-// Copy a skill to another profile on the SAME agent (cross-host copy
-// is not supported — the wrapper that needs to write the file lives
-// on one host only). Pops a quick prompt to pick the target profile.
-async function copySkillTo(agentId, srcProfile, skillName, allProfiles) {
-    const candidates = allProfiles.filter(n => n !== srcProfile);
-    if (candidates.length === 0) {
-        alert('No other profiles on this agent to copy to.');
-        return;
-    }
-    const to = prompt(
-        `Copy skill "${skillName}" from "${srcProfile}" to which profile?\n\n` +
-        `Available: ${candidates.join(', ')}\n\n` +
-        `Type the target profile name (case-sensitive):`,
-        candidates[0],
-    );
-    if (!to || !candidates.includes(to)) {
-        if (to !== null) alert('Unknown target profile. Copy cancelled.');
-        return;
-    }
-    if (to === srcProfile) {
-        alert('Source and target are the same. Copy cancelled.');
-        return;
-    }
-    const overwrite = confirm(
-        `Overwrite if "${to}" already has skill "${skillName}"?\n\n` +
-        `OK = overwrite (existing content replaced)\nCancel = skip if exists (returns 409)`
-    );
-    try {
-        const r = await _fetchWithTimeout(
-            `/api/agents/${agentId}/profiles/${encodeURIComponent(srcProfile)}/skills/${encodeURIComponent(skillName)}/copy?to_profile=${encodeURIComponent(to)}`,
-            {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({overwrite}),
-            },
-            30000,
-        );
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok && r.status !== 201) {
-            throw new Error(_errDetailToString(j.detail, r.status));
-        }
-        alert(`Copied "${skillName}" to ${to}.\nThe wrapper on ${to} will write the file on its next config poll (within 5s).`);
-        setTimeout(() => location.reload(), 600);
-    } catch (err) {
-        alert('Copy failed: ' + (err.message || String(err)));
-    }
-}
-
-// Trigger a reverse sync: scan <profile>/skills/ on the agent host and
-// register any files the orchestrator doesn't know about. Used both for
-// skills you copied in manually and for self-taught skills the agent
-// dropped in. The wrapper picks up the trigger on its next config poll
-// (within 5s) and pushes new/changed files back to us.
-async function syncSkillsFromDisk(agentId, profileName, btn) {
-    const orig = btn.innerHTML;
-    btn.disabled = true;
-    btn.innerHTML = '...';
-    try {
-        const r = await fetch(`/api/agents/${agentId}/profiles/${encodeURIComponent(profileName)}/skills/sync`, {
-            method: 'POST',
-        });
-        if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            alert('Sync failed: ' + (err.detail || r.status));
-            btn.innerHTML = orig;
-            btn.disabled = false;
-            return;
-        }
-        btn.innerHTML = 'syncing...';
-        // Wrapper polls every 5s. Wait ~7s then reload to see the result.
-        setTimeout(() => {
-            btn.innerHTML = orig;
-            btn.disabled = false;
-            if (!document.activeElement || document.activeElement === document.body) {
-                location.reload();
-            }
-        }, 7000);
-    } catch (err) {
-        alert('Error: ' + err.message);
-        btn.innerHTML = orig;
-        btn.disabled = false;
-    }
-}
-
-// ===== Overview donut =====
-// Renders a 3-slice donut (idle / busy / offline) on the overview
-// card. Slices come from the page context (window.OVERVIEW_SUMMARY
-// is set in the inline <script> at the top of the page). Pure
-// inline SVG, no chart library.
-
-(function renderOverviewDonut() {
-    const overview = {
-        idle: {{ overview.idle }},
-        busy: {{ overview.busy }},
-        // offline = total profiles - online. If no profiles at all,
-        // the donut shows 100% grey "no data".
-        total_profiles: {{ overview.profiles_total }},
-        online_profiles: {{ overview.subagents_online }},
-    };
-    const offline = Math.max(0, overview.total_profiles - overview.online_profiles);
-    const total = overview.idle + overview.busy + offline;
-    const slices = total > 0
-        ? [
-            {label: 'idle',  count: overview.idle,  color: '#1d4ed8'},  // blue-700
-            {label: 'busy',  count: overview.busy,  color: '#b45309'},  // amber-700 (less alarming than red)
-            {label: 'offline', count: offline,      color: '#9ca3af'},  // gray-400
-        ].filter(s => s.count > 0)
-        : [{label: 'no data', count: 1, color: '#e5e7eb'}];  // gray-200 fallback
-    const svg = document.getElementById('overview-donut');
-    if (!svg) return;
-    const cx = 80, cy = 80, r = 60;
-    const total2 = slices.reduce((a, s) => a + s.count, 0);
-    // The grey background ring is already in the SVG; only draw
-    // slices on top, with a 24px stroke and a small gap effect via
-    // round line caps.
-    // Edge case: if there's only ONE slice and it's 100%, the SVG
-    // arc would be degenerate (start == end point) and most
-    // renderers (Chrome/Safari/Firefox) draw a 0-length invisible
-    // path. So we special-case: draw a full circle for the
-    // single-slice-100% case, otherwise the usual arc. The 'no
-    // data' fallback is the same color as the background ring, so
-    // we skip drawing it (just shows the ring).
-    const is_no_data_fallback = slices.length === 1 && slices[0].label === 'no data';
-    if (is_no_data_fallback) {
-        // Nothing to draw — the background ring is the visual
-    } else if (slices.length === 1 && total2 > 0) {
-        const s = slices[0];
-        const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-        circle.setAttribute('cx', cx);
-        circle.setAttribute('cy', cy);
-        circle.setAttribute('r', r);
-        circle.setAttribute('fill', 'none');
-        circle.setAttribute('stroke', s.color);
-        circle.setAttribute('stroke-width', '24');
-        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-        title.textContent = `${s.label}: ${s.count} (100%)`;
-        circle.appendChild(title);
-        svg.appendChild(circle);
-    } else {
-        let angle = -Math.PI / 2;  // start at 12 o'clock
-        for (const s of slices) {
-            const frac = s.count / total2;
-            const sweep = frac * 2 * Math.PI;
-            const end = angle + sweep;
-            const x1 = cx + r * Math.cos(angle);
-            const y1 = cy + r * Math.sin(angle);
-            const x2 = cx + r * Math.cos(end);
-            const y2 = cy + r * Math.sin(end);
-            const large = sweep > Math.PI ? 1 : 0;
-            const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-            // Use a stroke arc instead of a filled wedge — simpler and
-            // matches the existing grey ring (same r/stroke-width).
-            const d = `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}`;
-            path.setAttribute('d', d);
-            path.setAttribute('stroke', s.color);
-            path.setAttribute('stroke-width', '24');
-            path.setAttribute('fill', 'none');
-            path.setAttribute('stroke-linecap', 'butt');
-            const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-            title.textContent = `${s.label}: ${s.count} (${(frac * 100).toFixed(0)}%)`;
-            path.appendChild(title);
-            svg.appendChild(path);
-            angle = end;
-        }
-    }
-    // Center label: total profiles
-    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    text.setAttribute('x', cx);
-    text.setAttribute('y', cy + 6);
-    text.setAttribute('text-anchor', 'middle');
-    text.setAttribute('font-size', '20');
-    text.setAttribute('font-weight', '700');
-    // Use CSS variables so dark mode override works (set in base.html)
-    text.setAttribute('fill', 'var(--text-primary, #1f2937)');
-    text.textContent = total;
-    svg.appendChild(text);
-    const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    sub.setAttribute('x', cx);
-    sub.setAttribute('y', cy + 22);
-    sub.setAttribute('text-anchor', 'middle');
-    sub.setAttribute('font-size', '10');
-    sub.setAttribute('fill', 'var(--text-muted, #6b7280)');
-    sub.textContent = 'profiles';
-    svg.appendChild(sub);
+// ===== Auto-select first agent so the right panel isn't empty =====
+(function autoSelectFirst() {
+    const first = document.querySelector('.agent-row');
+    if (first) selectAgent(first.dataset.agentId);
 })();
 
+// ===== Collapsed analytics toggle =====
+function toggleAnalytics() {
+    const body = document.getElementById('analytics-body');
+    const chev = document.getElementById('analytics-chevron');
+    if (!body) return;
+    const isOpen = body.style.display !== 'none';
+    body.style.display = isOpen ? 'none' : 'block';
+    chev.textContent = isOpen ? '▶' : '▼';
+}
 </script>
-
 {% endblock %}

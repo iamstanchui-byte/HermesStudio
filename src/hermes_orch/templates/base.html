@@ -43,13 +43,157 @@
     }
     </script>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft JhengHei", sans-serif; background: #f9fafb; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft JhengHei", sans-serif;
+            background: #f9fafb;
+            margin: 0;
+        }
         pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
+        /* v3.0: layout = left sidebar + main area. Sidebar is 220px
+           expanded, 64px collapsed. State persists in localStorage
+           so power users stay in icon-only mode. */
+        .sidebar {
+            position: fixed; top: 0; left: 0; bottom: 0;
+            width: 220px;
+            background: #ffffff;
+            border-right: 1px solid #e5e7eb;
+            display: flex; flex-direction: column;
+            transition: width 0.18s ease;
+            z-index: 20;
+            overflow-x: hidden;
+        }
+        body.sidebar-collapsed .sidebar { width: 64px; }
+        .sidebar-header {
+            display: flex; align-items: center; gap: 0.5rem;
+            padding: 0.875rem 1rem;
+            border-bottom: 1px solid #f1f5f9;
+            min-height: 56px;
+        }
+        .sidebar-logo {
+            width: 28px; height: 28px;
+            background: #3b82f6; color: #fff;
+            border-radius: 6px;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 700; font-size: 14px;
+            flex-shrink: 0;
+        }
+        .sidebar-title {
+            font-weight: 600; color: #1f2937; font-size: 0.9rem;
+            white-space: nowrap; overflow: hidden;
+        }
+        body.sidebar-collapsed .sidebar-title { display: none; }
+        .sidebar-nav { flex: 1; padding: 0.75rem 0.5rem; overflow-y: auto; }
+        .sidebar-item {
+            display: flex; align-items: center; gap: 0.625rem;
+            padding: 0.5rem 0.75rem;
+            margin: 0.125rem 0;
+            border-radius: 6px;
+            color: #4b5563;
+            text-decoration: none;
+            font-size: 0.875rem;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: background 0.1s;
+        }
+        .sidebar-item:hover { background: #f3f4f6; color: #1f2937; }
+        .sidebar-item.active {
+            background: #eff6ff; color: #2563eb; font-weight: 500;
+        }
+        .sidebar-icon {
+            width: 18px; height: 18px;
+            flex-shrink: 0;
+            display: inline-flex; align-items: center; justify-content: center;
+            font-size: 14px;
+        }
+        .sidebar-label {
+            overflow: hidden; text-overflow: ellipsis;
+        }
+        body.sidebar-collapsed .sidebar-label { display: none; }
+        .sidebar-group-toggle {
+            display: flex; align-items: center; gap: 0.625rem;
+            padding: 0.5rem 0.75rem;
+            margin: 0.125rem 0;
+            border-radius: 6px;
+            color: #4b5563;
+            font-size: 0.875rem;
+            cursor: pointer;
+            white-space: nowrap;
+            background: none; border: none; width: 100%; text-align: left;
+        }
+        .sidebar-group-toggle:hover { background: #f3f4f6; color: #1f2937; }
+        .sidebar-group-toggle .caret {
+            margin-left: auto; font-size: 10px; color: #9ca3af;
+            transition: transform 0.15s;
+        }
+        .sidebar-group-toggle.expanded .caret { transform: rotate(90deg); }
+        body.sidebar-collapsed .sidebar-group-toggle .caret { display: none; }
+        .sidebar-subitems {
+            margin-left: 1.5rem;
+            border-left: 1px solid #e5e7eb;
+            padding-left: 0.25rem;
+        }
+        body.sidebar-collapsed .sidebar-subitems { display: none; }
+        .sidebar-subitem {
+            display: block;
+            padding: 0.375rem 0.75rem;
+            color: #6b7280;
+            text-decoration: none;
+            font-size: 0.825rem;
+            border-radius: 4px;
+        }
+        .sidebar-subitem:hover { background: #f3f4f6; color: #1f2937; }
+        .sidebar-subitem.active { color: #2563eb; font-weight: 500; }
+        .sidebar-footer {
+            border-top: 1px solid #f1f5f9;
+            padding: 0.5rem;
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 0.5rem;
+        }
+        .sidebar-toggle-btn {
+            background: none; border: none; cursor: pointer;
+            color: #6b7280; padding: 0.25rem 0.5rem; border-radius: 4px;
+            font-size: 0.875rem;
+        }
+        .sidebar-toggle-btn:hover { background: #f3f4f6; color: #1f2937; }
+        body.sidebar-collapsed .sidebar-footer { flex-direction: column; }
+        body.sidebar-collapsed .sidebar-footer .sidebar-status { display: none; }
+        .sidebar-status {
+            display: flex; flex-direction: column; gap: 0.25rem;
+            font-size: 0.7rem;
+        }
+        .sidebar-status .pill {
+            display: inline-block;
+            padding: 0.125rem 0.5rem;
+            border-radius: 999px;
+            font-weight: 500;
+            font-size: 0.7rem;
+            white-space: nowrap;
+        }
+        .pill-green { background: #dcfce7; color: #166534; }
+        .pill-yellow { background: #fef3c7; color: #92400e; }
+        /* Main content area: respect sidebar width */
+        .main-area {
+            margin-left: 220px;
+            min-height: 100vh;
+            transition: margin-left 0.18s ease;
+        }
+        body.sidebar-collapsed .main-area { margin-left: 64px; }
+        .main-content { max-width: 1400px; margin: 0 auto; padding: 1.5rem 2rem; }
+        .topbar {
+            position: sticky; top: 0; z-index: 10;
+            background: #ffffff;
+            border-bottom: 1px solid #e5e7eb;
+            padding: 0.625rem 1.5rem;
+            display: flex; align-items: center; gap: 1rem;
+        }
+        /* Mock mode banner (kept as-is from old design) */
+        .container-legacy { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
         .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
         .dot-running { background: #10b981; }
         .dot-idle { background: #9ca3af; }
         .dot-error { background: #ef4444; }
+        .dot-verifying { background: #f59e0b; }
+        .dot-stale { background: #f59e0b; }
 
         /* Toggle switch (used by auto-refresh + theme buttons) */
         .toggle-track {
@@ -64,19 +208,105 @@
         }
         .toggle-knob {
             position: absolute;
-            top: 2px;
-            left: 2px;
-            width: 14px;
-            height: 14px;
+            top: 2px; left: 2px;
+            width: 14px; height: 14px;
             background: #fff;
             border-radius: 50%;
             box-shadow: 0 1px 2px rgba(0,0,0,0.2);
             transition: left 0.15s;
         }
-        /* Both classes on the same element - the JS sets toggle-on
-           on the .toggle-track span itself. */
         .toggle-track.toggle-on { background: #3b82f6; }
         .toggle-track.toggle-on .toggle-knob { left: 16px; }
+
+        /* v3.0: card + KPI styles (used by new agents / token_usage pages) */
+        .card {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 1.25rem;
+        }
+        .kpi {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 1rem 1.25rem;
+        }
+        .kpi-value {
+            font-size: 1.75rem; font-weight: 700;
+            color: #1f2937; line-height: 1.1;
+        }
+        .kpi-label {
+            font-size: 0.75rem; color: #6b7280;
+            text-transform: uppercase; letter-spacing: 0.05em;
+            margin-bottom: 0.25rem;
+        }
+        .kpi-sub {
+            font-size: 0.75rem; color: #9ca3af;
+            margin-top: 0.25rem;
+        }
+        .pill-status {
+            display: inline-block;
+            padding: 0.125rem 0.5rem;
+            border-radius: 999px;
+            font-size: 0.7rem;
+            font-weight: 500;
+        }
+        .pill-online { background: #dcfce7; color: #166534; }
+        .pill-degraded { background: #fef3c7; color: #92400e; }
+        .pill-offline { background: #f3f4f6; color: #6b7280; }
+        .pill-busy { background: #fef3c7; color: #92400e; }
+        .pill-healthy { background: #dcfce7; color: #166534; }
+
+        /* Master-detail layout */
+        .master-detail { display: grid; gap: 1rem; }
+        .master-detail.cols-60-40 { grid-template-columns: 6fr 4fr; }
+        .master-detail.cols-50-50 { grid-template-columns: 1fr 1fr; }
+        @media (max-width: 900px) {
+            .master-detail.cols-60-40, .master-detail.cols-50-50 {
+                grid-template-columns: 1fr;
+            }
+        }
+        .kpi-grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
+        @media (max-width: 900px) { .kpi-grid-4 { grid-template-columns: repeat(2, 1fr); } }
+        .breakdown-grid-2x2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+        @media (max-width: 900px) { .breakdown-grid-2x2 { grid-template-columns: 1fr; } }
+
+        /* Bar chart (CSS-only) — used by analytics breakdowns */
+        .bar-row { display: grid; grid-template-columns: 140px 1fr 70px; align-items: center; gap: 0.5rem; padding: 0.25rem 0; }
+        .bar-row .bar-track { background: #f1f5f9; border-radius: 4px; height: 18px; position: relative; overflow: hidden; }
+        .bar-row .bar-fill { background: #3b82f6; height: 100%; border-radius: 4px; }
+        .bar-row .bar-value { text-align: right; font-variant-numeric: tabular-nums; color: #4b5563; font-size: 0.85rem; }
+        .bar-row .bar-label { font-size: 0.85rem; color: #1f2937; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        /* Donut (CSS conic-gradient) */
+        .donut {
+            width: 140px; height: 140px;
+            border-radius: 50%;
+            position: relative;
+            display: inline-block;
+        }
+        .donut::after {
+            content: ""; position: absolute; inset: 28px;
+            background: #fff; border-radius: 50%;
+        }
+        .donut-center {
+            position: absolute; inset: 0;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            text-align: center; pointer-events: none;
+            z-index: 1;
+        }
+        .donut-center .big { font-size: 1.25rem; font-weight: 700; color: #1f2937; }
+        .donut-center .small { font-size: 0.7rem; color: #6b7280; }
+
+        /* Stacked bar chart (7d daily) */
+        .stacked-bar-row { display: grid; grid-template-columns: 70px 1fr 70px; align-items: center; gap: 0.5rem; padding: 0.25rem 0; }
+        .stacked-bar-track { background: #f1f5f9; border-radius: 4px; height: 22px; display: flex; overflow: hidden; }
+        .stacked-bar-fill-input { background: #3b82f6; height: 100%; }
+        .stacked-bar-fill-output { background: #93c5fd; height: 100%; }
+        .stacked-bar-label { font-size: 0.8rem; color: #6b7280; }
+
+        /* Trend chart container */
+        .trend-chart { width: 100%; height: 220px; }
 
         /* Dark mode overrides. When body has .dark class, override the
            most common Tailwind colors used across templates. */
@@ -135,8 +365,43 @@
         body.dark .border-gray-200 { border-color: #4b5563; }
         body.dark .border { border-color: #4b5563; }
         body.dark .border-b { border-color: #4b5563; }
+        body.dark .border-r { border-color: #4b5563; }
+        body.dark .border-l { border-color: #4b5563; }
         body.dark pre { background: #0f172a !important; color: #e5e7eb; }
         body.dark code { background: #374151; color: #fbbf24; }
+        /* v3.0: dark mode for new sidebar + card elements */
+        body.dark .sidebar { background: #1f2937; border-right-color: #374151; }
+        body.dark .sidebar-header { border-bottom-color: #374151; }
+        body.dark .sidebar-title { color: #f3f4f6; }
+        body.dark .sidebar-item { color: #d1d5db; }
+        body.dark .sidebar-item:hover { background: #374151; color: #f3f4f6; }
+        body.dark .sidebar-item.active { background: #1e3a8a; color: #93c5fd; }
+        body.dark .sidebar-group-toggle { color: #d1d5db; }
+        body.dark .sidebar-group-toggle:hover { background: #374151; color: #f3f4f6; }
+        body.dark .sidebar-subitems { border-left-color: #374151; }
+        body.dark .sidebar-subitem { color: #9ca3af; }
+        body.dark .sidebar-subitem:hover { background: #374151; color: #f3f4f6; }
+        body.dark .sidebar-subitem.active { color: #93c5fd; }
+        body.dark .sidebar-footer { border-top-color: #374151; }
+        body.dark .sidebar-toggle-btn { color: #9ca3af; }
+        body.dark .sidebar-toggle-btn:hover { background: #374151; color: #f3f4f6; }
+        body.dark .topbar { background: #1f2937; border-bottom-color: #374151; }
+        body.dark .card, body.dark .kpi { background: #1f2937; border-color: #374151; }
+        body.dark .kpi-value { color: #f3f4f6; }
+        body.dark .kpi-label { color: #9ca3af; }
+        body.dark .kpi-sub { color: #6b7280; }
+        body.dark .bar-row .bar-label { color: #f3f4f6; }
+        body.dark .bar-row .bar-value { color: #9ca3af; }
+        body.dark .bar-row .bar-track { background: #374151; }
+        body.dark .stacked-bar-track { background: #374151; }
+        body.dark .stacked-bar-label { color: #9ca3af; }
+        body.dark .pill-online { background: #064e3b; color: #86efac; }
+        body.dark .pill-degraded, body.dark .pill-busy { background: #422006; color: #fde68a; }
+        body.dark .pill-offline { background: #374151; color: #9ca3af; }
+        body.dark .pill-healthy { background: #064e3b; color: #86efac; }
+        body.dark .donut::after { background: #1f2937; }
+        body.dark .donut-center .big { color: #f3f4f6; }
+        body.dark .donut-center .small { color: #9ca3af; }
         /* Nav stays slightly elevated */
         body.dark nav.bg-white { background-color: #1f2937; border-color: #374151; }
         body.dark .bg-yellow-50 { background-color: #422006; border-color: #78350f; }
@@ -163,11 +428,7 @@
             outline: none;
             box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.2);
         }
-        /* Select dropdown options inherit the dark background in
-           most browsers, but on Windows Chrome the popup menu may
-           still render light. Force dark on the option list too. */
         body.dark select option { background-color: #1f2937; color: #f3f4f6; }
-        /* Checkbox/radio also need explicit styling */
         body.dark input[type="checkbox"],
         body.dark input[type="radio"] {
             background-color: #374151;
@@ -201,11 +462,7 @@
         body.dark .hover\:bg-amber-50:hover { background-color: #78350f; }
         body.dark .hover\:bg-red-50:hover { background-color: #7f1d1d; }
         body.dark .hover\:bg-green-50:hover { background-color: #14532d; }
-        /* Status pill backgrounds. Without these, the outline pills (used by
-           tasks page + project page status badges) lose their fill in dark
-           mode and the text appears on the bare page background. Keep the
-           fill desaturated (not pure red/blue) so the border (a shade
-           lighter) still reads as the colored outline. */
+        /* Status pill backgrounds. */
         body.dark .bg-gray-50 { background-color: #1f2937; }
         body.dark .bg-blue-50 { background-color: #172554; }
         body.dark .bg-purple-50 { background-color: #2e1065; }
@@ -216,9 +473,7 @@
         body.dark .bg-yellow-50 { background-color: #422006; }
         body.dark .text-orange-700 { color: #fdba74; }
         body.dark .text-yellow-700 { color: #fde68a; }
-        /* Dropdown menu (used by schedules page ⋮ menu). In light mode the
-           menu is bg-white with gray border; in dark mode it should be a
-           dark elevated surface so it stands out from the table. */
+        /* Dropdown menu (used by schedules page ⋮ menu). */
         body.dark .menu-elevated, body.dark [id^="menu-"] {
             background-color: #1f2937 !important;
             border-color: #4b5563 !important;
@@ -226,73 +481,142 @@
         body.dark [id^="menu-"] button {
             color: #e5e7eb;
         }
-        /* <pre> blocks (project memory L2 dump, agent output, etc.) */
         body.dark pre {
             background-color: #0f172a !important;
             color: #e5e7eb !important;
             border-color: #4b5563 !important;
         }
         body.dark pre code { color: #fbbf24; }
-        /* Tables (history, projects list) - invert header + row colors */
         body.dark table th { background-color: #1f2937; color: #f3f4f6; }
         body.dark table td { border-color: #4b5563; }
         body.dark table tr:hover { background-color: #1f2937; }
-        .dot-verifying { background: #f59e0b; }
-        .dot-stale { background: #f59e0b; }  /* amber/yellow, same as verifying - heartbeating is paused */
     </style>
 </head>
-<body>
-    <nav class="bg-white border-b sticky top-0 z-10">
-        <div class="container flex items-center gap-6 py-3">
-            <a href="/agents" class="font-semibold text-gray-800">Hermes Orchestrator</a>
-            <div class="flex gap-4 text-sm">
-                <a href="/agents" class="{% if active_page == 'agents' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Agents</a>
-                <a href="/tasks" class="{% if active_page == 'tasks' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Tasks</a>
-                <a href="/projects" class="{% if active_page == 'projects' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Projects</a>
-                <a href="/schedules" class="{% if active_page == 'schedules' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Schedules</a>
-                <a href="/workflows" class="{% if active_page == 'workflows' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Workflows</a>
-                <a href="/history" class="{% if active_page == 'history' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">History</a>
-                <a href="/settings" class="{% if active_page == 'settings' %}font-bold text-blue-600{% else %}text-gray-600 hover:text-gray-800{% endif %}">Settings</a>
+<body class="{% if active_page in ('token_usage',) %}sidebar-collapsed{% endif %}">
+    {# v3.0: left sidebar (replaces the v2.x top nav). 5 top-level items
+       matching the Perplexity-approved mockup, with Settings as an
+       expandable group containing secondary entries (Models, Evaluations,
+       Guardrails, Integrations, Token Usage, Schedules, History).
+       Sidebar collapses to 64px icon-only mode via the chevron button;
+       state persists in localStorage. #}
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <div class="sidebar-logo">H</div>
+            <div class="sidebar-title">Hermes Orchestrator</div>
+        </div>
+        <nav class="sidebar-nav">
+            <a href="/projects" class="sidebar-item {% if active_page == 'projects' or active_page == 'project_detail' or active_page == 'visual_project' %}active{% endif %}">
+                <span class="sidebar-icon">📁</span>
+                <span class="sidebar-label">Projects</span>
+            </a>
+            <a href="/agents" class="sidebar-item {% if active_page == 'agents' %}active{% endif %}">
+                <span class="sidebar-icon">🤖</span>
+                <span class="sidebar-label">Agents</span>
+            </a>
+            <a href="/workflows" class="sidebar-item {% if active_page == 'workflows' or active_page == 'workflow_detail' or active_page == 'visual_workflow' %}active{% endif %}">
+                <span class="sidebar-icon">🔀</span>
+                <span class="sidebar-label">Workflows</span>
+            </a>
+            <a href="/tasks" class="sidebar-item {% if active_page == 'tasks' or active_page == 'task_detail' or active_page == 'single_tasks' %}active{% endif %}">
+                <span class="sidebar-icon">☑️</span>
+                <span class="sidebar-label">Tasks</span>
+            </a>
+            <button type="button" class="sidebar-group-toggle {% if active_page in ('settings', 'models', 'evaluations', 'guardrails', 'integrations', 'token_usage', 'schedules', 'history') %}expanded{% endif %}" onclick="toggleSettingsGroup()">
+                <span class="sidebar-icon">⚙️</span>
+                <span class="sidebar-label">Settings</span>
+                <span class="caret">▶</span>
+            </button>
+            <div class="sidebar-subitems" id="settings-subitems" style="display: {% if active_page in ('settings', 'models', 'evaluations', 'guardrails', 'integrations', 'token_usage', 'schedules', 'history') %}block{% else %}none{% endif %};">
+                <a href="/settings" class="sidebar-subitem {% if active_page == 'settings' %}active{% endif %}">General</a>
+                <a href="/token-usage" class="sidebar-subitem {% if active_page == 'token_usage' %}active{% endif %}">Token Usage</a>
+                <a href="/schedules" class="sidebar-subitem {% if active_page == 'schedules' %}active{% endif %}">Schedules</a>
+                <a href="/history" class="sidebar-subitem {% if active_page == 'history' %}active{% endif %}">History</a>
+                <a href="/settings#models" class="sidebar-subitem">Models</a>
+                <a href="/settings#evaluations" class="sidebar-subitem">Evaluations</a>
+                <a href="/settings#guardrails" class="sidebar-subitem">Guardrails</a>
+                <a href="/settings#integrations" class="sidebar-subitem">Integrations</a>
             </div>
-            <div class="ml-auto flex items-center gap-4 text-xs">
+        </nav>
+        <div class="sidebar-footer">
+            <div class="sidebar-status">
                 {% if llm_configured %}
-                <span class="px-2 py-0.5 bg-green-100 text-green-800 rounded">LLM ready</span>
+                <span class="pill pill-green" title="LLM ready">LLM ready</span>
                 {% else %}
-                <span class="px-2 py-0.5 bg-yellow-100 text-yellow-800 rounded">Mock mode</span>
+                <span class="pill pill-yellow" title="Mock mode">Mock</span>
                 {% endif %}
-                {# Auto-refresh toggle: switch UI. Click anywhere to toggle. #}
+            </div>
+            <button class="sidebar-toggle-btn" onclick="toggleSidebar()" title="Toggle sidebar (collapse to icons)">«</button>
+        </div>
+    </aside>
+
+    <div class="main-area">
+        <div class="topbar">
+            <div class="flex items-center gap-4 text-xs ml-auto">
                 <button id="auto-refresh-toggle" onclick="toggleAutoRefresh()" class="flex items-center gap-2" title="Pause/resume 10s page auto-refresh. Persists in localStorage.">
                     <span id="auto-refresh-label" class="text-gray-500">Auto-refresh</span>
                     <span id="auto-refresh-switch" class="toggle-track">
                         <span class="toggle-knob"></span>
                     </span>
                 </button>
-                {# Dark mode toggle #}
                 <button id="theme-toggle" onclick="toggleTheme()" class="flex items-center gap-2" title="Toggle dark mode. Persists in localStorage.">
                     <span id="theme-label" class="text-gray-500">Light</span>
                     <span id="theme-icon">&#9728;</span>
                 </button>
             </div>
         </div>
-    </nav>
-    {% if not llm_configured %}
-    <div class="bg-yellow-50 border-b border-yellow-200">
-        <div class="container py-2 flex items-center gap-3 text-sm">
-            <span class="text-yellow-800">
-                <strong>Running in mock mode.</strong>
-                Add an LLM API key to enable natural-language project planning.
-            </span>
-            <a href="/settings" class="ml-auto px-3 py-1 bg-yellow-600 text-white rounded text-xs hover:bg-yellow-700">
-                Set up LLM &rarr;
-            </a>
+        {% if not llm_configured %}
+        <div class="bg-yellow-50 border-b border-yellow-200">
+            <div class="main-content py-2 flex items-center gap-3 text-sm">
+                <span class="text-yellow-800">
+                    <strong>Running in mock mode.</strong>
+                    Add an LLM API key to enable natural-language project planning.
+                </span>
+                <a href="/settings" class="ml-auto px-3 py-1 bg-yellow-600 text-white rounded text-xs hover:bg-yellow-700">
+                    Set up LLM &rarr;
+                </a>
+            </div>
+        </div>
+        {% endif %}
+        <div class="main-content">
+            {% block content %}{% endblock %}
         </div>
     </div>
-    {% endif %}
-    <div class="container">
-        {% block content %}{% endblock %}
-    </div>
+
     <script>
-    // Smart polling: skip when user is editing a form, or tab is hidden,
+    // ===== Sidebar collapse / Settings group =====
+    function applySidebarState() {
+        const collapsed = localStorage.getItem('orch.sidebar') === 'collapsed';
+        document.body.classList.toggle('sidebar-collapsed', collapsed);
+    }
+    function toggleSidebar() {
+        const collapsed = !document.body.classList.contains('sidebar-collapsed');
+        document.body.classList.toggle('sidebar-collapsed', collapsed);
+        localStorage.setItem('orch.sidebar', collapsed ? 'collapsed' : 'expanded');
+    }
+    function toggleSettingsGroup() {
+        const subitems = document.getElementById('settings-subitems');
+        if (!subitems) return;
+        const btn = document.querySelector('.sidebar-group-toggle');
+        const isHidden = subitems.style.display === 'none' || subitems.style.display === '';
+        subitems.style.display = isHidden ? 'block' : 'none';
+        if (btn) btn.classList.toggle('expanded', isHidden);
+        localStorage.setItem('orch.settingsGroup', isHidden ? 'open' : 'closed');
+    }
+    // Restore Settings group state on load (default: closed unless active sub-page).
+    (function initSettingsGroup() {
+        const saved = localStorage.getItem('orch.settingsGroup');
+        const subitems = document.getElementById('settings-subitems');
+        const btn = document.querySelector('.sidebar-group-toggle');
+        if (!subitems) return;
+        // If template rendered it open (because of active sub-page), keep it.
+        // Otherwise apply saved preference (default: closed).
+        if (subitems.style.display === 'none' && saved === 'open') {
+            subitems.style.display = 'block';
+            if (btn) btn.classList.add('expanded');
+        }
+    })();
+
+    // ===== Smart polling: skip when user is editing a form, or tab is hidden,
     // or any result panel is currently open (so reading a long result
     // doesn't get interrupted by a reload).
     let pollTimer = null;
@@ -301,17 +625,9 @@
         if (pollTimer || userPaused) return;
         pollTimer = setInterval(() => {
             if (document.hidden) return;  // tab not visible
-            // Pause if any [id^="result-"] or [id^="presult-"] panel is
-            // currently visible (user is reading the agent's output).
-            // The user can close the panel manually; polling resumes.
             if (document.querySelector('[id^="result-"]:not(.hidden), [id^="presult-"]:not(.hidden)')) {
                 return;
             }
-            // Pause if any modal overlay is visible. The focus-based
-            // check below misses the case where the user has clicked
-            // outside an open modal (focus -> body) or is hovering a
-            // button inside the modal, in which case location.reload()
-            // would clobber the form state.
             if (document.querySelector('.modal-overlay:not(.hidden), [id$="-modal-overlay"]:not(.hidden)')) {
                 return;
             }
@@ -347,7 +663,7 @@
         const label = document.getElementById('theme-label');
         const icon = document.getElementById('theme-icon');
         if (label) label.textContent = dark ? 'Dark' : 'Light';
-        if (icon) icon.innerHTML = dark ? '&#9789;' : '&#9728;';  // moon / sun
+        if (icon) icon.innerHTML = dark ? '&#9789;' : '&#9728;';
         const btn = document.getElementById('theme-toggle');
         if (btn) btn.title = dark ? 'Dark mode on. Click to switch to light.'
                                   : 'Light mode on. Click to switch to dark.';
@@ -357,29 +673,23 @@
         localStorage.setItem('orch.theme', dark ? 'dark' : 'light');
         setTheme(dark);
     }
-    // Apply persisted theme on load (before polling to avoid a flash)
     (function initTheme() {
         const dark = localStorage.getItem('orch.theme') === 'dark';
         if (dark) document.body.classList.add('dark');
         setTheme(dark);
     })();
 
-    // Initialize refresh toggle visual state from persisted value
+    // Apply persisted sidebar state on load
+    applySidebarState();
+
     setAutoRefreshUI(userPaused);
     startPolling();
-    // Also explicitly pause when focusing inputs (extra safety)
     document.addEventListener('focusin', (e) => {
         if (e.target.matches('input, textarea, select')) stopPolling();
     });
     document.addEventListener('focusout', (e) => {
         if (e.target.matches('input, textarea, select')) startPolling();
     });
-    // Public hook for page-specific scripts (e.g. task_progress.js
-    // on the project page) that want to take over the polling
-    // themselves. Calling this pauses the 10s page reload so the
-    // script can do in-place updates without nuking the user's
-    // expanded panels. The user can still hit the auto-refresh
-    // toggle to re-enable full reloads at any time.
     window.__orchPausePageRefresh = function() {
         userPaused = true;
         stopPolling();
