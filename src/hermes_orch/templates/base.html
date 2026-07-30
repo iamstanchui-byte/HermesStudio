@@ -65,7 +65,10 @@
         body.sidebar-collapsed .sidebar { width: 64px; }
         .sidebar-header {
             display: flex; align-items: center; gap: 0.5rem;
-            padding: 0.875rem 1rem;
+            /* v3.0.2: tighter vertical padding so the larger logo
+               (40px tall in expanded mode, 36px in collapsed) fills
+               the 56px-tall header instead of looking small. */
+            padding: 0.5rem 1rem;
             border-bottom: 1px solid #f1f5f9;
             min-height: 56px;
         }
@@ -80,14 +83,27 @@
             background-position: center;
             background-size: contain;
         }
+        /* v3.0.2: enlarged from 132x32 to 144x40 — fills the 56px-tall
+           sidebar header (header padding 8px top/bot + 40px logo = 56px
+           exactly). User reported the smaller version looked cramped
+           in dark mode (where the white wordmark against dark sidebar
+           has a high contrast edge that emphasized how small the
+           wordmark was). 144x40 keeps the same aspect ratio (~3.6:1)
+           and the same internal padding from the wordmark edges, so
+           the actual content looks the same — just bigger. */
         .sidebar-logo-full {
             display: block;
-            width: 132px; height: 32px;
+            width: 144px; height: 40px;
             background-image: url('/static/logos/hermes-nexus-light.png?v=20260731-2100');
         }
+        /* v3.0.2: enlarged from 30x30 to 36x36 to fill the 64px
+           collapsed sidebar better. With sidebar-collapsed state the
+           sidebar width = 64px, and the previous 30px icon left too
+           much visual air. 36px gives the icon more presence while
+           still leaving 14px on each side. */
         .sidebar-logo-icon {
             display: none;
-            width: 30px; height: 30px;
+            width: 36px; height: 36px;
             background-image: url('/static/logos/hermes-nexus-icon-light.png?v=20260731-2100');
         }
         body.dark .sidebar-logo-full {
@@ -620,6 +636,21 @@
         const collapsed = !document.body.classList.contains('sidebar-collapsed');
         document.body.classList.toggle('sidebar-collapsed', collapsed);
         localStorage.setItem('orch.sidebar', collapsed ? 'collapsed' : 'expanded');
+        // v3.0.2: when collapsing, force the Settings group closed too.
+        // The 64px collapsed sidebar can only show the top-level icons;
+        // subitems (General/Token Usage/etc.) would render as 1-2 chars
+        // each ("Ge", "To") before being cut off by overflow. Closing
+        // the group keeps the collapsed state visually clean. The user
+        // can still expand Settings later — when they re-expand the
+        // sidebar we don't auto-restore the group, since the act of
+        // toggling sidebar usually means "I want a clean view".
+        if (collapsed) {
+            const subitems = document.getElementById('settings-subitems');
+            const btn = document.querySelector('.sidebar-group-toggle');
+            if (subitems) subitems.style.display = 'none';
+            if (btn) btn.classList.remove('expanded');
+            localStorage.setItem('orch.settingsGroup', 'closed');
+        }
     }
     function toggleSettingsGroup() {
         const subitems = document.getElementById('settings-subitems');
@@ -631,11 +662,22 @@
         localStorage.setItem('orch.settingsGroup', isHidden ? 'open' : 'closed');
     }
     // Restore Settings group state on load (default: closed unless active sub-page).
+    // v3.0.2: also force close when sidebar is in collapsed state, even
+    // if the saved preference was "open" — because the 64px sidebar
+    // physically cannot show the subitems without truncation.
     (function initSettingsGroup() {
         const saved = localStorage.getItem('orch.settingsGroup');
+        const sidebarCollapsed = localStorage.getItem('orch.sidebar') === 'collapsed';
         const subitems = document.getElementById('settings-subitems');
         const btn = document.querySelector('.sidebar-group-toggle');
         if (!subitems) return;
+        if (sidebarCollapsed) {
+            // Sidebar starts collapsed → keep Settings closed regardless
+            // of saved state. User can re-open manually after expanding.
+            subitems.style.display = 'none';
+            if (btn) btn.classList.remove('expanded');
+            return;
+        }
         // If template rendered it open (because of active sub-page), keep it.
         // Otherwise apply saved preference (default: closed).
         if (subitems.style.display === 'none' && saved === 'open') {
