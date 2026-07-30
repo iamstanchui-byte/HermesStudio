@@ -766,13 +766,19 @@ async def submit_result(
     # and we skip silently. Cost of writing a row is ~1ms.
     if body.token_usage:
         try:
-            from hermes_orch.core.token_usage import record_token_usage
+            from hermes_orch.core.token_usage import record_token_usage, extract_cache_read_tokens
             tu = body.token_usage
             task_name = task.get("name") or task.get("agent_role") or "?"
             call_label = f"task:{task_name[:40]}"
             provider = tu.get("billing_provider")
             if provider:
                 call_label = f"{call_label} ({provider})"
+            # v3.1.2: prefer the wrapper-reported cache_read_tokens (the
+            # wrapper already parses the LLM's usage block per provider),
+            # fall back to the generic extractor if not provided.
+            # Either path returns 0 when the provider doesn't report
+            # cache (most non-Anthropic) so the column is harmless.
+            cache_read = int(tu.get("cache_read_tokens") or 0) or extract_cache_read_tokens(tu)
             await record_token_usage(
                 db,
                 agent_id=task.get("assigned_agent_id"),
@@ -785,6 +791,7 @@ async def submit_result(
                 prompt_tokens=int(tu.get("prompt_tokens") or 0),
                 completion_tokens=int(tu.get("completion_tokens") or 0),
                 total_tokens=int(tu.get("total_tokens") or 0),
+                cache_read_tokens=cache_read,  # v3.1.2
                 call_kind="agent_task",
                 call_label=call_label,
             )

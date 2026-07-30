@@ -548,7 +548,7 @@ class Planner:
         else:
             try:
                 usage = data.get("usage", {}) or {}
-                from .token_usage import record_token_usage
+                from .token_usage import record_token_usage, extract_cache_read_tokens
                 label = (goal[:50] + "...") if len(goal) > 50 else goal
                 await record_token_usage(
                     self.db,
@@ -557,6 +557,7 @@ class Planner:
                     prompt_tokens=usage.get("prompt_tokens", 0),
                     completion_tokens=usage.get("completion_tokens", 0),
                     total_tokens=usage.get("total_tokens", 0),
+                    cache_read_tokens=extract_cache_read_tokens(usage),  # v3.1.2
                     call_kind="planner",
                     call_label=label,
                 )

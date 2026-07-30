@@ -305,6 +305,13 @@
         }
         .kpi-grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
         @media (max-width: 900px) { .kpi-grid-4 { grid-template-columns: repeat(2, 1fr); } }
+        /* v3.1.2: 5-up variant for the Token Usage KPI row. Adds a
+           "Cache read" card on top of the v3.0 4-card layout. On
+           narrow screens it collapses to 2 cols (5 = 2 + 2 + 1, the
+           last card wraps to its own row). */
+        .kpi-grid-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.75rem; }
+        @media (max-width: 1200px) { .kpi-grid-5 { grid-template-columns: repeat(3, 1fr); } }
+        @media (max-width: 900px) { .kpi-grid-5 { grid-template-columns: repeat(2, 1fr); } }
         .breakdown-grid-2x2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
         @media (max-width: 900px) { .breakdown-grid-2x2 { grid-template-columns: 1fr; } }
 
@@ -340,6 +347,13 @@
         .stacked-bar-track { background: #f1f5f9; border-radius: 4px; height: 22px; display: flex; overflow: hidden; }
         .stacked-bar-fill-input { background: #3b82f6; height: 100%; }
         .stacked-bar-fill-output { background: #93c5fd; height: 100%; }
+        /* v3.1.2: cache_read bar (3rd color). The 3-bar stack is
+           cache_read (left, lightest blue) -> input (mid blue) ->
+           output (right, darkest blue). Lighter = "reused from
+           cache, didn't cost much". Distinct enough from #93c5fd
+           but in the same blue family so the 3-bar reads as one
+           group, not 3 random colors. */
+        .stacked-bar-fill-cache { background: #c7d2fe; height: 100%; }
         .stacked-bar-label { font-size: 0.8rem; color: #6b7280; }
 
         /* Trend chart container */

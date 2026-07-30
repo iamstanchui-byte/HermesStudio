@@ -530,6 +530,7 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
             "SELECT COALESCE(SUM(total_tokens),0) as total, "
             "COALESCE(SUM(prompt_tokens),0) as prompt, "
             "COALESCE(SUM(completion_tokens),0) as completion, "
+            "COALESCE(SUM(cache_read_tokens),0) as cache_read, "  # v3.1.2
             "COUNT(*) as calls FROM token_usage WHERE created_at >= ?",
             (cutoff,),
         )
@@ -537,6 +538,7 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
             "total": int(row["total"]) if row else 0,
             "prompt": int(row["prompt"]) if row else 0,
             "completion": int(row["completion"]) if row else 0,
+            "cache_read": int(row["cache_read"]) if row else 0,  # v3.1.2
             "calls": int(row["calls"]) if row else 0,
         }
     cutoff_7d = cutoffs["7d"]
@@ -635,6 +637,7 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
         "COALESCE(SUM(prompt_tokens),0) as prompt, "
         "COALESCE(SUM(completion_tokens),0) as completion, "
         "COALESCE(SUM(total_tokens),0) as total, "
+        "COALESCE(SUM(cache_read_tokens),0) as cache_read, "  # v3.1.2
         "COUNT(*) as calls "
         "FROM token_usage WHERE created_at >= ? "
         "GROUP BY day ORDER BY day ASC",
@@ -647,6 +650,7 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
             "label": d.strftime("%b %d"),
             "prompt": int((by_day.get(d.isoformat()) or {}).get("prompt") or 0),
             "completion": int((by_day.get(d.isoformat()) or {}).get("completion") or 0),
+            "cache_read": int((by_day.get(d.isoformat()) or {}).get("cache_read") or 0),  # v3.1.2
             "total": int((by_day.get(d.isoformat()) or {}).get("total") or 0),
             "calls": int((by_day.get(d.isoformat()) or {}).get("calls") or 0),
         }

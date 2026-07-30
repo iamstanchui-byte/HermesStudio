@@ -263,6 +263,15 @@ CREATE TABLE IF NOT EXISTS token_usage (
     total_tokens INTEGER NOT NULL,
     call_kind TEXT NOT NULL,   -- 'planner' | 'synthesis' | 'agent_task' | 'wrapper_other'
     call_label TEXT,          -- free text: e.g. 'plan_world_cup', 'regen_state'
+    -- v3.1.2: cache hit tokens (separate from prompt_tokens). Captured
+    -- from the LLM's `usage` block:
+    --   - Anthropic: usage.cache_read_input_tokens (prompt cached hits)
+    --   - OpenAI compatible: usage.prompt_tokens_details.cached_tokens
+    -- Always 0 for providers that don't report cache (most non-Anthropic).
+    -- Kept as a separate column (not subtracted from prompt_tokens) so
+    -- the dashboard can show "true new prompt" vs "cache hit" side by
+    -- side, and so the running total stays comparable across models.
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_token_usage_agent   ON token_usage(agent_id);
@@ -530,6 +539,12 @@ MIGRATIONS = [
     # legacy agents that haven't bootstrapped yet — those are still
     # accepted if HERMES_HMAC_REQUIRED is unset.
     "ALTER TABLE agents ADD COLUMN hmac_secret TEXT",
+    # v3.1.2: cache_read_tokens on token_usage. Captured from the LLM
+    # `usage` block (Anthropic: usage.cache_read_input_tokens, OpenAI:
+    # usage.prompt_tokens_details.cached_tokens). DEFAULT 0 so existing
+    # rows stay valid and the column is additive — no data migration
+    # needed. Older calls that don't pass cache_read just write 0.
+    "ALTER TABLE token_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
 ]
 
 

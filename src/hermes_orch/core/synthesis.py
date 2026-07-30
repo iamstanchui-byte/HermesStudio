@@ -197,7 +197,7 @@ class StateGenerator:
         else:
             try:
                 usage = data.get("usage", {}) or {}
-                from .token_usage import record_token_usage
+                from .token_usage import record_token_usage, extract_cache_read_tokens
                 await record_token_usage(
                     self.db,
                     project_id=getattr(self, "_current_project_id", None),
@@ -206,6 +206,7 @@ class StateGenerator:
                     prompt_tokens=usage.get("prompt_tokens", 0),
                     completion_tokens=usage.get("completion_tokens", 0),
                     total_tokens=usage.get("total_tokens", 0),
+                    cache_read_tokens=extract_cache_read_tokens(usage),  # v3.1.2
                     call_kind="synthesis",
                     call_label=getattr(self, "_current_call_label", "synth"),
                 )

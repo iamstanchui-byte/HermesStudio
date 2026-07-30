@@ -27,11 +27,15 @@
     </div>
 </div>
 
-{# ===== KPI cards: 4 actionable numbers ===== #}
+{# ===== KPI cards: 5 actionable numbers (v3.1.2 added Cache read) ===== #}
 {% set t7 = token_usage.totals["7d"] %}
 {% set input_pct = (t7.prompt / t7.total * 100) if t7.total else 0 %}
 {% set output_pct = (t7.completion / t7.total * 100) if t7.total else 0 %}
-<div class="kpi-grid-4 mb-4">
+{# Cache read % of input. When 0, show 0.0% (not "0 of 0") so the
+   operator immediately sees "we have no cache hits in this window"
+   rather than "the number is undefined". #}
+{% set cache_pct = (t7.cache_read / t7.prompt * 100) if t7.prompt else 0 %}
+<div class="kpi-grid-5 mb-4">
     <div class="kpi">
         <div class="kpi-label">Total tokens (7d)</div>
         <div class="kpi-value">{{ t7.total|format_tokens }}</div>
@@ -48,17 +52,26 @@
         <div class="kpi-sub">{{ output_pct|round(1) }}% of total</div>
     </div>
     <div class="kpi">
+        <div class="kpi-label">Cache read (7d)</div>
+        <div class="kpi-value" style="color: #6366f1;">{{ t7.cache_read|format_tokens }}</div>
+        <div class="kpi-sub">{{ cache_pct|round(1) }}% of input</div>
+    </div>
+    <div class="kpi">
         <div class="kpi-label">Total requests (7d)</div>
         <div class="kpi-value">{{ t7.calls }}</div>
         <div class="kpi-sub">last 7 days</div>
     </div>
 </div>
 
-{# ===== Daily trend: stacked bar chart (input + output per day) ===== #}
+{# ===== Daily trend: stacked bar chart (v3.1.2: cache_read + input + output per day) ===== #}
 <div class="card mb-4">
     <div class="flex items-center justify-between mb-3">
         <h2 class="text-sm font-semibold text-gray-700">Daily token usage — Last 7 days</h2>
         <div class="flex items-center gap-3 text-xs text-gray-500">
+            <span class="flex items-center gap-1">
+                <span style="display:inline-block;width:10px;height:10px;background:#c7d2fe;border-radius:2px;"></span>
+                Cache read
+            </span>
             <span class="flex items-center gap-1">
                 <span style="display:inline-block;width:10px;height:10px;background:#3b82f6;border-radius:2px;"></span>
                 Input
@@ -73,10 +86,22 @@
     {% if t7.total %}
     <div class="space-y-1.5">
         {% for d in token_usage.daily_breakdown %}
-        <div class="stacked-bar-row">
+        {# v3.1.2: title attribute on the row gives an instant hover
+           tooltip (no JS needed). Format: "Jul 25 — Cache 4.5K ·
+           Input 12.3K · Output 4.5K · Total 21.3K · 312 calls". For
+           days with 0 calls the tooltip still shows (helps the user
+           see "yes, 0 is real"). #}
+        <div class="stacked-bar-row"
+             title="{{ d.label }} — Cache {{ d.cache_read|format_tokens }} · Input {{ d.prompt|format_tokens }} · Output {{ d.completion|format_tokens }} · Total {{ d.total|format_tokens }} · {{ d.calls }} calls">
             <div class="stacked-bar-label">{{ d.label }}</div>
             <div class="stacked-bar-track">
                 {% if d.total > 0 %}
+                {# v3.1.2: 3-bar stack. Order matters: cache_read (left)
+                   -> input -> output. Cache read is shown first because
+                   it's the "discounted" portion of input — visually it
+                   sits at the start so the bar reads as
+                   "saved | new | produced". #}
+                <div class="stacked-bar-fill-cache" style="width: {{ (d.cache_read / max_day * 100)|round(1) }}%;"></div>
                 <div class="stacked-bar-fill-input" style="width: {{ (d.prompt / max_day * 100)|round(1) }}%;"></div>
                 <div class="stacked-bar-fill-output" style="width: {{ (d.completion / max_day * 100)|round(1) }}%;"></div>
                 {% endif %}
