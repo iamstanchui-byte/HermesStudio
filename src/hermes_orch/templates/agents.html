@@ -211,6 +211,33 @@
             </div>
             <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">Profiles</div>
             <div id="detail-profile-list"></div>
+            {# v3.2.0: profile settings tabs. Shown when the user clicks a
+               profile card above. Default tab = "overview". The 5 tabs
+               cover everything backend already loads: mcp_servers,
+               skills, storage_refs, capabilities. Overview shows the
+               model + last task; MCP / Skills are read-only (managed
+               by the wrapper on the agent host) and show a hint to
+               edit them in the wrapper; Storage / Capabilities are
+               editable via PATCH /api/agents/{id}/profiles/{name}.
+               The bar is hidden when no profile is selected. #}
+            <div id="profile-tabs-wrap" class="mt-4" style="display: none;">
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">
+                    Settings — <span id="profile-tabs-name" class="text-gray-700 font-medium"></span>
+                </div>
+                <div class="flex border-b border-gray-200 mb-2" id="profile-tabs-bar">
+                    <button class="profile-tab profile-tab-active" data-tab="overview"
+                            onclick="switchProfileTab('overview')">Overview</button>
+                    <button class="profile-tab" data-tab="mcp"
+                            onclick="switchProfileTab('mcp')">MCP</button>
+                    <button class="profile-tab" data-tab="skills"
+                            onclick="switchProfileTab('skills')">Skills</button>
+                    <button class="profile-tab" data-tab="storage"
+                            onclick="switchProfileTab('storage')">Storage</button>
+                    <button class="profile-tab" data-tab="capabilities"
+                            onclick="switchProfileTab('capabilities')">Capabilities</button>
+                </div>
+                <div id="profile-tab-content" class="text-xs text-gray-700"></div>
+            </div>
             {# v3.1.1: inline add-profile form (toggle) + per-profile delete button.
                The form is hidden by default; "+ Add profile" reveals it.
                submitAddProfile() POSTs /api/agents/{id}/profiles then reloads.
@@ -351,7 +378,10 @@
 
 <script>
 // ===== Master-detail: switch the right panel when the user clicks a row =====
-let currentAgentId = null;  // v3.1.1: tracked so add/delete-profile can target it
+let currentAgentId = null;     // v3.1.1: tracked so add/delete-profile can target it
+let currentProfiles = [];      // v3.2.0: full profile objects for the selected agent
+let currentProfileName = null; // v3.2.0: which profile the settings tabs are showing
+let currentTab = 'overview';   // v3.2.0: which tab is active
 
 function selectAgent(agentId) {
     // Highlight the chosen row, un-highlight others
@@ -371,6 +401,7 @@ function selectAgent(agentId) {
     const data = tpl.content.querySelector('.agent-template-data');
     if (!data) return;
     const profiles = JSON.parse(data.dataset.profiles || '[]');
+    currentProfiles = profiles;  // v3.2.0: cache for the settings tabs
     // Update the right panel
     document.getElementById('agent-detail-empty').style.display = 'none';
     document.getElementById('agent-detail-content').style.display = 'block';
@@ -381,14 +412,22 @@ function selectAgent(agentId) {
     const status = data.dataset.status;
     pill.className = 'pill-status ' + (status === 'verified' ? 'pill-online' : status === 'idle' ? 'pill-offline' : 'pill-degraded');
     pill.textContent = status;
-    // Render profile list (v3.1.1: add per-profile Delete button)
+    // v3.2.0: profile cards are now clickable selectors. Clicking
+    // selects that profile and reveals the settings tabs below.
+    // Delete button uses stopPropagation so the card click doesn't
+    // also fire (otherwise selecting + deleting would always select
+    // first). The model/provider row stays in the card so users
+    // still see the model without opening the Overview tab.
     const list = document.getElementById('detail-profile-list');
     list.innerHTML = profiles.map(p => `
-        <div class="card mb-2" style="padding: 0.75rem;">
+        <div class="profile-selector card mb-2"
+             data-profile-name="${escapeAttr(p.name || '')}"
+             onclick="selectProfile('${escapeAttr(p.name || '')}')"
+             style="padding: 0.75rem; cursor: pointer; border-left: 3px solid transparent;">
             <div class="flex items-center gap-2">
                 <div class="font-medium text-sm flex-1">${escapeHtml(p.name || '(unnamed)')}</div>
                 <span class="pill-status ${p.status === 'busy' ? 'pill-busy' : 'pill-healthy'}">${p.status || 'unknown'}</span>
-                <button onclick="deleteProfile('${escapeAttr(agentId)}', '${escapeAttr(p.name)}')"
+                <button onclick="event.stopPropagation(); deleteProfile('${escapeAttr(agentId)}', '${escapeAttr(p.name)}')"
                         class="text-xs px-2 py-0.5 bg-white border border-red-200 text-red-700 rounded hover:bg-red-50"
                         title="Remove this profile (fails if profile has an in-flight task)">
                     Delete
@@ -400,8 +439,380 @@ function selectAgent(agentId) {
             </div>
         </div>
     `).join('') || '<div class="text-xs text-gray-400 italic">No profiles configured</div>';
+    // v3.2.0: hide the settings tabs until a profile is picked. If
+    // the agent has only one profile, auto-select it so the user
+    // sees the settings without an extra click.
+    currentProfileName = null;
+    document.getElementById('profile-tabs-wrap').style.display = 'none';
+    if (profiles.length === 1) {
+        selectProfile(profiles[0].name);
+    }
     // v3.1.1: reset add-profile form state when switching agents
     hideAddProfileForm();
+}
+
+// v3.2.0: selectProfile() — highlight the chosen profile card and
+// show the settings tabs below. Mirrors the agent-level select on
+// the left panel: blue border-left, light blue background.
+function selectProfile(profileName) {
+    currentProfileName = profileName;
+    currentTab = 'overview';
+    document.querySelectorAll('#detail-profile-list .profile-selector').forEach(el => {
+        const isSel = el.dataset.profileName === profileName;
+        el.style.borderLeftColor = isSel ? '#3b82f6' : 'transparent';
+        el.style.background = isSel ? '#eff6ff' : '';
+    });
+    const wrap = document.getElementById('profile-tabs-wrap');
+    wrap.style.display = 'block';
+    document.getElementById('profile-tabs-name').textContent = profileName;
+    // Default to Overview tab
+    switchProfileTab('overview');
+}
+
+// v3.2.0: switchProfileTab() — toggle which tab content is shown.
+// The actual rendering is per-tab (renderOverview/renderMcp/etc).
+// We update the active tab styling on every switch.
+function switchProfileTab(tab) {
+    currentTab = tab;
+    document.querySelectorAll('#profile-tabs-bar .profile-tab').forEach(btn => {
+        btn.classList.toggle('profile-tab-active', btn.dataset.tab === tab);
+    });
+    const profile = currentProfiles.find(p => p.name === currentProfileName);
+    if (!profile) return;
+    const content = document.getElementById('profile-tab-content');
+    if (tab === 'overview') renderOverviewTab(profile, content);
+    else if (tab === 'mcp') renderMcpTab(profile, content);
+    else if (tab === 'skills') renderSkillsTab(profile, content);
+    else if (tab === 'storage') renderStorageTab(profile, content);
+    else if (tab === 'capabilities') renderCapabilitiesTab(profile, content);
+}
+
+// v3.2.0: Overview tab — model + status + last task. Read-only.
+function renderOverviewTab(profile, content) {
+    const model = profile.llm_model_default || '(not reported)';
+    const provider = profile.llm_model_provider || '(unknown)';
+    const baseUrl = profile.llm_model_base_url || '';
+    const mcpCount = (profile.mcp_servers || []).length;
+    const skillCount = (profile.skills || []).length;
+    const storageCount = (profile.storage_refs || []).length;
+    const capCount = Object.keys(profile.capabilities || {}).length;
+    content.innerHTML = `
+        <div class="space-y-1.5">
+            <div class="flex"><span class="text-gray-500 w-20">Model:</span><span class="font-mono">${escapeHtml(model)}</span></div>
+            <div class="flex"><span class="text-gray-500 w-20">Provider:</span><span>${escapeHtml(provider)}</span></div>
+            ${baseUrl ? `<div class="flex"><span class="text-gray-500 w-20">Base URL:</span><span class="font-mono text-[10px] break-all">${escapeHtml(baseUrl)}</span></div>` : ''}
+            <div class="flex"><span class="text-gray-500 w-20">Status:</span><span>${escapeHtml(profile.status || 'unknown')}</span></div>
+            <div class="flex"><span class="text-gray-500 w-20">Task:</span><span class="font-mono text-[10px]">${profile.current_task_id ? escapeHtml(profile.current_task_id) : '(idle)'}</span></div>
+        </div>
+        <div class="mt-3 pt-2 border-t border-gray-200 text-[11px] text-gray-500">
+            MCP: <strong>${mcpCount}</strong> server${mcpCount === 1 ? '' : 's'} ·
+            Skills: <strong>${skillCount}</strong> ·
+            Storage: <strong>${storageCount}</strong> ref${storageCount === 1 ? '' : 's'} ·
+            Capabilities: <strong>${capCount}</strong>
+        </div>
+    `;
+}
+
+// v3.2.0: MCP tab — read-only list, hint to edit in wrapper config.
+function renderMcpTab(profile, content) {
+    const mcps = profile.mcp_servers || [];
+    let html = `<div class="text-[11px] text-gray-500 mb-2 italic">
+        Edit MCP servers in the agent's <code class="text-[10px]">~/.hermes-orchestrator/profiles/&lt;name&gt;/config.yaml</code> → <code class="text-[10px]">mcp_servers:</code>. Dashboard reflects what the wrapper has reported.
+    </div>`;
+    if (mcps.length === 0) {
+        html += `<div class="text-xs text-gray-400 italic">No MCP servers reported.</div>`;
+    } else {
+        html += `<div class="space-y-1">`;
+        for (const m of mcps) {
+            const dotClass = m.enabled ? 'dot-running' : 'dot-idle';
+            const statusTxt = m.enabled ? 'enabled' : 'disabled';
+            html += `
+                <div class="flex items-center gap-2">
+                    <span class="status-dot ${dotClass}" style="width: 8px; height: 8px;"></span>
+                    <span class="font-mono text-[11px] flex-1">${escapeHtml(m.name || '?')}</span>
+                    <span class="text-[10px] text-gray-500">${statusTxt}</span>
+                </div>
+            `;
+        }
+        html += `</div>`;
+    }
+    content.innerHTML = html;
+}
+
+// v3.2.0: Skills tab — read-only list, hint to edit on agent host.
+function renderSkillsTab(profile, content) {
+    const skills = profile.skills || [];
+    let html = `<div class="text-[11px] text-gray-500 mb-2 italic">
+        Skills (SKILL.md) are managed by the agent wrapper on the host. Edit on <code class="text-[10px]">~/.hermes-orchestrator/profiles/&lt;name&gt;/skills/</code>. Dashboard reflects what's currently applied.
+    </div>`;
+    if (skills.length === 0) {
+        html += `<div class="text-xs text-gray-400 italic">No skills applied yet.</div>`;
+    } else {
+        const shown = skills.slice(0, 10);
+        const more = skills.length - shown.length;
+        html += `<div class="space-y-1">`;
+        for (const s of shown) {
+            // file_path is "skills/<name>/SKILL.md" — show just the name segment
+            const parts = (s.file_path || '').split('/');
+            const name = parts.length >= 2 ? parts[parts.length - 2] : (s.file_path || '?');
+            const sizeKb = s.size_bytes ? (s.size_bytes / 1024).toFixed(1) + ' KB' : '?';
+            const status = s.status || 'unknown';
+            const statusClass = status === 'applied' ? 'pill-healthy' : 'pill-degraded';
+            html += `
+                <div class="flex items-center gap-2">
+                    <span class="font-mono text-[11px] flex-1">${escapeHtml(name)}</span>
+                    <span class="text-[10px] text-gray-400">${sizeKb}</span>
+                    <span class="pill-status ${statusClass}" style="font-size: 0.65rem; padding: 0 0.3rem;">${escapeHtml(status)}</span>
+                </div>
+            `;
+        }
+        html += `</div>`;
+        if (more > 0) {
+            html += `<div class="mt-2 text-[10px] text-gray-500 italic">+ ${more} more</div>`;
+        }
+    }
+    content.innerHTML = html;
+}
+
+// v3.2.0: Storage tab — editable. Add/remove storage_refs via
+// PATCH /api/agents/{id}/profiles/{name}. The form is local; the
+// save button sends the full list. Storage refs let tasks write
+// large outputs to external paths (SMB, S3, gdrive, etc.) without
+// going through the orchestrator's 15MB cap.
+function renderStorageTab(profile, content) {
+    const refs = profile.storage_refs || [];
+    const refRows = refs.map((s, i) => {
+        const desc = s.description ? ` <span class="text-gray-500 text-[10px]">(${escapeHtml(s.description)})</span>` : '';
+        return `
+            <div class="flex items-start gap-2 py-1 border-b border-gray-100" data-idx="${i}">
+                <span class="pill-status pill-healthy" style="font-size: 0.65rem; padding: 0 0.4rem;">${escapeHtml(s.kind)}</span>
+                <div class="flex-1 min-w-0">
+                    ${s.name ? `<div class="font-mono text-[11px] font-semibold">${escapeHtml(s.name)}</div>` : ''}
+                    <div class="font-mono text-[10px] text-gray-600 break-all">${escapeHtml(s.ref)}</div>
+                    ${desc ? `<div class="text-[10px] text-gray-500">${desc}</div>` : ''}
+                </div>
+                <button onclick="removeStorageRef(${i})"
+                        class="text-xs text-red-600 hover:text-red-800"
+                        title="Remove this storage ref">×</button>
+            </div>
+        `;
+    }).join('');
+    content.innerHTML = `
+        <div class="text-[11px] text-gray-500 mb-2 italic">
+            Storage refs let tasks write large outputs to external paths (SMB, S3, gdrive, etc.), bypassing the orchestrator's 15MB per-file cap. The agent gets the list in its task prompt as <code class="text-[10px]">[AVAILABLE STORAGE]</code>.
+        </div>
+        <div id="storage-ref-list" class="mb-2">${refRows || '<div class="text-xs text-gray-400 italic">No storage refs configured.</div>'}</div>
+        <div class="border-t border-gray-200 pt-2">
+            <div class="text-xs text-gray-500 mb-1 font-semibold">+ Add storage ref</div>
+            <div class="grid grid-cols-2 gap-1">
+                <input id="new-sref-name" type="text" placeholder="alias (e.g. stanley)"
+                       class="border rounded px-2 py-1 text-xs font-mono">
+                <select id="new-sref-kind" class="border rounded px-2 py-1 text-xs">
+                    <option value="smb">smb (Windows share / UNC)</option>
+                    <option value="local">local (mounted path)</option>
+                    <option value="gdrive">gdrive (URL or ID)</option>
+                    <option value="s3">s3 (bucket/prefix)</option>
+                    <option value="url">url (with credentials)</option>
+                </select>
+            </div>
+            <input id="new-sref-ref" type="text" placeholder="\\\\nas01\\reports or S:\\reports"
+                   class="w-full mt-1 border rounded px-2 py-1 text-xs font-mono">
+            <input id="new-sref-desc" type="text" placeholder="description (optional)"
+                   class="w-full mt-1 border rounded px-2 py-1 text-xs">
+            <div class="flex items-center gap-2 mt-2">
+                <button onclick="addStorageRef()"
+                        class="text-xs px-2 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded">
+                    + Add to list
+                </button>
+                <button onclick="saveStorageRefs()"
+                        class="text-xs px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">
+                    Save
+                </button>
+                <span id="storage-status" class="text-xs text-gray-500"></span>
+            </div>
+        </div>
+    `;
+}
+
+// v3.2.0: Capabilities tab — editable. Add/remove capability flags
+// via PATCH. Standard capabilities (shell, web_search, code_exec,
+// web_extract, file_io) get checkboxes; custom capabilities can be
+// added by name. Saving sends the merged dict.
+function renderCapabilitiesTab(profile, content) {
+    const caps = profile.capabilities || {};
+    const standard = ['shell', 'web_search', 'code_exec', 'web_extract', 'file_io'];
+    const customKeys = Object.keys(caps).filter(k => !standard.includes(k));
+    const standardRows = standard.map(name => {
+        const val = !!caps[name];
+        return `
+            <label class="flex items-center gap-2 py-1">
+                <input type="checkbox" class="cap-standard" data-cap="${name}" ${val ? 'checked' : ''}>
+                <span class="font-mono text-[11px] flex-1">${name}</span>
+                <span class="text-[10px] text-gray-400">${val ? 'enabled' : 'off'}</span>
+            </label>
+        `;
+    }).join('');
+    const customRows = customKeys.map(k => {
+        const val = !!caps[k];
+        return `
+            <div class="flex items-center gap-2 py-1">
+                <span class="font-mono text-[11px] flex-1">${escapeHtml(k)}</span>
+                <span class="pill-status ${val ? 'pill-healthy' : 'pill-degraded'}" style="font-size: 0.65rem;">${val ? 'enabled' : 'off'}</span>
+                <button onclick="removeCustomCap('${escapeAttr(k)}')"
+                        class="text-xs text-red-600 hover:text-red-800"
+                        title="Remove this custom capability">×</button>
+            </div>
+        `;
+    }).join('');
+    content.innerHTML = `
+        <div class="text-[11px] text-gray-500 mb-2 italic">
+            Per-profile capability flags. The supervisor checks <code class="text-[10px]">tasks.required_capability</code> against these before dispatching — if a task needs <strong>X</strong> and the profile doesn't have it, the task fails with <code class="text-[10px]">dispatch.mismatch</code> rather than silently using the wrong tool.
+        </div>
+        <div class="mb-2">
+            <div class="text-xs text-gray-500 mb-1 font-semibold">Standard capabilities</div>
+            ${standardRows}
+        </div>
+        ${customKeys.length > 0 ? `
+        <div class="mb-2">
+            <div class="text-xs text-gray-500 mb-1 font-semibold">Custom capabilities</div>
+            ${customRows}
+        </div>
+        ` : ''}
+        <div class="border-t border-gray-200 pt-2">
+            <div class="text-xs text-gray-500 mb-1 font-semibold">+ Add custom capability</div>
+            <div class="grid grid-cols-2 gap-1">
+                <input id="new-cap-name" type="text" placeholder="capability name (e.g. db_query)"
+                       class="border rounded px-2 py-1 text-xs font-mono">
+                <label class="flex items-center gap-1 text-xs">
+                    <input id="new-cap-enabled" type="checkbox" checked>
+                    <span>enabled</span>
+                </label>
+            </div>
+            <div class="flex items-center gap-2 mt-2">
+                <button onclick="addCustomCap()"
+                        class="text-xs px-2 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded">
+                    + Add to list
+                </button>
+                <button onclick="saveCapabilities()"
+                        class="text-xs px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">
+                    Save
+                </button>
+                <span id="capabilities-status" class="text-xs text-gray-500"></span>
+            </div>
+        </div>
+    `;
+}
+
+// v3.2.0: storage_refs add/remove/save handlers. addStorageRef
+// mutates the local profile (cached) and re-renders the tab;
+// saveStorageRefs PATCHes the server with the full list.
+function addStorageRef() {
+    const name = document.getElementById('new-sref-name').value.trim() || null;
+    const kind = document.getElementById('new-sref-kind').value;
+    const ref = document.getElementById('new-sref-ref').value.trim();
+    const desc = document.getElementById('new-sref-desc').value.trim() || '';
+    const status = document.getElementById('storage-status');
+    if (!ref) { status.textContent = 'Path/URL is required'; status.className = 'text-xs text-red-600'; return; }
+    const profile = currentProfiles.find(p => p.name === currentProfileName);
+    if (!profile.storage_refs) profile.storage_refs = [];
+    profile.storage_refs.push({name, kind, ref, description: desc});
+    status.textContent = 'Added to list (not saved yet)';
+    status.className = 'text-xs text-gray-500';
+    renderStorageTab(profile, document.getElementById('profile-tab-content'));
+}
+
+function removeStorageRef(idx) {
+    const profile = currentProfiles.find(p => p.name === currentProfileName);
+    profile.storage_refs.splice(idx, 1);
+    document.getElementById('storage-status').textContent = 'Removed (not saved yet)';
+    document.getElementById('storage-status').className = 'text-xs text-gray-500';
+    renderStorageTab(profile, document.getElementById('profile-tab-content'));
+}
+
+async function saveStorageRefs() {
+    const status = document.getElementById('storage-status');
+    const profile = currentProfiles.find(p => p.name === currentProfileName);
+    status.textContent = 'Saving...';
+    status.className = 'text-xs text-gray-500';
+    try {
+        const r = await fetch(`/api/agents/${encodeURIComponent(currentAgentId)}/profiles/${encodeURIComponent(currentProfileName)}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({storage_refs: profile.storage_refs || []}),
+        });
+        if (r.ok) {
+            status.textContent = 'Saved!';
+            status.className = 'text-xs text-green-600';
+        } else {
+            const data = await r.json().catch(() => ({}));
+            status.textContent = 'Failed: ' + (data.detail || r.status);
+            status.className = 'text-xs text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-xs text-red-600';
+    }
+}
+
+// v3.2.0: capabilities add/remove/save handlers. addCustomCap
+// mutates local profile and re-renders; saveCapabilities collects
+// the checked standard flags + the custom dict, then PATCHes.
+function addCustomCap() {
+    const name = document.getElementById('new-cap-name').value.trim();
+    const enabled = document.getElementById('new-cap-enabled').checked;
+    const status = document.getElementById('capabilities-status');
+    if (!name) { status.textContent = 'Name is required'; status.className = 'text-xs text-red-600'; return; }
+    const profile = currentProfiles.find(p => p.name === currentProfileName);
+    if (!profile.capabilities) profile.capabilities = {};
+    profile.capabilities[name] = enabled;
+    status.textContent = `Added "${name}" (not saved yet)`;
+    status.className = 'text-xs text-gray-500';
+    renderCapabilitiesTab(profile, document.getElementById('profile-tab-content'));
+}
+
+function removeCustomCap(name) {
+    const profile = currentProfiles.find(p => p.name === currentProfileName);
+    if (profile.capabilities) delete profile.capabilities[name];
+    document.getElementById('capabilities-status').textContent = `Removed "${name}" (not saved yet)`;
+    document.getElementById('capabilities-status').className = 'text-xs text-gray-500';
+    renderCapabilitiesTab(profile, document.getElementById('profile-tab-content'));
+}
+
+async function saveCapabilities() {
+    const status = document.getElementById('capabilities-status');
+    const profile = currentProfiles.find(p => p.name === currentProfileName);
+    // Collect: standard flags from checkboxes + existing custom ones
+    // (custom ones are still in profile.capabilities; we read those)
+    const merged = {};
+    document.querySelectorAll('.cap-standard').forEach(cb => {
+        merged[cb.dataset.cap] = cb.checked;
+    });
+    // Re-add custom caps that weren't in the standard list
+    const standard = ['shell', 'web_search', 'code_exec', 'web_extract', 'file_io'];
+    for (const [k, v] of Object.entries(profile.capabilities || {})) {
+        if (!standard.includes(k)) merged[k] = v;
+    }
+    profile.capabilities = merged;
+    status.textContent = 'Saving...';
+    status.className = 'text-xs text-gray-500';
+    try {
+        const r = await fetch(`/api/agents/${encodeURIComponent(currentAgentId)}/profiles/${encodeURIComponent(currentProfileName)}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({capabilities: merged}),
+        });
+        if (r.ok) {
+            status.textContent = 'Saved!';
+            status.className = 'text-xs text-green-600';
+        } else {
+            const data = await r.json().catch(() => ({}));
+            status.textContent = 'Failed: ' + (data.detail || r.status);
+            status.className = 'text-xs text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-xs text-red-600';
+    }
 }
 
 function escapeHtml(s) {
