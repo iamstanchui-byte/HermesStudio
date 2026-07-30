@@ -161,7 +161,7 @@
                 Save
             </button>
             <button type="button" onclick="openInExplorer()" class="px-3 py-2 bg-white border text-gray-600 rounded text-sm hover:bg-gray-50">
-                Open in Explorer
+                Open folder
             </button>
             <span id="project-status" class="text-sm text-gray-500"></span>
         </div>
@@ -557,7 +557,9 @@ async function saveProjectStorage() {
 
 function openInExplorer() {
     const path = document.getElementById('project-path').value;
-    // Use the orchestrator's API to open the path (browsers can't open local paths directly)
+    // Use the orchestrator's API to open the path (browsers can't open local paths directly).
+    // Cross-platform: the response includes `file_manager` ("Explorer" / "Finder" / "Files")
+    // so the status message reads naturally on the host OS.
     fetch('/api/settings/project/open', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -565,7 +567,8 @@ function openInExplorer() {
     }).then(r => r.json()).then(d => {
         const status = document.getElementById('project-status');
         if (d.ok) {
-            status.textContent = 'Opened in Explorer';
+            const label = d.file_manager || 'folder';
+            status.textContent = 'Opened in ' + label;
             status.className = 'text-sm text-green-600';
         } else {
             status.textContent = 'Failed: ' + (d.error || 'unknown');

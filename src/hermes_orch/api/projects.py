@@ -829,24 +829,27 @@ async def open_project_folder(project_id: str, request: Request) -> dict[str, An
     Browser can't open local paths directly, so we shell out from the
     server. The user's browser must be running on the same host as the
     orchestrator (this won't work for remote browser → local server).
+
+    Cross-platform: dispatches via `hermes_orch.core.platform_compat`,
+    so the same endpoint works on Windows (Explorer), macOS (Finder),
+    and Linux (xdg-open / gio / kde-open / nautilus fallback chain).
     """
-    import platform
-    import subprocess
+    from hermes_orch.core.platform_compat import (
+        file_manager_label,
+        open_path,
+        platform_name,
+    )
     pdir = _project_dir(request, project_id)
-    sysname = platform.system().lower()
-    try:
-        if sysname.startswith("win"):
-            win_path = str(pdir).replace("/", "\\")
-            subprocess.Popen(["explorer", win_path])
-        elif sysname == "darwin":
-            subprocess.Popen(["open", str(pdir)])
-        else:
-            subprocess.Popen(["xdg-open", str(pdir)])
-        return {"ok": True, "path": str(pdir), "platform": sysname}
-    except FileNotFoundError as e:
-        return {"ok": False, "error": f"file manager not found: {e}"}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    ok, err = open_path(pdir)
+    result: dict[str, Any] = {
+        "ok": ok,
+        "path": str(pdir),
+        "platform": platform_name(),
+        "file_manager": file_manager_label(),
+    }
+    if not ok:
+        result["error"] = err or "unknown error"
+    return result
 
 
 @router.post("/{project_id}/archive")

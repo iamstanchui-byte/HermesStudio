@@ -355,17 +355,23 @@ class ProjectStorageOpenIn(BaseModel):
 
 @router.post("/project/open")
 async def open_project_storage(body: ProjectStorageOpenIn, request: Request) -> dict[str, Any]:
-    """Open the project storage path in the OS file explorer.
+    """Open the project storage path in the OS file manager.
 
     The browser can't open local paths directly, so we shell out from the
-    server. Works on Windows (explorer.exe), macOS (open), and Linux
-    (xdg-open). The path is taken from the request body (so the user can
-    open a not-yet-saved path), or falls back to the current config.
+    server. Cross-platform: dispatches via
+    `hermes_orch.core.platform_compat` (Windows Explorer / macOS Finder /
+    Linux xdg-open with fallback chain). The path is taken from the
+    request body (so the user can open a not-yet-saved path), or falls
+    back to the current config.
     """
-    import os
-    import platform
-    import subprocess
     from pathlib import Path
+
+    from hermes_orch.core.platform_compat import (
+        file_manager_label,
+        open_path,
+        platform_name,
+    )
+
     target = (body.storage_root or "").strip() or (request.app.state.config.get("projects") or {}).get("storage_root", "")
     if not target:
         return {"ok": False, "error": "no storage_root provided"}
@@ -376,21 +382,16 @@ async def open_project_storage(body: ProjectStorageOpenIn, request: Request) -> 
         except Exception as e:
             return {"ok": False, "error": f"cannot create directory: {e}"}
 
-    sysname = platform.system().lower()
-    try:
-        if sysname.startswith("win"):
-            # explorer.exe needs backslashes for some paths
-            win_path = str(p).replace("/", "\\")
-            subprocess.Popen(["explorer", win_path])
-        elif sysname == "darwin":
-            subprocess.Popen(["open", str(p)])
-        else:
-            subprocess.Popen(["xdg-open", str(p)])
-        return {"ok": True, "path": str(p), "platform": sysname}
-    except FileNotFoundError as e:
-        return {"ok": False, "error": f"file manager not found: {e}"}
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    ok, err = open_path(p)
+    result: dict[str, Any] = {
+        "ok": ok,
+        "path": str(p),
+        "platform": platform_name(),
+        "file_manager": file_manager_label(),
+    }
+    if not ok:
+        result["error"] = err or "unknown error"
+    return result
 
 
 # ===== Cleanup =====
