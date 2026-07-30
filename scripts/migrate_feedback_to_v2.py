@@ -64,15 +64,15 @@ def _ensure_marker_column(conn: sqlite3.Connection) -> None:
 def _audit(conn: sqlite3.Connection, project_id: str, payload: dict) -> None:
     """Write a single audit_log row for the migration event.
 
-    audit_log schema: id, ts, actor, project_id, task_id, event_type,
-    payload (TEXT JSON). We let `id` default (auto-rowid); ts is the
-    current UTC time in the same format the rest of the system uses.
+    audit_log schema: id, event_type, actor, project_id, task_id,
+    agent_id, payload (TEXT JSON), created_at (TIMESTAMP default
+    CURRENT_TIMESTAMP). We let `id` and `created_at` default; the
+    rest is set explicitly.
     """
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     conn.execute(
-        "INSERT INTO audit_log (ts, actor, project_id, task_id, event_type, payload) "
-        "VALUES (?, 'migration', ?, NULL, 'feedback_to.v2_migrated', ?)",
-        (ts, project_id, json.dumps(payload)),
+        "INSERT INTO audit_log (event_type, actor, project_id, task_id, payload) "
+        "VALUES ('feedback_to.v2_migrated', 'migration', ?, NULL, ?)",
+        (project_id, json.dumps(payload)),
     )
 
 
@@ -95,6 +95,15 @@ def migrate_one_project(
 ) -> dict:
     """Invert feedback_to on all tasks of `project_id`. Idempotent.
 
+    v2.0 (2026-07-30) FLIPPED algorithm — fixed the v1.0 bug where
+    a task that was BOTH a listener AND a target in OLD data would
+    have its new entries wiped by the clear step. Now we compute
+    the FINAL feedback_to for each task in one pass: it's the set
+    of listeners who point to this task in OLD data. If the task
+    had no listeners, its NEW feedback_to is []. If the task
+    wasn't a target of anyone, it wasn't a listener either, so
+    it stays unchanged.
+
     Returns a summary dict for the caller to log.
     """
     summary = {
@@ -116,34 +125,78 @@ def migrate_one_project(
         summary["skipped_already_migrated"] = True
         return summary
 
-    # Read all tasks' feedback_to, group by name → id for the audit
+    # Read all tasks' feedback_to
     rows = conn.execute(
         "SELECT id, name, feedback_to FROM tasks WHERE project_id = ?",
         (project_id,),
     ).fetchall()
     summary["tasks_read"] = len(rows)
 
-    # Build the inverted relationship.
-    # For each task T with feedback_to = [A_id, B_id, ...]:
-    #   For each X in T.feedback_to: append T.id to X's feedback_to.
-    #   Then clear T's feedback_to.
-    additions: dict[str, list[str]] = {}  # target_id -> [task_ids to add]
-    clears: set[str] = set()  # task_ids whose feedback_to should become []
+    # v2.0 FLIPPED algorithm:
+    #   For each listener T with feedback_to = [X, Y, Z]:
+    #     T becomes empty in NEW semantic (T was a listener, not a
+    #     failing step in OLD). If T is also a target of some other
+    #     listener U, then T's NEW feedback_to is the set of those U's
+    #     (we add U to T). If T isn't targeted by anyone, T is empty.
+    #   For each X in T's feedback_to (the OLD triggers):
+    #     X becomes the failing step in NEW. X's NEW feedback_to is
+    #     the set of all listeners (U) who point to X in OLD.
+    #
+    # So we compute: for each task_id, new_feedback_to = [U for each U
+    # with X in U.feedback_to (OLD)]. Tasks that aren't in any U's
+    # feedback_to AND had no OLD feedback_to themselves are unchanged.
+    new_fb: dict[str, list[str]] = {}
+    # Tracks which tasks had non-empty OLD feedback_to (so we know
+    # they were listeners and need their feedback_to REPLACED with
+    # the new value, not left as-is).
+    was_listener: set[str] = set()
+
     for tid, tname, raw_fb in rows:
         fb = _parse_fb(raw_fb)
         if not fb:
             continue
-        # Self-ref: skip (the supervisor drops these at run time anyway)
+        # Skip self-refs (no-op in both OLD and NEW)
         fb = [x for x in fb if x != tid]
         if not fb:
+            # T's only feedback_to entries were self-refs. Leave T alone.
             continue
+        was_listener.add(tid)
+        # For each X in T's OLD feedback_to: T is a listener of X.
+        # In NEW, X's feedback_to += [T].
         for x in fb:
-            additions.setdefault(x, []).append(tid)
-        clears.add(tid)
+            if x not in new_fb:
+                new_fb[x] = []
+            if tid not in new_fb[x]:
+                new_fb[x].append(tid)
 
-    if not additions and not clears:
-        # Nothing to migrate in this project; still stamp the marker
-        # so we don't re-scan.
+    # Apply: for each task in (new_fb union was_listener), write the
+    # final value. Tasks in new_fb that aren't listeners (targets only)
+    # get new_fb[x]. Tasks that are listeners (with no NEW listeners
+    # of their own) get [].
+    final_writes: dict[str, list[str]] = {}
+    for tid, tname, raw_fb in rows:
+        if tid in new_fb and tid in was_listener:
+            # Task is both a target (has NEW listeners) and a listener
+            # (had OLD feedback_to). Its NEW value is the set of NEW
+            # listeners (the OLD feedback_to is dropped because the
+            # semantic changed: T was listening to OLD triggers, but
+            # in NEW, T's feedback_to lists its own recovery targets,
+            # not the things it listens to).
+            final_writes[tid] = new_fb[tid]
+        elif tid in new_fb:
+            # Task is a target only (no OLD feedback_to of its own).
+            final_writes[tid] = new_fb[tid]
+        elif tid in was_listener:
+            # Task is a listener only (no NEW listeners).
+            final_writes[tid] = []
+        # else: task had no OLD feedback_to AND isn't a target of
+        # anyone → leave its feedback_to unchanged.
+
+    summary["tasks_modified"] = len(final_writes)
+    summary["rewires"] = sum(len(v) for v in final_writes.values())
+
+    if not final_writes:
+        # Nothing to migrate; still stamp the marker
         if not dry_run:
             conn.execute(
                 "UPDATE projects SET _feedback_to_v2_migrated_at = ? WHERE id = ?",
@@ -153,45 +206,17 @@ def migrate_one_project(
                 "project_id": project_id,
                 "tasks_read": summary["tasks_read"],
                 "rewires": 0,
+                "tasks_modified": 0,
                 "note": "no feedback_to entries; nothing to invert",
             })
         return summary
 
-    # Compute rewires count up front so it's reported even in dry-run.
-    for to_add in additions.values():
-        summary["rewires"] += len(to_add)
-    summary["tasks_modified"] = len(clears)
-
-    # Apply the inversion
     if not dry_run:
-        for target_id, to_add in additions.items():
-            cur_row = conn.execute(
-                "SELECT feedback_to FROM tasks WHERE id = ?",
-                (target_id,),
-            ).fetchone()
-            if cur_row is None:
-                # The named target doesn't exist (task was deleted or
-                # never created — probably an unresolved ref). Skip
-                # silently; this matches the supervisor's behavior.
-                continue
-            existing = _parse_fb(cur_row[0])
-            merged = list(existing)
-            for x in to_add:
-                if x not in merged:
-                    merged.append(x)
+        for tid, fb in final_writes.items():
             conn.execute(
                 "UPDATE tasks SET feedback_to = ? WHERE id = ?",
-                (json.dumps(merged), target_id),
+                (json.dumps(fb), tid),
             )
-
-        # Clear the old listeners' feedback_to (they were the OLD
-        # targets, now empty in the NEW semantic)
-        for tid in clears:
-            conn.execute(
-                "UPDATE tasks SET feedback_to = '[]' WHERE id = ?",
-                (tid,),
-            )
-
         # Stamp the marker
         conn.execute(
             "UPDATE projects SET _feedback_to_v2_migrated_at = ? WHERE id = ?",
@@ -254,14 +279,14 @@ def main() -> int:
             if s.get("skipped_already_migrated"):
                 grand["projects_skipped"] += 1
             elif s.get("error"):
-                print(f"  ! {pid}: {s['error']}")
+                print(f"  [err] {pid}: {s['error']}")
             else:
                 if s["rewires"] > 0 or s["tasks_modified"] > 0:
                     grand["projects_migrated"] += 1
                 grand["total_rewires"] += s["rewires"]
                 if not args.dry_run and (s["rewires"] > 0 or s["tasks_modified"] > 0):
                     print(
-                        f"  ✓ {pid}: read {s['tasks_read']} tasks, "
+                        f"  [ok] {pid}: read {s['tasks_read']} tasks, "
                         f"modified {s['tasks_modified']}, "
                         f"rewires {s['rewires']}"
                     )

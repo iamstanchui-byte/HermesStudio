@@ -61,12 +61,13 @@ def _fresh_db() -> sqlite3.Connection:
     conn.execute("""
         CREATE TABLE audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT,
+            event_type TEXT,
             actor TEXT,
             project_id TEXT,
             task_id TEXT,
-            event_type TEXT,
-            payload TEXT
+            agent_id TEXT,
+            payload TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     return conn
@@ -94,7 +95,12 @@ def test_migration_inverts_single_project():
     ])
     summary = mod.migrate_one_project(conn, "p1")
     assert summary["rewires"] == 1
-    assert summary["tasks_modified"] == 1  # t1 cleared
+    # v2.0 algorithm: 2 tasks are written — t1 is cleared, t2 gets
+    # t1 added. The OLD listener (t1) and the NEW target (t2) are
+    # both updated. (The v1.0 algorithm had a bug where if a task
+    # was both listener and target, the clear step wiped the new
+    # entry. v2.0 computes the final value in one pass per task.)
+    assert summary["tasks_modified"] == 2
     rows = {
         r[0]: json.loads(r[1] or "[]")
         for r in conn.execute(
@@ -121,6 +127,8 @@ def test_migration_handles_multi_target_rewire():
     ])
     summary = mod.migrate_one_project(conn, "p1")
     assert summary["rewires"] == 2
+    # t1 is cleared, t2 and t3 each get one entry
+    assert summary["tasks_modified"] == 3
     rows = {
         r[0]: json.loads(r[1] or "[]")
         for r in conn.execute(
@@ -130,6 +138,47 @@ def test_migration_handles_multi_target_rewire():
     assert rows["t1"] == []
     assert sorted(rows["t2"]) == ["t1"]
     assert sorted(rows["t3"]) == ["t1"]
+
+
+def test_migration_handles_task_that_is_both_listener_and_target():
+    """v2.0 fix: a task that's BOTH a listener (has its own OLD
+    feedback_to) AND a target (named in someone else's OLD
+    feedback_to) must have its NEW feedback_to correctly set to
+    the set of its NEW listeners — NOT wiped by the clear step.
+
+    v1.0 of the migration had a bug where:
+      T1.feedback_to = [T2]  (T1 listens for T2)
+      T2.feedback_to = [T3]  (T2 listens for T3)
+    ...would produce 0 entries in NEW because the clears would
+    wipe the new additions on T2.
+
+    v2.0 algorithm: compute the final value per task in one pass.
+    T2 is both a listener (was_listener) and a target (new_fb[T2] = [T1]).
+    T2's NEW feedback_to = [T1] (NOT wiped).
+    """
+    mod = _load_migration()
+    conn = _fresh_db()
+    conn.execute("INSERT INTO projects (id) VALUES ('p1')")
+    _insert_tasks(conn, "p1", [
+        {"id": "T1", "name": "first",  "feedback_to": ["T2"]},
+        {"id": "T2", "name": "middle", "feedback_to": ["T3"]},
+        {"id": "T3", "name": "last",   "feedback_to": []},
+    ])
+    summary = mod.migrate_one_project(conn, "p1")
+    # T1 is cleared (its OLD target T2 is now the failing step
+    # for T1's recovery). T2 is the OLD listener of T3, but
+    # ALSO the NEW target of T1. T2's NEW value should be [T1]
+    # (its new listener from T1), not []. T3 gets T2 added.
+    assert summary["rewires"] == 2  # T2=[T1], T3=[T2]
+    rows = {
+        r[0]: json.loads(r[1] or "[]")
+        for r in conn.execute(
+            "SELECT id, feedback_to FROM tasks ORDER BY id"
+        ).fetchall()
+    }
+    assert rows["T1"] == []  # cleared (was a listener only)
+    assert rows["T2"] == ["T1"]  # NEW: if T2 fails, re-run T1
+    assert rows["T3"] == ["T2"]  # NEW: if T3 fails, re-run T2
 
 
 def test_migration_drops_self_references():
