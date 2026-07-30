@@ -17,7 +17,7 @@
 {# _visual_workflow.js is loaded by the page at the bottom of <body>;
    it depends on drawflow being parsed first. We use `defer` above so
    the order is preserved. #}
-<script defer src="/static/visual_workflow.js?v=2026-07-30-v210"></script>
+<script defer src="/static/visual_workflow.js?v=2026-07-30-v220"></script>
 <style>
     /* Page-specific layout. The body uses Tailwind, but drawflow
        ships its own styles for nodes + connections which we keep
@@ -281,7 +281,7 @@
             </span>
         </p>
     </div>
-    <div class="flex gap-2">
+    <div class="flex gap-2 items-center">
         {# v2.1 (2026-07-30): Undo / Redo buttons. Disabled when
            the corresponding stack is empty. Tooltip shows the
            label of the mutation that will be reverted / re-applied.
@@ -298,6 +298,8 @@
             title="Nothing to redo (Ctrl+Y)">
             ↷ Redo
         </button>
+        {# v2.2 (2026-07-30): separator + clipboard group #}
+        <span class="w-px h-6 bg-gray-300 mx-1"></span>
         {# v2.1 (2026-07-30): copy / paste step. The clipboard holds
            one step at a time; paste produces a new step with a
            unique "-copy" / "-copy-N" name. No edges are
@@ -306,14 +308,16 @@
             onclick="window.visualBuilder.copyStep()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
             title="Copy the selected step to clipboard (Ctrl+C). Then click another card and Ctrl+V (or click Paste) to clone.">
-            📋 Copy step
+            📋 Copy
         </button>
         <button type="button"
             onclick="window.visualBuilder.pasteStep()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
             title="Paste the copied step as a new step with a unique -copy name (Ctrl+V). No edges auto-wired.">
-            📥 Paste step
+            📥 Paste
         </button>
+        {# v2.2 (2026-07-30): separator + file I/O group #}
+        <span class="w-px h-6 bg-gray-300 mx-1"></span>
         {# v2.1 (2026-07-30): workflow template JSON import / export.
            The hidden <input type="file"> is the actual file
            picker; we trigger it programmatically so the visible
@@ -324,14 +328,16 @@
             onclick="document.getElementById('vf-import-file').click()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
             title="Import a workflow .json template. Replaces the in-memory step_template + variables. Click Save to persist.">
-            ⬆ Import JSON
+            ⬆ Import
         </button>
         <button type="button"
             onclick="window.visualBuilder.exportJson()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
-            title="Download the current step_template + variables as a .workflow.json file you can share or archive. Re-importable via the Import JSON button.">
-            ⬇ Export JSON
+            title="Download the current step_template + variables as a .workflow.json file you can share or archive. Re-importable via the Import button.">
+            ⬇ Export
         </button>
+        {# v2.2 (2026-07-30): separator + AI assist group #}
+        <span class="w-px h-6 bg-gray-300 mx-1"></span>
         {# v2.1 (2026-07-30): parameter hints. Calls the backend
            /suggest-vars endpoint which extracts {{var}}
            placeholders + infers types from literal values in
@@ -341,27 +347,33 @@
             onclick="window.visualBuilder.suggestVars()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
             title="Scan all step params for {{var}} placeholders and add missing variables to the variables list. Inferred type comes from literal values in the same step (v2.1: local, deterministic; v2.2: LLM-backed).">
-            ✨ Suggest vars
+            ✨ Suggest
         </button>
-        <button onclick="window.visualBuilder.topoSort()"
-            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
-            title="Phase 1.5: auto-arrange cards top-to-bottom in execution order (so depends_on only references earlier steps). Use this if Save fails with a forward-ref error.">
-            Topo sort
-        </button>
+        {# v2.2 (2026-07-30): separator + layout + advanced group #}
+        <span class="w-px h-6 bg-gray-300 mx-1"></span>
+        {# Topo sort button removed in v2.2 (2026-07-30): the workflow
+           no longer needs manual topo ordering. depends_on references
+           can point to any step (not just earlier ones), and feedback_to
+           is placement-flexible (it's a runtime retry, not a linear
+           order). The drawflow canvas preserves positions per user
+           anyway, so forcing a layout would just trash their
+           arrangement. #}
         <button onclick="window.visualBuilder.resetLayout()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
             title="Phase 2.5 (2026-07-26): clear all saved card positions and re-stack the canvas in the default top-to-bottom order. step_template is NOT changed. Click Save to persist the cleared layout, otherwise refresh will restore the old positions.">
-            Reset layout
+            ↺ Reset layout
         </button>
         <button onclick="window.visualBuilder.toggleJsonForm()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
             title="Q4 (c): show/hide the raw JSON text form (hidden by default for semi-tech users)">
-            Edit as JSON
+            📝 Edit JSON
         </button>
+        {# v2.2 (2026-07-30): separator + primary action (rightmost) #}
+        <span class="w-px h-6 bg-gray-300 mx-1"></span>
         <button onclick="window.visualBuilder.save()"
-            class="px-3 py-1.5 text-xs font-medium rounded bg-blue-600 text-white hover:bg-blue-700"
+            class="px-4 py-1.5 text-xs font-medium rounded bg-blue-600 text-white hover:bg-blue-700"
             title="PUT step_template + variables back to the API">
-            Save
+            💾 Save
         </button>
     </div>
 </div>
