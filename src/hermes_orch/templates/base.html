@@ -527,6 +527,38 @@
         body.dark table th { background-color: #1f2937; color: #f3f4f6; }
         body.dark table td { border-color: #4b5563; }
         body.dark table tr:hover { background-color: #1f2937; }
+
+        /* v3.1.1: Modal overlay + card (Register agent modal). The
+           overlay is a full-screen semi-transparent backdrop; click on
+           it (not on the card) closes the modal. The card is centered
+           and uses the same border/shadow language as .card so it
+           doesn't feel out of place. z-index 50 puts it above the
+           sidebar (z-30) and any sticky header. .modal-card has
+           max-height + overflow so a long form scrolls inside the
+           card rather than overflowing the viewport. */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.55);
+            z-index: 50;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }
+        .modal-card {
+            background: #fff;
+            border-radius: 8px;
+            padding: 1.25rem;
+            box-shadow: 0 20px 25px -5px rgba(0,0,0,0.15), 0 8px 10px -6px rgba(0,0,0,0.1);
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        body.dark .modal-card {
+            background: #1f2937;
+            color: #f3f4f6;
+            border: 1px solid #374151;
+        }
     </style>
 </head>
 <body class="{% if active_page in ('token_usage',) %}sidebar-collapsed{% endif %}">
