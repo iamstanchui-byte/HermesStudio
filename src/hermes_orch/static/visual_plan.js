@@ -67,6 +67,30 @@
     // here so the visual editor gives the same error as the API.
     const KEBAB_RE = /^[a-z0-9][a-z0-9-]*$/;
 
+    // ===== v2.2 (2026-07-30): Undo/Redo + Copy/Paste =====
+    // Mirror of visual_workflow.js. The plan editor didn't have
+    // these before, so a lot of accidental deletions / typo renames
+    // were unrecoverable. History snapshots cover the whole _plan
+    // object (steps + variables + visual_layout + name + description);
+    // any mutation that touches _plan calls _checkpoint() at the
+    // top so undo can revert. Ctrl+Z / Ctrl+Y work everywhere,
+    // including in text fields (matches workflow editor + most
+    // native editors). Ctrl+C / Ctrl+V only fire when focus is
+    // NOT in a text field, so users can still copy-paste within
+    // the side panel form freely.
+    const _history = {
+        undoStack: [],          // [{label, snapshot: <deep-copy _plan>}]
+        redoStack: [],
+        maxSize: 50,
+        _isRendering: false,    // suppress checkpoints during renderAllSteps
+        _isApplyingPatch: false, // suppress during undo/redo
+    };
+    let _clipboard = null;      // {step: <deep-copy>, ts: <number>}
+    // Drag detection so dblclick on a moved card doesn't open the
+    // side panel (we use the same 8px threshold as visual_workflow.js).
+    const _DRAG_THRESHOLD_PX = 8;
+    let _mouseDownPos = null;
+
     // ===== DOM helpers =====
     function $(id) { return document.getElementById(id); }
     function showBanner(msg, kind) {
@@ -84,6 +108,208 @@
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#39;');
+    }
+
+    // ===== v2.2: Undo/Redo helpers =====
+    // Deep-copy the whole _plan object (steps + variables + layout +
+    // name + description). We don't try to be selective — 50 entries
+    // at ~2-10KB each is < 1MB of memory, well within the editor's
+    // lifetime budget.
+    function _snapshot() {
+        return { plan: JSON.parse(JSON.stringify(_plan)) };
+    }
+    function _restoreSnapshot(snap) {
+        _plan = snap.plan;
+    }
+    function _checkpoint(label) {
+        if (_history._isRendering || _history._isApplyingPatch) return;
+        _history.undoStack.push({ label, snapshot: _snapshot() });
+        if (_history.undoStack.length > _history.maxSize) {
+            _history.undoStack.shift();
+        }
+        // Any new edit invalidates the redo stack (standard editor behavior).
+        _history.redoStack = [];
+        _updateHistoryButtons();
+    }
+    function _undo() {
+        if (_history.undoStack.length === 0) return;
+        const entry = _history.undoStack.pop();
+        // Capture current state for the redo stack BEFORE we restore
+        // the snapshot. Same pattern as visual_workflow.js.
+        _history.redoStack.push({ label: entry.label, snapshot: _snapshot() });
+        _history._isApplyingPatch = true;
+        try {
+            _restoreSnapshot(entry.snapshot);
+            _renderAll();
+        } finally {
+            _history._isApplyingPatch = false;
+        }
+        _updateHistoryButtons();
+        showBanner('Undid: ' + entry.label, 'success');
+    }
+    function _redo() {
+        if (_history.redoStack.length === 0) return;
+        const entry = _history.redoStack.pop();
+        _history.undoStack.push({ label: entry.label, snapshot: _snapshot() });
+        _history._isApplyingPatch = true;
+        try {
+            _restoreSnapshot(entry.snapshot);
+            _renderAll();
+        } finally {
+            _history._isApplyingPatch = false;
+        }
+        _updateHistoryButtons();
+        showBanner('Redid: ' + entry.label, 'success');
+    }
+    function _updateHistoryButtons() {
+        const undoBtn = document.getElementById('vp-undo-btn');
+        const redoBtn = document.getElementById('vp-redo-btn');
+        if (undoBtn) {
+            undoBtn.disabled = _history.undoStack.length === 0;
+            undoBtn.title = _history.undoStack.length === 0
+                ? 'Nothing to undo (Ctrl+Z)'
+                : 'Undo: ' + _history.undoStack[_history.undoStack.length - 1].label + ' (Ctrl+Z)';
+        }
+        if (redoBtn) {
+            redoBtn.disabled = _history.redoStack.length === 0;
+            redoBtn.title = _history.redoStack.length === 0
+                ? 'Nothing to redo (Ctrl+Y)'
+                : 'Redo: ' + _history.redoStack[_history.redoStack.length - 1].label + ' (Ctrl+Y)';
+        }
+    }
+    // Re-render the whole plan UI after a snapshot restore. Wraps
+    // renderAllSteps + minimap + form fields so _isRendering is
+    // set correctly (suppresses any unintended checkpoint).
+    function _renderAll() {
+        _history._isRendering = true;
+        try {
+            renderAllSteps();
+            updateMinimap();
+            const nameInput = document.getElementById('vp-plan-name');
+            const descInput = document.getElementById('vp-plan-description');
+            if (nameInput) nameInput.value = _plan.name || '';
+            if (descInput) descInput.value = _plan.description || '';
+            // If the previously selected step was renamed/deleted,
+            // close the side panel so it doesn't show stale form
+            // values for a step that no longer exists.
+            if (_selectedNodeName) {
+                const stillExists = _plan.steps.some(s => s.name === _selectedNodeName);
+                if (!stillExists) closeSidePanel();
+            }
+        } finally {
+            _history._isRendering = false;
+        }
+    }
+
+    // ===== v2.2: Copy / Paste step =====
+    // Single-step clipboard (overwritten on each copy). Paste
+    // appends a deep-copy of the step with a unique -copy / -copy-N
+    // suffix to the name. We don't try to auto-wire anything (the
+    // user can drag if they want a similar depends_on pattern).
+    function _copySelectedStep() {
+        if (!_selectedNodeName) {
+            showBanner('No card selected to copy (double-click a card first)', 'info');
+            return;
+        }
+        const step = _plan.steps.find(s => s.name === _selectedNodeName);
+        if (!step) {
+            showBanner('Selected card is stale (not in _plan.steps). Re-render to refresh.', 'error');
+            return;
+        }
+        _clipboard = {
+            step: JSON.parse(JSON.stringify(step)),
+            ts: Date.now(),
+        };
+        showBanner('Copied step "' + step.name + '". Click another card or an empty spot, then Ctrl+V (or click Paste) to clone.', 'success');
+    }
+    function _pasteClipboard() {
+        if (!_clipboard) {
+            showBanner('Clipboard empty. Copy a step first (Ctrl+C).', 'info');
+            return;
+        }
+        // Find a unique name. Try `<name>-copy`, `<name>-copy-2`, ...
+        // Cap at 1000 so we don't loop forever.
+        const baseName = _clipboard.step.name;
+        const candidateBase = baseName.replace(/-copy(-\d+)?$/, '') + '-copy';
+        let candidate = candidateBase;
+        let n = 2;
+        const taken = new Set(_plan.steps.map(s => s.name));
+        while (taken.has(candidate)) {
+            if (n > 999) {
+                showBanner('Cannot paste: name collision cap reached (1000 -copy variants)', 'error');
+                return;
+            }
+            candidate = candidateBase + '-' + n;
+            n += 1;
+        }
+        // Deep copy again so two consecutive pastes don't share
+        // nested objects (params_template in particular).
+        const newStep = JSON.parse(JSON.stringify(_clipboard.step));
+        newStep.name = candidate;
+        // Wipe depends_on + feedback_to so the pasted step starts
+        // "loose" — the user wires it up explicitly. Auto-wiring
+        // would silently re-create the source's intent.
+        newStep.depends_on = [];
+        newStep.feedback_to = [];
+        _checkpoint('Paste step (as "' + candidate + '")');
+        _plan.steps.push(newStep);
+        renderAllSteps();
+        updateMinimap();
+        // Open the side panel on the new step so the user can
+        // rename / tweak before clicking Apply.
+        openSidePanel(candidate);
+        showBanner('Pasted as "' + candidate + '". Edits stay in memory until you click Apply.', 'success');
+    }
+
+    // ===== v2.2: Global keyboard shortcuts =====
+    // Bound once on init() (idempotent). Handles:
+    //   Ctrl+Z            = undo
+    //   Ctrl+Y / Ctrl+Shift+Z = redo
+    //   Ctrl+C            = copy selected step (skipped in text fields)
+    //   Ctrl+V            = paste step        (skipped in text fields)
+    //   Escape            = close side panel
+    // Undo/redo work EVERYWHERE including in text fields (matches
+    // native editor conventions; users expect Cmd+Z to work
+    // inside a textarea). Copy/paste defer to native browser
+    // behavior when focus is in a text input so users can still
+    // copy-paste within the side panel form fields.
+    function _bindGlobalShortcuts() {
+        if (window._vpShortcutsBound) return;
+        window._vpShortcutsBound = true;
+        document.addEventListener('keydown', (e) => {
+            const ctrl = e.ctrlKey || e.metaKey;
+            if (!ctrl) {
+                // Escape closes the side panel (no modifier needed)
+                if (e.key === 'Escape') {
+                    const sp = document.getElementById('vp-side-panel');
+                    if (sp && !sp.classList.contains('hidden')) {
+                        closeSidePanel();
+                        e.preventDefault();
+                    }
+                }
+                return;
+            }
+            const key = e.key.toLowerCase();
+            const tag = (e.target && e.target.tagName || '').toLowerCase();
+            const isTextField = tag === 'input' || tag === 'textarea' || (e.target && e.target.isContentEditable);
+            // Undo / Redo — work everywhere
+            if (key === 'z' && !e.shiftKey) {
+                e.preventDefault();
+                _undo();
+            } else if ((key === 'z' && e.shiftKey) || key === 'y') {
+                e.preventDefault();
+                _redo();
+            } else if (!isTextField) {
+                // Copy / Paste — only outside text fields
+                if (key === 'c' && !e.shiftKey) {
+                    e.preventDefault();
+                    _copySelectedStep();
+                } else if (key === 'v' && !e.shiftKey) {
+                    e.preventDefault();
+                    _pasteClipboard();
+                }
+            }
+        });
     }
 
     // ===== Init =====
@@ -179,6 +405,11 @@
         // Render initial nodes
         renderAllSteps();
         updateMinimap();
+        // v2.2: bind global keyboard shortcuts (Ctrl+Z/Y/C/V, Escape)
+        // and initialize the undo/redo button states (both disabled
+        // at start because undo stack is empty).
+        _bindGlobalShortcuts();
+        _updateHistoryButtons();
     }
 
     // ===== Render: build the in-memory plan from the canvas =====
@@ -595,6 +826,7 @@
 
     // ===== Step CRUD =====
     function addStep() {
+        _checkpoint('Add step');  // v2.2: undo support
         // Generate a default name. We scan existing names and
         // pick "step-N" with the smallest N that's not taken.
         const used = new Set(_plan.steps.map(s => s.name));
@@ -617,11 +849,16 @@
         // Position: place below the lowest existing node
         const lastIdx = _plan.steps.length - 1;
         addNodeToCanvas(step, 100 + (lastIdx % 3) * 280, 100 + Math.floor(lastIdx / 3) * 130);
+        // v2.2: auto-select the new step so the user can immediately
+        // Ctrl+C → Ctrl+V to clone, or dblclick to edit. Without
+        // this they'd have to dblclick first to "select".
+        _selectedNodeName = name;
         updateMinimap();
-        showBanner('Step added', 'success');
+        showBanner('Step "' + name + '" added. Double-click to edit, or Ctrl+C to clone.', 'success');
     }
 
     function deleteStepByName(name) {
+        _checkpoint('Delete step "' + name + '"');  // v2.2: undo support
         // Remove from plan model (in-memory). The nodeRemoved event
         // listener we registered in init() will fire when drawflow
         // actually removes the card, and that listener will run
@@ -699,6 +936,7 @@
 
     function saveStepEdits() {
         if (!_selectedNodeName) return;
+        _checkpoint('Edit step "' + _selectedNodeName + '"');  // v2.2: undo support
         const step = _plan.steps.find(s => s.name === _selectedNodeName);
         if (!step) return;
         const newName = ($('vp-f-name').value || '').trim();
@@ -1041,8 +1279,27 @@
     function wireCanvasEvents() {
         const wrap = $('vp-canvas');
         if (!wrap) return;
-        // Use capture-phase to intercept clicks on our × delete buttons
-        // and on nodes (open side panel).
+        // ===== v2.2: behavior change — dblclick opens, click-empty closes =====
+        // Before v2.2 a single click on a card opened the side panel
+        // (which was jarring — the user was often just dragging).
+        // v2.2 (matching visual_workflow.js's behavior) is:
+        //   - mousedown on a card: remember position (for drag detection)
+        //   - click on a card: just visual select (drawflow's built-in)
+        //   - click on the × button: delete (with confirm)
+        //   - click on the wrap's empty area: close the side panel
+        //   - dblclick on a card: open the side panel for editing
+        // The drag detection ensures a drag-reposition (movement >
+        // 8px between mousedown and dblclick) doesn't open the panel.
+        // Track mousedown on the wrap (card or empty). We only need
+        // the position when the mousedown is on a card, since only
+        // card-dblclicks need drag detection.
+        wrap.addEventListener('mousedown', (ev) => {
+            const nodeEl = ev.target.closest('.vp-node');
+            _mouseDownPos = nodeEl
+                ? { x: ev.clientX, y: ev.clientY }
+                : null;
+        });
+        // Click handler: delete button OR close-panel-on-empty.
         wrap.addEventListener('click', function(ev) {
             // Delete button: .vp-node-delete
             const del = ev.target.closest('.vp-node-delete');
@@ -1057,19 +1314,41 @@
                 }
                 return;
             }
-            // Node click: any element inside .vp-node (or .vp-node
-            // itself). The .vp-node inner div has data-step-name set
-            // by nodeHtml() in renderAllSteps. This was the bug
-            // before 2026-07-27 — the handler used to look for
-            // `[id^="node-vp-"]` but drawflow's DOM id is just
-            // "node-1", "node-2", etc., so the wrapper was never
-            // found and openSidePanel was never called. That's why
-            // double-clicking a card did nothing.
+            // Click on the wrap's empty area (not on a card AND
+            // not inside the side panel) → close the side panel if
+            // it's open. Reverts the form per closeSidePanel.
+            // Defensive: ignore clicks whose target is inside the
+            // side panel, otherwise the Apply/Cancel click bubbles
+            // up to wrap, sees target isn't a card, and closes the
+            // panel right after applyEdit re-opened it.
+            const sp = document.getElementById('vp-side-panel');
+            if (sp && sp.contains(ev.target)) return;
             const nodeInner = ev.target.closest('.vp-node[data-step-name]');
-            if (nodeInner) {
-                const name = nodeInner.dataset.stepName;
-                if (name) openSidePanel(name);
+            if (!nodeInner) {
+                if (sp && !sp.classList.contains('hidden')) {
+                    closeSidePanel();
+                }
             }
+            // Click on a card: no-op here (drawflow already handles
+            // selection visuals via .selected class). The user
+            // double-clicks to actually open the side panel.
+        });
+        // dblclick: open side panel. Same drag-detection as
+        // visual_workflow.js (skip if movement > 8px between
+        // mousedown and dblclick).
+        wrap.addEventListener('dblclick', (ev) => {
+            const nodeInner = ev.target.closest('.vp-node[data-step-name]');
+            if (!nodeInner) return;
+            const stepName = nodeInner.dataset.stepName;
+            if (!stepName) return;
+            if (_mouseDownPos) {
+                const dx = ev.clientX - _mouseDownPos.x;
+                const dy = ev.clientY - _mouseDownPos.y;
+                if (Math.sqrt(dx * dx + dy * dy) > _DRAG_THRESHOLD_PX) {
+                    return;
+                }
+            }
+            openSidePanel(stepName);
         });
     }
 
@@ -1217,6 +1496,14 @@
         copyCanvasToJson: copyCanvasToJson,
         saveStepEdits: saveStepEdits,
         deleteSelectedStep: deleteSelectedStep,
+        // v2.2 (2026-07-30): Undo / Redo / Copy / Paste — mirror the
+        // workflow template editor. See _checkpoint / _clipboard
+        // above for the data model. Toolbar buttons + keyboard
+        // shortcuts also bind to these via _bindGlobalShortcuts().
+        undo: _undo,
+        redo: _redo,
+        copyStep: _copySelectedStep,
+        pasteStep: _pasteClipboard,
         openGeneratePlanModal: openGeneratePlanModal,
         closeGeneratePlanModal: closeGeneratePlanModal,
         generatePlanFromLlm: generatePlanFromLlm,

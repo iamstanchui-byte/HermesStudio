@@ -28,7 +28,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
-<script defer src="/static/visual_plan.js?v=2026-07-30-v200fb"></script>
+<script defer src="/static/visual_plan.js?v=2026-07-30-v220"></script>
 <style>
     /* Page-specific layout */
     body { background: #f9fafb; }
@@ -257,6 +257,37 @@
             ·
             <span class="font-semibold" style="color: #dc2626;">red dashed</span> wire = loop-back (feedback_to)
         </span>
+        {# v2.2 (2026-07-30): Undo / Redo + Copy / Paste. Mirror of
+           visual_workflow.html. Disabled state is managed by
+           visual_plan.js's _updateHistoryButtons(). Keyboard
+           shortcuts: Ctrl+Z = undo, Ctrl+Y = redo, Ctrl+C = copy
+           selected step, Ctrl+V = paste, Escape = close panel. #}
+        <button id="vp-undo-btn" type="button" disabled
+            onclick="window.vp.undo()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Nothing to undo (Ctrl+Z)">
+            ↶ Undo
+        </button>
+        <button id="vp-redo-btn" type="button" disabled
+            onclick="window.vp.redo()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Nothing to redo (Ctrl+Y)">
+            ↷ Redo
+        </button>
+        <span class="w-px h-6 bg-gray-300 mx-1"></span>
+        <button type="button"
+            onclick="window.vp.copyStep()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            title="Copy the selected step to clipboard (Ctrl+C). Then click an empty spot or another card and Ctrl+V to clone.">
+            📋 Copy
+        </button>
+        <button type="button"
+            onclick="window.vp.pasteStep()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            title="Paste the copied step as a new step with a unique -copy name (Ctrl+V). No edges auto-wired.">
+            📥 Paste
+        </button>
+        <span class="w-px h-6 bg-gray-300 mx-1"></span>
         <button onclick="window.vp.toggleJsonMode()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
             title="Toggle the text/JSON editor (for power users who prefer raw JSON)">
