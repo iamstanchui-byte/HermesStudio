@@ -13,8 +13,8 @@
     After changing LLM settings, the next planning call will use the new configuration automatically.
 </p>
 
-<!-- LLM Settings Card -->
-<div class="bg-white border rounded-lg p-6 shadow-sm mb-4">
+<!-- LLM Settings Card (v3.1.0: id="models" anchors the /settings#models sub-item) -->
+<div id="models" class="bg-white border rounded-lg p-6 shadow-sm mb-4 scroll-mt-20">
     <h2 class="text-lg font-semibold text-gray-800 mb-3">LLM Provider</h2>
 
     {% if llm_configured %}
@@ -316,6 +316,50 @@
             <span id="tg-status" class="text-sm text-gray-500"></span>
         </div>
     </form>
+</div>
+
+<!-- v3.1.0: Placeholder cards for sidebar sub-items /settings#evaluations,
+     /settings#guardrails, /settings#integrations. Each gets its own
+     `id` so the browser scrolls to the right place when the user
+     clicks the sub-item. The actual feature bodies are planned for
+     v3.2+ (post-launch). Keeping a real (small) card instead of a
+     blank anchor means the user lands on something visible —
+     "Coming in v3.2" with the planned scope. `scroll-mt-20` leaves
+     80px of breathing room above the card after the jump. -->
+<div id="evaluations" class="bg-white border rounded-lg p-6 shadow-sm mb-4 scroll-mt-20">
+    <h2 class="text-lg font-semibold text-gray-800 mb-2">Evaluations</h2>
+    <p class="text-sm text-gray-500 mb-3">Planned for v3.2+.</p>
+    <p class="text-sm text-gray-500">
+        Run a curated set of golden projects against your current LLM
+        config to compare cost/quality across models. Each eval
+        produces a scorecard (pass rate, cost per project, P95 latency,
+        quality rubric) and is saved to history so you can spot
+        regressions before flipping a model into production.
+    </p>
+</div>
+
+<div id="guardrails" class="bg-white border rounded-lg p-6 shadow-sm mb-4 scroll-mt-20">
+    <h2 class="text-lg font-semibold text-gray-800 mb-2">Guardrails</h2>
+    <p class="text-sm text-gray-500 mb-3">Planned for v3.2+.</p>
+    <p class="text-sm text-gray-500">
+        Per-profile policy hooks that run before/after each task
+        dispatch: max tokens per call, deny-list of tool names, output
+        redaction (e.g. mask API keys before persisting to disk),
+        budget cap per day. Block + audit when a guardrail trips so
+        you can investigate later.
+    </p>
+</div>
+
+<div id="integrations" class="bg-white border rounded-lg p-6 shadow-sm mb-4 scroll-mt-20">
+    <h2 class="text-lg font-semibold text-gray-800 mb-2">Integrations</h2>
+    <p class="text-sm text-gray-500 mb-3">Planned for v3.2+.</p>
+    <p class="text-sm text-gray-500">
+        Connect external systems: Slack / Discord for notifications
+        beyond Telegram, GitHub / GitLab for auto-PR from workflow
+        output, S3 / GCS / SMB for share-folder alternatives. Each
+        integration stores its credentials the same way the Telegram
+        bot does (encrypted at rest, last-4 shown in the UI).
+    </p>
 </div>
 
 <script>
