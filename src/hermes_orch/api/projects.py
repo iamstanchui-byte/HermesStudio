@@ -2365,6 +2365,14 @@ materialized into tasks when they click Run on the dashboard.
       is non-empty): pick one. Or "" to let supervisor pick.
     - `depends_on` (optional, list of step names): upstream
       steps. Empty list = no upstream.
+    - `feedback_to` (optional, list of step names): loop-back
+      signal. When any of the listed steps FAIL, this step is
+      automatically re-dispatched (and its downstream via
+      depends_on is reset to pending). Only fires if the spawned
+      project has `max_iterations > 0`. Use for retry-on-validation-
+      failure patterns (e.g. an "auto-correct" step that re-runs
+      when a downstream "validate" step fails). Empty list = no
+      loop-back. Self-references are silently dropped at run time.
     - `skill` (optional, "" if N/A): canonical skill name from
       `agents_info.skills`. Leave "" if the step uses a generic
       action, not a specific skill.
@@ -2411,6 +2419,10 @@ materialized into tasks when they click Run on the dashboard.
   - All `depends_on` names resolve to steps in the plan (no
     dangling references)
   - No cycles (A→B→A)
+  - `feedback_to` is a list of OTHER STEP NAMES (never IDs)
+  - All `feedback_to` names resolve to steps in the plan (no
+    dangling references; self-references are silently dropped
+    at run time)
   - `agent_role` is in `agents_info.agent_roles` (or empty string)
   - `skill` is in `agents_info.skills` (or empty string)
   - `tool` is in `agents_info.tools` (or empty string)

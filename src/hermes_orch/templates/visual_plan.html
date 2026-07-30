@@ -28,7 +28,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
-<script defer src="/static/visual_plan.js?v=2026-07-29-v1532b"></script>
+<script defer src="/static/visual_plan.js?v=2026-07-30-v194fb"></script>
 <style>
     /* Page-specific layout */
     body { background: #f9fafb; }
@@ -113,6 +113,25 @@
         font-size: 10px;
         margin-top: 3px;
     }
+    /* v1.9.4: loop-back handle (output_2). Red, dashed border,
+       positioned LOWER on the right side so the two outputs are
+       visually distinct. drawflow's default puts both outputs at
+       the same y-coord which makes the two edge kinds ambiguous.
+       Matches visual_workflow.html's .output_2 styling so the
+       two editors look identical. */
+    .vp-node .output_2 {
+        background: #fee2e2 !important;
+        border: 2px dashed #dc2626 !important;
+    }
+    /* v1.9.4: loop-back connection (output_2 source). Red dashed
+       stroke to match the handle color. drawflow stamps the
+       output class name on the connection SVG, so targeting
+       .connection.output_2 overrides the default gray wire. */
+    .vp-wrap svg.output_2 .drawflow-path,
+    .vp-wrap svg.output_2 path {
+        stroke: #dc2626 !important;
+        stroke-dasharray: 4 3 !important;
+    }
     .vp-node-delete {
         position: absolute;
         top: 4px;
@@ -134,10 +153,7 @@
     }
     .vp-node-delete:hover { opacity: 1; background: #fee2e2; color: #b91c1c; }
     /* Wire (dependency) — match the workflow page's default
-       drawflow style (1px gray, no override). Per the user's
-       request 2026-07-27, the plan editor should look like the
-       workflow editor for consistency. The gray wire is enough
-       for the depends_on relationship to read clearly. */
+       drawflow style (1px gray, no override). */
     /* (no explicit wire style — let drawflow's default apply) */
     .vp-side-panel {
         position: absolute;
@@ -216,6 +232,15 @@
         </p>
     </div>
     <div class="flex items-center gap-2">
+        {# v1.9.4: legend explaining the two wire kinds. Mirrors
+           visual_workflow.html's legend so the two editors read
+           the same way. The user said the workflow template's
+           red loop-back line should be copied to the plan editor. #}
+        <span class="text-xs text-gray-500 hidden md:inline">
+            <span class="font-semibold text-gray-600">gray</span> wire = chain (depends_on)
+            ·
+            <span class="font-semibold" style="color: #dc2626;">red dashed</span> wire = loop-back (feedback_to)
+        </span>
         <button onclick="window.vp.toggleJsonMode()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
             title="Toggle the text/JSON editor (for power users who prefer raw JSON)">
@@ -351,6 +376,26 @@
         <textarea id="vp-f-params" placeholder='{"key": "value"}'></textarea>
         <label>Depends on (comma-separated step names)</label>
         <input id="vp-f-deps" type="text" placeholder="(optional)">
+        {# v1.9.4: feedback_to (loop-back). When any of the listed
+           steps fail, this step is re-dispatched (and its downstream
+           via depends_on is reset to pending). Only fires if the
+           spawned project has max_iterations > 0. Mirrors the
+           visual_workflow.html side panel field so the two editors
+           read the same way. #}
+        <label>
+            <span style="color: #dc2626;">Loop-back</span>: re-run me if these steps fail
+            <span class="text-xs text-gray-400 font-normal"
+                title="When any of the listed steps fail, this step is automatically re-dispatched, and all downstream steps (via depends_on) are reset to pending. Only fires if the spawned project has max_iterations > 0. Use for retry-on-validation-failure patterns.">
+                (?)
+            </span>
+        </label>
+        <input id="vp-f-feedback-to" type="text" placeholder="(optional) e.g. step-validate">
+        <p class="text-xs text-gray-500 mt-1">
+            <span class="inline-block w-3 h-3 align-middle rounded-full"
+                style="background: #dc2626; border: 1px dashed #dc2626;"></span>
+            <span class="font-mono text-[10px]">red dashed handle</span>
+            on each card's right side. Empty = no loop-back.
+        </p>
         <div class="flex gap-2 mt-3">
             <button onclick="window.vp.saveStepEdits()"
                 class="flex-1 px-3 py-1.5 text-xs font-medium rounded bg-cyan-600 text-white hover:bg-cyan-700">
@@ -361,6 +406,11 @@
                 Delete
             </button>
         </div>
+        {# v1.9.4: side-panel inline error display. Mirrors
+           visual_workflow.html's #vf-edit-error. Hidden by default;
+           visual_plan.js sets text + removes 'hidden' on validation
+           failure (duplicate name, self-feedback, dangling reference). #}
+        <p id="vp-f-error" class="hidden text-xs text-red-600 mt-2"></p>
     </div>
     {# Minimap removed 2026-07-28 — see CSS comment. #}
     {# JSON view — hidden by default, shown when user clicks "Text" #}

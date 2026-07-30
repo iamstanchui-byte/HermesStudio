@@ -224,22 +224,37 @@
     // 2026-07-27 — without it, dragging a wire updated drawflow's
     // data but not _plan, so Save sent depends_on=[] and the wire
     // disappeared on reload.
+    //
+    // v1.9.4: route by output_class. output_1 (chain) writes to
+    // target.depends_on; output_2 (loop-back) writes to
+    // target.feedback_to. Self-references (target == source) are
+    // silently dropped — a step can't loop back to itself.
     function _onConnectionCreated(connection) {
         const sourceInternal = connection.output_id;
         const targetInternal = connection.input_id;
         const sourceName = _stepNameFromInternalId(sourceInternal);
         const targetName = _stepNameFromInternalId(targetInternal);
         if (!sourceName || !targetName) return;
+        // Self-reference is a no-op. The plan runner also drops
+        // these but dropping here too means we never write the
+        // dangling ref to _plan, so Save round-trips clean.
+        if (sourceName === targetName) return;
         const target = _plan.steps.find(s => s.name === targetName);
         if (!target) return;
-        if (!Array.isArray(target.depends_on)) target.depends_on = [];
-        if (!target.depends_on.includes(sourceName)) {
-            target.depends_on.push(sourceName);
+        // Route by output class: output_2 = feedback_to, default
+        // (and output_1) = depends_on.
+        const outputClass = connection.output_class || 'output_1';
+        const fieldName = outputClass === 'output_2' ? 'feedback_to' : 'depends_on';
+        if (!Array.isArray(target[fieldName])) target[fieldName] = [];
+        if (!target[fieldName].includes(sourceName)) {
+            target[fieldName].push(sourceName);
         }
     }
     // Mirror of _onConnectionCreated for the patched removeConnection.
     // drawflow doesn't fire a "connectionRemoved" event, so we wrap
     // removeConnection (above in init) to call this manually.
+    // v1.9.4: route the removal by output_class so feedback_to
+    // wires are removed from the correct field.
     function _onConnectionRemoved(connection) {
         const sourceInternal = connection.output_id;
         const targetInternal = connection.input_id;
@@ -247,13 +262,18 @@
         const targetName = _stepNameFromInternalId(targetInternal);
         if (!sourceName || !targetName) return;
         const target = _plan.steps.find(s => s.name === targetName);
-        if (!target || !Array.isArray(target.depends_on)) return;
-        target.depends_on = target.depends_on.filter(n => n !== sourceName);
+        if (!target) return;
+        const outputClass = connection.output_class || 'output_1';
+        const fieldName = outputClass === 'output_2' ? 'feedback_to' : 'depends_on';
+        if (!Array.isArray(target[fieldName])) return;
+        target[fieldName] = target[fieldName].filter(n => n !== sourceName);
     }
     // drawflow fires nodeRemoved when a card is removed (Delete key,
     // our X button via removeNodeId, or any removeNode call). Payload
     // is the numeric id as a string. We scrub the step from _plan
     // so the in-memory model matches what's on canvas.
+    // v1.9.4: also scrub from any other step's feedback_to list
+    // so a deleted step doesn't leave dangling references.
     function _onNodeRemoved(numericId) {
         const name = _stepNameFromInternalId(String(numericId));
         if (!name) return;
@@ -262,14 +282,19 @@
             if (Array.isArray(s.depends_on)) {
                 s.depends_on = s.depends_on.filter(n => n !== name);
             }
+            if (Array.isArray(s.feedback_to)) {
+                s.feedback_to = s.feedback_to.filter(n => n !== name);
+            }
         }
         if (_selectedNodeName === name) closeSidePanel();
     }
 
     // ===== Step rendering =====
     function nodeHtml(step) {
-        // Compact card. No skill/feedback_to in the plan (those
-        // are workflow concepts; plans are simpler).
+        // Compact card. No skill in the plan editor side (skill is
+        // available in the side panel for advanced users).
+        // v1.9.4: feedback_to IS supported (it lives in the plan
+        // model and the side panel, like depends_on).
         // The .vp-node-header flex wrapper + <span> name element is
         // INTENTIONALLY copied from the workflow page's _stepToCardHtml
         // (see visual_workflow.js). Reason: chromium's headless font
@@ -285,8 +310,15 @@
         const action = step.action
             ? `<div class="vp-node-action">${escapeHtml(step.action)}</div>`
             : '';
+        // v1.9.4: also show a small loop-back indicator when the
+        // step has any feedback_to wires. Red color matches the
+        // wire so the user can see at a glance "this step listens
+        // for failures".
         const depsHtml = (step.depends_on && step.depends_on.length)
             ? `<div class="vp-node-deps" style="color:#6b7280;font-size:10px;margin-top:3px">← ${step.depends_on.length} dep${step.depends_on.length === 1 ? '' : 's'}</div>`
+            : '';
+        const fbHtml = (step.feedback_to && step.feedback_to.length)
+            ? `<div class="vp-node-fb" style="color:#dc2626;font-size:10px;margin-top:1px;font-weight:500">↻ ${step.feedback_to.length} loop-back${step.feedback_to.length === 1 ? '' : 's'}</div>`
             : '';
         return `
             <div class="vp-node" data-step-name="${escapeHtml(step.name)}">
@@ -297,6 +329,7 @@
                 </div>
                 ${action}
                 ${depsHtml}
+                ${fbHtml}
             </div>
         `;
     }
@@ -308,8 +341,11 @@
         // template applies (white card with cyan border, etc.).
         // Without this, drawflow's default style (cyan #0ff bg,
         // white text) leaks through and the card looks washed-out.
-        // We give each node 1 input + 1 output, so depends_on wires
-        // use the standard 1-to-1 connection.
+        // v1.9.4: each node now has 1 input + 2 outputs:
+        //   - output_1 = chain (depends_on, default gray wire)
+        //   - output_2 = loop-back (feedback_to, red dashed wire)
+        // The visual_workflow.html CSS targets .output_2 for the
+        // red dashed styling; the same CSS lives in visual_plan.html.
         // eslint-disable-next-line no-undef
         _editor.addNode(
             'vp-' + step.name,     // node name (stored as `name` on
@@ -317,7 +353,7 @@
                                    // the key in drawflow's data map
                                    // — see below)
             1,                      // inputs
-            1,                      // outputs
+            2,                      // outputs (output_1 chain, output_2 loop-back)
             x, y,
             'vp-node',              // class applied to .drawflow-node
             { stepName: step.name }, // node data (custom field)
@@ -362,7 +398,27 @@
             // should fire, but the live array length stays 0).
             // Manual push works reliably. So we do the data push
             // + SVG creation by hand instead.
-            _addWireManually(sourceId, targetId);
+            _addWireManually(sourceId, targetId, 'output_1');
+        }
+    }
+
+    // v1.9.4: same as wireDepsForStep but for feedback_to wires.
+    // Uses output_2 (the second output handle on each card) so the
+    // CSS can render the red dashed style. The connection routing
+    // (source → target) is identical to depends_on: source's name is
+    // added to target's feedback_to list. The semantic difference
+    // lives at run time, not at draw time.
+    function wireFeedbackForStep(step) {
+        if (!step.feedback_to) return;
+        for (const fbName of step.feedback_to) {
+            const sourceId = _internalIdByStepName.get(fbName);
+            const targetId = _internalIdByStepName.get(step.name);
+            if (!sourceId || !targetId) continue;
+            // Self-ref is dropped at the run step too, but skip the
+            // wire here so the user doesn't see a confusing wire
+            // that goes nowhere.
+            if (fbName === step.name) continue;
+            _addWireManually(sourceId, targetId, 'output_2');
         }
     }
 
@@ -371,22 +427,32 @@
     // but the in-library version silently no-ops (see wireDepsForStep
     // comment). Tested by: doing the same push by hand in the dev
     // console — array length goes 0 -> 1 as expected.
-    function _addWireManually(sourceId, targetId) {
+    //
+    // v1.9.4: outputClass is the SOURCE output class — 'output_1'
+    // (depends_on) or 'output_2' (feedback_to). The target input
+    // class is always 'input_1' (we only have one input per card).
+    // The SVG gets the output class stamped on it so the CSS can
+    // color depends_on gray and feedback_to red dashed.
+    function _addWireManually(sourceId, targetId, outputClass) {
         if (!_editor) return;
+        outputClass = outputClass || 'output_1';
         try {
-            // Push to data: source's outputs.output_1.connections
+            // Push to data: source's outputs.<outputClass>.connections
             const sourceData = _editor.drawflow.drawflow.Home.data[sourceId];
             const targetData = _editor.drawflow.drawflow.Home.data[targetId];
             if (!sourceData || !targetData) return;
-            const sourceOut = sourceData.outputs.output_1;
+            const sourceOut = sourceData.outputs[outputClass];
             const targetIn = targetData.inputs.input_1;
             if (!sourceOut || !targetIn) return;
-            // Skip if already connected
+            // Skip if already connected (check both classes — a
+            // step can in theory have both depends_on and feedback_to
+            // to the same source, which is OK, but two output_1
+            // wires or two output_2 wires would be a drawflow bug).
             for (const c of sourceOut.connections) {
                 if (c.node == targetId && c.output == 'input_1') return;
             }
             sourceOut.connections.push({node: targetId.toString(), output: 'input_1'});
-            targetIn.connections.push({node: sourceId.toString(), input: 'output_1'});
+            targetIn.connections.push({node: sourceId.toString(), input: outputClass});
             // Create the SVG path (drawflow uses SVG for wires)
             if (_editor.precanvas && _editor.module === 'Home') {
                 const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -396,7 +462,7 @@
                 svg.classList.add("connection");
                 svg.classList.add("node_in_node-" + targetId);
                 svg.classList.add("node_out_node-" + sourceId);
-                svg.classList.add("output_1");
+                svg.classList.add(outputClass);  // output_1 or output_2 — CSS hook
                 svg.classList.add("input_1");
                 svg.appendChild(path);
                 _editor.precanvas.appendChild(svg);
@@ -410,7 +476,7 @@
             if (typeof _editor.dispatch === 'function') {
                 _editor.dispatch("connectionCreated", {
                     output_id: sourceId, input_id: targetId,
-                    output_class: "output_1", input_class: "input_1",
+                    output_class: outputClass, input_class: "input_1",
                 });
             }
         } catch (e) {
@@ -454,9 +520,38 @@
         // refs (a step depending on a step that hasn't been added
         // yet because of position ordering).
         for (const step of _plan.steps) wireDepsForStep(step);
+        // v1.9.4: also wire feedback_to (loop-back, red dashed).
+        // Same retry-once-after-tick pattern.
+        for (const step of _plan.steps) wireFeedbackForStep(step);
+        // v1.9.4: add a `title` attribute to each card's two
+        // output handles so the user can tell them apart. drawflow
+        // auto-creates .output_1 and .output_2 divs inside the
+        // .drawflow-node but doesn't add title attrs; we do it
+        // here. Hint: output_1 is the chain edge, output_2 is the
+        // loop-back edge.
+        _annotateOutputHandles();
         setTimeout(() => {
             for (const step of _plan.steps) wireDepsForStep(step);
+            for (const step of _plan.steps) wireFeedbackForStep(step);
         }, 50);
+    }
+
+    // v1.9.4: stamp `title` attributes on each card's two output
+    // handles so the user can tell them apart without a legend
+    // tour. Mirrors visual_workflow.js's _annotateOutputHandles.
+    function _annotateOutputHandles() {
+        try {
+            const wrap = document.getElementById('vp-canvas-wrap') || document;
+            for (const el of wrap.querySelectorAll('.drawflow-node')) {
+                const o1 = el.querySelector('.output_1');
+                const o2 = el.querySelector('.output_2');
+                if (o1 && !o1.title) o1.title = 'chain (depends_on)';
+                if (o2 && !o2.title) o2.title = 'loop-back (feedback_to)';
+            }
+        } catch (e) {
+            // best-effort, don't break the canvas if drawflow's
+            // internal class names change in a future version
+        }
     }
 
     // ===== Step CRUD =====
@@ -475,6 +570,7 @@
             tool: '',
             required_capability: '',
             depends_on: [],
+            feedback_to: [],  // v1.9.4: loop-back field
             params_template: {},
             output_path: '',
         };
@@ -495,9 +591,11 @@
         // first so the in-memory model is correct even if removeNodeId
         // throws (e.g. on a stale step name).
         _plan.steps = _plan.steps.filter(s => s.name !== name);
-        // Scrub from any other step's depends_on
+        // Scrub from any other step's depends_on AND feedback_to
+        // (v1.9.4) so a deleted step doesn't leave dangling refs.
         for (const s of _plan.steps) {
             if (s.depends_on) s.depends_on = s.depends_on.filter(d => d !== name);
+            if (s.feedback_to) s.feedback_to = s.feedback_to.filter(d => d !== name);
         }
         // Remove the card from the canvas. drawflow expects the
         // DOM id (e.g. "node-3"), NOT the step name. We look up
@@ -536,6 +634,13 @@
         $('vp-f-output').value = step.output_path || '';
         $('vp-f-params').value = JSON.stringify(step.params_template || {}, null, 2);
         $('vp-f-deps').value = (step.depends_on || []).join(', ');
+        // v1.9.4: feedback_to (loop-back). Same comma-separated
+        // format as depends_on; user can also drag a red dashed
+        // wire from the card's output_2 handle.
+        $('vp-f-feedback-to').value = (step.feedback_to || []).join(', ');
+        // Hide the inline error from any prior failed save.
+        const errEl = $('vp-f-error');
+        if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
         $('vp-side-panel').classList.remove('hidden');
         // Highlight the selected node visually. drawflow wraps the
         // node in <div id="node-vp-{name}" class="parent-node
@@ -558,23 +663,26 @@
         const step = _plan.steps.find(s => s.name === _selectedNodeName);
         if (!step) return;
         const newName = ($('vp-f-name').value || '').trim();
-        if (!newName) { showBanner('Name required', 'error'); return; }
+        if (!newName) { _showSideError('Name required'); return; }
         if (!KEBAB_RE.test(newName)) {
-            showBanner('Name must be kebab-case (lowercase letters, digits, hyphens)', 'error');
+            _showSideError('Name must be kebab-case (lowercase letters, digits, hyphens)');
             return;
         }
         // If name changed, check uniqueness + update refs
         if (newName !== step.name) {
             if (_plan.steps.some(s => s.name === newName)) {
-                showBanner('A step with that name already exists', 'error');
+                _showSideError('A step with that name already exists');
                 return;
             }
             const oldName = step.name;
             step.name = newName;
-            // Update depends_on in other steps
+            // Update depends_on AND feedback_to (v1.9.4) in other steps
             for (const s of _plan.steps) {
                 if (s.depends_on) {
                     s.depends_on = s.depends_on.map(d => d === oldName ? newName : d);
+                }
+                if (s.feedback_to) {
+                    s.feedback_to = s.feedback_to.map(d => d === oldName ? newName : d);
                 }
             }
             // Update the canvas node id
@@ -583,7 +691,6 @@
             // drawflow 0.0.59 doesn't have a public rename API;
             // the easiest reliable way is to remove + re-add the
             // node with the new id, preserving position.
-            const pos = _editor.nodeId ? null : null;  // we don't track per-node position here
             try { _editor.removeNode(oldId); } catch (e) {}
             // Re-render the whole canvas (preserves deps via the
             // model). Simple, robust. For 10+ step plans this
@@ -600,7 +707,7 @@
         const paramsRaw = $('vp-f-params').value.trim();
         if (paramsRaw) {
             try { step.params_template = JSON.parse(paramsRaw); }
-            catch (e) { showBanner('Params must be valid JSON: ' + e.message, 'error'); return; }
+            catch (e) { _showSideError('Params must be valid JSON: ' + e.message); return; }
         } else {
             step.params_template = {};
         }
@@ -609,14 +716,36 @@
         step.depends_on = depsRaw
             ? depsRaw.split(',').map(s => s.trim()).filter(s => s)
             : [];
+        // v1.9.4: feedback_to (loop-back). Same format. Self-refs
+        // are dropped silently — a step can't loop back to itself.
+        const fbRaw = $('vp-f-feedback-to').value.trim();
+        step.feedback_to = fbRaw
+            ? fbRaw.split(',').map(s => s.trim()).filter(s => s && s !== step.name)
+            : [];
         // Re-render the canvas (to update the node card content
-        // + the wires from the new depends_on). For Phase C this
-        // is acceptable; Phase C+ will patch in place.
+        // + the wires from the new depends_on / feedback_to).
         renderAllSteps();
         // Re-open the side panel on the same step (render cleared
         // the selection).
         openSidePanel(step.name);
         showBanner('Step saved', 'success');
+    }
+
+    // v1.9.4: side-panel inline error display. Mirrors
+    // visual_workflow.html's #vf-edit-error. Used for soft errors
+    // (validation failures) that don't justify a top-of-page
+    // banner. The error sticks until the next successful save
+    // (openSidePanel hides it).
+    function _showSideError(msg) {
+        const errEl = $('vp-f-error');
+        if (!errEl) {
+            // Fallback: no error element in DOM (older template),
+            // use the banner.
+            showBanner(msg, 'error');
+            return;
+        }
+        errEl.textContent = msg;
+        errEl.classList.remove('hidden');
     }
 
     // ===== Min-map (basic) =====
@@ -809,6 +938,20 @@
             for (const d of s.depends_on) {
                 if (!names.has(d)) {
                     issues.push('Step "' + s.name + '" depends on unknown step "' + d + '"');
+                }
+            }
+        }
+        // v1.9.4: check feedback_to. Same rules as depends_on
+        // (must be a known step name; self-ref is a silent no-op
+        // at run time, but we still surface it as a client-side
+        // warning so the user can see it before saving).
+        for (const s of _plan.steps) {
+            if (!s.feedback_to) continue;
+            for (const f of s.feedback_to) {
+                if (f === s.name) {
+                    issues.push('Step "' + s.name + '" loops back to itself (silently dropped at run)');
+                } else if (!names.has(f)) {
+                    issues.push('Step "' + s.name + '" feedback_to references unknown step "' + f + '"');
                 }
             }
         }

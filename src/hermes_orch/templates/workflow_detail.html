@@ -91,18 +91,31 @@
                     <code class="text-emerald-700">{{ v.name }}</code>
                     <span class="text-xs text-gray-500">({{ v.type }}{% if v.required %}, required{% endif %})</span>
                     {% if v.description %}<span class="text-xs text-gray-400 ml-1">— {{ v.description }}</span>{% endif %}
+                    {% if v.default is not none and v.default != '' %}
+                    {# v1.9.4: small "default" pill so the user knows
+                       what's pre-filled below. Clear the field to
+                       revert to the workflow's stored default. #}
+                    <span class="text-xs text-emerald-600 ml-1"
+                        title="Pre-filled from the workflow's default value. Clear the field to use the value as-is.">↻ default</span>
+                    {% endif %}
                 </label>
                 {% if v.type == 'boolean' %}
                 <select name="var-{{ v.name }}" class="block w-full border rounded px-2 py-1 text-sm">
                     <option value="">(default: {{ v.default or 'unset' }})</option>
-                    <option value="true">true</option>
-                    <option value="false">false</option>
+                    <option value="true"{% if v.default == 'true' or v.default == true %} selected{% endif %}>true</option>
+                    <option value="false"{% if v.default == 'false' or v.default == false %} selected{% endif %}>false</option>
                 </select>
                 {% elif v.type == 'number' %}
-                <input type="number" name="var-{{ v.name }}" placeholder="{{ v.default or '' }}"
+                {# v1.9.4: pre-fill with default (was placeholder-only).
+                   User can clear the field to use the server default.
+                   The submit handler (line ~169) skips empty values, so
+                   cleared = "use default". #}
+                <input type="number" name="var-{{ v.name }}"
+                    value="{{ v.default if v.default is not none else '' }}"
                     class="block w-full border rounded px-2 py-1 text-sm font-mono">
                 {% else %}
-                <input type="text" name="var-{{ v.name }}" placeholder="{{ v.default or '' }}"
+                <input type="text" name="var-{{ v.name }}"
+                    value="{{ v.default if v.default is not none else '' }}"
                     class="block w-full border rounded px-2 py-1 text-sm font-mono">
                 {% endif %}
             </div>

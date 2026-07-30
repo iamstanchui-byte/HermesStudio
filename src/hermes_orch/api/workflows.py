@@ -85,6 +85,24 @@ class PromoteToWorkflowBody(BaseModel):
 class WorkflowSummary(BaseModel):
     id: str
     name: str
+    # TODO(v2.0 — workflow versioning UI): the workflow_packages
+    # table has a `version` column (text, default '0.1.0') and
+    # promote updates it on each synthesis. UI surfaces the
+    # current value as `v{{ workflow.version }}` on the detail
+    # page. What's MISSING for v2.0:
+    #   - a version-history view (per-name, all versions over
+    #     time, ordered by created_at)
+    #   - a side-by-side diff (step_template + variables) between
+    #     any two versions
+    #   - a "rollback to vN" action that creates a new package
+    #     from the historical step_template (preserves audit
+    #     trail — never overwrites a version in place)
+    #   - a "compare with current source project" diff so the
+    #     operator can see when a workflow has drifted from the
+    #     project it was synthesized from
+    # Defer until a user actually asks. The data model already
+    # supports multiple rows per name, so the UI is the only
+    # missing piece.
     version: str
     description: str
     source_project_id: str | None

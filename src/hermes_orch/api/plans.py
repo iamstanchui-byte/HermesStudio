@@ -86,6 +86,16 @@ class PlanStep(BaseModel):
     tool: str = ""   # canonical tool name (not row id)
     required_capability: str = ""
     depends_on: list[str] = Field(default_factory=list)
+    # v1.9.4 (2026-07-30): feedback_to mirrors workflow_packages
+    # step_template. List of OTHER STEP NAMES in the same plan.
+    # When any of the listed steps fail, this step is re-dispatched
+    # (and its downstream via depends_on is reset to pending). Only
+    # fires when the spawned project has max_iterations > 0.
+    # Server-side validator drops self-references and dangling
+    # names at /plan/run time (matches the workflow apply path).
+    # Visual plan editor uses the red output_2 handle / red dashed
+    # wire to draw this (mirroring the visual workflow builder).
+    feedback_to: list[str] = Field(default_factory=list)
     params_template: dict[str, Any] = Field(default_factory=dict)
     output_path: str = ""
 
@@ -806,6 +816,35 @@ async def run_project_plan(
                 )
             except Exception:
                 pass
+        # v1.9.4: resolve feedback_to (step name → task id), with
+        # the same self-reference + dangling-name rules as
+        # depends_on. A step can't loop back to itself (no-op),
+        # and a name that resolves to neither a workflow-internal
+        # step nor an existing project task is dropped with an
+        # audit event (matches apply-workflow's behavior).
+        fb_tids: list[str] = []
+        unresolved_fb: list[str] = []
+        for f in (step.feedback_to or []):
+            if f == step.name:
+                continue  # self-ref is a silent no-op
+            if f in name_to_tid:
+                fb_tids.append(name_to_tid[f])
+            elif f in existing_name_to_tid:
+                fb_tids.append(existing_name_to_tid[f])
+            else:
+                unresolved_fb.append(f)
+        if unresolved_fb:
+            try:
+                from hermes_orch.core.audit import audit_log as _al_fb
+                await _al_fb(
+                    db, "task.feedback_to_unresolved",
+                    actor="plan-runner", project_id=project_id, task_id=tid,
+                    payload={"step_name": step.name,
+                             "unresolved_feedback": unresolved_fb,
+                             "source": "plan_run"},
+                )
+            except Exception:
+                pass
         # Apply optional name suffix (helps users tell runs apart
         # in the UI when re-running). Suffix is just appended, no
         # kebab validation — operator override.
@@ -835,7 +874,7 @@ async def run_project_plan(
             "timeout_seconds": 1800,
             "output_path": step.output_path or "",
             "required_capability": step.required_capability or None,
-            "feedback_to": json.dumps([]),
+            "feedback_to": json.dumps(fb_tids),
             "is_single_task": 0,
             "archived": 0,
         })
@@ -1193,6 +1232,12 @@ async def generate_plan_from_llm(
         # — we treat them as opaque names; the validator at save time
         # will check they exist in the plan).
         deps = t.get("depends_on") or []
+        # v1.9.4: planner may also return feedback_to (loop-back).
+        # Pass through if present; default to empty list.
+        feedback = t.get("feedback_to") or []
+        if not isinstance(feedback, list):
+            feedback = []
+        feedback = [str(f) for f in feedback if f]
         # params may be a JSON string or dict. Normalise to dict.
         raw_params = t.get("params") or {}
         if isinstance(raw_params, str):
@@ -1210,6 +1255,7 @@ async def generate_plan_from_llm(
             tool="",
             required_capability=str(t.get("required_capability") or ""),
             depends_on=[str(d) for d in deps],
+            feedback_to=feedback,
             params_template=raw_params,
             output_path=str(t.get("output_path") or ""),
         ))
