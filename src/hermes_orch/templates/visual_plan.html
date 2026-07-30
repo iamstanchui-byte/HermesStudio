@@ -28,7 +28,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
-<script defer src="/static/visual_plan.js?v=2026-07-30-v194fb"></script>
+<script defer src="/static/visual_plan.js?v=2026-07-30-v194fb1"></script>
 <style>
     /* Page-specific layout */
     body { background: #f9fafb; }
@@ -126,9 +126,13 @@
     /* v1.9.4: loop-back connection (output_2 source). Red dashed
        stroke to match the handle color. drawflow stamps the
        output class name on the connection SVG, so targeting
-       .connection.output_2 overrides the default gray wire. */
-    .vp-wrap svg.output_2 .drawflow-path,
-    .vp-wrap svg.output_2 path {
+       .vp-canvas-wrap svg.output_2 overrides the default gray wire.
+       (Bug found 2026-07-30: v1.9.4 used .vp-wrap which doesn't
+       exist — the wrap is `.vp-canvas-wrap` not `.vp-wrap`. The
+       wrap tag is `<div class="vp-canvas-wrap" id="vp-canvas-wrap">`.
+       Selector must use the actual class name.) */
+    .vp-canvas-wrap svg.output_2 .drawflow-path,
+    .vp-canvas-wrap svg.output_2 path {
         stroke: #dc2626 !important;
         stroke-dasharray: 4 3 !important;
     }
@@ -227,8 +231,20 @@
             </a>
             <span class="text-gray-400 font-normal text-base">/ plan</span>
         </h1>
-        <p class="text-xs text-gray-500 mt-0.5">
-            Visual plan editor (Phase C) · design-time only · changes here don't dispatch until you click "Generate tasks"
+        <p class="text-xs text-gray-500 mt-0.5 flex items-center gap-2 flex-wrap">
+            <span>Visual plan editor (Phase C) · design-time only · changes here don't dispatch until you click "Generate tasks"</span>
+            {# v1.9.4.1: explicit project id display. User feedback
+               "在visual plan 中可不可以加個project id 顯示". The id
+               is also in the URL but a visible chip makes
+               it copyable + harder to miss when sharing the page.
+               Monospace + slightly muted so it doesn't compete
+               with the project name. #}
+            <button type="button"
+                onclick="navigator.clipboard.writeText('{{ project.id }}'); this.textContent='✓ copied'; setTimeout(() => this.textContent='{{ project.id }}', 1200);"
+                class="font-mono text-[10px] text-gray-400 hover:text-blue-600 hover:bg-blue-50 px-1.5 py-0.5 rounded border border-gray-200"
+                title="Click to copy project id">
+                {{ project.id }}
+            </button>
         </p>
     </div>
     <div class="flex items-center gap-2">
