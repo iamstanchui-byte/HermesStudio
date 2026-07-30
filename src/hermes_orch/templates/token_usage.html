@@ -190,7 +190,16 @@
            into adjacent sections (e.g. the daily chart above). The
            wrapper constrains the absolute center text to the donut. #}
         <div class="flex items-center gap-4">
-            <div style="position: relative; width: 140px; height: 140px; flex-shrink: 0;">
+            {# v3.0.1 follow-up: overflow:hidden added as defense-in-depth.
+               Playwright test (headless Chromium 1440x900) confirms
+               .donut-center is correctly contained at box (859, 1024, 140, 140)
+               with the existing wrapper fix. overflow:hidden is a belt-and-
+               suspenders guard in case any browser still escapes (e.g. during
+               a partial page reload that leaves the donut temporarily
+               unrendered). The user reported a "14.69M floating in middle of
+               daily chart" which is most likely a reload-transition artifact;
+               overflow:hidden guarantees the text stays clipped regardless. #}
+            <div style="position: relative; width: 140px; height: 140px; flex-shrink: 0; overflow: hidden; border-radius: 50%;">
                 <div class="donut" id="provider-donut"
                      style="background: conic-gradient(
                          {% set ns = namespace(segments=[]) %}

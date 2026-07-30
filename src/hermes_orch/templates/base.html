@@ -69,14 +69,35 @@
             border-bottom: 1px solid #f1f5f9;
             min-height: 56px;
         }
+        /* HermesNexus brand logo (v3.0.1) — full wordmark in expanded
+           mode, hexagon-only icon in collapsed mode. Both swap to the
+           dark variant under body.dark via background-image. Uses
+           background-image instead of <img src> so a single class can
+           swap between 4 image variants via CSS only. */
         .sidebar-logo {
-            width: 28px; height: 28px;
-            background: #3b82f6; color: #fff;
-            border-radius: 6px;
-            display: flex; align-items: center; justify-content: center;
-            font-weight: 700; font-size: 14px;
             flex-shrink: 0;
+            background-repeat: no-repeat;
+            background-position: center;
+            background-size: contain;
         }
+        .sidebar-logo-full {
+            display: block;
+            width: 132px; height: 32px;
+            background-image: url('/static/logos/hermes-nexus-light.png?v=20260731-2100');
+        }
+        .sidebar-logo-icon {
+            display: none;
+            width: 30px; height: 30px;
+            background-image: url('/static/logos/hermes-nexus-icon-light.png?v=20260731-2100');
+        }
+        body.dark .sidebar-logo-full {
+            background-image: url('/static/logos/hermes-nexus-dark.png?v=20260731-2100');
+        }
+        body.dark .sidebar-logo-icon {
+            background-image: url('/static/logos/hermes-nexus-icon-dark.png?v=20260731-2100');
+        }
+        body.sidebar-collapsed .sidebar-logo-full { display: none; }
+        body.sidebar-collapsed .sidebar-logo-icon { display: block; }
         .sidebar-title {
             font-weight: 600; color: #1f2937; font-size: 0.9rem;
             white-space: nowrap; overflow: hidden;
@@ -501,8 +522,15 @@
        state persists in localStorage. #}
     <aside class="sidebar">
         <div class="sidebar-header">
-            <div class="sidebar-logo">H</div>
-            <div class="sidebar-title">Hermes Orchestrator</div>
+            {# v3.0.1: full wordmark shown in expanded mode, icon-only
+               shown when sidebar is collapsed. CSS swaps the variant
+               between light and dark based on body.dark class. The
+               text title is removed because the wordmark already says
+               "HERMES NEXUS" — showing both would crowd the 220px
+               sidebar and look redundant. In collapsed mode, the icon
+               alone fits the 64px sidebar. #}
+            <div class="sidebar-logo sidebar-logo-full" role="img" aria-label="Hermes Orchestrator"></div>
+            <div class="sidebar-logo sidebar-logo-icon" role="img" aria-label="Hermes Orchestrator"></div>
         </div>
         <nav class="sidebar-nav">
             <a href="/projects" class="sidebar-item {% if active_page == 'projects' or active_page == 'project_detail' or active_page == 'visual_project' %}active{% endif %}">
