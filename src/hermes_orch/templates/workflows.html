@@ -10,6 +10,15 @@
             and a variables list. Click a workflow below to view, edit, run with variables, or delete it.
         </p>
     </div>
+    {# v2.3 (2026-07-31): bulk delete. Disabled until ≥1 row is selected.
+       The (N) suffix shows the live count. Click → confirm dialog with
+       the list of names to be deleted → DELETE each in turn → reload. #}
+    <button id="wf-bulk-delete-btn" type="button" disabled
+        onclick="wfDeleteSelected()"
+        class="px-3 py-1.5 text-xs font-medium rounded border border-red-300 text-red-700 hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed"
+        title="Delete the selected workflows (cannot be undone)">
+        🗑️ Delete selected (0)
+    </button>
 </div>
 
 {% if workflows %}
@@ -17,17 +26,29 @@
     <table class="w-full text-sm">
         <thead class="bg-gray-50 border-b">
             <tr>
+                <th class="text-left px-3 py-2 w-8">
+                    <input type="checkbox" id="wf-select-all"
+                        onchange="wfToggleAll(this)"
+                        title="Select / deselect all"
+                        class="cursor-pointer">
+                </th>
                 <th class="text-left px-3 py-2 font-medium text-gray-700">Name</th>
                 <th class="text-left px-3 py-2 font-medium text-gray-700">Description</th>
                 <th class="text-left px-3 py-2 font-medium text-gray-700">Source project</th>
                 <th class="text-right px-3 py-2 font-medium text-gray-700">Steps</th>
                 <th class="text-right px-3 py-2 font-medium text-gray-700">Vars</th>
                 <th class="text-left px-3 py-2 font-medium text-gray-700">Updated</th>
+                <th class="text-right px-3 py-2 font-medium text-gray-700 w-16">Action</th>
             </tr>
         </thead>
         <tbody>
             {% for w in workflows %}
             <tr class="border-b last:border-0 hover:bg-gray-50">
+                <td class="px-3 py-2">
+                    <input type="checkbox" class="wf-row-cb cursor-pointer"
+                        value="{{ w.id }}" data-name="{{ w.name }}"
+                        onchange="wfOnRowChange(this)">
+                </td>
                 <td class="px-3 py-2 font-mono">
                     <a href="/workflows/{{ w.id }}" class="text-blue-600 hover:underline">{{ w.name }}</a>
                     <span class="text-xs text-gray-400 ml-1">v{{ w.version }}</span>
@@ -45,6 +66,14 @@
                 <td class="px-3 py-2 text-right tabular-nums">{{ w.step_count }}</td>
                 <td class="px-3 py-2 text-right tabular-nums">{{ w.variable_count }}</td>
                 <td class="px-3 py-2 text-xs text-gray-500">{{ (w.updated_at or '')[:19] }}</td>
+                <td class="px-3 py-2 text-right">
+                    <button type="button"
+                        onclick="wfDeleteOne('{{ w.id }}', '{{ w.name | e }}')"
+                        class="text-red-600 hover:text-red-800 hover:bg-red-50 rounded px-2 py-0.5 text-xs font-medium"
+                        title="Delete this workflow (cannot be undone)">
+                        Delete
+                    </button>
+                </td>
             </tr>
             {% endfor %}
         </tbody>
@@ -69,5 +98,117 @@
         <li class="text-blue-700 italic">Click "▶ Run with variables" on the workflow detail page to spawn a fresh project with substituted values. Or "📥 Apply" on a project page to import the workflow's steps into an existing project as new tasks (additive — existing tasks are kept).</li>
     </ol>
 </div>
+
+<script>
+    // v2.3 (2026-07-31): workflow list bulk select + delete.
+    // Tracks which rows are checked, toggles the bulk-delete button
+    // state, and handles both bulk + single delete via the same
+    // fetch loop. Server endpoint is DELETE /api/workflows/{id} —
+    // already exists. Page reloads on success so the user sees
+    // the fresh list without a partial-update dance.
+
+    // Map from id -> name (read from the row's data attr). Populated
+    // on the first row change so we can show names in the confirm.
+    const _wfNameById = new Map();
+
+    function _wfCollectNames() {
+        // Pull from the DOM (cheaper than passing names around). This
+        // also serves as the canonical "what's selected" list — the
+        // checkbox state IS the source of truth, the buttons react
+        // to it on every change.
+        const ids = [];
+        const names = [];
+        document.querySelectorAll('.wf-row-cb').forEach((cb) => {
+            if (cb.checked) {
+                ids.push(cb.value);
+                names.push(cb.getAttribute('data-name') || cb.value);
+            }
+        });
+        return { ids, names };
+    }
+
+    function _wfUpdateBulkButton() {
+        const btn = document.getElementById('wf-bulk-delete-btn');
+        if (!btn) return;
+        const n = _wfCollectNames().ids.length;
+        btn.disabled = n === 0;
+        // Update the count in the label.
+        btn.textContent = `🗑️ Delete selected (${n})`;
+        // Also keep the "select all" header checkbox in sync.
+        const sa = document.getElementById('wf-select-all');
+        const total = document.querySelectorAll('.wf-row-cb').length;
+        if (sa) {
+            sa.checked = (n === total && total > 0);
+            sa.indeterminate = (n > 0 && n < total);
+        }
+    }
+
+    function wfOnRowChange(cb) {
+        _wfNameById.set(cb.value, cb.getAttribute('data-name') || cb.value);
+        _wfUpdateBulkButton();
+    }
+
+    function wfToggleAll(headerCb) {
+        document.querySelectorAll('.wf-row-cb').forEach((cb) => {
+            cb.checked = headerCb.checked;
+        });
+        _wfUpdateBulkButton();
+    }
+
+    async function wfDeleteOne(id, name) {
+        if (!confirm(`Delete workflow "${name}"?\n\nThis cannot be undone.`)) return;
+        try {
+            const r = await fetch(`/api/workflows/${encodeURIComponent(id)}`, { method: 'DELETE' });
+            if (r.ok) {
+                window.location.reload();
+            } else {
+                const text = await r.text();
+                alert(`Delete failed (${r.status}): ${text || r.statusText}`);
+            }
+        } catch (e) {
+            alert('Delete failed: ' + e.message);
+        }
+    }
+
+    async function wfDeleteSelected() {
+        const { ids, names } = _wfCollectNames();
+        if (ids.length === 0) return;
+        // Show the names so the user can sanity-check before
+        // pulling the trigger. Cap the list at 20 so the dialog
+        // doesn't get out of hand for huge selections.
+        const preview = names.length <= 20
+            ? names.join('\n')
+            : names.slice(0, 20).join('\n') + `\n…and ${names.length - 20} more`;
+        if (!confirm(
+            `Delete ${ids.length} workflow(s)?\n\n${preview}\n\n` +
+            `This cannot be undone. Source projects are not affected.`
+        )) return;
+        // Disable the button + show progress in the label so the
+        // user can see something is happening.
+        const btn = document.getElementById('wf-bulk-delete-btn');
+        btn.disabled = true;
+        const origLabel = btn.textContent;
+        let ok = 0, fail = 0;
+        for (const id of ids) {
+            btn.textContent = `🗑️ Deleting… ${ok + fail + 1}/${ids.length}`;
+            try {
+                const r = await fetch(`/api/workflows/${encodeURIComponent(id)}`, { method: 'DELETE' });
+                if (r.ok) ok++;
+                else fail++;
+            } catch (e) {
+                fail++;
+            }
+        }
+        // Final report + reload. Use a short confirm-style alert
+        // so the user sees the count of failures before we nuke
+        // the page state.
+        if (fail === 0) {
+            window.location.reload();
+        } else {
+            alert(`Deleted ${ok} workflow(s). ${fail} failed — see server log. Reloading anyway.`);
+            window.location.reload();
+        }
+    }
+</script>
 
 {% endblock %}
