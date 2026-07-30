@@ -1606,12 +1606,12 @@ def start(
                         )
             except Exception as e:
                 click.echo(f"[daemon] hermes sessions delete {sid} error: {e}")
-            # Always ack — even on failure, we don't want the row stuck
+            # Always ack -- even on failure, we don't want the row stuck
             # in pending_cleanup. The audit log retains the failure
             # context via the stdout/stderr we just printed.
             try:
                 # v1.9 fix: path was a literal `{}` template (not f-string)
-                # which produced a signature bound to the WRONG path —
+                # which produced a signature bound to the WRONG path --
                 # the server would 401 every cleanup-ack. Caught when
                 # flipping HERMES_HMAC_REQUIRED=true exposed the
                 # hmac_auth_failed events at full volume. Now the path
@@ -1628,9 +1628,16 @@ def start(
     def _claim(task_id: str) -> bool:
         """Atomically flip task from 'assigned' to 'running'."""
         try:
+            # v1.9.1 fix: same class of bug as cleanup-ack (v1.9).
+            # The path arg must be the f-string-interpolated actual
+            # path, not the literal `{}` template. Server's
+            # require_hmac_auth computes the signature over
+            # request.url.path; if the wrapper signs a different
+            # string, every call 401s.
+            _start_path = f"/api/tasks/{task_id}/start"
             r = httpx.post(
-                f"{orchestrator_url}/api/tasks/{task_id}/start",
-                headers=_auth_headers('POST', '/api/tasks/{task_id}/start'),
+                f"{orchestrator_url}{_start_path}",
+                headers=_auth_headers('POST', _start_path),
                 timeout=10,
             )
             if r.status_code != 200:
@@ -1643,9 +1650,15 @@ def start(
 
     def _submit_result(task_id: str, result: dict) -> bool:
         try:
+            # v1.9.1 fix: see _claim above. Same path-template bug
+            # in the result submission. Pre-fix, the wrapper
+            # would submit the LLM result and the server would
+            # 401; the task would stay in 'running' until
+            # timeout kicked in.
+            _result_path = f"/api/tasks/{task_id}/result"
             r = httpx.post(
-                f"{orchestrator_url}/api/tasks/{task_id}/result",
-                headers=_auth_headers('POST', '/api/tasks/{task_id}/result'),
+                f"{orchestrator_url}{_result_path}",
+                headers=_auth_headers('POST', _result_path),
                 json=result,
                 timeout=10,
             )
