@@ -580,22 +580,30 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
     ]
     # v3.0: by_provider (7d) — group by base_url. The base_url column
     # holds the LLM API endpoint (e.g. https://api.openai.com/v1, or a
-    # local vLLM URL). We collapse the full URL to a friendly label by
-    # taking the hostname minus "www." — enough for humans to know
-    # "OpenAI" vs "Anthropic" vs "Local vLLM" without showing the
-    # full path. A NULL base_url becomes "(unknown)" so we still count
+    # local vLLM URL). We strip the scheme and trailing slash, then
+    # keep the path so distinct endpoints on the same host
+    # (e.g. api.example.com/anthropic vs api.example.com/v1, a
+    # common pattern when the same proxy serves both Anthropic- and
+    # OpenAI-compatible APIs) show as separate rows. We strip "www."
+    # only — leaving the rest of the path intact so the admin can tell
+    # "api.minimax.io/anthropic" apart from "api.minimax.io/v1" at
+    # a glance. A NULL base_url becomes "(unknown)" so we still count
     # it rather than dropping on the floor.
     def _provider_label(base_url: str | None) -> str:
         if not base_url:
             return "(unknown)"
-        try:
-            from urllib.parse import urlparse
-            host = urlparse(base_url).hostname or base_url
-        except Exception:
-            host = base_url
-        if host.startswith("www."):
-            host = host[4:]
-        return host or "(unknown)"
+        s = str(base_url).strip()
+        # Strip scheme (http://, https://, etc.)
+        for scheme in ("https://", "http://", "wss://", "ws://"):
+            if s.lower().startswith(scheme):
+                s = s[len(scheme):]
+                break
+        # Strip trailing slash
+        s = s.rstrip("/")
+        # Strip "www." prefix only
+        if s.lower().startswith("www."):
+            s = s[4:]
+        return s or "(unknown)"
 
     provider_rows = await db.fetchall(
         "SELECT base_url, SUM(total_tokens) as total, COUNT(*) as calls "

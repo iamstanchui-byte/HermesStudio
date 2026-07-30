@@ -183,28 +183,36 @@
         {% if token_usage.by_provider %}
         {% set total_prov = t7.total %}
         {% set providers_data = token_usage.by_provider %}
+        {# Donut + center are wrapped in a positioned container. Without
+           the wrapper, the center text (position: absolute) would
+           attach to the nearest positioned ancestor (.card or the
+           .breakdown-grid-2x2 grid), escaping the donut and bleeding
+           into adjacent sections (e.g. the daily chart above). The
+           wrapper constrains the absolute center text to the donut. #}
         <div class="flex items-center gap-4">
-            <div class="donut" id="provider-donut"
-                 style="background: conic-gradient(
-                     {% set ns = namespace(acc=0, segments=[]) %}
-                     {% for p in providers_data %}
-                         {% set pct = (p.total / total_prov * 100) if total_prov else 0 %}
-                         {% set _ = ns.segments.append(p.provider ~ ' ' ~ pct ~ '%') %}
-                     {% endfor %}
-                     {{ ns.segments|join(', ') }}
-                     #f1f5f9 0
-                 )">
-            </div>
-            <div class="donut-center">
-                <div class="big">{{ t7.total|format_tokens }}</div>
-                <div class="small">Total tokens</div>
+            <div style="position: relative; width: 140px; height: 140px; flex-shrink: 0;">
+                <div class="donut" id="provider-donut"
+                     style="background: conic-gradient(
+                         {% set ns = namespace(segments=[]) %}
+                         {% for p in providers_data %}
+                             {% set pct = (p.total / total_prov * 100) if total_prov else 0 %}
+                             {% set _ = ns.segments.append(p.provider ~ ' ' ~ pct ~ '%') %}
+                         {% endfor %}
+                         {{ ns.segments|join(', ') }}
+                         #f1f5f9 0
+                     )">
+                    <div class="donut-center">
+                        <div class="big">{{ t7.total|format_tokens }}</div>
+                        <div class="small">Total tokens</div>
+                    </div>
+                </div>
             </div>
             <div class="flex-1 space-y-1.5 text-xs">
                 {% for p in providers_data %}
                 {% set pct = (p.total / total_prov * 100) if total_prov else 0 %}
                 <div class="flex items-center gap-2">
                     <span style="display:inline-block;width:8px;height:8px;background:{{ ['#3b82f6', '#a78bfa', '#10b981', '#f59e0b', '#ef4444', '#06b6d4'][loop.index0 % 6] }};border-radius:2px;"></span>
-                    <span class="flex-1 text-gray-700">{{ p.provider }}</span>
+                    <span class="flex-1 text-gray-700" title="{{ p.provider }}">{{ p.provider }}</span>
                     <span class="text-gray-500">{{ pct|round(1) }}%</span>
                 </div>
                 {% endfor %}
