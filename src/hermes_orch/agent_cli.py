@@ -21,6 +21,7 @@ import os
 import sys
 import platform
 import re
+import subprocess
 import time
 from pathlib import Path
 
@@ -382,6 +383,86 @@ def _hmac_headers(
         "X-Timestamp": ts,
         "X-Signature": sig,
     }
+
+
+# ===== v1.9.3 subprocess timeout helper =====
+#
+# Previously, _run_task did `proc.wait(timeout=timeout)` and on
+# TimeoutExpired called `proc.kill()`. Two problems:
+#
+#   1. `timeout` was a CLI-level constant (--timeout default 1800).
+#      The task model has its own `timeout_seconds` field (per-task,
+#      also defaulting to 1800 in the schema), but the wrapper
+#      ignored it. A supervisor-set 1200s task would still get the
+#      full 1800s before being killed.
+#
+#   2. `proc.kill()` is SIGKILL/TerminateProcess — immediate, no
+#      chance for hermes to flush its session, write a graceful
+#      shutdown, or release file locks. Better practice: SIGTERM
+#      first (grace_seconds), then SIGKILL only if it ignored
+#      SIGTERM. Same shape as Linux/Unix process supervision.
+#
+# This helper centralizes both fixes. It returns (rc, timed_out)
+# so the caller can build the right failure result message. It
+# is module-level (not nested in start()) so it can be unit-tested
+# directly with a real subprocess — no daemon required.
+DEFAULT_SUBPROCESS_GRACE_SEC = 5
+MAX_TASK_TIMEOUT_SEC = 1800  # 30 min hard cap (defense in depth)
+
+
+def _run_subprocess_with_timeout(
+    proc: "subprocess.Popen",
+    *,
+    timeout: int,
+    grace_seconds: int = DEFAULT_SUBPROCESS_GRACE_SEC,
+) -> tuple[int | None, bool]:
+    """Wait for `proc` to exit, with a hard timeout.
+
+    Behavior:
+      - If the process exits within `timeout` seconds, returns
+        (returncode, False).
+      - If the process is still alive after `timeout` seconds:
+          1. Send SIGTERM/terminate() (graceful shutdown)
+          2. Wait up to `grace_seconds` for clean exit
+          3. If still alive, send SIGKILL/kill() and wait 2s for
+             OS to reap
+        Returns (None, True). The caller is responsible for the
+        "task failed: timeout" result message.
+
+    Why terminate-then-kill (not just kill):
+      - hermes-agent on a clean SIGTERM flushes its session.db,
+        releases MCP server connections, and writes a partial
+        transcript. SIGKILL skips all of that, so the user loses
+        whatever output the agent had generated so far.
+      - On Windows, terminate() calls GenerateConsoleCtrlEvent
+        which hermes handles as a graceful shutdown. Most of the
+        time hermes exits in <1s; the 5s grace covers slow cases.
+    """
+    try:
+        rc = proc.wait(timeout=timeout)
+        return rc, False
+    except subprocess.TimeoutExpired:
+        # Phase 1: graceful terminate. On Windows this is
+        # GenerateConsoleCtrlEvent; on POSIX it's SIGTERM.
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=grace_seconds)
+            return None, True  # exited within grace
+        except subprocess.TimeoutExpired:
+            pass
+        # Phase 2: force kill. Stops ignoring SIGTERM/CTRL_BREAK.
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        return None, True
 
 
 def _bootstrap_hmac_secret(orchestrator_url: str, agent_id: str, secret: str) -> None:
@@ -1651,16 +1732,52 @@ def start(
 
     def _submit_result(task_id: str, result: dict) -> bool:
         try:
-            # v1.9.1 fix: see _claim above. Same path-template bug
-            # in the result submission. Pre-fix, the wrapper
-            # would submit the LLM result and the server would
-            # 401; the task would stay in 'running' until
-            # timeout kicked in.
+            # v1.9.3 fix: TWO bugs in this one call. v1.9.1 fixed the
+            # path-template bug (extract f-string into _result_path
+            # local). This is the deeper bug:
+            #
+            #   (a) Body-signing bug: the wrapper was using
+            #       `json=result` (httpx encodes the dict) but
+            #       signing the request with `body=b""` (the
+            #       default for _auth_headers). Server's
+            #       require_hmac_auth hashes the actual request
+            #       body, gets a different SHA256, and 401s.
+            #
+            #   (b) Content-Type bug: when we switched to
+            #       `content=_result_body` (the fix for (a)),
+            #       httpx does NOT auto-set Content-Type to
+            #       application/json. Without it, the server's
+            #       pydantic TaskResult model gets the body as
+            #       a string and fails validation with 422
+            #       "Input should be a valid dictionary or
+            #       object to extract fields from".
+            #
+            # Pre-fix symptoms: hermes ran fine, the wrapper did
+            # all the post-processing (upload artifacts, capture
+            # tokens), then `_submit_result` got 401 (a) → task
+            # stayed in 'running' for 3 minutes → supervisor's
+            # stuck_wrapper check finally marked it failed. With
+            # the v1.9.1 path fix applied, the 401 went away but
+            # the 422 surfaced (b). User saw "task timeout failed"
+            # but the root cause was a chain of signing + content-
+            # type bugs, not a hermes hang.
+            #
+            # Fix: serialize the body once, sign it, send it as
+            # `content=`, and set Content-Type explicitly. Same
+            # pattern as output-chunk (line ~2203) and tool-call
+            # (line ~2270). The dict is now round-tripped through
+            # the same bytes both sides.
+            #
+            # Regression test: tests/test_submit_result_body.py
+            # (added in v1.9.3).
             _result_path = f"/api/tasks/{task_id}/result"
+            _result_body = json.dumps(result).encode("utf-8")
+            _auth_h = _auth_headers('POST', _result_path, _result_body)
+            _auth_h["Content-Type"] = "application/json"
             r = httpx.post(
                 f"{orchestrator_url}{_result_path}",
-                headers=_auth_headers('POST', _result_path),
-                json=result,
+                headers=_auth_h,
+                content=_result_body,
                 timeout=10,
             )
             if r.status_code != 200:
@@ -2295,16 +2412,54 @@ def start(
         stream_threads.append(tool_call_thread)
         try:
             try:
+                # Per-task timeout (v1.9.3, 2026-07-30):
+                # Use task.timeout_seconds (per-task, set by supervisor
+                # or task author) capped at MAX_TASK_TIMEOUT_SEC (30 min
+                # hard cap) as a defense-in-depth ceiling. The wrapper's
+                # CLI --timeout is now only the FALLBACK when
+                # task.timeout_seconds is missing/zero.
+                #
+                # Pre-v1.9.3: the wrapper used the CLI --timeout value
+                # (default 1800) for every task regardless of what the
+                # task declared. A supervisor-set 1200s task would still
+                # get 1800s before being killed. Worse: a 1ms task would
+                # also wait 1800s if hermes hung. The 30-min cap also
+                # protects against operator typo (e.g. 999999s).
+                task_timeout_field = task.get("timeout_seconds")
+                task_timeout = min(
+                    int(task_timeout_field) if task_timeout_field else timeout,
+                    MAX_TASK_TIMEOUT_SEC,
+                )
+                if task_timeout_field is None or int(task_timeout_field) == 0:
+                    click.echo(
+                        f"  task_timeout={task_timeout}s "
+                        f"(no task.timeout_seconds; using CLI --timeout={timeout})"
+                    )
+                elif int(task_timeout_field) > MAX_TASK_TIMEOUT_SEC:
+                    click.echo(
+                        f"  task_timeout={task_timeout}s "
+                        f"(capped from task.timeout_seconds={task_timeout_field}; "
+                        f"MAX_TASK_TIMEOUT_SEC={MAX_TASK_TIMEOUT_SEC})"
+                    )
                 # proc.wait() does NOT touch stdout/stderr (those go to
                 # files), so it never deadlocks on the PIPE-buffer issue.
-                # We just wait for hermes to exit, up to `timeout` seconds.
-                rc = proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    pass
+                # _run_subprocess_with_timeout handles the timeout +
+                # graceful terminate-then-kill sequence (v1.9.3).
+                rc, timed_out = _run_subprocess_with_timeout(
+                    proc, timeout=task_timeout,
+                )
+            except Exception as e:
+                # proc.wait() can throw on Windows if the child closes
+                # handles abruptly. Bail out via the catch-all below
+                # (the except Exception as e at line ~2750 returns
+                # {"status": "failed", "error": ...}). Surface the
+                # error here for visibility.
+                raise
+            if timed_out:
+                # Subprocess didn't exit in time. Helper already sent
+                # SIGTERM (then SIGKILL after grace). We just clean up
+                # wrapper-side state and return a clear failure result
+                # so the main loop unblocks and picks up the next task.
                 # stop the liveness poller before any other handling
                 stop_poll.set()
                 # Live output streaming (v1.1): stop the tail threads
@@ -2321,7 +2476,7 @@ def start(
                     stderr_fh.close()
                 except Exception:
                     pass
-                return {"status": "failed", "error": f"hermes timeout after {timeout}s. See {stdout_log.name} for full transcript."}
+                return {"status": "failed", "error": f"hermes subprocess timeout after {task_timeout}s. See {stdout_log.name} for full transcript."}
             # Live output streaming (v1.1): stop tail threads so they
             # do a final flush of any buffered chunks before we close
             # the file handles and read the full transcript.

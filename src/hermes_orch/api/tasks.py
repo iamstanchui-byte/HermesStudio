@@ -800,8 +800,18 @@ async def submit_result(
     # badge update instantly (no waiting for the next 5s poll tick).
     # The browser re-evaluates the loop_status from audit_log data
     # on its next refresh; for now we just notify the state change.
+    #
+    # v1.9.3 fix (2026-07-30): `updated` is a pydantic Task model,
+    # not a dict — use attribute access, not `.get()`. The v1.8 line
+    # used `updated.get("project_id", ...)` which throws AttributeError
+    # on every result submission. The 500 was silently being returned
+    # to the wrapper; the wrapper logged the 401 (a DIFFERENT bug from
+    # v1.9.1) and the task was marked failed via the stuck_wrapper
+    # timeout. With v1.9.3's body-signing fix, the wrapper now reaches
+    # this code path; the 500 surfaces. Both bugs were chained: the
+    # 401 was the loud symptom, the 500 was the silent one.
     await publish_event(
-        updated.get("project_id", task.get("project_id", "")),
+        updated.project_id or task.get("project_id", ""),
         "task.state_changed",
         {
             "task_id": task_id,
