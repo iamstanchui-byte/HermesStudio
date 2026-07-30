@@ -415,7 +415,7 @@ async function submitNewTask() {
                 {% for a in task.result.artifacts %}
                     <li>
                         {% if a.exists %}
-                        <a href="/api/projects/{{ task.project_id }}/files/{{ a.name or a.path }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name or a.path }}</a>
+                        <a href="/api/projects/{{ task.project_id }}/file-preview/{{ a.name or a.path }}" target="_blank" class="font-mono text-blue-600 hover:underline">{{ a.name or a.path }}</a>
                         <span class="text-gray-500">({{ a.storage_kind|default('?') }}{% if a.size_bytes %}, {{ a.size_bytes }} bytes{% endif %})</span>
                         {% else %}
                         <span class="font-mono text-gray-500" title="{% if a.is_ephemeral %}Ephemeral control file: read + unlinked by supervisor (decision / status / plan signal){% else %}File no longer on disk (may have been cleaned up){% endif %}{% if a.size_bytes %}&#10;original size: {{ a.size_bytes }} bytes{% endif %}">{{ a.name or a.path }}</span>

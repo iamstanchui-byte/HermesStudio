@@ -407,6 +407,61 @@ async def read_file(
     )
 
 
+# v1.9.3 dashboard-side file preview endpoint.
+#
+# Why this exists (separate from /api/projects/{id}/files/{path} above):
+#   The HMAC-authed endpoint was added in v1.6 for wrapper-side file sync
+#   (PUT/DELETE/GET used by the wrapper to upload artifacts to the
+#   orchestrator). But the dashboard's artifact list (project.html line
+#   573 + 705) renders files via:
+#       <a href="/api/projects/{id}/files/{name}" target="_blank">
+#   The browser opens this URL in a new tab. There is no way for a
+#   browser to attach HMAC headers, so the user gets:
+#       {"detail":"Missing auth headers (X-Agent-Id, X-Timestamp, X-Signature)"}
+#   in the popup. Symptom: artifact link in the dashboard looks broken
+#   even though the file is on disk. Confirmed by user 2026-07-30.
+#
+# The right fix is to split the endpoint:
+#   - /api/projects/{id}/files/{path}              → wrapper (HMAC, sync upload)
+#   - /api/projects/{id}/files/{path}/preview      → dashboard (no auth, view)
+#
+# Threat model: the dashboard already has NO auth (no session, no
+# cookie). The project_id in the URL is the only barrier. Local network
+# trust + project_id secrecy is the same security posture as every
+# other dashboard read endpoint (status, plan, results, etc.). For
+# productize, the productize auth (session cookie) is a separate task
+# and would gate ALL dashboard endpoints uniformly.
+#
+# This endpoint is GET-only (read). It does NOT support PUT/DELETE —
+# those remain on the HMAC'd endpoint. That preserves the wrapper
+# contract: a leaked project_id alone can't be used to mutate files.
+@router.get("/{project_id}/file-preview/{path:path}")
+async def preview_file(
+    project_id: str,
+    path: str,
+    request: Request,
+) -> Response:
+    """Dashboard-side file preview (v1.9.3, no HMAC).
+    Uses /file-preview/ instead of /files/{path}/preview to avoid
+    path:path greedy-match conflict with the HMAC'd /files/{path}
+    endpoint. Same security model (project_id-in-URL is the only
+    barrier; same as every other dashboard read endpoint).
+    """
+    pdir = _project_dir(request, project_id)
+    safe = _validate_relpath(path)
+    full = _resolve_inside(pdir, safe)
+    if not full.exists():
+        raise HTTPException(404, f"File not found: {path}")
+    if not full.is_file():
+        raise HTTPException(400, f"Not a file: {path}")
+    content = full.read_text(encoding="utf-8", errors="replace")
+    return Response(
+        content=content,
+        media_type="text/plain; charset=utf-8",
+        headers={"X-File-Path": path},
+    )
+
+
 @router.put("/{project_id}/files/{path:path}")
 async def write_file(
     project_id: str,
