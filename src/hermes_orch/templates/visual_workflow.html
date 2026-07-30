@@ -17,7 +17,7 @@
 {# _visual_workflow.js is loaded by the page at the bottom of <body>;
    it depends on drawflow being parsed first. We use `defer` above so
    the order is preserved. #}
-<script defer src="/static/visual_workflow.js?v=2026-07-30-v200fb"></script>
+<script defer src="/static/visual_workflow.js?v=2026-07-30-v210"></script>
 <style>
     /* Page-specific layout. The body uses Tailwind, but drawflow
        ships its own styles for nodes + connections which we keep
@@ -238,6 +238,26 @@
     .vf-save-banner.show { opacity: 1; }
     .vf-save-banner.success { background: #d1fae5; color: #065f46; }
     .vf-save-banner.error { background: #fee2e2; color: #991b1b; }
+    /* v2.1 (2026-07-30): mini-map. Fixed in the bottom-right
+       corner of the canvas wrap, on top of drawflow. Shows a
+       scaled-down SVG of all step positions. Click a dot to
+       scroll the main canvas to that step. */
+    .vf-minimap {
+        position: absolute;
+        bottom: 12px;
+        right: 12px;
+        width: 200px;
+        height: 120px;
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        padding: 4px;
+        z-index: 5;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        pointer-events: auto;
+    }
+    .vf-minimap svg { border-radius: 4px; }
+    .vf-minimap-dot:hover { stroke: #111827; stroke-width: 1.5; }
 </style>
 {% endblock %}
 
@@ -262,6 +282,67 @@
         </p>
     </div>
     <div class="flex gap-2">
+        {# v2.1 (2026-07-30): Undo / Redo buttons. Disabled when
+           the corresponding stack is empty. Tooltip shows the
+           label of the mutation that will be reverted / re-applied.
+           Keyboard shortcut: Ctrl+Z = undo, Ctrl+Y = redo. #}
+        <button id="vf-undo-btn" type="button" disabled
+            onclick="window.visualBuilder.undo()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Nothing to undo (Ctrl+Z)">
+            ↶ Undo
+        </button>
+        <button id="vf-redo-btn" type="button" disabled
+            onclick="window.visualBuilder.redo()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Nothing to redo (Ctrl+Y)">
+            ↷ Redo
+        </button>
+        {# v2.1 (2026-07-30): copy / paste step. The clipboard holds
+           one step at a time; paste produces a new step with a
+           unique "-copy" / "-copy-N" name. No edges are
+           auto-wired — the user can drag if they want. #}
+        <button type="button"
+            onclick="window.visualBuilder.copyStep()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            title="Copy the selected step to clipboard (Ctrl+C). Then click another card and Ctrl+V (or click Paste) to clone.">
+            📋 Copy step
+        </button>
+        <button type="button"
+            onclick="window.visualBuilder.pasteStep()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            title="Paste the copied step as a new step with a unique -copy name (Ctrl+V). No edges auto-wired.">
+            📥 Paste step
+        </button>
+        {# v2.1 (2026-07-30): workflow template JSON import / export.
+           The hidden <input type="file"> is the actual file
+           picker; we trigger it programmatically so the visible
+           button is just a label. #}
+        <input type="file" id="vf-import-file" accept="application/json,.json"
+            class="hidden" onchange="window.visualBuilder.importJson(this.files[0]); this.value='';" />
+        <button type="button"
+            onclick="document.getElementById('vf-import-file').click()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            title="Import a workflow .json template. Replaces the in-memory step_template + variables. Click Save to persist.">
+            ⬆ Import JSON
+        </button>
+        <button type="button"
+            onclick="window.visualBuilder.exportJson()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            title="Download the current step_template + variables as a .workflow.json file you can share or archive. Re-importable via the Import JSON button.">
+            ⬇ Export JSON
+        </button>
+        {# v2.1 (2026-07-30): parameter hints. Calls the backend
+           /suggest-vars endpoint which extracts {{var}}
+           placeholders + infers types from literal values in
+           the same step's params_template. No LLM call (the v2.1
+           implementation is local + deterministic). #}
+        <button type="button"
+            onclick="window.visualBuilder.suggestVars()"
+            class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
+            title="Scan all step params for {{var}} placeholders and add missing variables to the variables list. Inferred type comes from literal values in the same step (v2.1: local, deterministic; v2.2: LLM-backed).">
+            ✨ Suggest vars
+        </button>
         <button onclick="window.visualBuilder.topoSort()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
             title="Phase 1.5: auto-arrange cards top-to-bottom in execution order (so depends_on only references earlier steps). Use this if Save fails with a forward-ref error.">
@@ -404,6 +485,11 @@
         </p>
     </div>
 </div>
+
+{# v2.1: mini-map lives inside the canvas wrap (so it
+   inherits the wrap's positioning context). The JS rebuilds
+   the SVG on every _render() call. #}
+<div class="vf-minimap" id="vf-minimap"></div>
 
 {# Save status banner — top right. #}
 <div class="vf-save-banner" id="vf-save-banner"></div>

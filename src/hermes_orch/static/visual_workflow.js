@@ -52,6 +52,515 @@
     // jitter during a click should NOT skip opening the side panel.
     const _DRAG_THRESHOLD_PX = 8;
 
+    // ===== v2.1 (2026-07-30): Undo / Redo =====
+    // Snapshot-based history. Before any state-mutating user action
+    // (add step, delete step, edit step, add wire, remove wire,
+    // change variable), we call _checkpoint("label") which deep-
+    // copies the current state and pushes it onto _undoStack. Undo
+    // pops + restores; redo re-applies the inverse direction.
+    //
+    // Why snapshot (not patch-diff): workflows are 10-50 steps with
+    // nested params_template. A 50-step snapshot is ~100-200KB;
+    // 50 snapshots = ~5-10MB. Cheap, simple, and avoids the
+    // patch-inverse bugs that bit the migration script in v2.0.
+    //
+    // _isRendering is set during _render() to suppress history
+    // pushes from drawflow's connectionRemoved / nodeRemoved events
+    // that fire as a side effect of the canvas clear+rebuild.
+    const _history = {
+        undoStack: [],          // [{label, snapshot}] — most recent at end
+        redoStack: [],          // [{label, snapshot}]
+        maxSize: 50,            // cap depth so memory stays bounded
+        _isRendering: false,    // set true during _render() to suppress
+        _isApplyingPatch: false, // set true during undo/redo to suppress
+    };
+    function _snapshot() {
+        return {
+            stepTemplate: JSON.parse(JSON.stringify(_stepTemplate)),
+            variables: JSON.parse(JSON.stringify(_variables || [])),
+            visualLayout: JSON.parse(JSON.stringify(_visualLayout || {})),
+        };
+    }
+    function _restoreSnapshot(snap) {
+        _stepTemplate = snap.stepTemplate;
+        _variables = snap.variables;
+        _visualLayout = snap.visualLayout;
+    }
+    function _checkpoint(label) {
+        if (_history._isRendering || _history._isApplyingPatch) return;
+        // Deep-copy on push so a later mutation doesn't mutate the
+        // historical snapshot.
+        _history.undoStack.push({label, snapshot: _snapshot()});
+        if (_history.undoStack.length > _history.maxSize) {
+            _history.undoStack.shift();
+        }
+        _history.redoStack = [];
+        _updateHistoryButtons();
+    }
+    function _undo() {
+        if (_history.undoStack.length === 0) return;
+        const entry = _history.undoStack.pop();
+        // Capture current state for the redo stack BEFORE we restore
+        _history.redoStack.push({label: entry.label, snapshot: _snapshot()});
+        _history._isApplyingPatch = true;
+        try {
+            _restoreSnapshot(entry.snapshot);
+            _render();
+        } finally {
+            _history._isApplyingPatch = false;
+        }
+        _updateHistoryButtons();
+        _showBanner('Undid: ' + entry.label, 'success');
+    }
+    function _redo() {
+        if (_history.redoStack.length === 0) return;
+        const entry = _history.redoStack.pop();
+        _history.undoStack.push({label: entry.label, snapshot: _snapshot()});
+        _history._isApplyingPatch = true;
+        try {
+            _restoreSnapshot(entry.snapshot);
+            _render();
+        } finally {
+            _history._isApplyingPatch = false;
+        }
+        _updateHistoryButtons();
+        _showBanner('Redid: ' + entry.label, 'success');
+    }
+    function _updateHistoryButtons() {
+        const undoBtn = document.getElementById('vf-undo-btn');
+        const redoBtn = document.getElementById('vf-redo-btn');
+        if (undoBtn) {
+            undoBtn.disabled = _history.undoStack.length === 0;
+            undoBtn.title = _history.undoStack.length === 0
+                ? 'Nothing to undo'
+                : 'Undo: ' + _history.undoStack[_history.undoStack.length - 1].label
+                + ' (Ctrl+Z)';
+        }
+        if (redoBtn) {
+            redoBtn.disabled = _history.redoStack.length === 0;
+            redoBtn.title = _history.redoStack.length === 0
+                ? 'Nothing to redo'
+                : 'Redo: ' + _history.redoStack[_history.redoStack.length - 1].label
+                + ' (Ctrl+Y)';
+        }
+    }
+    // Keyboard shortcuts: Ctrl+Z = undo, Ctrl+Y or Ctrl+Shift+Z = redo.
+    // We bind to the document and skip when focus is in a text
+    // input (so the user's typing isn't hijacked) UNLESS the editor
+    // is focused and the shortcut was an explicit Ctrl+ combo.
+    document.addEventListener('keydown', (e) => {
+        const ctrl = e.ctrlKey || e.metaKey;
+        if (!ctrl) return;
+        const key = e.key.toLowerCase();
+        // Ctrl+Z (no shift) = undo; Ctrl+Shift+Z or Ctrl+Y = redo
+        if (key === 'z' && !e.shiftKey) {
+            e.preventDefault();
+            _undo();
+        } else if ((key === 'z' && e.shiftKey) || key === 'y') {
+            e.preventDefault();
+            _redo();
+        }
+    });
+    // ===== v2.1: Copy / Paste step =====
+    // Module-level clipboard (just one step at a time — pasting
+    // twice produces step-copy-1, step-copy-2 with unique names).
+    // We hold the deep-copied step OBJECT (not just a name) so
+    // paste can recreate the step verbatim with only a name
+    // collision to resolve.
+    let _clipboard = null;       // {step: <obj>, ts: <number>}
+    function _copySelectedStep() {
+        if (!_selectedNodeId) {
+            _showBanner('No card selected to copy (double-click a card first)', 'info');
+            return;
+        }
+        const step = _findStepByNodeId(_selectedNodeId);
+        if (!step) {
+            _showBanner('Selected card not in step_template (stale drawflow state)', 'error');
+            return;
+        }
+        // Deep copy so subsequent edits to the original don't mutate
+        // the clipboard. The pasted step will get its own unique
+        // name (with a -copy or -copy-N suffix) so it doesn't
+        // collide with the source.
+        _clipboard = {
+            step: JSON.parse(JSON.stringify(step)),
+            ts: Date.now(),
+        };
+        _showBanner('Copied step "' + step.name + '". Click another card and press Ctrl+V (or click Paste) to clone.', 'success');
+    }
+    function _pasteClipboard() {
+        if (!_clipboard) {
+            _showBanner('Clipboard empty. Copy a step first (Ctrl+C).', 'info');
+            return;
+        }
+        // Find a unique name. Try `<name>-copy`, `<name>-copy-2`,
+        // ... up to a reasonable cap so we don't loop forever.
+        const baseName = _clipboard.step.name;
+        const candidateBase = baseName.replace(/-copy(-\d+)?$/, '') + '-copy';
+        let candidate = candidateBase;
+        let n = 2;
+        const taken = new Set(_stepTemplate.map((s) => s.name));
+        while (taken.has(candidate)) {
+            if (n > 999) {
+                _showBanner('Cannot paste: name collision cap reached (1000 -copy variants)', 'error');
+                return;
+            }
+            candidate = candidateBase + '-' + n;
+            n += 1;
+        }
+        // Deep copy again so two consecutive pastes don't share a
+        // reference to the same nested objects (especially
+        // params_template, which is a dict we don't want them to
+        // mutate together).
+        const newStep = JSON.parse(JSON.stringify(_clipboard.step));
+        newStep.name = candidate;
+        // v2.1: checkpoint BEFORE the push so undo restores to
+        // pre-paste state.
+        _checkpoint('Paste step (as "' + candidate + '")');
+        _stepTemplate.push(newStep);
+        // Re-render so the new card appears on canvas.
+        _render();
+        // After re-render, the new step's node is on the canvas.
+        // We don't auto-wire anything (the user can drag if they
+        // want the same edge pattern) but we open the side panel
+        // on it so the user can rename / tweak before clicking Save.
+        const nodeId = _findNodeIdByStepName(candidate, _getAllNodes());
+        if (nodeId) {
+            openSidePanel(nodeId);
+        }
+        _showBanner('Pasted as "' + candidate + '". Edits stay in memory until you click Save.', 'success');
+    }
+    // Ctrl+C / Ctrl+V keyboard shortcuts. We avoid hijacking the
+    // browser's native copy/paste when focus is in a text input
+    // (so users can still copy-paste within side-panel fields).
+    function _bindCopyPasteShortcuts() {
+        if (window._vfCopyPasteBound) return;
+        window._vfCopyPasteBound = true;
+        document.addEventListener('keydown', (e) => {
+            const ctrl = e.ctrlKey || e.metaKey;
+            if (!ctrl) return;
+            // Skip if focus is in a text input / textarea — let
+            // the user copy-paste within the field naturally.
+            const tag = (e.target && e.target.tagName || '').toLowerCase();
+            const isTextField = tag === 'input' || tag === 'textarea' || (e.target && e.target.isContentEditable);
+            if (isTextField) return;
+            if (e.key.toLowerCase() === 'c' && !e.shiftKey) {
+                e.preventDefault();
+                _copySelectedStep();
+            } else if (e.key.toLowerCase() === 'v' && !e.shiftKey) {
+                e.preventDefault();
+                _pasteClipboard();
+            }
+        });
+    }
+    // ===== v2.1: JSON import / export (workflow template) =====
+    // Export: download step_template + variables as a single
+    // .workflow.json file. The file is a self-contained template
+    // that can be re-imported into another workflow (or the same
+    // one after a destructive edit). Useful for sharing patterns
+    // between operators and for "save my work" before risky edits.
+    //
+    // The exported shape intentionally OMITS the workflow_id +
+    // workflow name (those are server-assigned on import). We keep
+    // the version + description so the importer can detect a
+    // schema-version mismatch and refuse to apply a too-old / too-
+    // new template. step_template + variables are the payload.
+    function _exportWorkflowAsJson() {
+        const payload = {
+            // v2.1 export format. Bump `format_version` whenever
+            // the JSON shape changes so the importer can do a
+            // forward/backward check.
+            format_version: '2.1',
+            // Free-text comment the user can leave before saving.
+            // The importer reads but doesn't require it.
+            description: '',
+            step_template: _stepTemplate,
+            variables: _variables || [],
+        };
+        // Pretty-print so the file is human-readable. JSON.parse
+        // round-trip is forgiving on whitespace.
+        const text = JSON.stringify(payload, null, 2);
+        const blob = new Blob([text], {type: 'application/json'});
+        const url = URL.createObjectURL(blob);
+        // Filename: `workflow-{name-or-id}-{YYYYMMDD-HHMM}.json`.
+        // We use a timestamp so consecutive exports don't collide
+        // in the user's Downloads folder.
+        const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const fname = 'workflow-' + (_workflowId || 'template') + '-' + ts + '.json';
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        // Defer revoke to give the browser time to start the
+        // download; otherwise the click might race with revoke.
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+        _showBanner('Exported ' + fname + ' (' + _stepTemplate.length + ' steps, ' + (_variables || []).length + ' variables)', 'success');
+    }
+    // Import: read a workflow.json file (same shape as export),
+    // validate, and replace the in-memory step_template +
+    // variables. The user must click Save to persist. We do NOT
+    // auto-validate the imported plan against the agent roles
+    // (the Save endpoint does that). We DO check the format_version
+    // and the top-level shape so a clearly-bad file is rejected
+    // up-front with a readable error.
+    function _importWorkflowFromJson(file) {
+        if (!file) return;
+        if (file.size > 2 * 1024 * 1024) {
+            // 2 MB cap. Reasonable for a workflow (50 steps +
+            // variables + descriptions). Bigger files are likely
+            // either accidentally a DB export or a malicious
+            // upload. Reject early.
+            _showBanner('Import failed: file too large (' + Math.round(file.size / 1024) + ' KB > 2 MB cap)', 'error');
+            return;
+        }
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            let data;
+            try {
+                data = JSON.parse(e.target.result);
+            } catch (err) {
+                _showBanner('Import failed: not valid JSON (' + err.message + ')', 'error');
+                return;
+            }
+            // Schema check
+            if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                _showBanner('Import failed: top-level must be a JSON object', 'error');
+                return;
+            }
+            if (typeof data.format_version !== 'string') {
+                _showBanner('Import failed: missing format_version (is this a workflow template?)', 'error');
+                return;
+            }
+            // v2.1 supports format_version = "2.1" exactly. We
+            // accept minor 2.x but warn; reject 1.x / 3.x.
+            const fv = data.format_version;
+            const major = parseInt(fv.split('.')[0], 10);
+            if (isNaN(major) || major !== 2) {
+                _showBanner('Import failed: format_version=' + fv + ' is not 2.x (this editor only accepts 2.x templates)', 'error');
+                return;
+            }
+            if (!Array.isArray(data.step_template)) {
+                _showBanner('Import failed: step_template must be an array', 'error');
+                return;
+            }
+            // v2.1: checkpoint BEFORE the replace so undo can
+            // restore the pre-import state. Save() also has its
+            // own checkpoint; together they make the import +
+            // subsequent save fully undoable.
+            _checkpoint('Import workflow template (' + file.name + ')');
+            _stepTemplate = data.step_template;
+            _variables = Array.isArray(data.variables) ? data.variables : [];
+            _render();
+            _showBanner('Imported ' + data.step_template.length + ' steps from ' + file.name + '. Review + click Save to persist.', 'success');
+        };
+        reader.onerror = () => {
+            _showBanner('Import failed: could not read file', 'error');
+        };
+        reader.readAsText(file);
+    }
+    // ===== v2.1: Mini-map =====
+    // A small fixed div in the bottom-right corner that shows all
+    // step positions in the canvas. Click a dot to scroll the
+    // canvas to that step. We re-render the mini-map after every
+    // _render() (which is called on add/delete/move/undo/redo)
+    // so it stays in sync.
+    //
+    // Why roll our own vs. drawflow-plugin-minimap: the plugin
+    // adds 50KB+ of JS for canvas-rendering. Our canvas has 5-30
+    // steps, so a simple SVG of <circle> elements is enough and
+    // ~50 lines. If we later need to zoom or show a live
+    // execution indicator (Phase 4+), revisit the plugin.
+    function _renderMinimap() {
+        const map = document.getElementById('vf-minimap');
+        if (!map) return;
+        const nodes = _getAllNodes();
+        const names = Object.keys(nodes);
+        // Compute bounding box of all step positions. If no
+        // nodes, show an empty placeholder and bail.
+        if (names.length === 0) {
+            map.innerHTML = '<div class="vf-minimap-empty" style="font-size:9px;color:#9ca3af;text-align:center;padding:8px;">no steps</div>';
+            return;
+        }
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const k of names) {
+            const n = nodes[k];
+            if (!n || typeof n.pos_x !== 'number' || typeof n.pos_y !== 'number') continue;
+            // drawflow stores absolute positions; the .drawflow-node
+            // wrapper is ~160px wide × ~50px tall by default, plus
+            // the user can resize. Use 200x80 as a conservative
+            // card size so the bbox of dots covers the visible card
+            // area, not just the dot positions.
+            const cardW = 200, cardH = 80;
+            minX = Math.min(minX, n.pos_x);
+            minY = Math.min(minY, n.pos_y);
+            maxX = Math.max(maxX, n.pos_x + cardW);
+            maxY = Math.max(maxY, n.pos_y + cardH);
+        }
+        if (!isFinite(minX)) {
+            map.innerHTML = '<div class="vf-minimap-empty" style="font-size:9px;color:#9ca3af;text-align:center;padding:8px;">no positions</div>';
+            return;
+        }
+        // Add a small padding around the bbox so dots aren't at
+        // the very edge of the minimap div.
+        const padX = 30, padY = 20;
+        const bboxW = (maxX - minX) + 2 * padX;
+        const bboxH = (maxY - minY) + 2 * padY;
+        // Scale: fit the bbox into the minimap's 200x120 box
+        // (matches the CSS .vf-minimap size). preserveAspectRatio
+        // so the map isn't squished.
+        const mapW = 200, mapH = 120;
+        const scale = Math.min(mapW / bboxW, mapH / bboxH);
+        // Dots: one per step. Color: gray for regular, red if
+        // feedback_to is set (so the operator sees "this step has
+        // a loop-back" at a glance). Tooltip = step name.
+        const dots = [];
+        for (const k of names) {
+            const n = nodes[k];
+            if (!n || typeof n.pos_x !== 'number') continue;
+            const step = _stepTemplate.find((s) => s.name === (n.data && n.data.name));
+            const cx = ((n.pos_x - minX + padX) * scale).toFixed(1);
+            const cy = ((n.pos_y - minY + padY) * scale).toFixed(1);
+            const isFeedback = step && Array.isArray(step.feedback_to) && step.feedback_to.length > 0;
+            const fill = isFeedback ? '#dc2626' : '#6b7280';
+            const name = (n.data && n.data.name) || k;
+            // Clicking a dot scrolls the main canvas so this card
+            // is roughly centered. We use scrollIntoView on the
+            // matching .drawflow-node DOM element.
+            dots.push(
+                '<circle cx="' + cx + '" cy="' + cy + '" r="4" fill="' + fill + '" '
+                + 'data-step-name="' + _escapeAttr(name) + '" '
+                + 'class="vf-minimap-dot" style="cursor:pointer;" '
+                + 'title="' + _escapeAttr(name) + '">'
+                + '</circle>'
+            );
+        }
+        const svgW = (mapW).toFixed(0);
+        const svgH = (mapH).toFixed(0);
+        map.innerHTML =
+            '<svg width="' + svgW + '" height="' + svgH + '" '
+            + 'viewBox="0 0 ' + mapW + ' ' + mapH + '" '
+            + 'style="display:block;background:#f9fafb;border-radius:4px;">'
+            + dots.join('')
+            + '</svg>';
+        // Wire clicks: each dot scrolls the main canvas to the
+        // matching card. One delegated handler (not one per dot)
+        // so adding 50 dots doesn't add 50 listeners.
+        const svg = map.querySelector('svg');
+        if (svg) {
+            svg.addEventListener('click', (e) => {
+                const t = e.target;
+                if (!t || !t.dataset || !t.dataset.stepName) return;
+                const stepName = t.dataset.stepName;
+                // Find the .drawflow-node element with this step
+                // name. drawflow's id is "node-<num>" (numeric) so
+                // we walk all .drawflow-node elements and check
+                // their inner data-step-name.
+                const cardEls = document.querySelectorAll('.drawflow-node [data-step-name]');
+                for (const el of cardEls) {
+                    if (el.dataset.stepName === stepName) {
+                        // scrollIntoView with center alignment; the
+                        // wrap is the scrollable container.
+                        const card = el.closest('.drawflow-node');
+                        if (card && card.scrollIntoView) {
+                            card.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'center'});
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    }
+    // Minimal HTML attribute escape for the minimap dot tooltips
+    // (step names can contain hyphens / underscores but not
+    // quotes; we still escape defensively).
+    function _escapeAttr(s) {
+        if (s == null) return '';
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
+    // ===== v2.1: Parameter hints (LLM suggest var types) =====
+    // Calls POST /api/workflows/{id}/suggest-vars and merges the
+    // suggestions into _variables. The backend does a LOCAL
+    // extraction of {{var}} placeholders + infers type from
+    // literal values in the same step's params (no LLM call —
+    // see the backend docstring for the algorithm + future LLM
+    // extension). User can review each suggestion before applying.
+    async function _suggestAndMergeVars() {
+        if (!_workflowId) {
+            _showBanner('Cannot suggest: workflow id missing (refresh the page)', 'error');
+            return;
+        }
+        // v2.1: checkpoint BEFORE the merge so undo can restore
+        // the pre-suggestion variable list.
+        _checkpoint('Suggest variables from LLM');
+        try {
+            const r = await fetch('/api/workflows/' + encodeURIComponent(_workflowId) + '/suggest-vars', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: '{}',
+            });
+            if (!r.ok) {
+                const errBody = await r.json().catch(() => ({}));
+                _showBanner('Suggest failed: ' + (errBody.detail || r.status), 'error');
+                return;
+            }
+            const data = await r.json();
+            const suggestions = data.suggestions || [];
+            if (suggestions.length === 0) {
+                _showBanner('No {{var}} placeholders found in any step. Add placeholders in params_template, then try again.', 'info');
+                return;
+            }
+            // Merge into _variables. For each suggestion:
+            //   - If already defined, skip (or update if the existing
+            //     type is "string" and we have a better type)
+            //   - If not defined, add a new entry
+            if (!Array.isArray(_variables)) _variables = [];
+            const byName = new Map(_variables.map((v) => [v.name, v]));
+            let added = 0;
+            let updated = 0;
+            for (const s of suggestions) {
+                if (byName.has(s.name)) {
+                    const existing = byName.get(s.name);
+                    // Conservative update: only update the type
+                    // if the existing one is the default "string"
+                    // and we inferred something more specific.
+                    if ((existing.type || "string") === "string" && s.type && s.type !== "string") {
+                        existing.type = s.type;
+                        updated += 1;
+                    }
+                } else {
+                    _variables.push({
+                        name: s.name,
+                        type: s.type || "string",
+                        default: s.default || "",
+                        description: s.description || "",
+                        required: true,
+                    });
+                    byName.set(s.name, _variables[_variables.length - 1]);
+                    added += 1;
+                }
+            }
+            // Re-render the JSON form (where the variables textbox
+            // lives) so the user sees the new variables.
+            const ta = document.getElementById('vf-variables-json');
+            if (ta) ta.value = JSON.stringify(_variables, null, 2);
+            // Re-render canvas (in case the JS auto-adds anything
+            // for new placeholders; the existing _autoAddVariablesFromParams
+            // is a no-op here but we keep the call for consistency).
+            _render();
+            _showBanner('Suggested ' + suggestions.length + ' variable(s); added ' + added + ', updated ' + updated + '. Review in the JSON form, then Save.', 'success');
+        } catch (e) {
+            _showBanner('Suggest failed: ' + e.message, 'error');
+        }
+    }
+    // ===== end v2.1 Parameter hints =====
+
     // ---- DOM lookup ----
     function _canvas() { return document.getElementById('vf-canvas'); }
     function _sidePanel() { return document.getElementById('vf-side-panel'); }
@@ -183,6 +692,24 @@
     }
 
     function _render() {
+        // v2.1: set the _isRendering flag so drawflow's
+        // connectionRemoved / nodeRemoved events (which fire as a
+        // side effect of _editor.clear()) don't push unwanted
+        // entries to the undo stack. Cleared in the finally.
+        _history._isRendering = true;
+        try {
+            const r = _renderInner();
+            // v2.1: refresh the mini-map so it stays in sync
+            // with the new state. Done inside the try so the
+            // flag is true here too (we don't want a cascade of
+            // mini-map redraws to push undo entries).
+            _renderMinimap();
+            return r;
+        } finally {
+            _history._isRendering = false;
+        }
+    }
+    function _renderInner() {
         const wrap = _canvas();
         // Pass the wrap itself (not an inner div) so drawflow injects
         // its DOM as a direct child of the wrap. The side panel is
@@ -786,6 +1313,9 @@
             }
             if (!Array.isArray(source.feedback_to)) source.feedback_to = [];
             if (!source.feedback_to.includes(targetName)) {
+                // v2.1: checkpoint BEFORE the data change so undo
+                // restores the pre-wire state (no loop-back).
+                _checkpoint('Add loop-back: ' + sourceName + ' → ' + targetName);
                 source.feedback_to.push(targetName);
                 _showBanner(
                     `Wired ${sourceName} --${edgeLabel}--> ${targetName} (if ${sourceName} fails, re-run ${targetName}). Click Save to persist.`,
@@ -801,6 +1331,8 @@
             }
             if (!Array.isArray(target.depends_on)) target.depends_on = [];
             if (!target.depends_on.includes(sourceName)) {
+                // v2.1: checkpoint BEFORE the data change.
+                _checkpoint('Add chain: ' + sourceName + ' → ' + targetName);
                 target.depends_on.push(sourceName);
                 _showBanner(
                     `Wired ${sourceName} --${edgeLabel}--> ${targetName}. Click Save to persist.`,
@@ -831,6 +1363,8 @@
             if (!source || !Array.isArray(source.feedback_to)) return;
             const i = source.feedback_to.indexOf(targetName);
             if (i >= 0) {
+                // v2.1: checkpoint BEFORE the splice.
+                _checkpoint('Remove loop-back: ' + sourceName + ' → ' + targetName);
                 source.feedback_to.splice(i, 1);
                 _showBanner(
                     `Unwired ${sourceName} -/-> ${targetName} (${edgeLabel}). Click Save to persist.`,
@@ -843,6 +1377,8 @@
             if (!target || !Array.isArray(target.depends_on)) return;
             const i = target.depends_on.indexOf(sourceName);
             if (i >= 0) {
+                // v2.1: checkpoint BEFORE the splice.
+                _checkpoint('Remove chain: ' + sourceName + ' → ' + targetName);
                 target.depends_on.splice(i, 1);
                 _showBanner(
                     `Unwired ${sourceName} -/-> ${targetName} (${edgeLabel}). Click Save to persist.`,
@@ -890,6 +1426,11 @@
             }
         }
         if (!removedName) return;
+        // v2.1: checkpoint BEFORE the splice + scrub. The snapshot
+        // captures the full step (with all fields) + all
+        // depends_on / feedback_to references, so undo restores
+        // the step in its original position with original wires.
+        _checkpoint('Delete step "' + removedName + '"');
         // Remove from _stepTemplate
         const idx = _stepTemplate.findIndex((s) => s.name === removedName);
         if (idx >= 0) {
@@ -953,6 +1494,14 @@
         }
         _render();
         _bindGlobalShortcuts();
+        // v2.1: bind Ctrl+C / Ctrl+V for copy / paste step. Done
+        // once on init (guarded by the _vfCopyPasteBound flag).
+        _bindCopyPasteShortcuts();
+        // v2.1: initialize the Undo/Redo button disabled state.
+        // _render() above will have set isRendering=true during
+        // the rebuild; now that we're back in normal mode, refresh
+        // the buttons to match the (empty) undo / redo stacks.
+        _updateHistoryButtons();
         // Phase 1.4 (2026-07-25): click a palette chip to add a
         // step + auto-place at the next Y slot + auto-wire to
         // the last step (chain mode). Most workflows are linear
@@ -980,6 +1529,10 @@
                 if (lastStep) {
                     newStep.depends_on = [lastStep.name];
                 }
+                // v2.1: checkpoint BEFORE the push so undo restores
+                // the pre-add state. _render() inside the undo path
+                // will re-render the canvas from the restored data.
+                _checkpoint('Add step "' + newStep.name + '"');
                 _stepTemplate.push(newStep);
                 _render();
                 // After _render, drawflow has the new card but
@@ -1229,6 +1782,12 @@
         // All validations passed. Commit the edits to the in-memory
         // step_template. The user must still click "Save" to persist.
         const oldNameLocal = step.name;
+        // v2.1: checkpoint BEFORE the field assignment + reference
+        // rewrite. The snapshot captures the old name + all field
+        // values + all depends_on / feedback_to references that
+        // pointed to the old name, so undo restores everything.
+        _checkpoint('Edit step "' + oldNameLocal + '"' +
+            (oldNameLocal !== newName ? ' → "' + newName + '"' : ''));
         step.name = newName;
         step.agent_role = newRole;
         step.action = newAction;
@@ -1319,6 +1878,11 @@
     async function save() {
         // Q4 c: if the JSON form is open, the user may have edited it.
         // Prefer JSON form content over the canvas when it's open.
+        // v2.1: checkpoint once at the top of save() so undo can
+        // revert the entire save operation (including the JSON-form
+        // text edits and any topo-sort or auto-add-variable side
+        // effects) back to the pre-save state.
+        _checkpoint('Save (before persist)');
         let stepTemplate, variables;
         if (_jsonForm().classList.contains('open')) {
             try {
@@ -1502,6 +2066,32 @@
         closeSidePanel,
         applyEdit,
         toggleJsonForm,
+        // v2.1 (2026-07-30): undo / redo exposed for the toolbar
+        // buttons + future keyboard shortcuts. State is the snapshot
+        // model: a single "checkpoint(label)" call before any
+        // mutation pushes the pre-state onto the undo stack; undo
+        // pops + restores + re-renders; redo is the inverse.
+        undo: _undo,
+        redo: _redo,
+        // v2.1: copy / paste step. Ctrl+C / Ctrl+V also work via
+        // _bindCopyPasteShortcuts. The clipboard is module-level
+        // (single-step; paste twice → step-copy, step-copy-2).
+        copyStep: _copySelectedStep,
+        pasteStep: _pasteClipboard,
+        // v2.1: workflow template import / export. The export
+        // writes a self-contained .workflow.json file (step_template
+        // + variables + format_version) the user can share or
+        // archive. The import replaces the in-memory state and
+        // re-renders. The user still has to click Save to persist.
+        exportJson: _exportWorkflowAsJson,
+        importJson: _importWorkflowFromJson,
+        // v2.1: parameter hints. Calls the backend
+        // /suggest-vars endpoint which extracts {{var}}
+        // placeholders + infers types from literal values in
+        // the same step's params. No LLM call (the v2.1
+        // implementation is local + deterministic; the LLM-
+        // backed version is a v2.2 followup).
+        suggestVars: _suggestAndMergeVars,
         topoSort: () => {
             const changed = _topoSortSteps();
             _showBanner(
