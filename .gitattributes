@@ -1,0 +1,11 @@
+# Force LF line endings for shell / Python / PowerShell scripts.
+# Without this, Windows checkouts with core.autocrlf=true would convert
+# these files to CRLF, which breaks bash (hermes-orch-agent + watchdog
+# scripts) and PowerShell on Linux (PowerShell Core on Linux is LF-only
+# safe; CRLF works but is wasteful).
+*.sh             text eol=lf
+*.py             text eol=lf
+*.ps1            text eol=lf
+watchdog/*.sh    text eol=lf
+watchdog/*.py    text eol=lf
+watchdog/*.ps1   text eol=lf

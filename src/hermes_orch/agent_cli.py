@@ -10,8 +10,12 @@ Commands (per REVIEW.md §8.1):
 - apply-configs-loop  Daemon: keep polling and applying
 
 Implementation note: this is a SEPARATE process from the orchestrator.
-On Windows: registered as Windows Service via NSSM.
-On Linux:   registered as systemd service.
+On Windows: registered as Windows Service via NSSM. Use
+            `watchdog/register-system.ps1` (admin PowerShell) to install.
+On Linux:   registered as a systemd user service. Use
+            `watchdog/install-systemd.sh` to install.
+The orchestrator itself also has a watchdog for monitoring + auto-restart
+on both platforms (see `watchdog/` for the per-platform scripts).
 """
 from __future__ import annotations
 
@@ -30,12 +34,15 @@ import httpx
 
 import shutil
 
-# Force UTF-8 on stdout/stderr for NSSM/LocalSystem logs.
-# Without this, any Unicode in click.echo / prompt content (CJK, em-dash,
-# smart quotes) blows up with UnicodeEncodeError on the cp1252 log stream
-# that NSSM uses by default. That failure propagates OUT of _run_task and
-# the supervisor marks the task failed -- even though the actual work
-# (hermes subprocess) never even started.
+# Force UTF-8 on stdout/stderr for service-manager log streams.
+# On Windows + NSSM, the log is a cp1252 pipe — any Unicode in
+# click.echo / prompt content (CJK, em-dash, smart quotes) blows up with
+# UnicodeEncodeError on that stream. That failure propagates OUT of
+# _run_task and the supervisor marks the task failed — even though the
+# actual work (hermes subprocess) never even started.
+# On Linux + systemd, the journal captures bytes verbatim, but the
+# same reconfigure keeps click.echo safe under locale-odd environments
+# (e.g. LANG=C, no UTF-8 charmap). Cheap insurance either way.
 # Bug seen 2026-07-23 on proj-1a4a2962 ("Create a skill to get 香港天氣...").
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -2181,10 +2188,12 @@ def start(
                     cwd=hermes_cwd,
                     # DEVNULL stdin prevents hermes's dep_ensure.py
                     # `input("Install now? [Y/n] ")` from hanging on a
-                    # closed stdin (NSSM service context has no
-                    # controlling terminal). When isatty() returns
-                    # False, hermes skips the prompt and proceeds
-                    # to install attempt. The transcript log
+                    # closed stdin. The wrapper is normally run as a
+                    # service (NSSM on Windows, systemd on Linux) which
+                    # has no controlling terminal — input() would block
+                    # forever. When isatty() returns False, hermes
+                    # skips the prompt and proceeds to install attempt.
+                    # The transcript log
                     # (hermes.{tid}.stdout.log) still captures any
                     # later output, so the user can review what
                     # happened even if install fails.
@@ -3314,12 +3323,13 @@ def start(
                 time_mod.sleep(1)
             # Self-restart on source change: if any watched .py in our
             # package has been edited since this process started, exit
-            # cleanly so NSSM (or whatever supervisor is running us)
-            # respawns us with the new code. Without this, editing
-            # `agent_cli.py` has no effect on the running wrapper —
-            # the user would have to manually bounce NSSM, which on
-            # Windows 11 requires admin and a slow stop/start cycle.
-            # Detected within `interval` seconds of the save.
+            # cleanly so the service manager (NSSM on Windows, systemd
+            # on Linux) respawns us with the new code. Without this,
+            # editing `agent_cli.py` has no effect on the running
+            # wrapper — the user would have to manually bounce the
+            # service, which on Windows 11 requires admin and a slow
+            # stop/start cycle. Detected within `interval` seconds of
+            # the save.
             #
             # The check compares the source .py mtime against the
             # process start time, NOT against the previous tick. This
