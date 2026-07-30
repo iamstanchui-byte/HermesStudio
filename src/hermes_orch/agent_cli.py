@@ -1,3 +1,4 @@
+# coding: utf-8
 """Agent-side CLI (hermes-orch-agent command).
 
 Commands (per REVIEW.md §8.1):

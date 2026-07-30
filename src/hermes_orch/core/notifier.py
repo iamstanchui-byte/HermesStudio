@@ -1,3 +1,4 @@
+# coding: utf-8
 """Notifier — sends alerts to the operator (currently Telegram).
 
 Used by supervisor to flag failures that need human attention:

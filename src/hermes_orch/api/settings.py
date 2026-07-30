@@ -1,3 +1,4 @@
+# coding: utf-8
 """Settings API (LLM provider + API key + model + Telegram).
 
 Endpoints:

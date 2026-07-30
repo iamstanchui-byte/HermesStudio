@@ -1,3 +1,4 @@
+# coding: utf-8
 """Plan contract — the one real (LLM-backed) contract for now.
 
 Takes a project description + available skills + optional

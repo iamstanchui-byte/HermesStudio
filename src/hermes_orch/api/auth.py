@@ -1,3 +1,4 @@
+# coding: utf-8
 """Auth / bootstrap endpoints (per REVIEW.md §6.2).
 
 TODO:

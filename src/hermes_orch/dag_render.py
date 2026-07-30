@@ -1,3 +1,4 @@
+# coding: utf-8
 """Plain-text DAG renderer for project plans (Phase 1, 2026-07-28).
 
 Renders a ProjectPlan (or just a list of steps) as an ASCII tree

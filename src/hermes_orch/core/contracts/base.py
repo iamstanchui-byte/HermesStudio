@@ -1,3 +1,4 @@
+# coding: utf-8
 """Contract base class.
 
 Each Agent contract (plan / route / judge / repair / audit) is a

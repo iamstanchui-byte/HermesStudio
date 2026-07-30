@@ -1,3 +1,4 @@
+# coding: utf-8
 """Audit contract — STUB (design-time only, not yet wired to LLM).
 
 Given a task + result + optional rubric, produce a structured

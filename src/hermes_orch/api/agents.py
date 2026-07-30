@@ -1,3 +1,4 @@
+# coding: utf-8
 """Agent endpoints (per REVIEW.md §6, §6.4 multi-role Model A).
 
 Endpoints:

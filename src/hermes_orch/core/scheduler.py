@@ -1,3 +1,4 @@
+# coding: utf-8
 """Background scheduler for recurring project runs (#22).
 
 The orchestrator's main process holds a singleton `Scheduler` instance.

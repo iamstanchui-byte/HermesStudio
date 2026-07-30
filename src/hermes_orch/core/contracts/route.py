@@ -1,3 +1,4 @@
+# coding: utf-8
 """Route contract — STUB (design-time only, not yet wired to LLM).
 
 Given a task description (name, action, params) and the available

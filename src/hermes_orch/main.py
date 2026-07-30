@@ -1,3 +1,4 @@
+# coding: utf-8
 """FastAPI app factory + lifespan.
 
 Routes mounted from src/hermes_orch/api/* submodules.

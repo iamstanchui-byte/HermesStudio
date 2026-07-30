@@ -1,3 +1,4 @@
+# coding: utf-8
 """Agent contract API (Object Layer Agent Layer, 2026-07-26).
 
 The doc's 5 planning-time LLM hooks (plan / route / judge /

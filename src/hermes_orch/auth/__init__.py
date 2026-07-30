@@ -1,3 +1,4 @@
+# coding: utf-8
 """Auth package (v1.6+): HMAC agent auth and future auth schemes."""
 from hermes_orch.auth.hmac import (
     DEFAULT_HMAC_WINDOW_SEC,

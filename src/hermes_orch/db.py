@@ -1,3 +1,4 @@
+# coding: utf-8
 """SQLite database connection + schema.
 
 Per REVIEW.md §3-§6, the DB stores denormalized views of:

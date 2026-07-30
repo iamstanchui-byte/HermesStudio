@@ -1,3 +1,4 @@
+# coding: utf-8
 """Project endpoints + file API (per REVIEW.md §3.6, §4).
 
 All file access goes through HTTP (no SMB/NFS) per §3.6.

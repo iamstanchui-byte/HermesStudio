@@ -1,3 +1,4 @@
+# coding: utf-8
 """Object Layer API (2026-07-26).
 
 First-class read endpoints for the three core object types:

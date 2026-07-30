@@ -1,3 +1,4 @@
+# coding: utf-8
 """Configuration loader.
 
 Priority: env vars > config.yaml > defaults

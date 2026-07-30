@@ -1,3 +1,4 @@
+# coding: utf-8
 """Task progress monitor — compute loop/stuck status for a running task.
 
 Added 2026-07-29 (docs/task-progress-monitor.md, Phase 1).

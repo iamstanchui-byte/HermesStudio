@@ -1,3 +1,4 @@
+# coding: utf-8
 """L3 state.md synthesis (Phase 2 of 3-tier memory).
 
 See docs/design/3-tier-memory.md for the full design.

@@ -1,3 +1,4 @@
+# coding: utf-8
 """Audit log helper for tracking system events.
 
 Per REVIEW.md §7 — history page shows what happened to projects / tasks / agents.

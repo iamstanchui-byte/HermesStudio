@@ -1,3 +1,4 @@
+# coding: utf-8
 """Single task API (Object Layer + chatbox code-gen, 2026-07-27).
 
 Single tasks live in the virtual `__single_tasks__` project with

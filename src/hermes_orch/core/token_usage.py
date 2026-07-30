@@ -1,3 +1,4 @@
+# coding: utf-8
 """Token usage helper — write one row per LLM call.
 
 Called from:

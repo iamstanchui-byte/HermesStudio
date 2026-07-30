@@ -1,3 +1,4 @@
+# coding: utf-8
 """SSE event bus (v1.8, 2026-07-29).
 
 A minimal in-process pub/sub for pushing real-time events to

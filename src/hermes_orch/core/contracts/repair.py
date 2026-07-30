@@ -1,3 +1,4 @@
+# coding: utf-8
 """Repair contract — STUB (design-time only, not yet wired to LLM).
 
 Given a task + its failure mode + attempt history, suggest a

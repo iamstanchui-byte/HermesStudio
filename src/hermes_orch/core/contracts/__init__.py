@@ -1,3 +1,4 @@
+# coding: utf-8
 """Agent contracts — planning-time LLM hooks (Object Layer Agent Layer, 2026-07-26).
 
 The doc's 5 standardized agent contracts (plan / route / judge /

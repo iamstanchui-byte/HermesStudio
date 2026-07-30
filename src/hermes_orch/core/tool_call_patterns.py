@@ -1,3 +1,4 @@
+# coding: utf-8
 """Hermes tool-call line patterns (v1.7, 2026-07-29).
 
 Hermes's transcript uses one of these formats for every tool call:

@@ -1,3 +1,4 @@
+# coding: utf-8
 """Judge contract — STUB (design-time only, not yet wired to LLM).
 
 Given a task's goal + result, judge whether the result meets the

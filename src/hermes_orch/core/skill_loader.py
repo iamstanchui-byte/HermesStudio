@@ -1,3 +1,4 @@
+# coding: utf-8
 """Skill sidecar schema loader (Object Layer foundation, 2026-07-26).
 
 Each skill (SKILL.md) can have an optional sidecar file

@@ -1,3 +1,4 @@
+# coding: utf-8
 """Unified LLM call helper (Object Layer Agent contract foundation, 2026-07-26).
 
 Replaces the ad-hoc httpx + parse-logic that was duplicated across

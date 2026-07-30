@@ -1,3 +1,4 @@
+# coding: utf-8
 """3-tier project memory (Phase 1: L1 trace + L2 facts).
 
 See docs/design/3-tier-memory.md for full design.

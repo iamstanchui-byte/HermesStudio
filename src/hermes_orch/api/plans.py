@@ -1,3 +1,4 @@
+# coding: utf-8
 """Project Plan layer (2026-07-27).
 
 The plan-first architectural shift: a project can carry a "plan"

@@ -1,3 +1,4 @@
+# coding: utf-8
 """Recurring project schedules API (#22).
 
 Endpoints:

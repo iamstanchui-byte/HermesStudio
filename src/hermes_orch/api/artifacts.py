@@ -1,3 +1,4 @@
+# coding: utf-8
 """Artifact endpoints (per REVIEW.md §5).
 
 Storage strategy:

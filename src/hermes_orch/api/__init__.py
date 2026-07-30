@@ -1,3 +1,4 @@
+# coding: utf-8
 """API routers — filled in during build phase.
 
 Per REVIEW.md:

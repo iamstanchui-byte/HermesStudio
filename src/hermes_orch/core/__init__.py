@@ -1,3 +1,4 @@
+# coding: utf-8
 """Core domain logic (per REVIEW.md §1, §3, §4).
 
 Modules (filled in as we build):

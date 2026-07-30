@@ -1,3 +1,4 @@
+# coding: utf-8
 """Optimize-tasks endpoint — chatbox-driven code-gen flow.
 
 The user-stated model (2026-07-26): "用orch server chatbox LLM 分析流程,

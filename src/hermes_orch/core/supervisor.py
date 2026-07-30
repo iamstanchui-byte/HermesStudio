@@ -1,3 +1,4 @@
+# coding: utf-8
 """Supervisor — background loop that drives project lifecycle.
 
 Runs as an asyncio task started from FastAPI's lifespan. Every N seconds:

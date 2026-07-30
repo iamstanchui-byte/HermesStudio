@@ -1,3 +1,4 @@
+# coding: utf-8
 """Shared utilities for hermes-orchestrator.
 
 Kept deliberately small. Right now just the timestamp helpers, which

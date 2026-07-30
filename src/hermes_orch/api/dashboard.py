@@ -1,3 +1,4 @@
+# coding: utf-8
 """Dashboard pages (per REVIEW.md §7).
 
 Pages:

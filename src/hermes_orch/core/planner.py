@@ -1,3 +1,4 @@
+# coding: utf-8
 """Planner — convert a project goal into a list of tasks (DAG).
 
 Two modes:

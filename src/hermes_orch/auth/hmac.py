@@ -1,3 +1,4 @@
+# coding: utf-8
 """HMAC-SHA256 agent authentication helpers (v1.6, 2026-07-29).
 
 Replaces the placeholder `X-Signature = SHA256(secret)` that v1.0

@@ -1,3 +1,4 @@
+# coding: utf-8
 """Path resolution for hermes profile directories.
 
 Used by the agent CLI (register, apply-configs, start) to find where hermes

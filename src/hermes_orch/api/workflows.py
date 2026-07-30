@@ -1,3 +1,4 @@
+# coding: utf-8
 """Workflow package API + LLM synthesis.
 
 Stage 1 (2026-07-23): synthesize a workflow package from a completed

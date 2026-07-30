@@ -1,3 +1,4 @@
+# coding: utf-8
 """Single task HTML pages (Commit 3 of Object Layer, 2026-07-27).
 
 Renders the /single-tasks/{id} DETAIL page only — the LIST page

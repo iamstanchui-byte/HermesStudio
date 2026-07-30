@@ -1,3 +1,4 @@
+# coding: utf-8
 """Cleanup job — hard-deletes projects that have been in `deleted` state
 longer than `cleanup.retention_days`.
 

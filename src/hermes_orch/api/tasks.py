@@ -1,3 +1,4 @@
+# coding: utf-8
 """Task endpoints (per REVIEW.md §1, §4).
 
 Task lifecycle:
