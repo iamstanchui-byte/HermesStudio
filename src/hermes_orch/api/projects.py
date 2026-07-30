@@ -2366,13 +2366,16 @@ materialized into tasks when they click Run on the dashboard.
     - `depends_on` (optional, list of step names): upstream
       steps. Empty list = no upstream.
     - `feedback_to` (optional, list of step names): loop-back
-      signal. When any of the listed steps FAIL, this step is
-      automatically re-dispatched (and its downstream via
-      depends_on is reset to pending). Only fires if the spawned
-      project has `max_iterations > 0`. Use for retry-on-validation-
-      failure patterns (e.g. an "auto-correct" step that re-runs
-      when a downstream "validate" step fails). Empty list = no
-      loop-back. Self-references are silently dropped at run time.
+      signal. v2.0 semantic: this field is on the FAILING step
+      (matches the standard `on_failure` pattern in AWS Step
+      Functions, Airflow, Temporal). "step.feedback_to = [A, B]"
+      means "if THIS step fails, re-run A and B (and reset
+      their downstream via depends_on)". Only fires if the
+      spawned project has `max_iterations > 0`. Use for retry-
+      on-validation-failure patterns (e.g. an "audit" step that
+      re-runs the earlier "search" step when the audit fails).
+      Empty list = no loop-back. Self-references are silently
+      dropped at run time.
     - `skill` (optional, "" if N/A): canonical skill name from
       `agents_info.skills`. Leave "" if the step uses a generic
       action, not a specific skill.
@@ -2420,6 +2423,9 @@ materialized into tasks when they click Run on the dashboard.
     dangling references)
   - No cycles (A→B→A)
   - `feedback_to` is a list of OTHER STEP NAMES (never IDs)
+  - v2.0 semantic: this field is on the FAILING step
+    (matches standard on_failure pattern). If step X has
+    `feedback_to: [Y]`, that means "if X fails, re-run Y".
   - All `feedback_to` names resolve to steps in the plan (no
     dangling references; self-references are silently dropped
     at run time)

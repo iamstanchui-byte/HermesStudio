@@ -1641,18 +1641,44 @@ class Supervisor:
                 )
                 log.info(f"task {t['id']} ({t['name']!r}) skipped (parent failed)")
 
-    # ===== Phase 0 of visual workflow builder (2026-07-24):
-    # cascading invalidation + loop-back. Re-dispatches a task when one
-    # of its `feedback_to` references fails, and transitively resets all
-    # dependents (via depends_on) so downstream analysis agents don't
-    # keep stale output. The fundamental correctness primitive of the
-    # search→analyze→audit→re-run-search loop-back pattern.
+    # ===== Phase 0 of visual workflow builder (2026-07-24),
+    # reworked in v2.0 (2026-07-30) to FLIP the `feedback_to` semantic.
+    #
+    # OLD: B.feedback_to = [A] meant "if A fails, re-run B"
+    #      (target subscribes to trigger's failure)
+    # NEW: A.feedback_to = [B] means "if A fails, re-run B"
+    #      (failing step declares its recovery targets)
+    #
+    # Why flipped: the OLD design is the inverted pattern that
+    # confused new users. The NEW design matches the standard
+    # "on_failure" pattern in AWS Step Functions (`Catch`),
+    # Airflow (`on_failure_callback`), Temporal (retry policies),
+    # and most CI systems. The field is on the failing step
+    # (the one with the feedback), and it lists the steps to
+    # recover by.
+    #
+    # Cascade direction is unchanged: when step R is re-run,
+    # reset R + all tasks that depend on R (via depends_on) so
+    # the whole chain re-runs with fresh data. Only the
+    # "which step is the entry point" changes.
+    #
+    # Migration: `scripts/migrate_feedback_to_v2.py` inverts
+    # existing data in-place. Must be run after deploying this
+    # code change; otherwise OLD data would be misinterpreted
+    # (T.feedback_to = [A] would now mean "if T fails, re-run A",
+    # which is the OPPOSITE of what the original code did).
 
     async def _maybe_loop_back(self, project_id: str) -> bool:
-        """If any FAILED task in this project is named in some other
-        task's `feedback_to` list, AND the project hasn't hit
-        max_iterations, run cascade-reset on those other tasks and
+        """If any FAILED task in this project has a non-empty
+        `feedback_to` list, AND the project hasn't hit
+        max_iterations, cascade-reset each listed task and
         increment current_iteration.
+
+        v2.0 (2026-07-30) FLIPPED SEMANTIC: the field is on the
+        FAILING step (was on the target/listener). For each failed
+        task, its `feedback_to` list is the set of task IDs to
+        re-dispatch (and cascade-reset so the chain downstream
+        also re-runs).
 
         Returns True if a loop-back was fired (so the next _find_ready
         picks up the now-pending tasks). Returns False otherwise
@@ -1661,10 +1687,9 @@ class Supervisor:
         Decision matrix:
           max_iter == 0  →  disabled (user opted out). No-op, no mark.
           max_iter > 0:
-            no failed tasks                →  no-op
-            no candidates with feedback_to →  no-op
-            cur_iter >= max_iter           →  mark project failed, no-op
-            else                           →  fire (cascade + increment)
+            no failed tasks with feedback_to →  no-op
+            cur_iter >= max_iter              →  mark project failed, no-op
+            else                              →  fire (cascade + increment)
 
         MUST be called AFTER _propagate_failures (so failed tasks are
         visible in 'failed' state) and BEFORE _find_ready_tasks (so
@@ -1687,47 +1712,43 @@ class Supervisor:
         if max_iter <= 0:
             return False
 
-        # Find all failed tasks in this project (by NAME, since
-        # feedback_to references step names, not task IDs).
+        # Find all failed tasks in this project. Each failed task's
+        # feedback_to list (already resolved to task IDs by
+        # run_workflow / run_project_plan) is the set of tasks to
+        # re-dispatch. So a single pass gives us both the trigger
+        # (the failed task) and the targets (each id in feedback_to).
         failed = await self.db.fetchall(
-            "SELECT id, name FROM tasks WHERE project_id = ? "
+            "SELECT id, name, feedback_to FROM tasks WHERE project_id = ? "
             "AND status = 'failed'",
             (project_id,),
         )
         if not failed:
             return False
-        failed_names = {f["name"] for f in failed if f.get("name")}
-        if not failed_names:
-            return False
 
-        # Find tasks in this project whose feedback_to overlaps with
-        # the set of failed step names. JSON LIKE is too crude
-        # (substring matches across names), so we load all candidates
-        # and filter in Python.
-        candidates = await self.db.fetchall(
-            "SELECT id, name, feedback_to FROM tasks WHERE project_id = ? "
-            "AND feedback_to IS NOT NULL AND feedback_to != '[]'",
-            (project_id,),
-        )
-        # Map: target task_id -> set of failed step names that triggered it
-        targets: dict[str, set[str]] = {}
-        for c in candidates:
-            # Self-reference guard: skip candidates whose name IS in
-            # the trigger set. run_workflow already drops self-refs at
-            # insert time, but a row could have been hand-edited or
-            # migrated from an older schema, so we defend in depth.
-            cname = c.get("name")
-            if not cname or cname in failed_names:
-                continue
+        # Build the set of target task IDs to re-run, plus a map from
+        # target_id -> {failing_step_name, ...} for the audit log.
+        # Self-reference guard: a task in its own feedback_to list is
+        # a no-op (run_workflow / run_project_plan already drop
+        # self-refs at insert time, but a row could have been hand-
+        # edited or migrated, so we defend in depth).
+        targets: set[str] = set()
+        triggered_by: dict[str, set[str]] = {}  # target -> set of failing step names
+        for f in failed:
+            fname = f.get("name") or f["id"]
             try:
-                fb = json.loads(c.get("feedback_to") or "[]")
+                fb = json.loads(f.get("feedback_to") or "[]")
             except (json.JSONDecodeError, TypeError):
                 continue
             if not isinstance(fb, list):
                 continue
-            triggers = set(fb) & failed_names
-            if triggers:
-                targets[c["id"]] = triggers
+            for tid in fb:
+                if not isinstance(tid, str) or not tid:
+                    continue
+                if tid == f["id"]:
+                    # Self-ref — drop silently
+                    continue
+                targets.add(tid)
+                triggered_by.setdefault(tid, set()).add(fname)
 
         if not targets:
             return False
@@ -1740,8 +1761,15 @@ class Supervisor:
             failed_task_names = sorted(
                 f["name"] for f in failed if f.get("name")
             )
+            # Look up target names for the human-readable summary.
+            target_rows = await self.db.fetchall(
+                "SELECT id, name FROM tasks WHERE id IN ("
+                + ",".join("?" * len(targets))
+                + ")",
+                tuple(targets),
+            ) if targets else []
             target_names = sorted(
-                t["name"] for t in candidates if t["id"] in targets
+                r["name"] for r in target_rows if r.get("name")
             )
             await self.db.execute(
                 "UPDATE projects SET state = 'failed', "
@@ -1760,7 +1788,7 @@ class Supervisor:
                 payload={
                     "current_iteration": cur_iter,
                     "max_iterations": max_iter,
-                    "failed_step_names": sorted(failed_names),
+                    "failed_step_names": failed_task_names,
                     "would_re_dispatch": target_names,
                 },
             )
@@ -1774,19 +1802,28 @@ class Supervisor:
             (new_iter, _now_iso(), project_id),
         )
 
+        # Look up target names once (for the audit log / log line)
+        target_rows = await self.db.fetchall(
+            "SELECT id, name FROM tasks WHERE id IN ("
+            + ",".join("?" * len(targets))
+            + ")",
+            tuple(targets),
+        ) if targets else []
+        name_by_id: dict[str, str] = {
+            r["id"]: (r.get("name") or r["id"]) for r in target_rows
+        }
+
         fired_count = 0
-        for tid, triggers in targets.items():
+        for tid in targets:
             reset_ids = await self._cascade_reset(project_id, tid)
-            target_name = next(
-                (c["name"] for c in candidates if c["id"] == tid),
-                tid,
-            )
+            target_name = name_by_id.get(tid, tid)
+            triggers = sorted(triggered_by.get(tid, set()))
             await audit_log(
                 self.db, "loopback.fired",
                 actor="supervisor", project_id=project_id, task_id=tid,
                 payload={
                     "iteration": new_iter,
-                    "triggers": sorted(triggers),
+                    "triggers": triggers,
                     "target_step": target_name,
                     "reset_count": len(reset_ids),
                     "reset_task_ids": reset_ids,
@@ -1794,7 +1831,7 @@ class Supervisor:
             )
             log.info(
                 f"project {project_id}: loop-back iteration {new_iter} — "
-                f"re-dispatched {target_name!r} (triggers: {sorted(triggers)}); "
+                f"re-dispatched {target_name!r} (triggers: {triggers}); "
                 f"cascade reset {len(reset_ids)} task(s)"
             )
             fired_count += 1

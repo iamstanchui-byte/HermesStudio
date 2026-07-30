@@ -17,7 +17,7 @@
 {# _visual_workflow.js is loaded by the page at the bottom of <body>;
    it depends on drawflow being parsed first. We use `defer` above so
    the order is preserved. #}
-<script defer src="/static/visual_workflow.js?v=2026-07-24-1"></script>
+<script defer src="/static/visual_workflow.js?v=2026-07-30-v200fb"></script>
 <style>
     /* Page-specific layout. The body uses Tailwind, but drawflow
        ships its own styles for nodes + connections which we keep
@@ -257,7 +257,7 @@
             Phase 1 skeleton
             <span class="text-gray-400 ml-2">
                 · <span class="font-semibold text-gray-600">blue</span> wires = chain (depends_on)
-                · <span class="font-semibold" style="color: #dc2626;">red dashed</span> wire = loop-back (feedback_to)
+                · <span class="font-semibold" style="color: #dc2626;">red dashed</span> wire = if I fail, re-run target (feedback_to, v2.0)
             </span>
         </p>
     </div>
@@ -357,16 +357,19 @@
             <label>output_path (optional)</label>
             <input type="text" id="vf-edit-output-path">
             <label>
-                Loop-back: re-run me if these steps fail
+                {# v2.0 (2026-07-30) FLIPPED the label to match the
+                   new semantic: feedback_to is on the FAILING step
+                   (this step), and it lists the steps to re-run. #}
+                Loop-back: re-run these steps if I fail
                 <span class="text-xs text-gray-400 font-normal"
-                    title="When any of these steps fail, this step is automatically re-dispatched, and all downstream steps (via depends_on) are reset to pending. Useful for upstream retries when downstream validation catches a stale data problem.">
+                    title="When THIS step fails, each listed step is automatically re-dispatched, and all downstream steps (via depends_on) are reset to pending. Useful for re-running the upstream 'search' / 'fetch' step when a downstream 'audit' or 'validate' step fails and reports bad data.">
                     (?)
                 </span>
             </label>
             <input type="text" id="vf-edit-feedback-to"
-                placeholder="e.g. verify-step, audit-step">
+                placeholder="e.g. search-step, fetch-step">
             <p class="text-xs text-gray-500 mt-1">
-                Wire from another step's
+                Wire to another step's
                 <span class="inline-block w-3 h-3 align-middle rounded-full"
                     style="background: #dc2626; border: 1px dashed #dc2626;"></span>
                 <span class="font-mono text-[10px]">red handle</span>

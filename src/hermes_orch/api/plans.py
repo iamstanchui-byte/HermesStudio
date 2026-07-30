@@ -86,11 +86,13 @@ class PlanStep(BaseModel):
     tool: str = ""   # canonical tool name (not row id)
     required_capability: str = ""
     depends_on: list[str] = Field(default_factory=list)
-    # v1.9.4 (2026-07-30): feedback_to mirrors workflow_packages
-    # step_template. List of OTHER STEP NAMES in the same plan.
-    # When any of the listed steps fail, this step is re-dispatched
-    # (and its downstream via depends_on is reset to pending). Only
-    # fires when the spawned project has max_iterations > 0.
+    # v1.9.4 (2026-07-30, FLIPPED 2026-07-30 in v2.0): feedback_to
+    # mirrors workflow_packages step_template. List of step names
+    # in the same plan to RE-RUN when THIS step fails (and reset
+    # their downstream via depends_on). v2.0 semantic: field is on
+    # the FAILING step (matches standard on_failure pattern in
+    # AWS Step Functions / Airflow / Temporal). Only fires when
+    # the spawned project has max_iterations > 0.
     # Server-side validator drops self-references and dangling
     # names at /plan/run time (matches the workflow apply path).
     # Visual plan editor uses the red output_2 handle / red dashed

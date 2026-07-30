@@ -48,15 +48,14 @@ _STEP_FIELDS = (
     # prompt, stale data) or re-discovering the data source URL
     # on every run (token waste), just reference the skill by name.
     # Phase 0 of visual workflow builder (2026-07-24, updated 2026-07-25
-    # for Phase 2): `feedback_to` is an OPTIONAL list of step names
-    # (NOT restricted to earlier ones — it's a TRIGGER semantic). If any
-    # of those steps fails, this step is re-dispatched (and so are all
-    # its transitive dependents via cascading invalidation). Used to
-    # implement the search→analyze→audit→re-run-search loop-back pattern.
-    # The wire direction in the visual builder is source→target, and
-    # target.feedback_to += [source] — counter-intuitive but consistent:
-    # target listens for source's failure and gets re-run on it.
-    # Default: null/omitted (no loop-back). Cap: project.max_iterations.
+    # for Phase 2, FLIPPED 2026-07-30 in v2.0): `feedback_to` is an
+    # OPTIONAL list of step names. v2.0 FLIPPED the semantic: this
+    # field is now on the FAILING step (matches the standard
+    # "on_failure" pattern in AWS Step Functions / Airflow /
+    # Temporal). "step.feedback_to = [A, B]" means "if THIS step
+    # fails, re-run A and B (and reset their downstream via
+    # depends_on)". Default: null/omitted (no loop-back).
+    # Cap: project.max_iterations.
     "feedback_to",
 )
 # Fields whose VALUES may contain {{var}} placeholders. Excludes
@@ -235,28 +234,29 @@ The `description` field MUST be a 1-2 sentence human-readable summary of what th
     to GDrive. The user had to PATCH a 2nd step by hand.
 13. **OPTIONAL `feedback_to` for the search→analyze→audit loop-back
     pattern** (Phase 0 of visual workflow builder, 2026-07-24,
-    updated 2026-07-25 for Phase 2 — feedback_to can now reference
-    ANY step in the workflow, not just earlier ones; it's a TRIGGER
-    semantic).
+    updated 2026-07-25 for Phase 2, **FLIPPED 2026-07-30 in v2.0**).
     When a later step AUDITS the output of an earlier step (e.g.
     `audit-quality` checks `analyze-report`), and the audit can
     fail in a way that requires the earlier step to re-run with
-    new inputs, set the earlier step's `feedback_to` to the audit
-    step's name. The supervisor's loop-back logic will, on audit
-    failure: (a) re-dispatch the earlier step, (b) **cascade** reset
-    all its transitive dependents to `pending` (so analyze doesn't
-    keep the stale report), (c) increment `current_iteration`, and
-    (d) bail out at `max_iterations` (project-level cap).
+    new inputs, set the **AUDIT step's** `feedback_to` to the
+    **earlier step's** name. v2.0 semantic: the field is on the
+    FAILING step (the audit), and it lists the steps to recover by
+    (the earlier step). The supervisor's loop-back logic will, on
+    audit failure: (a) re-dispatch the earlier step, (b) **cascade**
+    reset all its transitive dependents to `pending` (so analyze
+    doesn't keep the stale report), (c) increment `current_iteration`,
+    and (d) bail out at `max_iterations` (project-level cap).
     - `feedback_to` is a LIST of step names (NOT restricted to
       earlier ones — it can reference any step in the workflow;
       the validator just checks that the name exists).
       Self-reference is a silent no-op.
     - OMIT `feedback_to` when no loop-back is needed (the safe
       default). Forgetting it is OK; including it incorrectly
-      (e.g. pointing to a step that doesn't actually audit this
-      step) just means the loop never fires — safe failure.
-    - Cap: `feedback_to` may reference MULTIPLE steps (the
-      target step is re-dispatched if ANY of them fails).
+      (e.g. a step that never actually fires failure saying
+      "re-run X on my fail") just means the loop never fires —
+      safe failure.
+    - `feedback_to` may reference MULTIPLE steps (each listed
+      step is re-dispatched when this step fails).
     - Real example (search→analyze→audit→deliver):
       ```
       step_template: [
@@ -273,24 +273,22 @@ The `description` field MUST be a 1-2 sentence human-readable summary of what th
       // (downstream tasks get SKIPPED by _propagate_failures, but
       // the user has to manually re-run)
       ```
-      WRONG (only audit gets feedback_to — re-runs audit, but
-      analyze still uses old data — STALE OUTPUT BUG the user
-      caught on 2026-07-24):
+      WRONG (search has feedback_to but pointing to itself —
+      re-runs search on search's own failure, which is a
+      no-op):
       ```
-      {{ "name": "audit", "feedback_to": ["audit"], ... }}
+      {{ "name": "search", "feedback_to": ["search"], ... }}
       // self-reference — silent no-op
       ```
-      RIGHT (search re-dispatched on audit fail; cascade resets
-      analyze, audit, deliver to pending so they re-run with
-      fresh search data). NOTE: search.feedback_to references
-      audit, which is LATER in step_template — this is now valid
-      because feedback_to is a trigger, not a dependency:
+      RIGHT (audit declares "when I fail, re-run search and
+      cascade-reset the chain so analyze/audit/deliver re-run
+      with fresh search data"):
       ```
-      {{ "name": "search",  "feedback_to": ["audit"], ... }},
-      // feedback_to=["audit"] means:
-      //   "if audit fails, re-run me (search)"
-      // analyze/audit/deliver need NO feedback_to — the cascade
-      // follows depends_on backwards from search automatically
+      {{ "name": "audit",   "feedback_to": ["search"], ... }},
+      // feedback_to=["search"] means:
+      //   "if I (audit) fail, re-run search"
+      // search/analyze/deliver need NO feedback_to — the cascade
+      // follows depends_on forward from search automatically
       ```
 
 # Operator hints (use as starting point for variable names + types)
@@ -683,20 +681,15 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
             if any(s in skill for s in ("coord_pickup", "handoff:", "_iteration_review")):
                 return False, f"step_template[{i}].skill={skill!r} contains L3 scaffolding"
         # feedback_to (optional, Phase 0 of visual builder, 2026-07-24,
-        # updated 2026-07-25 for Phase 2 red dashed handle).
-        # List of step names whose failure should re-dispatch THIS step.
+        # updated 2026-07-25 for Phase 2 red dashed handle,
+        # FLIPPED 2026-07-30 in v2.0).
+        # List of step names to RE-RUN when THIS step fails.
         # null/omitted = no loop-back. Empty list = no loop-back.
-        # Semantic: target.feedback_to = [source] means "if source fails,
-        # re-run me (target)". It's a TRIGGER relationship — source is the
-        # listener, target is the re-runner. Order does NOT matter; target
-        # can be anywhere relative to source in step_template. The wire
-        # goes source → target, and source is the one that gets re-run on
-        # target's failure (intentionally counter-intuitive; see the
-        # _STEP_FIELDS docstring + the LLM-synth prompt rules 13 for the
-        # full example).
-        # Each name must reference SOME step in the workflow (existence
-        # check) but is NOT required to be earlier — only depends_on has
-        # the forward-ref rule. Self-reference is a no-op (skip silently).
+        # v2.0 semantic: A.feedback_to = [B] means "if A fails,
+        # re-run B". Field is on the failing step (matches standard
+        # on_failure pattern). Each name must reference SOME step
+        # in the workflow (existence check). Self-reference is a
+        # no-op (skip silently).
         fb = step.get("feedback_to")
         if fb is not None:
             if not isinstance(fb, list):
@@ -1462,13 +1455,14 @@ async def run_workflow(
             # Copy params to avoid mutating the substituted template
             params = dict(params)
             params["_workflow_skill"] = skill_name
-        # Phase 0 of visual workflow builder (2026-07-24): copy
-        # step.feedback_to (a list of earlier step names) into the
-        # task row. Supervisor reads this on every tick; if any named
-        # step fails, this task is cascade-reset to pending. Default
-        # '[]' = no loop-back (safe; matches pre-Phase-0 behavior).
-        # Self-references (step name appears in its own feedback_to)
-        # are silently dropped — a step can't react to its own failure.
+        # v2.0 (2026-07-30) FLIPPED feedback_to semantic: the
+        # field is on the FAILING step. We copy the step's
+        # feedback_to (a list of recovery step names) into the
+        # task row. The supervisor reads this on every tick;
+        # for each FAILED task, the listed recovery steps are
+        # cascade-reset to pending. Default '[]' = no loop-back
+        # (safe; matches pre-Phase-0 behavior). Self-references
+        # (the failing step names itself) are silently dropped.
         raw_fb = step.get("feedback_to") or []
         if isinstance(raw_fb, list):
             feedback_to = [f for f in raw_fb if f != sname]

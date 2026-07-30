@@ -28,7 +28,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
-<script defer src="/static/visual_plan.js?v=2026-07-30-v194fb1"></script>
+<script defer src="/static/visual_plan.js?v=2026-07-30-v200fb"></script>
 <style>
     /* Page-specific layout */
     body { background: #f9fafb; }
@@ -392,16 +392,17 @@
         <textarea id="vp-f-params" placeholder='{"key": "value"}'></textarea>
         <label>Depends on (comma-separated step names)</label>
         <input id="vp-f-deps" type="text" placeholder="(optional)">
-        {# v1.9.4: feedback_to (loop-back). When any of the listed
-           steps fail, this step is re-dispatched (and its downstream
-           via depends_on is reset to pending). Only fires if the
-           spawned project has max_iterations > 0. Mirrors the
+        {# v1.9.4 (v2.0 FLIPPED 2026-07-30): feedback_to (loop-back).
+           v2.0 semantic: this field is on the FAILING step. Listing
+           a step here means "if THIS step fails, re-run that step
+           (and reset its downstream via depends_on)". Only fires if
+           the spawned project has max_iterations > 0. Mirrors the
            visual_workflow.html side panel field so the two editors
            read the same way. #}
         <label>
-            <span style="color: #dc2626;">Loop-back</span>: re-run me if these steps fail
+            <span style="color: #dc2626;">Loop-back</span>: re-run these steps if I fail
             <span class="text-xs text-gray-400 font-normal"
-                title="When any of the listed steps fail, this step is automatically re-dispatched, and all downstream steps (via depends_on) are reset to pending. Only fires if the spawned project has max_iterations > 0. Use for retry-on-validation-failure patterns.">
+                title="When THIS step fails, each listed step is automatically re-dispatched, and all downstream steps (via depends_on) are reset to pending. Only fires if the spawned project has max_iterations > 0. Use for retry-on-validation-failure patterns (e.g. an 'audit' step that re-runs the earlier 'search' step when the audit fails).">
                 (?)
             </span>
         </label>

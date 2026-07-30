@@ -249,20 +249,33 @@ async def test_cascade_resets_business_profile():
 
 @pytest.mark.asyncio
 async def test_loop_back_fires():
-    """audit fails. search.feedback_to = ['audit']. search +
-    analyze + audit all reset to pending; iteration counter bumps."""
+    """audit fails. audit.feedback_to = [t-search] (v2.0: on the
+    FAILING step, listing the recovery step by task id). search +
+    analyze + audit all reset to pending; iteration counter bumps.
+
+    v2.0 (2026-07-30) FLIPPED: feedback_to is on the FAILING step.
+    OLD: search.feedback_to = ['audit'] meant "if audit fails,
+    re-run search". NEW: audit.feedback_to = [t-search_id] means
+    "if audit fails, re-run search" — same outcome, different
+    field placement. The cascade direction is unchanged: reset
+    the recovery step (search) + its downstream (analyze,
+    audit, deliver)."""
     db = await _new_db()
     try:
         sup = _new_supervisor(db)
         pid = await _make_project(db, max_iterations=3)
         # search, analyze, audit, deliver all terminal (search completed,
         # analyze completed, audit failed, deliver skipped by propagate)
-        search = await _make_task(db, pid, name="search", status="completed",
-                                  feedback_to=["audit"])
+        search = await _make_task(db, pid, name="search", status="completed")
         analyze = await _make_task(db, pid, name="analyze", status="skipped",
                                    depends_on=[search])
+        # v2.0: feedback_to is on the FAILING step (audit), with the
+        # task ID of the recovery step (search). In the real planner
+        # path, plan-runner resolves step names to task IDs at /plan/run
+        # time, so feedback_to stores task IDs.
         audit = await _make_task(db, pid, name="audit", status="failed",
-                                 depends_on=[analyze])
+                                 depends_on=[analyze],
+                                 feedback_to=[search])
         deliver = await _make_task(db, pid, name="deliver", status="skipped",
                                    depends_on=[audit])
 
@@ -306,9 +319,11 @@ async def test_loop_back_cap():
         await db.execute(
             "UPDATE projects SET current_iteration = 2 WHERE id = ?", (pid,)
         )
-        await _make_task(db, pid, name="search", status="completed",
-                         feedback_to=["audit"])
-        await _make_task(db, pid, name="audit", status="failed")
+        search = await _make_task(db, pid, name="search", status="completed")
+        # v2.0: feedback_to on the FAILING step (audit), with the
+        # task ID of the recovery step (search).
+        await _make_task(db, pid, name="audit", status="failed",
+                         feedback_to=[search])
 
         fired = await sup._maybe_loop_back(pid)
         assert fired is False
@@ -332,9 +347,9 @@ async def test_loop_back_no_feedback_to():
     try:
         sup = _new_supervisor(db)
         pid = await _make_project(db, max_iterations=3)
-        await _make_task(db, pid, name="search", status="completed")
+        search = await _make_task(db, pid, name="search", status="completed")
         await _make_task(db, pid, name="analyze", status="failed",
-                         depends_on=["t-search"])
+                         depends_on=[search])
         before_iter = (await db.fetchall(
             "SELECT current_iteration FROM projects WHERE id = ?", (pid,)
         ))[0]["current_iteration"]
@@ -352,20 +367,27 @@ async def test_loop_back_no_feedback_to():
 
 @pytest.mark.asyncio
 async def test_loop_back_self_reference_silent_noop():
-    """If a task's feedback_to references itself, that's a silent
-    no-op (we drop self-refs at task insert time anyway, but the
-    supervisor should also tolerate it if a bad row slips through)."""
+    """If a task's feedback_to references its own task id, that's a
+    silent no-op. v2.0: a step saying "if I fail, re-run me" is
+    meaningless (you'd loop forever). Dropped silently.
+
+    OLD: the test put feedback_to on the LISTENER. The listener's
+    name appearing in its own feedback_to was a no-op.
+    NEW: the failing step's task id appearing in its own feedback_to
+    is a no-op (the supervisor's `tid == f["id"]` check)."""
     db = await _new_db()
     try:
         sup = _new_supervisor(db)
         pid = await _make_project(db, max_iterations=3)
-        # audit has feedback_to=['audit'] (self-ref)
-        await _make_task(db, pid, name="audit", status="failed",
-                         feedback_to=["audit"])
-
+        audit = await _make_task(db, pid, name="audit", status="failed")
+        # Now set the self-ref (audit's own id in its feedback_to).
+        await db.execute(
+            "UPDATE tasks SET feedback_to = ? WHERE id = ?",
+            (json.dumps([audit]), audit),
+        )
         fired = await sup._maybe_loop_back(pid)
-        # No target should match (the only candidate, audit, has a
-        # self-ref, which doesn't trigger)
+        # Self-ref is dropped inside the failed-task loop. No targets
+        # remain, so _maybe_loop_back returns False.
         assert fired is False
     finally:
         await db.close()
@@ -379,9 +401,11 @@ async def test_loop_back_max_iter_zero_disables_loop():
     try:
         sup = _new_supervisor(db)
         pid = await _make_project(db, max_iterations=0)
-        await _make_task(db, pid, name="search", status="completed",
-                         feedback_to=["audit"])
-        await _make_task(db, pid, name="audit", status="failed")
+        search = await _make_task(db, pid, name="search", status="completed")
+        # v2.0: feedback_to on the FAILING step (audit), with the
+        # task ID of the recovery step (search).
+        await _make_task(db, pid, name="audit", status="failed",
+                         feedback_to=[search])
 
         fired = await sup._maybe_loop_back(pid)
         # 0 means disabled, so we don't fire. But we also don't
@@ -402,11 +426,14 @@ async def test_loop_back_max_iter_zero_disables_loop():
 def test_validator_accepts_feedback_to():
     """feedback_to as a list of valid step names is accepted.
 
-    Phase 2 (2026-07-25): feedback_to can reference ANY step in the
-    workflow, not just earlier ones. The earlier restriction was wrong —
-    the canonical search→analyze→audit loop-back pattern needs
-    search.feedback_to=['audit'] (a LATER step) to mean "re-run me
-    if audit fails". This is the trigger semantic."""
+    v2.0 (2026-07-30) FLIPPED: feedback_to is on the FAILING step
+    (audit), listing the recovery step (search) by name. The
+    validator only checks existence + no-self-ref, so the
+    placement doesn't matter — only that the names resolve to
+    real steps in the workflow. The search→analyze→audit
+    loop-back pattern is now expressed as
+    `audit.feedback_to = ['search']` (audit is the failing
+    step, search is the recovery step)."""
     from hermes_orch.api.workflows import _validate_workflow_package
     pkg = {
         "description": "test",
@@ -416,10 +443,10 @@ def test_validator_accepts_feedback_to():
             {"name": "analyze", "agent_role": "r1", "action": "a",
              "depends_on": ["search"], "params_template": {}},
             {"name": "audit", "agent_role": "r1", "action": "a",
-             "depends_on": ["analyze"], "params_template": {}},
+             "depends_on": ["analyze"], "params_template": {},
+             "feedback_to": ["search"]},  # v2.0: if audit fails, re-run search
             {"name": "deliver", "agent_role": "r1", "action": "a",
-             "depends_on": ["audit"], "params_template": {},
-             "feedback_to": ["audit"]},  # re-dispatch deliver if audit fails
+             "depends_on": ["audit"], "params_template": {}},
         ],
         "variables": [],
     }
@@ -428,27 +455,30 @@ def test_validator_accepts_feedback_to():
 
 
 def test_validator_accepts_forward_feedback_to():
-    """Phase 2 (2026-07-25): feedback_to with a FORWARD ref is now
-    accepted. The earlier 'must be earlier step' rule was wrong
-    (see _validate_workflow_package docstring). The canonical pattern
-    is search.feedback_to=['audit'] where 'audit' is a LATER step —
-    that's the search→analyze→audit loop-back semantic."""
+    """v2.0 (2026-07-30): feedback_to is a TRIGGER (not a forward
+    dependency), so the failing step can list ANY step in the
+    workflow, including ones that come AFTER it. The canonical
+    search→analyze→audit pattern has audit (a LATER step in the
+    template) listing search (an EARLIER step) — totally valid.
+
+    This used to be the "forward ref" exception in v1.9.4; in
+    v2.0, "any direction" is the only rule, not an exception."""
     from hermes_orch.api.workflows import _validate_workflow_package
     pkg = {
         "description": "test",
         "step_template": [
             {"name": "search", "agent_role": "r1", "action": "a",
-             "depends_on": [], "params_template": {},
-             "feedback_to": ["audit"]},  # 'audit' is a LATER step, but valid
+             "depends_on": [], "params_template": {}},
             {"name": "analyze", "agent_role": "r1", "action": "a",
              "depends_on": ["search"], "params_template": {}},
             {"name": "audit", "agent_role": "r1", "action": "a",
-             "depends_on": ["analyze"], "params_template": {}},
+             "depends_on": ["analyze"], "params_template": {},
+             "feedback_to": ["search"]},  # 'search' is an EARLIER step — valid in v2.0
         ],
         "variables": [],
     }
     ok, err = _validate_workflow_package(pkg)
-    assert ok, f"valid package (forward feedback_to) rejected: {err}"
+    assert ok, f"valid package (feedback_to to earlier step) rejected: {err}"
 
 
 def test_validator_rejects_nonexistent_feedback_to():
@@ -459,10 +489,10 @@ def test_validator_rejects_nonexistent_feedback_to():
         "description": "test",
         "step_template": [
             {"name": "search", "agent_role": "r1", "action": "a",
-             "depends_on": [], "params_template": {},
-             "feedback_to": ["nonexistent-step"]},  # WRONG: doesn't exist
+             "depends_on": [], "params_template": {}},
             {"name": "analyze", "agent_role": "r1", "action": "a",
-             "depends_on": ["search"], "params_template": {}},
+             "depends_on": ["search"], "params_template": {},
+             "feedback_to": ["nonexistent-step"]},  # WRONG: doesn't exist
         ],
         "variables": [],
     }

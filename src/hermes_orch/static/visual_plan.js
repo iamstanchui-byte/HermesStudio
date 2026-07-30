@@ -225,10 +225,23 @@
     // data but not _plan, so Save sent depends_on=[] and the wire
     // disappeared on reload.
     //
-    // v1.9.4: route by output_class. output_1 (chain) writes to
-    // target.depends_on; output_2 (loop-back) writes to
-    // target.feedback_to. Self-references (target == source) are
-    // silently dropped — a step can't loop back to itself.
+    // v1.9.4 (FLIPPED 2026-07-30 in v2.0): route by output_class.
+    //   output_1 (chain)    → target.depends_on += [source]
+    //                         (the dependent step lists what it waits for)
+    //   output_2 (loop-back)→ source.feedback_to += [target]
+    //                         (the FAILING step lists its recovery steps)
+    //
+    // v2.0 (FLIPPED) explanation: feedback_to is now on the FAILING
+    // step (matches the standard on_failure pattern in AWS Step
+    // Functions, Airflow, Temporal). A wire from A to B with the
+    // red handle means: "if A fails, re-run B". The data lives on A
+    // (the failing step), not B (the recovery step). depends_on
+    // stays on the dependent step (the "downstream" end of the
+    // chain) because that's the natural English reading too:
+    // B.depends_on = [A] = "B depends on A".
+    //
+    // Self-references (target == source) are silently dropped — a
+    // step can't loop back to itself.
     function _onConnectionCreated(connection) {
         const sourceInternal = connection.output_id;
         const targetInternal = connection.input_id;
@@ -239,34 +252,47 @@
         // these but dropping here too means we never write the
         // dangling ref to _plan, so Save round-trips clean.
         if (sourceName === targetName) return;
-        const target = _plan.steps.find(s => s.name === targetName);
-        if (!target) return;
-        // Route by output class: output_2 = feedback_to, default
-        // (and output_1) = depends_on.
         const outputClass = connection.output_class || 'output_1';
-        const fieldName = outputClass === 'output_2' ? 'feedback_to' : 'depends_on';
-        if (!Array.isArray(target[fieldName])) target[fieldName] = [];
-        if (!target[fieldName].includes(sourceName)) {
-            target[fieldName].push(sourceName);
+        if (outputClass === 'output_2') {
+            // v2.0: feedback_to lives on the SOURCE (failing step)
+            const source = _plan.steps.find(s => s.name === sourceName);
+            if (!source) return;
+            if (!Array.isArray(source.feedback_to)) source.feedback_to = [];
+            if (!source.feedback_to.includes(targetName)) {
+                source.feedback_to.push(targetName);
+            }
+        } else {
+            // depends_on lives on the TARGET (dependent step) — unchanged
+            const target = _plan.steps.find(s => s.name === targetName);
+            if (!target) return;
+            if (!Array.isArray(target.depends_on)) target.depends_on = [];
+            if (!target.depends_on.includes(sourceName)) {
+                target.depends_on.push(sourceName);
+            }
         }
     }
     // Mirror of _onConnectionCreated for the patched removeConnection.
     // drawflow doesn't fire a "connectionRemoved" event, so we wrap
     // removeConnection (above in init) to call this manually.
-    // v1.9.4: route the removal by output_class so feedback_to
-    // wires are removed from the correct field.
+    // v2.0: feedback_to is removed from the SOURCE (failing step).
     function _onConnectionRemoved(connection) {
         const sourceInternal = connection.output_id;
         const targetInternal = connection.input_id;
         const sourceName = _stepNameFromInternalId(sourceInternal);
         const targetName = _stepNameFromInternalId(targetInternal);
         if (!sourceName || !targetName) return;
-        const target = _plan.steps.find(s => s.name === targetName);
-        if (!target) return;
         const outputClass = connection.output_class || 'output_1';
-        const fieldName = outputClass === 'output_2' ? 'feedback_to' : 'depends_on';
-        if (!Array.isArray(target[fieldName])) return;
-        target[fieldName] = target[fieldName].filter(n => n !== sourceName);
+        if (outputClass === 'output_2') {
+            // v2.0: feedback_to is on the SOURCE
+            const source = _plan.steps.find(s => s.name === sourceName);
+            if (!source || !Array.isArray(source.feedback_to)) return;
+            source.feedback_to = source.feedback_to.filter(n => n !== targetName);
+        } else {
+            // depends_on is on the TARGET — unchanged
+            const target = _plan.steps.find(s => s.name === targetName);
+            if (!target || !Array.isArray(target.depends_on)) return;
+            target.depends_on = target.depends_on.filter(n => n !== sourceName);
+        }
     }
     // drawflow fires nodeRemoved when a card is removed (Delete key,
     // our X button via removeNodeId, or any removeNode call). Payload
@@ -402,22 +428,30 @@
         }
     }
 
-    // v1.9.4: same as wireDepsForStep but for feedback_to wires.
-    // Uses output_2 (the second output handle on each card) so the
-    // CSS can render the red dashed style. The connection routing
-    // (source → target) is identical to depends_on: source's name is
-    // added to target's feedback_to list. The semantic difference
-    // lives at run time, not at draw time.
+    // v1.9.4 (FLIPPED 2026-07-30 in v2.0): in the NEW semantic,
+    // feedback_to is on the FAILING step (the source), not the
+    // target. So when loading from data, we iterate EACH step as
+    // a potential source and for each target in its feedback_to,
+    // draw wire from this step → target (this step is the failing
+    // step; the target is the recovery step). This is the inverse
+    // of depends_on's wire (where the target is the dependent).
+    //
+    // Uses output_2 (the second output handle on each card) so
+    // the CSS can render the red dashed style. The wire direction
+    // (source → target) is the same as depends_on; only the data
+    // placement differs.
     function wireFeedbackForStep(step) {
         if (!step.feedback_to) return;
-        for (const fbName of step.feedback_to) {
-            const sourceId = _internalIdByStepName.get(fbName);
-            const targetId = _internalIdByStepName.get(step.name);
+        for (const targetName of step.feedback_to) {
+            // v2.0: source is THIS step (the failing one), target
+            // is the one we want to re-run when this fails.
+            const sourceId = _internalIdByStepName.get(step.name);
+            const targetId = _internalIdByStepName.get(targetName);
             if (!sourceId || !targetId) continue;
             // Self-ref is dropped at the run step too, but skip the
             // wire here so the user doesn't see a confusing wire
             // that goes nowhere.
-            if (fbName === step.name) continue;
+            if (targetName === step.name) continue;
             _addWireManually(sourceId, targetId, 'output_2');
         }
     }
@@ -536,17 +570,22 @@
         }, 50);
     }
 
-    // v1.9.4: stamp `title` attributes on each card's two output
-    // handles so the user can tell them apart without a legend
-    // tour. Mirrors visual_workflow.js's _annotateOutputHandles.
+    // v1.9.4 (v2.0 updated 2026-07-30): stamp `title` attributes
+    // on each card's two output handles so the user can tell them
+    // apart without a legend tour. Mirrors visual_workflow.js's
+    // _annotateOutputHandles.
+    //   output_1 (chain, normal):     adds target.depends_on += [this]
+    //   output_2 (loop-back, red dashed):
+    //                                 adds this.feedback_to += [target]
+    //                                 ("if I fail, re-run target")
     function _annotateOutputHandles() {
         try {
             const wrap = document.getElementById('vp-canvas-wrap') || document;
             for (const el of wrap.querySelectorAll('.drawflow-node')) {
                 const o1 = el.querySelector('.output_1');
                 const o2 = el.querySelector('.output_2');
-                if (o1 && !o1.title) o1.title = 'chain (depends_on)';
-                if (o2 && !o2.title) o2.title = 'loop-back (feedback_to)';
+                if (o1 && !o1.title) o1.title = 'chain (target depends on this)';
+                if (o2 && !o2.title) o2.title = 'loop-back (if I fail, re-run target)';
             }
         } catch (e) {
             // best-effort, don't break the canvas if drawflow's
