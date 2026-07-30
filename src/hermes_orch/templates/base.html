@@ -94,7 +94,13 @@
         .sidebar-logo-full {
             display: block;
             width: 144px; height: 40px;
-            background-image: url('/static/logos/hermes-nexus-light.png?v=20260731-2100');
+            /* v3.0.4: wordmark swapped to the new user-designed variant.
+               Hexagon + gradient HERMES/NEXUS text. Light variant has
+               all-black text (works on white sidebar); dark variant has
+               white "HERMES" + gradient "NEXUS" (works on #1f2937).
+               Aspect ~3:1 cropped, displayed in 144x40 with
+               background-size: contain so it scales cleanly. */
+            background-image: url('/static/logos/hermes-nexus-light.png?v=20260731-2326');
         }
         /* v3.0.2: enlarged from 30x30 to 36x36 to fill the 64px
            collapsed sidebar better. With sidebar-collapsed state the
@@ -104,13 +110,13 @@
         .sidebar-logo-icon {
             display: none;
             width: 36px; height: 36px;
-            background-image: url('/static/logos/hermes-nexus-icon-light.png?v=20260731-2100');
+            background-image: url('/static/logos/hermes-nexus-icon-light.png?v=20260731-2326');
         }
         body.dark .sidebar-logo-full {
-            background-image: url('/static/logos/hermes-nexus-dark.png?v=20260731-2100');
+            background-image: url('/static/logos/hermes-nexus-dark.png?v=20260731-2326');
         }
         body.dark .sidebar-logo-icon {
-            background-image: url('/static/logos/hermes-nexus-icon-dark.png?v=20260731-2100');
+            background-image: url('/static/logos/hermes-nexus-icon-dark.png?v=20260731-2326');
         }
         body.sidebar-collapsed .sidebar-logo-full { display: none; }
         body.sidebar-collapsed .sidebar-logo-icon { display: block; }
