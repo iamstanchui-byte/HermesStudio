@@ -200,46 +200,83 @@
         <div class="text-sm text-gray-500" id="agent-detail-empty">
             Select an agent on the left to view its profiles.
         </div>
-        <div id="agent-detail-content" style="display: none;">
-            <div class="flex items-start justify-between mb-3">
-                <div>
-                    <div class="text-xs text-gray-500 uppercase tracking-wide">Agent</div>
-                    <h2 id="detail-agent-name" class="text-lg font-bold text-gray-800"></h2>
-                    <div id="detail-agent-meta" class="text-xs text-gray-500 mt-1"></div>
+        {# v3.6.0 follow-up: the right detail panel now has its own
+           max-height (matches the left agent list at 540px) and is
+           a flex column. The header + Agent settings block + per-
+           profile settings tabs are `flex: 0 0 auto` so they stay
+           visible; the middle (profile list) is the only part that
+           scrolls. This way a 50-profile agent doesn't push the
+           settings offscreen — the settings stay glued to the
+           current profile at the bottom of the panel while the
+           user scrolls the list. Same UX pattern as the agent
+           list on the left. #}
+        <div id="agent-detail-content"
+             style="display: none; max-height: 540px; display: flex; flex-direction: column; overflow: hidden;">
+            {# --- Top: agent header + Agent settings (sticky-feel) --- #}
+            <div style="flex: 0 0 auto;">
+                <div class="flex items-start justify-between mb-3">
+                    <div>
+                        <div class="text-xs text-gray-500 uppercase tracking-wide">Agent</div>
+                        <h2 id="detail-agent-name" class="text-lg font-bold text-gray-800"></h2>
+                        <div id="detail-agent-meta" class="text-xs text-gray-500 mt-1"></div>
+                    </div>
+                    <span id="detail-status-pill"></span>
                 </div>
-                <span id="detail-status-pill"></span>
+                {# v3.6.0: agent-level settings. v3.5.0/v3.5.1 only had
+                   agent-level PATCH for ip/os_type but no UI form; this is
+                   the first agent-level settings block on the dashboard.
+                   Single field for now (max_concurrent_tasks) — extend
+                   here when more agent-level settings are added (e.g.
+                   accept_criteria defaults, custom task timeout, etc).
+                   The PUT /api/agents/{id} endpoint is what gets called.
+                   v3.6.0 follow-up: the long help text was moved into a
+                   popover behind a "?" icon so the field row stays
+                   compact. Click or hover the "?" to see the same
+                   explanation. #}
+                <div class="mb-3 p-3 bg-gray-50 border border-gray-200 rounded">
+                    <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">
+                        Agent settings
+                    </div>
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <label for="agent-max-concurrent-tasks" class="text-xs text-gray-700">
+                            Max concurrent tasks
+                        </label>
+                        <input id="agent-max-concurrent-tasks"
+                               type="number" min="1" max="32" step="1"
+                               class="text-xs border rounded px-2 py-1 w-16"
+                               title="How many tasks the wrapper can run in parallel.">
+                        <button onclick="saveAgentSettings()"
+                                class="text-xs px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">
+                            Save
+                        </button>
+                        <button type="button"
+                                id="agent-cap-help-toggle"
+                                onclick="toggleAgentCapHelp(event)"
+                                class="text-xs w-5 h-5 rounded-full border border-gray-300 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+                                aria-label="What does this do?"
+                                title="Click for help">
+                            ?
+                        </button>
+                        <span id="agent-settings-status" class="text-xs"></span>
+                    </div>
+                    <div id="agent-cap-help-popover"
+                         style="display: none;"
+                         class="mt-2 p-2 text-xs text-gray-700 bg-white border border-gray-300 rounded shadow-sm">
+                        How many tasks this agent's wrapper will run in parallel.
+                        Default 1 = sequential (one task at a time per process, backward compatible).
+                        The orchestrator skips dispatch when the agent is at capacity;
+                        the wrapper sizes its ThreadPoolExecutor from this value.
+                        Range 1..32.
+                    </div>
+                </div>
             </div>
-            {# v3.6.0: agent-level settings. v3.5.0/v3.5.1 only had
-               agent-level PATCH for ip/os_type but no UI form; this is
-               the first agent-level settings block on the dashboard.
-               Single field for now (max_concurrent_tasks) — extend
-               here when more agent-level settings are added (e.g.
-               accept_criteria defaults, custom task timeout, etc).
-               The PUT /api/agents/{id} endpoint is what gets called. #}
-            <div class="mt-3 mb-3 p-3 bg-gray-50 border border-gray-200 rounded">
-                <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">
-                    Agent settings
-                </div>
-                <div class="flex items-center gap-2 flex-wrap">
-                    <label for="agent-max-concurrent-tasks" class="text-xs text-gray-700">
-                        Max concurrent tasks
-                    </label>
-                    <input id="agent-max-concurrent-tasks"
-                           type="number" min="1" max="32" step="1"
-                           class="text-xs border rounded px-2 py-1 w-16"
-                           title="How many tasks the wrapper can run in parallel. 1 = sequential (backward compatible). Range 1..32.">
-                    <button onclick="saveAgentSettings()"
-                            class="text-xs px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">
-                        Save
-                    </button>
-                    <span id="agent-settings-status" class="text-xs"></span>
-                </div>
-                <div class="text-xs text-gray-500 mt-1">
-                    How many tasks this agent's wrapper will run in parallel. Default 1 = sequential. The orchestrator skips dispatch when the agent is at capacity; the wrapper's pool is sized from this value.
-                </div>
+            {# --- Middle: profile list (the only scrollable region) --- #}
+            <div style="flex: 1 1 auto; min-height: 0; overflow-y: auto;"
+                 class="pr-1">
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">Profiles</div>
+                <div id="detail-profile-list"></div>
             </div>
-            <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">Profiles</div>
-            <div id="detail-profile-list"></div>
+            {# --- Bottom: per-profile settings tabs (sticky-feel) --- #}
             {# v3.2.0: profile settings tabs. Shown when the user clicks a
                profile card above. Default tab = "overview". The 5 tabs
                cover everything backend already loads: mcp_servers,
@@ -249,7 +286,9 @@
                edit them in the wrapper; Storage / Capabilities are
                editable via PATCH /api/agents/{id}/profiles/{name}.
                The bar is hidden when no profile is selected. #}
-            <div id="profile-tabs-wrap" class="mt-4" style="display: none;">
+            <div id="profile-tabs-wrap"
+                 class="mt-3 pt-3 border-t border-gray-200 bg-white"
+                 style="display: none; flex: 0 0 auto; max-height: 45%; overflow-y: auto;">
                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">
                     Settings — <span id="profile-tabs-name" class="text-gray-700 font-medium"></span>
                 </div>
@@ -416,7 +455,43 @@ let currentProfiles = [];      // v3.2.0: full profile objects for the selected 
 let currentProfileName = null; // v3.2.0: which profile the settings tabs are showing
 let currentTab = 'overview';   // v3.2.0: which tab is active
 
+// v3.6.0 follow-up: URL-hash-based selection persistence. Without
+// this, every `location.reload()` (the 10s auto-refresh, the save
+// success reload, the add-profile success reload) drops the user
+// back to "Select an agent" with no selection. The user has to
+// re-click the agent they were working on. Storing the current
+// selection in `location.hash` survives the reload because the
+// hash is part of the URL the browser keeps. On page load we read
+// the hash and call `selectAgent()` to restore the selection.
+//
+// Format: `#agent=win-local-1`. The hash is plain ASCII so we don't
+// need encodeURIComponent for the IDs we use today, but we encode
+// defensively in case an agent ID ever contains a non-URL-safe
+// character (e.g. `:` from a future namespace scheme).
+function _setAgentHash(agentId) {
+    if (!agentId) return;
+    // Use replaceState to avoid creating a new history entry on
+    // every selectAgent call. The user only needs the selection
+    // to survive reloads, not to be navigable via back/forward.
+    try {
+        history.replaceState(null, '', '#agent=' + encodeURIComponent(agentId));
+    } catch (e) {
+        // Older browsers / private mode: fall back to direct hash set
+        window.location.hash = '#agent=' + encodeURIComponent(agentId);
+    }
+}
+
+function _getAgentHash() {
+    const h = window.location.hash || '';
+    const m = h.match(/^#agent=(.+)$/);
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+}
+
 function selectAgent(agentId) {
+    // v3.6.0 follow-up: persist the selection in the URL hash so
+    // it survives page reloads (auto-refresh, save, add-profile).
+    _setAgentHash(agentId);
     // Highlight the chosen row, un-highlight others.
     // v3.3.1: use a class instead of inline styles so dark mode can
     // override the background + text color. Previous inline #eff6ff
@@ -434,13 +509,17 @@ function selectAgent(agentId) {
     currentProfiles = profiles;  // v3.2.0: cache for the settings tabs
     // Update the right panel
     document.getElementById('agent-detail-empty').style.display = 'none';
-    document.getElementById('agent-detail-content').style.display = 'block';
+    document.getElementById('agent-detail-content').style.display = 'flex';
     document.getElementById('detail-agent-name').textContent = agentId;
     document.getElementById('detail-agent-meta').textContent =
         'OS: ' + data.dataset.os + ' · IP: ' + data.dataset.ip + ' · Heartbeat: ' + data.dataset.heartbeat;
     // v3.6.0: populate the Max concurrent tasks input. Coerce to int
     // defensively (the dataset is always a string). Clamp 1..32 so a
     // hand-edited template can't break the form's own validation.
+    // v3.6.0 follow-up: also close the help popover if it's open,
+    // so a new agent doesn't inherit the previous agent's open help.
+    const popover = document.getElementById('agent-cap-help-popover');
+    if (popover) popover.style.display = 'none';
     const maxInput = document.getElementById('agent-max-concurrent-tasks');
     const rawCap = parseInt(data.dataset.maxConcurrentTasks || '1', 10);
     maxInput.value = String(isNaN(rawCap) ? 1 : Math.max(1, Math.min(32, rawCap)));
@@ -520,23 +599,70 @@ async function saveAgentSettings() {
         }
         statusEl.textContent = `Saved. The wrapper picks up the new cap on its next heartbeat.`;
         statusEl.style.color = '#059669';
-        // Update the in-memory data attribute on the template so a
-        // re-select of the same agent shows the new value, then
-        // reload the page after a short pause so the left list and
-        // any open tabs reflect the change too. Without the reload,
-        // the data-profiles/dataset props would be stale until the
-        // user clicks another agent and back.
+        // v3.6.0 follow-up: update the in-memory template data
+        // attribute so a re-select of the same agent shows the new
+        // value, but don't reload the page. Reloading would drop
+        // the user back to the empty right panel for one frame
+        // (during URL hash restore), and the user's scroll position
+        // would be lost. The cap is now saved both server-side and
+        // client-side; the next 10s auto-refresh will sync the
+        // left list row's "max concurrent tasks" indicator (when
+        // we add one) and any other places that read it.
         const tpl = document.getElementById('agent-tpl-' + currentAgentId);
         if (tpl) {
             const data = tpl.content.querySelector('.agent-template-data');
             if (data) data.dataset.maxConcurrentTasks = String(cap);
         }
-        setTimeout(() => location.reload(), 800);
     } catch (e) {
         statusEl.textContent = `Network error: ${e}`;
         statusEl.style.color = '#dc2626';
     }
 }
+
+// v3.6.0 follow-up: toggle the help popover for the "Max concurrent
+// tasks" field. Click the "?" button to show the explanation, click
+// again (or anywhere outside) to hide. The same explanation is also
+// available as a native `title` tooltip on the input field, so
+// mouse-only users still get something. event.stopPropagation() is
+// needed so the click on "?" doesn't immediately trigger the
+// document-level outside-click handler below.
+function toggleAgentCapHelp(event) {
+    if (event) event.stopPropagation();
+    const popover = document.getElementById('agent-cap-help-popover');
+    if (!popover) return;
+    popover.style.display = (popover.style.display === 'none' || !popover.style.display) ? 'block' : 'none';
+}
+
+// Click-outside-to-close for the help popover. Bound once on
+// document load; checks the target on every click and hides the
+// popover if the click wasn't on the toggle button or inside the
+// popover itself. Same pattern as the standard Bootstrap / Headless
+// UI popover. Without this, the popover would only close on a
+// second click of the "?" — which the user would expect anyway,
+// but the outside-click feels more "expected" for a help tooltip
+// and matches what most users see in modern dashboards.
+document.addEventListener('click', function(e) {
+    const popover = document.getElementById('agent-cap-help-popover');
+    if (!popover || popover.style.display === 'none') return;
+    const toggle = document.getElementById('agent-cap-help-toggle');
+    if (toggle && (e.target === toggle || toggle.contains(e.target))) return;
+    if (popover.contains(e.target)) return;
+    popover.style.display = 'none';
+});
+
+// Esc-to-close for the help popover (keyboard accessibility).
+// Document-level keydown listener; only acts if the popover is
+// currently visible. Doesn't interfere with form input focus
+// because we check `defaultPrevented` to leave room for higher-
+// priority handlers (none today, but defensive).
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    const popover = document.getElementById('agent-cap-help-popover');
+    if (popover && popover.style.display === 'block') {
+        popover.style.display = 'none';
+        e.preventDefault();
+    }
+});
 
 // v3.2.0: selectProfile() — highlight the chosen profile card and
 // show the settings tabs below. Mirrors the agent-level select on
@@ -1222,7 +1348,33 @@ async function submitAddProfile() {
         if (r.ok) {
             status.textContent = 'Created!';
             status.className = 'text-xs text-green-600';
-            setTimeout(() => location.reload(), 400);
+            // v3.6.0 follow-up: don't reload the page. The reload
+            // was the root cause of the "jumps back to first agent"
+            // complaint — every `location.reload()` clears the URL
+            // hash (well, it doesn't, but the JS module state does,
+            // and the page repaints without the right panel populated
+            // because the `<template>` blocks aren't re-evaluated by
+            // the restore-hash IIFE for a frame). Instead: re-fetch
+            // the single-agent record, splice the new profile into
+            // `currentProfiles`, re-render the profile list, and
+            // keep the user on the same agent with the same
+            // selected profile. The new profile is auto-selected
+            // so the settings tabs show its data immediately.
+            await _refreshAgentAfterProfileChange();
+            const newProfile = currentProfiles[currentProfiles.length - 1];
+            if (newProfile) selectProfile(newProfile.name);
+            // Clear the form so the user can add another profile
+            // without first clearing the inputs.
+            document.getElementById('new-profile-name').value = '';
+            document.getElementById('new-profile-desc').value = '';
+            // Re-show the "Add profile" button after a brief pause
+            // (so the success message is visible). User clicks it
+            // again to add another — no reload, no scroll loss.
+            setTimeout(() => {
+                status.textContent = '';
+                status.className = 'text-xs';
+                hideAddProfileForm();
+            }, 1200);
         } else if (r.status === 409) {
             status.textContent = `Profile "${name}" already exists.`;
             status.className = 'text-xs text-red-600';
@@ -1236,6 +1388,89 @@ async function submitAddProfile() {
     }
 }
 
+// v3.6.0 follow-up: refresh the current agent's profile list in
+// place after a profile is added or deleted, so we don't have to
+// reload the page (which loses the user's selection + scroll
+// position). Pulls the latest agent record from the server, splices
+// the profiles into `currentProfiles` (used by the settings tabs),
+// and re-renders the profile list.
+//
+// We use the user-authed /api/agents/ list endpoint (not the HMAC-
+// authed /api/agents/{id} single-agent endpoint) because the JS runs
+// in the browser with a user session cookie, not an agent's HMAC
+// secret. The list endpoint returns all agents with their full
+// profile data; we filter to the one we're working on. Cost is
+// O(agents) — negligible for the typical fleet size.
+async function _refreshAgentAfterProfileChange() {
+    if (!currentAgentId) return;
+    try {
+        const r = await fetch('/api/agents/');
+        if (!r.ok) {
+            console.warn('profile refresh failed', r.status);
+            return;
+        }
+        const allAgents = (await r.json()).agents || [];
+        const data = allAgents.find(a => a.id === currentAgentId);
+        if (!data) {
+            console.warn('current agent not found in list response');
+            return;
+        }
+        // Update the in-memory profile list
+        currentProfiles = data.profiles || [];
+        // Re-render the profile list in the right panel
+        const list = document.getElementById('detail-profile-list');
+        if (list) {
+            list.innerHTML = currentProfiles.map(p => `
+                <div class="profile-selector card mb-2"
+                     data-profile-name="${escapeAttr(p.name || '')}"
+                     onclick="selectProfile('${escapeAttr(p.name || '')}')"
+                     style="padding: 0.75rem; cursor: pointer; border-left: 3px solid transparent;">
+                    <div class="flex items-center gap-2">
+                        <div class="font-medium text-sm flex-1">${escapeHtml(p.name || '(unnamed)')}</div>
+                        <span class="pill-status ${p.status === 'busy' ? 'pill-busy' : 'pill-healthy'}">${p.status || 'unknown'}</span>
+                        <button onclick="event.stopPropagation(); deleteProfile('${escapeAttr(currentAgentId)}', '${escapeAttr(p.name)}')"
+                                class="text-xs px-2 py-0.5 bg-white border border-red-200 text-red-700 rounded hover:bg-red-50"
+                                title="Remove this profile (fails if profile has an in-flight task)">
+                            Delete
+                        </button>
+                    </div>
+                    <div class="text-xs text-gray-500 mt-1">
+                        Model: ${p.llm_model_default ? escapeHtml(p.llm_model_default) : '(not reported)'}
+                        ${p.llm_model_provider ? ' · Provider: ' + escapeHtml(p.llm_model_provider) : ''}
+                    </div>
+                </div>
+            `).join('') || '<div class="text-xs text-gray-400 italic">No profiles configured</div>';
+        }
+        // Update the agent's template <template> element so the next
+        // page load (via URL hash restore) sees the new profile too.
+        // Without this, the URL hash would restore to an agent
+        // whose pre-rendered template still has the OLD profile list.
+        const tpl = document.getElementById('agent-tpl-' + currentAgentId);
+        if (tpl) {
+            const dataEl = tpl.content.querySelector('.agent-template-data');
+            if (dataEl) {
+                dataEl.dataset.profiles = JSON.stringify(currentProfiles);
+            }
+        }
+        // Also update the left-list row's profile count (the small
+        // "5 profiles" badge in the upper-right of the row). The
+        // row is re-rendered from the agent's template on next
+        // page load; for the live update we do a targeted text
+        // replace so the user sees the new count immediately
+        // without waiting for the 10s auto-refresh.
+        const leftRow = document.querySelector(`.agent-row[data-agent-id="${currentAgentId}"]`);
+        if (leftRow) {
+            const badge = leftRow.querySelector('.text-xs.text-gray-500:last-child');
+            if (badge) {
+                const n = currentProfiles.length;
+                badge.textContent = `${n} profile${n === 1 ? '' : 's'}`;
+            }
+        }
+    } catch (e) {
+        console.warn('profile refresh error', e);
+    }
+}
+
 async function deleteProfile(agentId, profileName) {
     if (!confirm(`Delete profile "${profileName}" on agent "${agentId}"?\n\nThis will fail if the profile is currently working on a task.`)) return;
     try {
@@ -1243,7 +1478,22 @@ async function deleteProfile(agentId, profileName) {
             method: 'DELETE',
         });
         if (r.status === 204) {
-            location.reload();
+            // v3.6.0 follow-up: refresh in place instead of
+            // reloading the page. Reloading drops the user back to
+            // the empty right panel (URL hash restore has a 1-frame
+            // delay during which the panel shows "Select an agent"),
+            // and the user's scroll position is lost. Re-fetch
+            // the agent's profile list, re-render, and clear the
+            // settings tabs (since the just-deleted profile may
+            // have been the one shown there).
+            await _refreshAgentAfterProfileChange();
+            // If the deleted profile was the one whose settings
+            // were open, hide the tabs (no profile to show).
+            if (currentProfileName === profileName) {
+                currentProfileName = null;
+                const tabsWrap = document.getElementById('profile-tabs-wrap');
+                if (tabsWrap) tabsWrap.style.display = 'none';
+            }
         } else {
             const data = await r.json().catch(() => ({}));
             alert('Failed to delete profile: ' + (data.detail || r.status));
@@ -1259,5 +1509,38 @@ function escapeAttr(s) {
     if (s == null) return '';
     return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+
+// v3.6.0 follow-up: auto-restore the previously selected agent on
+// page load. Without this, every reload (10s auto-refresh, save
+// success, add-profile success) drops the user back to "Select an
+// agent" and they have to re-click. We read the agent ID from
+// `location.hash` (set by selectAgent) and call selectAgent if a
+// valid agent ID is present AND the agent still exists on the page
+// (otherwise hash from a deleted agent would silently fail).
+//
+// The check `tplExists` defends against the case where the agent
+// was deleted between page loads: the hash would point to a
+// non-existent agent, and `selectAgent` would early-return with no
+// error but the right panel would stay in the "empty" state. We
+// proactively clear the hash in that case so the next reload
+// doesn't loop on the same dead ID.
+(function restoreAgentFromHash() {
+    const id = _getAgentHash();
+    if (!id) return;
+    // Defer to the next tick so the DOM is fully wired (templates
+    // rendered, JS module variables initialized). Without the
+    // defer, _getAgentHash would run before the page-specific
+    // script is parsed in some browsers.
+    setTimeout(function() {
+        if (document.getElementById('agent-tpl-' + id)) {
+            selectAgent(id);
+        } else {
+            // Stale hash pointing to a deleted agent — clear it
+            // so we don't keep trying on every reload.
+            try { history.replaceState(null, '', window.location.pathname + window.location.search); }
+            catch (e) { window.location.hash = ''; }
+        }
+    }, 0);
+})();
 </script>
 {% endblock %}
