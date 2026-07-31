@@ -213,6 +213,107 @@
        kills that bug surface. We'll add a real minimap lib
        (e.g. drawflow-plugin-minimap) when there's a concrete
        use case (zoom-to-fit, pan-to-node, etc.). */
+
+    /* v3.7.1: dark mode for the design-time plan editor. Per user
+       feedback after v3.7.0, the design-time editor (this page) is
+       the higher-value surface — it has the toolbar (Undo/Redo/
+       Copy/Paste/Validate/Apply/Generate/Save) and is where plans
+       are built. Same slate palette as the v3.7.0 task canvas:
+       canvas = slate-900, card = slate-800, border = slate-700,
+       text = slate-200/100/400. Note: .vp-node uses !important
+       for bg/border, so dark-mode rules must also use !important
+       to override (same selector specificity, !important ties
+       are broken by source order in the cascade — our rule
+       comes later, so it wins).
+
+       The top toolbar buttons (Undo/Redo/etc) are NOT in this
+       block — they use Tailwind utility classes (text-gray-700,
+       border-gray-300, etc.) that base.html already overrides.
+       The buttons should auto-darken via base.html.
+
+       The connection paths use drawflow's default stroke. Default
+       (gray) works on both light and dark. Loop-back (output_2)
+       uses red — kept as red-400 in dark for contrast. */
+    body.dark { background: #0f172a; }
+    body.dark .vp-canvas-wrap {
+        background: #0f172a;
+        border-color: #334155;
+    }
+    body.dark .vp-node,
+    body.dark .vp-node.selected {
+        background: #1e293b !important;
+        border-color: #334155 !important;
+        color: #e2e8f0;
+    }
+    /* Selection highlight: brighten the blue ring on dark so the
+       selected card is unmistakable against the slate-800. */
+    body.dark .vp-node.selected {
+        border-color: #60a5fa !important;
+        box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.3);
+    }
+    body.dark .vp-node-name { color: #f1f5f9; }
+    body.dark .vp-node-header { color: #e2e8f0; }
+    body.dark .vp-node-role {
+        background: #334155;
+        color: #cbd5e1;
+    }
+    body.dark .vp-node-action { color: #60a5fa; }  /* blue-400 */
+    body.dark .vp-node-deps { color: #94a3b8; }
+    body.dark .vp-node-delete {
+        background: transparent;
+        color: #94a3b8;
+    }
+    body.dark .vp-node-delete:hover {
+        background: #450a0a;
+        color: #fca5a5;
+    }
+    /* Loop-back handle (red dashed circle) — keep red but brighten
+       for dark bg. The .vp-node .output_2 original uses
+       !important, so we match. */
+    body.dark .vp-node .output_2 {
+        background: #450a0a !important;
+        border-color: #fca5a5 !important;
+    }
+    /* Loop-back wire (red dashed path) — same */
+    body.dark .vp-canvas-wrap svg.output_2 .drawflow-path,
+    body.dark .vp-canvas-wrap svg.output_2 path {
+        stroke: #f87171 !important;
+    }
+    /* Default (gray) wire — brighten to slate-500 for dark bg */
+    body.dark .vp-canvas-wrap svg.connection path { stroke: #64748b; }
+
+    /* Right side panel (step details editor) */
+    body.dark .vp-side-panel {
+        background: #1e293b;
+        border-left-color: #334155;
+        color: #e2e8f0;
+    }
+    body.dark .vp-side-panel h3 { color: #f1f5f9; }
+    body.dark .vp-side-panel label { color: #94a3b8; }
+    body.dark .vp-side-panel input,
+    body.dark .vp-side-panel select,
+    body.dark .vp-side-panel textarea {
+        background: #0f172a;
+        border-color: #334155;
+        color: #e2e8f0;
+    }
+
+    /* JSON form (Text mode) */
+    body.dark .vp-json-form textarea {
+        background: #0f172a;
+        border-color: #334155;
+        color: #cbd5e1;
+    }
+
+    /* Save banner — light green/red in light mode → dark green/red */
+    body.dark .vp-save-banner.success {
+        background: #064e3b;
+        color: #86efac;
+    }
+    body.dark .vp-save-banner.error {
+        background: #450a0a;
+        color: #fca5a5;
+    }
 </style>
 {% endblock %}
 
