@@ -232,6 +232,7 @@ def create_app() -> FastAPI:
     from hermes_orch.api.single_tasks import router as single_tasks_router
     from hermes_orch.api.single_tasks_pages import router as single_tasks_pages_router
     from hermes_orch.api.tasks import router as tasks_router
+    from hermes_orch.api.users import router as users_router
     from hermes_orch.api.workflows import router as workflows_router
 
     app.include_router(agents_router, prefix="/api/agents", tags=["agents"])
@@ -248,6 +249,8 @@ def create_app() -> FastAPI:
     app.include_router(schedules_router, prefix="/api/schedules", tags=["schedules"])
     app.include_router(settings_router, prefix="/api/settings", tags=["settings"])
     app.include_router(tasks_router, prefix="/api/tasks", tags=["tasks"])
+    # v3.5.0: admin user CRUD (list, create, reset password, disable/enable)
+    app.include_router(users_router, prefix="/api/users", tags=["users"])
     app.include_router(workflows_router, tags=["workflows"])
     app.include_router(dashboard_router, tags=["dashboard"])
     app.include_router(single_tasks_pages_router, tags=["pages"])
