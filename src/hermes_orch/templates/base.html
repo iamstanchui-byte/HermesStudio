@@ -113,10 +113,10 @@
             background-image: url('/static/logos/hermes-nexus-icon-light.png?v=20260731-2326');
         }
         body.dark .sidebar-logo-full {
-            background-image: url('/static/logos/hermes-nexus-dark.png?v=20260731-2326');
+            background-image: url('/static/logos/hermes-nexus-dark.png?v=20260731-1128');
         }
         body.dark .sidebar-logo-icon {
-            background-image: url('/static/logos/hermes-nexus-icon-dark.png?v=20260731-2326');
+            background-image: url('/static/logos/hermes-nexus-icon-dark.png?v=20260731-1128');
         }
         body.sidebar-collapsed .sidebar-logo-full { display: none; }
         body.sidebar-collapsed .sidebar-logo-icon { display: block; }
@@ -440,6 +440,51 @@
         body.dark .sidebar-subitem:hover { background: #374151; color: #f3f4f6; }
         body.dark .sidebar-subitem.active { color: #93c5fd; }
         body.dark .sidebar-footer { border-top-color: #374151; }
+
+        /* v3.3.1: master-detail "selected" row highlight.
+           The selected row was previously hardcoded to #eff6ff via
+           inline JS style. In dark mode that light-blue on dark text
+           = invisible. Use a class so dark mode can swap the palette. */
+        .agent-row.selected, .profile-selector.selected {
+            border-left-color: #3b82f6 !important;
+            background: #eff6ff !important;
+        }
+        body.dark .agent-row.selected,
+        body.dark .profile-selector.selected {
+            background: #1e3a8a !important;  /* matches active sidebar */
+            color: #f3f4f6;
+        }
+        body.dark .agent-row.selected .text-gray-500,
+        body.dark .profile-selector.selected .text-gray-500,
+        body.dark .agent-row.selected .text-gray-800,
+        body.dark .profile-selector.selected .text-gray-800 {
+            color: #f3f4f6;
+        }
+
+        /* v3.3.1: profile settings tab content — cap the height and
+           scroll internally so the Storage / Capabilities forms
+           (which have multi-row input groups + 5-10 storage_refs rows)
+           don't push the Save button off-screen. The page-level
+           scrollbar is what user saw in the screenshot — it covered
+           the buttons + read-only text. 360px fits the Overview tab
+           fully (smallest) and scrolls on Storage/Capabilities when
+           the list is long.
+           `padding-right` gives the scrollbar its own gutter so it
+           doesn't overlap the rightmost input/button. */
+        #profile-tab-content {
+            max-height: 360px;
+            overflow-y: auto;
+            padding-right: 6px;
+        }
+        /* Slimmer scrollbar on Windows so the gutter doesn't take too
+           much space. Not a focus ring, just a cosmetic preference. */
+        #profile-tab-content::-webkit-scrollbar { width: 8px; }
+        #profile-tab-content::-webkit-scrollbar-thumb {
+            background: rgba(0, 0, 0, 0.2); border-radius: 4px;
+        }
+        body.dark #profile-tab-content::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+        }
         body.dark .sidebar-toggle-btn { color: #9ca3af; }
         body.dark .sidebar-toggle-btn:hover { background: #374151; color: #f3f4f6; }
         body.dark .topbar { background: #1f2937; border-bottom-color: #374151; }
@@ -604,11 +649,10 @@
         body.dark .profile-tab { color: #9ca3af; }
         body.dark .profile-tab:hover { color: #f3f4f6; }
         body.dark .profile-tab-active { color: #60a5fa; border-bottom-color: #60a5fa; }
-        #profile-tab-content {
-            max-height: 320px;
-            overflow-y: auto;
-            padding: 0.25rem 0 0.5rem 0;
-        }
+        {# v3.3.1: removed duplicate #profile-tab-content rule that
+           lived further down (the v3.2.0 320px version). The v3.3.1
+           rule above (line ~474, max-height: 360px + padding-right: 6px
+           gutter for the scrollbar) is the canonical one. #}
     </style>
 </head>
 <body class="{% if active_page in ('token_usage',) %}sidebar-collapsed{% endif %}">
@@ -738,6 +782,16 @@
         const subitems = document.getElementById('settings-subitems');
         if (!subitems) return;
         const btn = document.querySelector('.sidebar-group-toggle');
+        // v3.3.1: if the sidebar is collapsed, the user can't see the
+        // Settings subitems (the 64px width only shows top-level icons).
+        // Auto-expand the sidebar so the click is meaningful — otherwise
+        // clicking the gear icon does nothing visible and the user is
+        // stuck wondering why Settings won't open. Same intent as
+        // expand-on-click-when-collapsed.
+        if (document.body.classList.contains('sidebar-collapsed')) {
+            document.body.classList.remove('sidebar-collapsed');
+            localStorage.setItem('orch.sidebar', 'expanded');
+        }
         const isHidden = subitems.style.display === 'none' || subitems.style.display === '';
         subitems.style.display = isHidden ? 'block' : 'none';
         if (btn) btn.classList.toggle('expanded', isHidden);

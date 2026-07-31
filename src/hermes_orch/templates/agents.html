@@ -384,16 +384,13 @@ let currentProfileName = null; // v3.2.0: which profile the settings tabs are sh
 let currentTab = 'overview';   // v3.2.0: which tab is active
 
 function selectAgent(agentId) {
-    // Highlight the chosen row, un-highlight others
-    document.querySelectorAll('.agent-row').forEach(r => {
-        r.style.borderLeftColor = 'transparent';
-        r.style.background = '';
-    });
+    // Highlight the chosen row, un-highlight others.
+    // v3.3.1: use a class instead of inline styles so dark mode can
+    // override the background + text color. Previous inline #eff6ff
+    // + white text in dark mode = unreadable.
+    document.querySelectorAll('.agent-row').forEach(r => r.classList.remove('selected'));
     const row = document.querySelector(`.agent-row[data-agent-id="${agentId}"]`);
-    if (row) {
-        row.style.borderLeftColor = '#3b82f6';
-        row.style.background = '#eff6ff';
-    }
+    if (row) row.classList.add('selected');
     currentAgentId = agentId;  // v3.1.1
     // Pull the pre-rendered template for this agent
     const tpl = document.getElementById('agent-tpl-' + agentId);
@@ -454,13 +451,12 @@ function selectAgent(agentId) {
 // v3.2.0: selectProfile() — highlight the chosen profile card and
 // show the settings tabs below. Mirrors the agent-level select on
 // the left panel: blue border-left, light blue background.
+// v3.3.1: use .selected class so dark mode can override.
 function selectProfile(profileName) {
     currentProfileName = profileName;
     currentTab = 'overview';
     document.querySelectorAll('#detail-profile-list .profile-selector').forEach(el => {
-        const isSel = el.dataset.profileName === profileName;
-        el.style.borderLeftColor = isSel ? '#3b82f6' : 'transparent';
-        el.style.background = isSel ? '#eff6ff' : '';
+        el.classList.toggle('selected', el.dataset.profileName === profileName);
     });
     const wrap = document.getElementById('profile-tabs-wrap');
     wrap.style.display = 'block';
@@ -540,6 +536,12 @@ function renderMcpTab(profile, content) {
 }
 
 // v3.2.0: Skills tab — read-only list, hint to edit on agent host.
+// v3.3.1: two fixes:
+//   (a) API field is `s.size` not `s.size_bytes` — previous code always
+//       showed literal "?" in the size column, looking like a status
+//       icon. Now we render the column only when size is known.
+//   (b) "+ N more" was static italic text — user couldn't open it.
+//       Make it a real button that toggles the hidden rows.
 function renderSkillsTab(profile, content) {
     const skills = profile.skills || [];
     let html = `<div class="text-[11px] text-gray-500 mb-2 italic">
@@ -548,30 +550,62 @@ function renderSkillsTab(profile, content) {
     if (skills.length === 0) {
         html += `<div class="text-xs text-gray-400 italic">No skills applied yet.</div>`;
     } else {
-        const shown = skills.slice(0, 10);
-        const more = skills.length - shown.length;
+        const visible = 10;
         html += `<div class="space-y-1">`;
-        for (const s of shown) {
-            // file_path is "skills/<name>/SKILL.md" — show just the name segment
+        skills.forEach((s, i) => {
             const parts = (s.file_path || '').split('/');
-            const name = parts.length >= 2 ? parts[parts.length - 2] : (s.file_path || '?');
-            const sizeKb = s.size_bytes ? (s.size_bytes / 1024).toFixed(1) + ' KB' : '?';
+            const name = parts.length >= 2 ? parts[parts.length - 2] : (s.file_path || 'unknown');
+            const sizeBytes = Number(s.size) || 0;
+            // Only render size when known (>0). Otherwise leave a
+            // spacer of the same width so the status pill still aligns.
+            const sizeHtml = sizeBytes > 0
+                ? `<span class="text-[10px] text-gray-400 w-14 text-right">${(sizeBytes / 1024).toFixed(1)} KB</span>`
+                : `<span class="w-14"></span>`;
             const status = s.status || 'unknown';
             const statusClass = status === 'applied' ? 'pill-healthy' : 'pill-degraded';
+            // Rows past `visible` are hidden by default; the toggle
+            // button below reveals them.
+            const hiddenCls = i >= visible ? ' skill-extra hidden' : '';
             html += `
-                <div class="flex items-center gap-2">
-                    <span class="font-mono text-[11px] flex-1">${escapeHtml(name)}</span>
-                    <span class="text-[10px] text-gray-400">${sizeKb}</span>
+                <div class="flex items-center gap-2${hiddenCls}" data-skill-idx="${i}">
+                    <span class="font-mono text-[11px] flex-1 truncate">${escapeHtml(name)}</span>
+                    ${sizeHtml}
                     <span class="pill-status ${statusClass}" style="font-size: 0.65rem; padding: 0 0.3rem;">${escapeHtml(status)}</span>
                 </div>
             `;
-        }
+        });
         html += `</div>`;
+        const more = skills.length - visible;
         if (more > 0) {
-            html += `<div class="mt-2 text-[10px] text-gray-500 italic">+ ${more} more</div>`;
+            html += `<button type="button"
+                class="mt-2 text-[10px] text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 italic"
+                data-skills-toggle
+                data-expanded="0"
+                onclick="toggleSkillsList(this)">+ ${more} more</button>`;
         }
     }
     content.innerHTML = html;
+}
+
+// v3.3.1: expand/collapse the hidden skills. The button is created
+// with data-skills-toggle; we find the sibling .skill-extra rows in
+// the same parent and toggle their .hidden class. Label flips between
+// "+ N more" and "− show less".
+function toggleSkillsList(btn) {
+    const wrap = btn.parentElement;
+    if (!wrap) return;
+    const expanded = btn.dataset.expanded === '1';
+    const hidden = wrap.querySelectorAll('.skill-extra');
+    hidden.forEach(el => el.classList.toggle('hidden', expanded));
+    btn.dataset.expanded = expanded ? '0' : '1';
+    // Re-derive count from the first hidden row's data attr if any
+    // (we don't carry the count forward — recompute label).
+    if (expanded) {
+        const more = hidden.length;
+        btn.textContent = `+ ${more} more`;
+    } else {
+        btn.textContent = '− show less';
+    }
 }
 
 // v3.2.0: Storage tab — editable. Add/remove storage_refs via
