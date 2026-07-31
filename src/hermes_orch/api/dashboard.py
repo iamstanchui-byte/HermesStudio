@@ -79,11 +79,35 @@ def _llm_configured(cfg: dict[str, Any] | None) -> bool:
     return bool((llm.get("api_key") or "").strip())
 
 
-def _base_context(request: Request, active_page: str) -> dict[str, Any]:
-    """Common context for all dashboard templates (llm_configured + active_page)."""
+async def _base_context(request: Request, active_page: str) -> dict[str, Any]:
+    """Common context for all dashboard templates (llm_configured + active_page).
+
+    v3.4: also surfaces the current user (or None) so the topbar can
+    show a user pill vs a "Sign in" link without each page having to
+    re-fetch /api/auth/me. The middleware already validated the
+    cookie before this renders, so `current_user` is always non-None
+    on pages; the None branch exists for completeness (and for any
+    page that the middleware later decides to allowlist).
+    """
+    # Imported lazily to avoid a circular import (auth.cookie depends
+    # on core.audit, which is independent, but the page route handlers
+    # only need it here, not at module import time).
+    from hermes_orch.auth.cookie import current_user as _current_user
+
+    # Cached on request.state so the per-page render doesn't re-query
+    # if a page route also calls /api/auth/me.
+    cached = getattr(request.state, "current_user_ctx", None)
+    if cached is None and hasattr(request.state, "user_id"):
+        cached = await _current_user(request, user_id=request.state.user_id)
+        request.state.current_user_ctx = cached
+    elif cached is None:
+        cached = await _current_user(request)
+        request.state.current_user_ctx = cached
+
     return {
         "active_page": active_page,
         "llm_configured": _llm_configured(getattr(request.app.state, "config", None)),
+        "current_user_ctx": cached,
     }
 
 
@@ -703,7 +727,7 @@ async def agents_page(request: Request) -> HTMLResponse:
         request=request,
         name="agents.html",
         context={
-            **_base_context(request, "agents"),
+            **(await _base_context(request, "agents")),
             "agents": agents,
             "overview": overview,
             "token_usage": token_usage,
@@ -727,7 +751,7 @@ async def token_usage_page(request: Request) -> HTMLResponse:
         request=request,
         name="token_usage.html",
         context={
-            **_base_context(request, "token_usage"),
+            **(await _base_context(request, "token_usage")),
             "token_usage": token_usage,
         },
     )
@@ -898,7 +922,7 @@ async def tasks_page(
         request=request,
         name="tasks.html",
         context={
-            **_base_context(request, "tasks"),
+            **(await _base_context(request, "tasks")),
             "tasks": tasks,
             "projects": projects,
             "project_map": project_map,
@@ -1031,7 +1055,7 @@ async def projects_list_page(
         request=request,
         name="projects_list.html",
         context={
-            **_base_context(request, "projects"),
+            **(await _base_context(request, "projects")),
             "projects": projects,
             "token_map": token_map,
             "schedule_map": schedule_map,
@@ -1289,7 +1313,7 @@ async def project_page(
         request=request,
         name="project.html",
         context={
-            **_base_context(request, "projects"),
+            **(await _base_context(request, "projects")),
             "project": project,
             "tasks": project_tasks,
             "total_count": total_count,
@@ -1424,7 +1448,7 @@ async def project_visual_page(
         request=request,
         name="visual_project.html",
         context={
-            **_base_context(request, "projects"),
+            **(await _base_context(request, "projects")),
             "project": project,
             "tasks": tasks,
             "archived_tasks": archived_rows,
@@ -1470,7 +1494,7 @@ async def settings_page(request: Request) -> HTMLResponse:
         request=request,
         name="settings.html",
         context={
-            **_base_context(request, "settings"),
+            **(await _base_context(request, "settings")),
             "providers": LLM_PROVIDERS,
             "current_provider": llm.get("provider"),
             "current_base_url": llm.get("base_url"),
@@ -1537,7 +1561,7 @@ async def schedules_page(
         request=request,
         name="schedules.html",
         context={
-            **_base_context(request, "schedules"),
+            **(await _base_context(request, "schedules")),
             "schedules": [dict(r) for r in schedule_rows],
             "templates": [dict(r) for r in template_rows],
             "preselect_template_id": template or "",
@@ -1582,7 +1606,7 @@ async def workflows_page(request: Request) -> HTMLResponse:
         request=request,
         name="workflows.html",
         context={
-            **_base_context(request, "workflows"),
+            **(await _base_context(request, "workflows")),
             "workflows": workflows,
         },
     )
@@ -1639,7 +1663,7 @@ async def workflow_detail_page(workflow_id: str, request: Request) -> HTMLRespon
         request=request,
         name="workflow_detail.html",
         context={
-            **_base_context(request, "workflows"),
+            **(await _base_context(request, "workflows")),
             "workflow": d,
         },
     )
@@ -1706,7 +1730,7 @@ async def workflow_visual_page(workflow_id: str, request: Request) -> HTMLRespon
         request=request,
         name="visual_workflow.html",
         context={
-            **_base_context(request, "workflows"),
+            **(await _base_context(request, "workflows")),
             "workflow": d,
         },
     )
@@ -1769,7 +1793,7 @@ async def history_page(
         request=request,
         name="history.html",
         context={
-            **_base_context(request, "history"),
+            **(await _base_context(request, "history")),
             "events": rows,
             "event_types": [r["event_type"] for r in event_types],
             "projects": projects,

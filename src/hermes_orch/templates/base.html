@@ -776,6 +776,27 @@
                     <span id="theme-label" class="text-gray-500">Light</span>
                     <span id="theme-icon">&#9728;</span>
                 </button>
+                {# v3.4: user pill (logged in) or Sign in link (not). Server-rendered
+                   from request.state.current_user_ctx so the topbar is correct on
+                   first paint without a JS roundtrip. #}
+                {% if current_user_ctx %}
+                <div class="flex items-center gap-2" id="user-pill-wrap">
+                    <span class="text-gray-500" id="user-pill-name"
+                          title="Signed in as {{ current_user_ctx.username }} ({{ current_user_ctx.role }})">
+                        {{ current_user_ctx.username }}
+                        {% if current_user_ctx.role == 'admin' %}<span class="text-[9px] uppercase tracking-wider text-blue-600 ml-0.5">admin</span>{% endif %}
+                    </span>
+                    <form method="post" action="/logout" style="display:inline; margin:0;">
+                        <button type="submit" class="text-gray-500 hover:text-red-600" title="Sign out">
+                            &#x21AA; logout
+                        </button>
+                    </form>
+                </div>
+                {% else %}
+                <a href="/login?next={{ request.url.path }}" class="text-gray-500 hover:text-blue-600" id="signin-link">
+                    Sign in
+                </a>
+                {% endif %}
             </div>
         </div>
         {% if not llm_configured %}

@@ -8,6 +8,7 @@ Commands:
 """
 from __future__ import annotations
 
+import asyncio
 import secrets
 import sys
 from pathlib import Path
@@ -26,8 +27,15 @@ def cli() -> None:
 
 @cli.command()
 @click.option("--config-dir", type=click.Path(), default=None, help="Config directory (default: ~/.hermes-orchestrator)")
-def init(config_dir: str | None) -> None:
-    """Initialize orchestrator: create config dir, projects/, artifacts/, DB schema, admin token."""
+@click.option("--admin-username", default="admin", show_default=True, help="Username for the bootstrap admin user (created with no password; first web login sets it).")
+def init(config_dir: str | None, admin_username: str) -> None:
+    """Initialize orchestrator: create config dir, projects/, artifacts/, DB schema, admin token.
+
+    v3.4: also creates a bootstrap admin user (no password set). The
+    first time someone visits /login with that username, the web UI
+    walks them through setting the password. This avoids storing a
+    default password in the CLI that operators might forget to change.
+    """
     base = Path(config_dir) if config_dir else Path.home() / ".hermes-orchestrator"
     base.mkdir(parents=True, exist_ok=True)
 
@@ -68,31 +76,71 @@ logging:
     else:
         click.echo(f"Config exists: {config_file}")
 
-    # DB schema (initialize)
+    # DB schema (initialize) + bootstrap admin user
     from hermes_orch.db import SCHEMA, Database
+    from hermes_orch.auth.cookie import (
+        BOOTSTRAP_ADMIN_USERNAME, ROLE_ADMIN, create_user, get_user_by_username,
+    )
 
     async def _init_db() -> None:
         db = Database(base / "hermes-orch.db")
         await db.connect()
+        # Bootstrap admin: only created if NO admin user exists yet.
+        # We pick the username from --admin-username, but if a previous
+        # init created "admin" we keep that. Subsequent re-inits with
+        # --admin-username different from the existing one are rejected
+        # loudly so operators don't silently end up with two admins.
+        existing = await get_user_by_username(db, admin_username)
+        if existing:
+            click.echo(f"Admin user '{admin_username}' exists (id={existing['id']})")
+        else:
+            # Check if any admin exists at all (someone re-ran init with
+            # a different --admin-username)
+            any_admin = await db.fetchone(
+                "SELECT username FROM users WHERE role = ? LIMIT 1",
+                (ROLE_ADMIN,),
+            )
+            if any_admin:
+                click.echo(
+                    f"WARNING: an admin user '{any_admin['username']}' already "
+                    f"exists. Skipping bootstrap admin creation. To add "
+                    f"another admin, use 'hermes-orch user add --admin'."
+                )
+            else:
+                uid = await create_user(
+                    db,
+                    username=admin_username,
+                    password=None,  # bootstrap: no password until first web login
+                    role=ROLE_ADMIN,
+                    is_bootstrap_admin=True,
+                )
+                click.echo(f"Created bootstrap admin: {admin_username} (id={uid})")
+                click.echo(
+                    f"  → Visit /login and enter '{admin_username}' + any "
+                    f"password; you'll be prompted to set the initial password."
+                )
         await db.close()
 
     import asyncio
     asyncio.run(_init_db())
     click.echo(f"Initialized DB: {base / 'hermes-orch.db'}")
 
-    # Admin token
+    # Admin token (legacy — pre-v3.4). Kept for backward compat with the
+    # agent-bootstrap flow (HMAC agent registration). The dashboard
+    # user is separate.
     token_file = base / "admin-token.txt"
     if not token_file.exists():
         token = secrets.token_urlsafe(32)
         token_file.write_text(token)
         token_file.chmod(0o600)
-        click.echo(f"Generated admin token: {token_file}")
+        click.echo(f"Generated admin token (for agent bootstrap): {token_file}")
         click.echo(f"  Token: {token}")
-        click.echo("  (Save this — first dashboard login uses it)")
+        click.echo("  (Save this — first agent register uses it)")
     else:
         click.echo(f"Admin token exists: {token_file}")
 
-    click.echo(f"\n✅ Init complete. Next: hermes-orch serve")
+    click.echo(f"\n[OK] Init complete. Next: hermes-orch serve")
+    click.echo(f"   Then visit: http://localhost:<port>/login")
 
 
 @cli.command()
@@ -230,6 +278,151 @@ def sessions_cleanup(older_than: int | None, dry_run: bool) -> None:
             click.echo(f"  errors:  {len(report['errors'])}")
             for e in report["errors"][:5]:
                 click.echo(f"    - {e}")
+
+    asyncio.run(_run())
+
+
+# ===== user subcommands (v3.4 dashboard auth) =====
+
+@cli.group()
+def user() -> None:
+    """Manage dashboard users (v3.4).
+
+    After `hermes-orch init` creates the bootstrap admin, use these
+    subcommands to add more users, reset passwords, or disable
+    accounts. The dashboard only sees users listed in the `users`
+    table; HMAC agent identities are separate.
+    """
+
+
+@user.command(name="add")
+@click.option("--username", required=True, help="Username (case-insensitive, must be unique)")
+@click.option("--password", required=True, help="Initial password (min 8 chars). User can change via /api/auth/password after first login.")
+@click.option("--admin/--no-admin", default=False, help="Grant admin role (default: regular user)")
+def user_add(username: str, password: str, admin: bool) -> None:
+    """Add a new dashboard user."""
+    from hermes_orch.auth.cookie import create_user, get_user_by_username, ROLE_ADMIN, ROLE_USER
+
+    async def _run() -> None:
+        from hermes_orch.db import Database
+        db = Database(_default_db_path())
+        await db.connect()
+        try:
+            existing = await get_user_by_username(db, username)
+            if existing:
+                raise click.ClickException(f"User '{username}' already exists (id={existing['id']})")
+            if len(password) < 8:
+                raise click.ClickException("Password must be at least 8 characters")
+            uid = await create_user(
+                db,
+                username=username,
+                password=password,
+                role=ROLE_ADMIN if admin else ROLE_USER,
+            )
+            click.echo(f"Created user '{username}' (id={uid}, role={'admin' if admin else 'user'})")
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@user.command(name="list")
+def user_list() -> None:
+    """List all dashboard users."""
+    from hermes_orch.auth.cookie import list_users
+
+    async def _run() -> None:
+        from hermes_orch.db import Database
+        db = Database(_default_db_path())
+        await db.connect()
+        try:
+            rows = await list_users(db)
+        finally:
+            await db.close()
+        if not rows:
+            click.echo("(no users)")
+            return
+        click.echo(f"{len(rows)} user(s):")
+        click.echo(f"  {'ID':14s}  {'USERNAME':20s}  {'ROLE':8s}  {'DISABLED':8s}  LAST LOGIN")
+        for r in rows:
+            last = r.get("last_login_at") or 0
+            last_str = (
+                __import__("datetime").datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M")
+                if last else "-"
+            )
+            click.echo(
+                f"  {r['id']:14s}  {r['username']:20s}  {r['role']:8s}  "
+                f"{'yes' if r['disabled'] else '-':8s}  {last_str}"
+            )
+
+    asyncio.run(_run())
+
+
+@user.command(name="disable")
+@click.argument("username")
+def user_disable(username: str) -> None:
+    """Disable a user (revokes their session on next request; doesn't delete history)."""
+    from hermes_orch.auth.cookie import get_user_by_username, set_user_disabled
+
+    async def _run() -> None:
+        from hermes_orch.db import Database
+        db = Database(_default_db_path())
+        await db.connect()
+        try:
+            u = await get_user_by_username(db, username)
+            if not u:
+                raise click.ClickException(f"No such user: '{username}'")
+            await set_user_disabled(db, u["id"], True)
+            click.echo(f"Disabled user '{username}' (id={u['id']}). Their existing cookies stop working on next request.")
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@user.command(name="enable")
+@click.argument("username")
+def user_enable(username: str) -> None:
+    """Re-enable a previously disabled user."""
+    from hermes_orch.auth.cookie import get_user_by_username, set_user_disabled
+
+    async def _run() -> None:
+        from hermes_orch.db import Database
+        db = Database(_default_db_path())
+        await db.connect()
+        try:
+            u = await get_user_by_username(db, username)
+            if not u:
+                raise click.ClickException(f"No such user: '{username}'")
+            await set_user_disabled(db, u["id"], False)
+            click.echo(f"Enabled user '{username}' (id={u['id']})")
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@user.command(name="passwd")
+@click.argument("username")
+@click.option("--password", required=True, help="New password (min 8 chars).")
+def user_passwd(username: str, password: str) -> None:
+    """Reset a user's password. Admin-only operation; no old password required."""
+    from hermes_orch.auth.cookie import get_user_by_username, set_user_password
+
+    async def _run() -> None:
+        from hermes_orch.db import Database
+        db = Database(_default_db_path())
+        await db.connect()
+        try:
+            u = await get_user_by_username(db, username)
+            if not u:
+                raise click.ClickException(f"No such user: '{username}'")
+            if len(password) < 8:
+                raise click.ClickException("Password must be at least 8 characters")
+            await set_user_password(db, u["id"], password)
+            click.echo(f"Password reset for '{username}' (id={u['id']}). Their existing cookies stay valid until expiry; new logins use the new password.")
+        finally:
+            await db.close()
 
     asyncio.run(_run())
 

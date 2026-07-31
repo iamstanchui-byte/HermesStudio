@@ -28,6 +28,12 @@ dependencies = [
     # ZoneInfoNotFoundError. tzdata is a small pure-Python fallback
     # (~300KB) that ships the tzdata2024a+ database.
     "tzdata>=2024.1",
+    # v3.4 dashboard user auth — bcrypt password hashing + itsdangerous
+    # signed cookies. bcrypt has a 72-byte input cap (we pre-hash with
+    # SHA-256 for longer passwords). itsdangerous TimestampSigner
+    # provides tamper-detection + max-age expiry on the session cookie.
+    "bcrypt>=4.0.0",
+    "itsdangerous>=2.2.0",
 ]
 
 [project.optional-dependencies]

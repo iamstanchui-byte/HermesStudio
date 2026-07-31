@@ -6,11 +6,15 @@ Routes mounted from src/hermes_orch/api/* submodules.
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
 
 from hermes_orch.config import load_config
 from hermes_orch.core.cleanup import CleanupJob
@@ -128,6 +132,86 @@ def create_app() -> FastAPI:
 
     app.add_middleware(_NoStoreOnSkills)
 
+    # v3.4: dashboard user auth gate. Two layers of auth co-exist:
+    #   - HMAC for agent → orchestrator (per-route Depends)
+    #   - Cookie session for human → dashboard (this middleware)
+    # Allowlist contains paths that don't need a user session. Everything
+    # else requires a valid `hermes_orch_session` cookie.
+    from hermes_orch.auth.cookie import COOKIE_NAME as _COOKIE_NAME
+    from hermes_orch.auth.cookie import current_user_id as _current_user_id
+
+    # HMAC-gated agent paths — wrapper signs them, no user session needed.
+    # The endpoints themselves still go through require_hmac_auth Depends;
+    # this allowlist just keeps the user-cookie middleware out of the way.
+    _HMAC_PATH_PATTERNS = [
+        re.compile(r"^/api/agents/[^/]+/heartbeat/?$"),
+        re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/configs/pending/?$"),
+        re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/cleanup-ack/?$"),
+        re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/terminal-ack/?$"),
+        re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/tool-ack/?$"),
+        re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/tool-output/?$"),
+        re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/(?:start|update|complete|fail|log|abort)/?$"),
+        re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/(?:skills|mcp|llm)/.*$"),
+    ]
+    _ALLOWLIST_PREFIXES = (
+        "/static/",
+        "/login",
+        "/setup-password",
+        "/approval/",  # magic-link approval (future)
+        "/api/auth/",
+        "/api/health",
+        "/docs",  # FastAPI auto-generated
+        "/openapi.json",
+        "/redoc",
+    )
+
+    class _RequireUserMiddleware(BaseHTTPMiddleware):
+        """Gate dashboard routes + most /api/* behind a user session cookie.
+
+        - Allowed prefixes → pass through (login, static, auth endpoints, health)
+        - HMAC path patterns → pass through (gated by require_hmac_auth inside)
+        - Otherwise → require user. If no valid session:
+            * HTML page request → 302 redirect to /login?next=...
+            * API request → 401 JSON
+        """
+
+        async def dispatch(self, request: StarletteRequest, call_next):
+            path = request.url.path
+
+            # Always-allow: static, login, auth endpoints, health, docs
+            for prefix in _ALLOWLIST_PREFIXES:
+                if path == prefix.rstrip("/") or path.startswith(prefix):
+                    return await call_next(request)
+
+            # HMAC-gated agent paths (wrapper, not user)
+            for pat in _HMAC_PATH_PATTERNS:
+                if pat.match(path):
+                    return await call_next(request)
+
+            # Everything else requires a user session
+            user_id = await _current_user_id(request)
+            if not user_id:
+                # Distinguish page requests (redirect) from API (JSON 401)
+                accept = request.headers.get("accept", "")
+                if path.startswith("/api/") or "application/json" in accept:
+                    return JSONResponse(
+                        {"detail": "Not authenticated"},
+                        status_code=401,
+                    )
+                # Page request → redirect to /login with next= param
+                next_url = path
+                if request.url.query:
+                    next_url = path + "?" + request.url.query
+                return RedirectResponse(
+                    url=f"/login?next={next_url}", status_code=302
+                )
+
+            # Attach user_id for downstream handlers
+            request.state.user_id = user_id
+            return await call_next(request)
+
+    app.add_middleware(_RequireUserMiddleware)
+
     # Health check
     @app.get("/api/health")
     async def health() -> dict[str, str]:
@@ -136,7 +220,7 @@ def create_app() -> FastAPI:
     # Mount routers (will be filled in as we build)
     from hermes_orch.api.agents import router as agents_router
     from hermes_orch.api.artifacts import router as artifacts_router
-    from hermes_orch.api.auth import router as auth_router
+    from hermes_orch.api.auth import router as auth_router, page_router as auth_page_router
     from hermes_orch.api.contracts import router as contracts_router
     from hermes_orch.api.dashboard import router as dashboard_router
     from hermes_orch.api.objects import router as objects_router
@@ -153,6 +237,8 @@ def create_app() -> FastAPI:
     app.include_router(agents_router, prefix="/api/agents", tags=["agents"])
     app.include_router(artifacts_router, prefix="/api/artifacts", tags=["artifacts"])
     app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
+    # v3.4: /login, /setup-password, /logout (HTML pages, no prefix)
+    app.include_router(auth_page_router, tags=["auth-pages"])
     app.include_router(contracts_router, prefix="/api/contracts", tags=["contracts"])
     app.include_router(objects_router, prefix="/api/objects", tags=["objects"])
     app.include_router(optimize_router, prefix="/api/contracts/optimize-tasks", tags=["optimize"])

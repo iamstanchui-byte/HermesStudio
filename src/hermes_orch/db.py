@@ -178,6 +178,22 @@ CREATE INDEX IF NOT EXISTS idx_profile_configs_status ON profile_configs(status)
 CREATE INDEX IF NOT EXISTS idx_profile_configs_profile_path_created
     ON profile_configs(profile_id, file_path, created_at DESC);
 
+-- v3.4: users (dashboard auth). Bootstrap admin is created with
+-- password_hash=NULL by `hermes-orch init`; the first login through
+-- the web UI sets the password (see src/hermes_orch/auth/cookie.py).
+-- The `disabled` flag is a soft-delete so we never lose audit history.
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT,            -- bcrypt; NULL = must set (bootstrap admin only)
+    role TEXT NOT NULL DEFAULT 'user',  -- 'admin' | 'user'
+    is_bootstrap_admin INTEGER NOT NULL DEFAULT 0,  -- 1 only for the first admin row
+    disabled INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    last_login_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username COLLATE NOCASE);
+
 -- Project SOUL presets: per-project snapshot of agent identity (SOUL.md)
 -- content for each role the project plans to use. Lets the user switch
 -- "which project is active" by loading a preset into the relevant profile's
