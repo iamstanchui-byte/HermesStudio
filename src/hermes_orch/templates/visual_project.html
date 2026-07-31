@@ -491,6 +491,174 @@ svg.connection.output_2 path {
 /* Stage 3.5 — extra padding-right on name so the X button
    doesn't overlap the task name. */
 .vp-card { padding-right: 28px; }
+
+/* v3.7.0: dark mode for the visual project page. Tailwind overrides
+   in base.html already handle .bg-white, .text-gray-*, .border-gray-*
+   etc. — this block only covers the page-specific .vp-* and drawflow
+   classes. Palette is slate-based (matches the Perplexity reference):
+   canvas = slate-900, card = slate-800, border = slate-700, text =
+   slate-200/300/400. The whole block is gated on body.dark so light
+   mode is unchanged.
+
+   Tested by switching the theme toggle (in the topbar) and verifying
+   the canvas, card, status chip, banner, and side panel all render
+   dark. Connection paths use slate-500 to stay visible without
+   competing with node content. The card-del X button uses a
+   semi-transparent slate-800 so it floats on top of the card without
+   needing its own solid bg. */
+body.dark .vp-canvas-wrap {
+    background: #0f172a;  /* slate-900 — user-requested for canvas */
+    border-color: #334155;
+}
+body.dark .drawflow .drawflow-node,
+body.dark .drawflow-node.selected {
+    background: #1e293b !important;  /* slate-800 — slightly elevated from canvas */
+    border-color: #334155 !important;
+    color: #e2e8f0 !important;       /* slate-200 — primary text on card */
+}
+body.dark .vp-card {
+    background: transparent;   /* let .drawflow-node bg show through */
+    border-color: transparent;
+    color: #e2e8f0;
+}
+body.dark .vp-card .vp-name { color: #f1f5f9; }  /* slate-100 — slightly brighter for emphasis */
+body.dark .vp-card .vp-role { color: #94a3b8; }  /* slate-400 — muted */
+body.dark .vp-card .vp-metric {
+    background: #0f172a;  /* slate-900 — sunken chip on card */
+    color: #cbd5e1;       /* slate-300 */
+    border: 1px solid #334155;
+}
+body.dark .vp-card .vp-status { color: #fff; }  /* status badge text stays white */
+
+/* Card X delete button (Stage 3.5) — floats on top of the card with
+   a translucent dark bg so it reads as "overlay" not "solid panel". */
+body.dark .vp-card-del {
+    background: rgba(30, 41, 59, 0.85);
+    color: #94a3b8;
+}
+body.dark .vp-card-del:hover {
+    background: #450a0a;  /* red-950 — destructive intent on dark */
+    color: #fca5a5;
+}
+
+/* Status chips at the top of the canvas */
+body.dark .vp-status-chip {
+    background: #1e293b;
+    border-color: #334155;
+    color: #e2e8f0;
+}
+
+/* Stage banner (light blue in light mode → dark blue in dark mode) */
+body.dark .vp-stage-banner {
+    background: #1e3a8a;  /* blue-900 — matches base.html .bg-blue-50 override */
+    border-color: #1d4ed8;
+    color: #bfdbfe;       /* blue-200 */
+}
+body.dark .vp-stage-banner a { color: #93c5fd; }
+
+/* Stale updates banner (light yellow → dark amber) */
+body.dark .vp-stale-banner {
+    background: #422006;
+    border-color: #92400e;
+    color: #fde68a;
+}
+body.dark .vp-stale-btn {
+    background: transparent;
+    border-color: #92400e;
+    color: #fde68a;
+}
+body.dark .vp-stale-btn:hover { background: #78350f; }
+body.dark .vp-stale-btn-dismiss {
+    border-color: #4b5563;
+    color: #9ca3af;
+}
+body.dark .vp-stale-btn-dismiss:hover { background: #374151; }
+
+/* Empty state (no tasks) */
+body.dark .vp-empty { color: #64748b; }
+
+/* Connection paths on the canvas. Default (solid) uses slate-500 for
+   good contrast on slate-900. Error/conditional (output_2) brightens
+   to red-400 so it still reads as an error path without going neon. */
+body.dark svg.connection path { stroke: #64748b !important; }
+body.dark svg.connection.output_2 path { stroke: #f87171 !important; }
+
+/* Side panel (slides in from the right). Inner panel uses slate-800
+   (same as card) to feel like "another elevated layer". Header and
+   footer get slate-700 borders. */
+body.dark .vp-side-panel-inner {
+    background: #1e293b;
+    color: #e2e8f0;
+    box-shadow: -4px 0 16px rgba(0, 0, 0, 0.4);
+}
+body.dark .vp-side-panel-header {
+    border-bottom-color: #334155;
+    color: #f1f5f9;
+}
+body.dark .vp-sp-close { color: #9ca3af; }
+body.dark .vp-sp-close:hover { color: #f3f4f6; }
+body.dark .vp-side-panel-footer {
+    border-top-color: #334155;
+    background: #0f172a;  /* sunken footer (save actions are the "primary" thing) */
+}
+body.dark .vp-sp-label { color: #94a3b8; }
+body.dark .vp-sp-mono { color: #e2e8f0; }
+body.dark .vp-sp-h3 {
+    color: #94a3b8;
+    border-top-color: #334155;
+}
+body.dark .vp-sp-pre {
+    background: #0f172a;
+    border-color: #334155;
+    color: #cbd5e1;
+}
+/* sp-error uses dark-red text in light mode; on dark bg that becomes
+   invisible. Bump to red-300. */
+body.dark .vp-sp-error { color: #fca5a5; }
+body.dark .vp-sp-btn {
+    background: #1e293b;
+    border-color: #334155;
+    color: #e2e8f0;
+}
+body.dark .vp-sp-btn:hover:not(:disabled) { background: #334155; }
+body.dark .vp-sp-btn-primary {
+    background: #2563eb;
+    border-color: #2563eb;
+    color: #fff;
+}
+body.dark .vp-sp-btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+body.dark .vp-sp-btn-warn {
+    background: #dc2626;
+    border-color: #dc2626;
+    color: #fff;
+}
+body.dark .vp-sp-btn-warn:hover:not(:disabled) { background: #b91c1c; }
+body.dark .vp-sp-btn-danger {
+    background: transparent;
+    color: #fca5a5;
+    border-color: #7f1d1d;
+}
+body.dark .vp-sp-btn-danger:hover:not(:disabled) { background: #450a0a; }
+body.dark .vp-sp-edit-label { color: #94a3b8; }
+body.dark .vp-sp-input {
+    background: #0f172a;
+    border-color: #334155;
+    color: #e2e8f0;
+}
+body.dark .vp-sp-textarea {
+    background: #0f172a;
+    border-color: #334155;
+    color: #e2e8f0;
+}
+body.dark .vp-sp-textarea:focus { background: #0f172a; }
+body.dark .vp-sp-dep-list {
+    background: #0f172a;
+    border-color: #334155;
+}
+body.dark .vp-sp-dep-label:hover { background: #334155; }
+body.dark .vp-sp-dep-name { color: #e2e8f0; }
+body.dark .vp-sp-dep-id { color: #64748b; }
+body.dark .vp-sp-empty { color: #64748b; }
 </style>
 {% endblock %}
 
