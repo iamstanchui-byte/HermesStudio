@@ -1389,7 +1389,27 @@
                 },
                 180_000,  // 3 min for LLM
             );
-            const j = await r.json();
+            // v3.5.2: defensive JSON parsing. The fetch() itself
+            // succeeded (got a Response object), but the body might
+            // not be JSON if a proxy/load-balancer or FastAPI's
+            // default 500 handler returned HTML. Without this guard
+            // the user sees the cryptic "Unexpected token 'I', 'Inter
+            // nal S'... is not valid JSON" nested-exception error.
+            // Try to parse JSON; on failure, surface the raw body
+            // (first 300 chars) so the user sees what actually came
+            // back from the server.
+            const _rawText = await r.text();
+            let j = null;
+            try {
+                j = _rawText ? JSON.parse(_rawText) : {};
+            } catch (_parseErr) {
+                // Body isn't JSON. Build a minimal {"detail": "..."}
+                // shape so the existing _errDetailToString path works.
+                const _snippet = (_rawText || '').slice(0, 300)
+                    .replace(/\s+/g, ' ').trim();
+                j = {detail: `non-JSON response (status ${r.status}, ` +
+                    `body: ${_snippet}${_rawText && _rawText.length > 300 ? '…' : ''})`};
+            }
             if (!r.ok) {
                 throw new Error(_errDetailToString(j.detail, r.status));
             }
