@@ -656,6 +656,33 @@
     </style>
 </head>
 <body class="{% if active_page in ('token_usage',) %}sidebar-collapsed{% endif %}">
+    {# v3.3.1: pre-hydrate the sidebar state from localStorage BEFORE the
+       browser paints. Without this, the server-rendered body class
+       (which is collapsed only for /token-usage) shows the sidebar as
+       expanded for ~1 frame, then DOMContentLoaded fires and
+       applySidebarState() flips it to collapsed — a visible "flash" of
+       the expanded state on every page change. The script below runs
+       synchronously before the first paint, so the class is correct
+       from frame 1 and no transition fires.
+       Also pre-set the Settings subitems + theme so those don't flash
+       on subsequent page navigations. #}
+    <script>
+    (function() {
+        try {
+            var s = localStorage.getItem('orch.sidebar');
+            if (s === 'collapsed') document.body.classList.add('sidebar-collapsed');
+            else if (s === 'expanded') document.body.classList.remove('sidebar-collapsed');
+            // Settings subitems — same idea. The server-rendered class
+            // is only set for "active" subpages; for the same-page nav
+            // (e.g. clicking a sub-item in the group), the saved
+            // preference should win.
+            var g = localStorage.getItem('orch.settingsGroup');
+            if (g === 'open' || g === 'closed') {
+                document.documentElement.dataset.settingsGroup = g;
+            }
+        } catch (e) { /* localStorage may be disabled — silently fall back to server-rendered state */ }
+    })();
+    </script>
     {# v3.0: left sidebar (replaces the v2.x top nav). 5 top-level items
        matching the Perplexity-approved mockup, with Settings as an
        expandable group containing secondary entries (Models, Evaluations,
