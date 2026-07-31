@@ -561,6 +561,19 @@ MIGRATIONS = [
     # rows stay valid and the column is additive — no data migration
     # needed. Older calls that don't pass cache_read just write 0.
     "ALTER TABLE token_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+    # ===== v3.6.0: per-agent concurrent task cap =====
+    # How many tasks a single wrapper process can run in parallel
+    # (i.e. N parallel hermes subprocesses per agent_id). Default 1
+    # = backward compatible (the historical "one task at a time per
+    # process" behavior). Upper bound (32) is enforced in the API
+    # layer (Pydantic Field ge=1, le=32) — we don't add a SQLite CHECK
+    # constraint because ALTER TABLE ADD CHECK isn't supported
+    # without rebuilding the table; app-layer validation is the
+    # single source of truth. The orchestrator's _assign_task
+    # consults this column to skip dispatch when the agent is at
+    # capacity; the wrapper reads the value from the heartbeat
+    # response and sizes its ThreadPoolExecutor accordingly.
+    "ALTER TABLE agents ADD COLUMN max_concurrent_tasks INTEGER NOT NULL DEFAULT 1",
 ]
 
 

@@ -363,6 +363,10 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
                 "status": row["status"],
                 "last_heartbeat_at": row.get("last_heartbeat_at"),
                 "created_at": row.get("created_at"),
+                # v3.6.0: per-agent concurrent task cap. Surfaced to
+                # the dashboard so the operator can see at a glance
+                # how parallel the wrapper will run.
+                "max_concurrent_tasks": int(row.get("max_concurrent_tasks") or 1),
                 "profiles": profile_list,
             }
         )

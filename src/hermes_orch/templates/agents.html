@@ -209,6 +209,35 @@
                 </div>
                 <span id="detail-status-pill"></span>
             </div>
+            {# v3.6.0: agent-level settings. v3.5.0/v3.5.1 only had
+               agent-level PATCH for ip/os_type but no UI form; this is
+               the first agent-level settings block on the dashboard.
+               Single field for now (max_concurrent_tasks) — extend
+               here when more agent-level settings are added (e.g.
+               accept_criteria defaults, custom task timeout, etc).
+               The PUT /api/agents/{id} endpoint is what gets called. #}
+            <div class="mt-3 mb-3 p-3 bg-gray-50 border border-gray-200 rounded">
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">
+                    Agent settings
+                </div>
+                <div class="flex items-center gap-2 flex-wrap">
+                    <label for="agent-max-concurrent-tasks" class="text-xs text-gray-700">
+                        Max concurrent tasks
+                    </label>
+                    <input id="agent-max-concurrent-tasks"
+                           type="number" min="1" max="32" step="1"
+                           class="text-xs border rounded px-2 py-1 w-16"
+                           title="How many tasks the wrapper can run in parallel. 1 = sequential (backward compatible). Range 1..32.">
+                    <button onclick="saveAgentSettings()"
+                            class="text-xs px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">
+                        Save
+                    </button>
+                    <span id="agent-settings-status" class="text-xs"></span>
+                </div>
+                <div class="text-xs text-gray-500 mt-1">
+                    How many tasks this agent's wrapper will run in parallel. Default 1 = sequential. The orchestrator skips dispatch when the agent is at capacity; the wrapper's pool is sized from this value.
+                </div>
+            </div>
             <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">Profiles</div>
             <div id="detail-profile-list"></div>
             {# v3.2.0: profile settings tabs. Shown when the user clicks a
@@ -279,6 +308,10 @@
          data-ip="{{ a.ip or '—' }}"
          data-heartbeat="{{ a.last_heartbeat_at or 'never' }}"
          data-status="{{ a.status }}"
+         {# v3.6.0: per-agent concurrent task cap. Read by the JS to
+            populate the new "Max concurrent tasks" form field on the
+            detail panel. Default 1 = sequential (backward compatible). #}
+         data-max-concurrent-tasks="{{ a.max_concurrent_tasks or 1 }}"
          data-profiles='{{ a.profiles|tojson }}'>
     </div>
 </template>
@@ -405,6 +438,14 @@ function selectAgent(agentId) {
     document.getElementById('detail-agent-name').textContent = agentId;
     document.getElementById('detail-agent-meta').textContent =
         'OS: ' + data.dataset.os + ' · IP: ' + data.dataset.ip + ' · Heartbeat: ' + data.dataset.heartbeat;
+    // v3.6.0: populate the Max concurrent tasks input. Coerce to int
+    // defensively (the dataset is always a string). Clamp 1..32 so a
+    // hand-edited template can't break the form's own validation.
+    const maxInput = document.getElementById('agent-max-concurrent-tasks');
+    const rawCap = parseInt(data.dataset.maxConcurrentTasks || '1', 10);
+    maxInput.value = String(isNaN(rawCap) ? 1 : Math.max(1, Math.min(32, rawCap)));
+    // Clear the status pill from any previous agent's save attempt.
+    document.getElementById('agent-settings-status').textContent = '';
     const pill = document.getElementById('detail-status-pill');
     const status = data.dataset.status;
     pill.className = 'pill-status ' + (status === 'verified' ? 'pill-online' : status === 'idle' ? 'pill-offline' : 'pill-degraded');
@@ -446,6 +487,55 @@ function selectAgent(agentId) {
     }
     // v3.1.1: reset add-profile form state when switching agents
     hideAddProfileForm();
+}
+
+// v3.6.0: save the agent-level settings form. Currently just the
+// max_concurrent_tasks field; extend the body if more fields are
+// added. Uses PUT /api/agents/{id} (the same endpoint that already
+// exists for ip / os_type). On success, refreshes the page so the
+// left-list row's `data-max-concurrent-tasks` is up to date.
+async function saveAgentSettings() {
+    if (!currentAgentId) return;
+    const statusEl = document.getElementById('agent-settings-status');
+    const capStr = document.getElementById('agent-max-concurrent-tasks').value;
+    const cap = parseInt(capStr, 10);
+    if (isNaN(cap) || cap < 1 || cap > 32) {
+        statusEl.textContent = 'Cap must be 1..32';
+        statusEl.style.color = '#dc2626';
+        return;
+    }
+    statusEl.textContent = 'Saving...';
+    statusEl.style.color = '#6b7280';
+    try {
+        const r = await fetch(`/api/agents/${encodeURIComponent(currentAgentId)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ max_concurrent_tasks: cap }),
+        });
+        if (!r.ok) {
+            const errText = await r.text();
+            statusEl.textContent = `Save failed (${r.status}): ${errText.slice(0, 200)}`;
+            statusEl.style.color = '#dc2626';
+            return;
+        }
+        statusEl.textContent = `Saved. The wrapper picks up the new cap on its next heartbeat.`;
+        statusEl.style.color = '#059669';
+        // Update the in-memory data attribute on the template so a
+        // re-select of the same agent shows the new value, then
+        // reload the page after a short pause so the left list and
+        // any open tabs reflect the change too. Without the reload,
+        // the data-profiles/dataset props would be stale until the
+        // user clicks another agent and back.
+        const tpl = document.getElementById('agent-tpl-' + currentAgentId);
+        if (tpl) {
+            const data = tpl.content.querySelector('.agent-template-data');
+            if (data) data.dataset.maxConcurrentTasks = String(cap);
+        }
+        setTimeout(() => location.reload(), 800);
+    } catch (e) {
+        statusEl.textContent = `Network error: ${e}`;
+        statusEl.style.color = '#dc2626';
+    }
 }
 
 // v3.2.0: selectProfile() — highlight the chosen profile card and

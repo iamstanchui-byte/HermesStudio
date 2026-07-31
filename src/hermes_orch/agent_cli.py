@@ -137,6 +137,15 @@ MAX_SUMMARY_CHARS = 32_000
 # edits to storage_refs in the dashboard propagate within 5s).
 _storage_refs_cache: dict[str, list[dict]] = {}
 
+# v3.6.0: per-agent concurrent task cap. Sourced from the heartbeat
+# response (server's `agents.max_concurrent_tasks` column) and used
+# to size the ThreadPoolExecutor in the daemon loop. Default 1 =
+# backward compatible (sequential, one task at a time per process).
+# Read by the daemon loop at the top of every tick; size changes
+# take effect on the next tick (the pool is rebuilt per tick so we
+# don't need to resize an active pool).
+_max_concurrent_tasks_cache: int = 1
+
 
 def _render_storage_block(role: str) -> str:
     """Render the [AVAILABLE STORAGE] block for the task prompt.
@@ -1584,6 +1593,13 @@ def start(
         `_run_task` function injects an [AVAILABLE STORAGE] block into
         the task prompt so the agent knows where to write large
         outputs (bypassing the 15MB per-file orch cap).
+
+        v3.6.0: also caches the per-agent `max_concurrent_tasks` cap
+        in module-level `_max_concurrent_tasks_cache`. The daemon
+        loop sizes its ThreadPoolExecutor from this value; size changes
+        take effect on the next tick (the pool is rebuilt per tick,
+        so we don't have to track in-flight tasks and resize the pool
+        while workers are running).
         """
         profile_meta: list[dict] = []
         for role, pcfg in (profiles_cfg or {}).items():
@@ -1630,6 +1646,20 @@ def start(
                 for pname, refs in srefs.items():
                     if isinstance(refs, list):
                         _storage_refs_cache[str(pname)] = refs
+            # v3.6.0: cache the per-agent concurrent task cap. Defensive:
+            # clamp to 1..32 here too (server validates but a malformed
+            # body from a buggy custom client should still not crash the
+            # pool with max_workers=0 or -1). Default 1 = backward compat.
+            # We use `global` because the cache is a module-level
+            # variable (not a closure variable; the daemon loop is a
+            # top-level function, not nested).
+            global _max_concurrent_tasks_cache
+            try:
+                cap = int(body.get("max_concurrent_tasks") or 1)
+            except (TypeError, ValueError):
+                cap = 1
+            cap = max(1, min(32, cap))
+            _max_concurrent_tasks_cache = cap
             return body.get("tasks", []), body.get("cleanup_session_ids", []) or []
         except httpx.RequestError as e:
             click.echo(f"[daemon] heartbeat failed: {e}")
@@ -3259,18 +3289,76 @@ def start(
             assigned = [t for t in tasks if t.get("status") == "assigned"]
             if assigned:
                 click.echo(f"[daemon] got {len(assigned)} assigned task(s)")
-            for t in assigned:
+            # v3.6.0: per-agent concurrent task cap. We rebuild the
+            # ThreadPoolExecutor on every tick so cap changes (via
+            # PUT /api/agents/{id}) take effect within `interval`
+            # seconds without a wrapper restart. The pool size is
+            # the lower of:
+            #   (a) cap from server (1..32, default 1)
+            #   (b) len(assigned) (no point spinning up idle workers
+            #       when fewer tasks are available)
+            # so we never queue workers that have nothing to do.
+            #
+            # Threading note: the workers each run a hermes subprocess
+            # via subprocess.Popen + .communicate(). The GIL is released
+            # during that I/O so the workers run in true parallel for
+            # IO-bound work (LLM API calls, file uploads). For pure
+            # CPU work this would be a bottleneck, but hermes's hot
+            # path is dominated by subprocess + network calls.
+            #
+            # Why ThreadPoolExecutor over fork-N-processes: 1 process
+            # keeps shared state (config cache, file descriptors, the
+            # in-process daemon heartbeat thread, the L1/L2 profile
+            # metadata) reusable across workers. Forking N processes
+            # would lose that and require re-reading config per child.
+            # The trade-off is no GIL-free parallelism, which is fine
+            # here because hermes workers are IO-bound subprocesses.
+            cap = _max_concurrent_tasks_cache
+            pool_size = max(1, min(cap, len(assigned) if assigned else cap))
+            if pool_size > 1 and len(assigned) > 1:
+                click.echo(
+                    f"[daemon] using ThreadPoolExecutor with "
+                    f"{pool_size} workers (cap={cap}, tasks={len(assigned)})"
+                )
+            # Each worker does the same thing the old sequential loop
+            # did: claim, run, submit. We pass the task dict in;
+            # everything else is closure-captured (the orchestrator URL,
+            # the helper funcs, stop_flag).
+            def _process_one(t: dict) -> None:
                 if stop_flag["stop"]:
-                    break
+                    return
                 if not _claim(t["id"]):
-                    continue
+                    return
                 result = _run_task(t)
                 _submit_result(t["id"], result)
-                if once:
-                    click.echo("[daemon] --once: exiting after one task")
-                    return
-            if once and not assigned:
-                click.echo("[daemon] --once: no assigned tasks found, exiting")
+            if assigned:
+                # `with` ensures all workers are joined (or the pool
+                # is shut down) before we fall through to the
+                # post-task maintenance work below (config apply,
+                # zombie sweep, skill sync). Without `with`, a
+                # `break` in the pool shutdown could leave
+                # workers in flight while we move on.
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=pool_size,
+                    thread_name_prefix="hermes-task",
+                ) as pool:
+                    futures = [pool.submit(_process_one, t) for t in assigned]
+                    # Wait for all workers. We DON'T short-circuit on
+                    # stop_flag here — we want in-flight hermes
+                    # subprocesses to complete so we don't leak
+                    # processes (each worker holds a subprocess.Popen).
+                    # A kill signal via the outer while-loop's stop
+                    # check will catch the next tick.
+                    for f in futures:
+                        try:
+                            f.result()
+                        except Exception as e:
+                            click.echo(
+                                f"[daemon] worker exception: {type(e).__name__}: {e}"
+                            )
+            if once:
+                click.echo("[daemon] --once: exiting after one tick")
                 return
             # Apply pending profile configs (e.g. soul.md) every tick.
             # Cheap when nothing pending; no separate loop needed.

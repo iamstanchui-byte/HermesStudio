@@ -1486,6 +1486,45 @@ class Supervisor:
             if not prof:
                 log.info(f"task {tid} (role={role}): no agent has this role")
                 return False
+        # v3.6.0: per-agent concurrent task cap. If the chosen agent
+        # already has `max_concurrent_tasks` tasks in assigned+running
+        # state, skip this assignment and let the next supervisor tick
+        # retry. We don't fail the task — the task is still pending
+        # and will be picked up when the agent frees a slot. This is
+        # the orchestrator-side counterpart of the wrapper's
+        # ThreadPoolExecutor size: it prevents the supervisor from
+        # assigning more than the wrapper can run, so the task doesn't
+        # sit in `assigned` forever waiting for a slot the wrapper
+        # won't take (the v3.5.2 middleware bug, different cause, same
+        # symptom).
+        #
+        # Defensive: row.get with default 1 so legacy agents without
+        # the column (pre-migration DB) still work — they get the
+        # backward-compatible "1 task at a time" cap.
+        cap_row = await self.db.fetchone(
+            "SELECT max_concurrent_tasks FROM agents WHERE id = ?",
+            (prof["agent_id"],),
+        )
+        cap = int((cap_row or {}).get("max_concurrent_tasks") or 1)
+        if cap < 1:
+            cap = 1  # belt-and-braces; the API validates 1..32 on input
+        cur_count = await self.db.fetchone(
+            "SELECT COUNT(*) AS n FROM tasks "
+            "WHERE assigned_agent_id = ? "
+            "AND status IN ('assigned', 'running')",
+            (prof["agent_id"],),
+        )
+        in_flight = int((cur_count or {}).get("n") or 0)
+        if in_flight >= cap:
+            # Don't log at warn/info per-task (noisy in a tight loop
+            # when many tasks are pending and one agent is at cap);
+            # debug level so operators can opt in via log level if
+            # they want to verify the cap is biting.
+            log.debug(
+                f"task {tid} ({task.get('name')!r}): agent {prof['agent_id']} "
+                f"at cap ({in_flight}/{cap}); deferring to next tick"
+            )
+            return False
         # Phase 4 (smart dispatch): if the task requires a capability the
         # chosen profile doesn't have, fail the task with dispatch.mismatch
         # instead of silently letting the agent fall back to a worse tool

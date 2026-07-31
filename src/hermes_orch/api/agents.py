@@ -63,11 +63,23 @@ class AgentRegister(BaseModel):
     # as `roles_ignored` so operators can tell old clients are still
     # sending it. Remove in a future major version.
     roles: list[str] = Field(default_factory=list)
+    # v3.6.0: per-agent concurrent task cap. How many tasks the
+    # wrapper's ThreadPoolExecutor can run in parallel. Default 1 =
+    # backward compatible. 1..32 enforced here (single source of truth;
+    # the DB has no CHECK constraint). The orchestrator's _assign_task
+    # uses this to skip dispatch when the agent is at capacity; the
+    # wrapper reads it from the heartbeat response and sizes its
+    # pool accordingly.
+    max_concurrent_tasks: int = Field(default=1, ge=1, le=32)
 
 
 class AgentUpdate(BaseModel):
     ip: str | None = None
     os_type: str | None = None
+    # v3.6.0: editable from the Agent page settings (PUT
+    # /api/agents/{id}). Same 1..32 range as register. The wrapper
+    # picks up the new value on its next heartbeat tick.
+    max_concurrent_tasks: int | None = Field(default=None, ge=1, le=32)
 
 
 class StorageRef(BaseModel):
@@ -163,6 +175,10 @@ class Agent(BaseModel):
     status: str = "verifying"
     last_heartbeat_at: str | None = None
     created_at: str | None = None
+    # v3.6.0: per-agent concurrent task cap (1..32). Surfaced to the
+    # dashboard so the operator can see at a glance how parallel an
+    # agent's wrapper will run. Editable via PUT /api/agents/{id}.
+    max_concurrent_tasks: int = 1
     profiles: list[AgentProfile] = Field(default_factory=list)
 
 
@@ -328,6 +344,12 @@ async def _agent_with_profiles(db: Any, agent_id: str) -> Agent:
         status=row["status"],
         last_heartbeat_at=row.get("last_heartbeat_at"),
         created_at=row.get("created_at"),
+        # v3.6.0: per-agent concurrent task cap. Row.get returns None
+        # if the column is missing (defensive: the migration should
+        # have added it, but a hand-crafted DB may not have it). Coerce
+        # None -> 1 to keep the Agent model happy (it's non-Optional
+        # because the column is NOT NULL with DEFAULT 1 in the schema).
+        max_concurrent_tasks=int(row.get("max_concurrent_tasks") or 1),
         profiles=[_row_to_profile(p) for p in profile_rows],
     )
 
@@ -360,6 +382,10 @@ async def register_agent(body: AgentRegister, request: Request) -> AgentRegistra
             "ip": body.ip,
             "os_type": body.os_type,
             "status": "verifying",
+            # v3.6.0: per-agent concurrent task cap. Pydantic already
+            # validated 1..32 (Field ge=1, le=32), so we just pass
+            # the value through. Default 1 = backward compatible.
+            "max_concurrent_tasks": body.max_concurrent_tasks,
         },
     )
 
@@ -384,6 +410,10 @@ async def register_agent(body: AgentRegister, request: Request) -> AgentRegistra
             "ip": body.ip,
             "os_type": body.os_type,
             "roles_ignored": roles_ignored,
+            # v3.6.0: record the initial cap so the audit log shows
+            # the starting configuration. Subsequent changes are
+            # captured by `agent.max_concurrent_tasks_changed`.
+            "max_concurrent_tasks": body.max_concurrent_tasks,
         },
     )
     return AgentRegistrationResponse(
@@ -498,6 +528,9 @@ async def list_agents(request: Request) -> dict:
                 status=row["status"],
                 last_heartbeat_at=row.get("last_heartbeat_at"),
                 created_at=row.get("created_at"),
+                # v3.6.0: same defensive coercion as _agent_with_profiles
+                # (None -> 1). See comment there for why.
+                max_concurrent_tasks=int(row.get("max_concurrent_tasks") or 1),
                 profiles=[_row_to_profile(p) for p in profile_rows],
             ).model_dump()
         )
@@ -521,9 +554,11 @@ async def get_agent(
 
 @router.put("/{agent_id}", response_model=Agent)
 async def update_agent(agent_id: str, body: AgentUpdate, request: Request) -> Agent:
-    """Update agent metadata (ip, os_type)."""
+    """Update agent metadata (ip, os_type, max_concurrent_tasks)."""
     db = request.app.state.db
-    agent = await db.fetchone("SELECT id FROM agents WHERE id = ?", (agent_id,))
+    agent = await db.fetchone(
+        "SELECT id, max_concurrent_tasks FROM agents WHERE id = ?", (agent_id,)
+    )
     if not agent:
         raise HTTPException(404, f"Agent not found: {agent_id}")
 
@@ -535,12 +570,39 @@ async def update_agent(agent_id: str, body: AgentUpdate, request: Request) -> Ag
     if body.os_type is not None:
         updates.append("os_type = ?")
         params.append(body.os_type)
+    # v3.6.0: per-agent concurrent task cap. Audit-logged so operators
+    # can see when a cap was raised/lowered and from what to what
+    # (the supervisor's dispatch decisions need to be traceable —
+    # "did we skip this task because the cap was at N?").
+    if body.max_concurrent_tasks is not None:
+        new_cap = body.max_concurrent_tasks
+        old_cap = int(agent.get("max_concurrent_tasks") or 1)
+        if new_cap != old_cap:
+            updates.append("max_concurrent_tasks = ?")
+            params.append(new_cap)
     if updates:
         params.append(agent_id)
         await db.execute(
             f"UPDATE agents SET {', '.join(updates)} WHERE id = ?",
             tuple(params),
         )
+    # Audit log: only emit if a change was actually applied. Skipping
+    # no-op PUTs keeps the log from filling up with PATCH-equivalent
+    # calls that the operator UI may make on autosave.
+    if body.max_concurrent_tasks is not None:
+        new_cap = body.max_concurrent_tasks
+        old_cap = int(agent.get("max_concurrent_tasks") or 1)
+        if new_cap != old_cap:
+            await audit_log(
+                db, "agent.max_concurrent_tasks_changed",
+                actor="operator",
+                agent_id=agent_id,
+                payload={
+                    "old": old_cap,
+                    "new": new_cap,
+                    "source": "PUT /api/agents/{id}",
+                },
+            )
     return await _agent_with_profiles(db, agent_id)
 
 
@@ -786,6 +848,12 @@ async def heartbeat(
         # if operator hasn't configured any storage for that profile.
         # Wrapper caches this and injects as [AVAILABLE STORAGE] block.
         "storage_refs_by_profile": storage_refs_by_profile,
+        # v3.6.0: per-agent concurrent task cap. The wrapper sizes
+        # its ThreadPoolExecutor from this value; size changes take
+        # effect on the next tick (the pool is rebuilt per tick).
+        # Defensive: same None -> 1 coercion as _agent_with_profiles
+        # (legacy DB without the column would have None here).
+        "max_concurrent_tasks": int(agent.get("max_concurrent_tasks") or 1),
     }
 
 
