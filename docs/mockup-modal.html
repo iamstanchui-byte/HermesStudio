@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mockup: agent page settings modal (v3.6.0 follow-up)</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+  /* Re-create the agent page look (sidebar + main) */
+  .sidebar-link.active { background: #eff6ff; color: #1d4ed8; border-left: 3px solid #2563eb; }
+  .pill-online { background: #d1fae5; color: #065f46; }
+  .pill-busy { background: #fef3c7; color: #92400e; }
+  .pill-degraded { background: #fee2e2; color: #991b1b; }
+  .dot-running { background: #10b981; }
+  .dot-idle { background: #f59e0b; }
+  .dot-error { background: #ef4444; }
+  .profile-selector { padding: 0.75rem; cursor: pointer; border-left: 3px solid transparent; border-radius: 0.375rem; border: 1px solid #e5e7eb; background: white; }
+  .profile-selector.selected { border-left-color: #2563eb; background: #eff6ff; }
+  .profile-selector:hover { background: #f9fafb; }
+  .tab-active { color: #2563eb; border-bottom: 2px solid #2563eb; }
+  .tab { padding: 0.5rem 0.75rem; color: #6b7280; font-size: 0.75rem; cursor: pointer; background: none; border: none; }
+  .tab:hover { color: #111827; }
+  /* Modal styles */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.4);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100;
+  }
+  .modal-box {
+    background: white; border-radius: 0.5rem;
+    box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
+    width: 70%; max-width: 900px; max-height: 80vh;
+    display: flex; flex-direction: column;
+  }
+  /* When modal is closed, the right panel shows the agent list freely */
+  .modal-closed { display: none; }
+  .badge { background: #dbeafe; color: #1e40af; font-size: 0.625rem; padding: 0.125rem 0.5rem; border-radius: 0.25rem; font-weight: 500; }
+</style>
+</head>
+<body class="bg-gray-50">
+
+<!-- ============ SIDEBAR (fixed) ============ -->
+<aside class="fixed top-0 left-0 w-56 h-screen bg-white border-r border-gray-200 flex flex-col">
+  <div class="px-5 py-4 border-b">
+    <div class="flex items-center gap-2">
+      <div class="w-8 h-8 bg-gradient-to-br from-blue-500 to-purple-600 rounded"></div>
+      <div>
+        <div class="text-sm font-bold text-gray-800">HERMES</div>
+        <div class="text-xs text-gray-500 tracking-widest">NEXUS</div>
+      </div>
+    </div>
+  </div>
+  <nav class="flex-1 py-2 text-sm">
+    <a class="sidebar-link flex items-center gap-2 px-5 py-2 text-gray-700 hover:bg-gray-50">
+      <span>📁</span> Projects
+    </a>
+    <a class="sidebar-link active flex items-center gap-2 px-5 py-2 text-gray-700">
+      <span>🤖</span> Agents
+    </a>
+    <a class="sidebar-link flex items-center gap-2 px-5 py-2 text-gray-700 hover:bg-gray-50">
+      <span>🔀</span> Workflows
+    </a>
+    <a class="sidebar-link flex items-center gap-2 px-5 py-2 text-gray-700 hover:bg-gray-50">
+      <span>✓</span> Tasks
+    </a>
+    <a class="sidebar-link flex items-center gap-2 px-5 py-2 text-gray-700 hover:bg-gray-50">
+      <span>⚙</span> Settings <span class="ml-auto text-gray-400">▾</span>
+    </a>
+    <div class="ml-7 mt-1">
+      <a class="block px-3 py-1 text-xs text-gray-600 hover:text-gray-900">General</a>
+      <a class="block px-3 py-1 text-xs text-gray-600 hover:text-gray-900">Token Usage</a>
+      <a class="block px-3 py-1 text-xs text-gray-600 hover:text-gray-900">Schedules</a>
+      <a class="block px-3 py-1 text-xs text-gray-600 hover:text-gray-900">History</a>
+      <a class="block px-3 py-1 text-xs text-gray-600 hover:text-gray-900">Models</a>
+      <a class="block px-3 py-1 text-xs text-gray-600 hover:text-gray-900">Evaluations</a>
+      <a class="block px-3 py-1 text-xs text-gray-600 hover:text-gray-900">Guardrails</a>
+      <a class="block px-3 py-1 text-xs text-gray-600 hover:text-gray-900">Integrations</a>
+      <a class="block px-3 py-1 text-xs text-gray-600 hover:text-gray-900">Users</a>
+    </div>
+  </nav>
+  <div class="px-5 py-3 border-t text-xs text-gray-500">
+    <span class="bg-green-100 text-green-700 px-2 py-0.5 rounded">LLM ready</span>
+  </div>
+</aside>
+
+<!-- ============ MAIN CONTENT ============ -->
+<main class="ml-56 min-h-screen p-6">
+
+  <!-- KPI cards row -->
+  <div class="grid grid-cols-4 gap-4 mb-4">
+    <div class="bg-white rounded-lg border border-gray-200 p-4">
+      <div class="text-xs text-gray-500 uppercase tracking-wide">Online Agents</div>
+      <div class="text-3xl font-bold text-gray-800 mt-1">2</div>
+      <div class="text-xs text-gray-500 mt-1">heartbeat &lt; 90s</div>
+    </div>
+    <div class="bg-white rounded-lg border border-gray-200 p-4">
+      <div class="text-xs text-gray-500 uppercase tracking-wide">Active Jobs</div>
+      <div class="text-3xl font-bold text-gray-800 mt-1">0</div>
+      <div class="text-xs text-gray-500 mt-1">profiles working</div>
+    </div>
+    <div class="bg-white rounded-lg border border-gray-200 p-4">
+      <div class="text-xs text-gray-500 uppercase tracking-wide">Agents with no profile</div>
+      <div class="text-3xl font-bold text-gray-800 mt-1">0</div>
+      <div class="text-xs text-gray-500 mt-1">actionable signal</div>
+    </div>
+    <div class="bg-white rounded-lg border border-gray-200 p-4">
+      <div class="text-xs text-gray-500 uppercase tracking-wide">Offline / Unhealthy</div>
+      <div class="text-3xl font-bold text-red-700 mt-1">0</div>
+      <div class="text-xs text-gray-500 mt-1">needs attention</div>
+    </div>
+  </div>
+
+  <!-- Master-detail: agent list (left) + selected agent (right) -->
+  <div class="grid grid-cols-12 gap-4">
+
+    <!-- LEFT: agent list -->
+    <div class="col-span-7 bg-white rounded-lg border border-gray-200" style="overflow: hidden;">
+      <div class="px-4 py-3 border-b flex items-center gap-3">
+        <h2 class="text-sm font-semibold text-gray-700 flex-1">Agent registry (2)</h2>
+        <input type="text" placeholder="Search agents..." class="text-xs border rounded px-2 py-1 w-40">
+      </div>
+      <div style="max-height: 480px; overflow-y: auto;">
+        <div class="px-4 py-3 border-b cursor-pointer hover:bg-gray-50 flex items-center gap-3">
+          <span class="w-2 h-2 rounded-full dot-running"></span>
+          <div class="flex-1">
+            <div class="font-medium text-sm text-gray-800">linux-a-01</div>
+            <div class="text-xs text-gray-500 mt-0.5">OS: linux · IP: 192.168.2.161 · Heartbeat: 2026-08-01T00:17:22</div>
+          </div>
+          <div class="text-xs text-gray-500">3 profiles</div>
+        </div>
+        <div class="px-4 py-3 border-b cursor-pointer" style="background: #eff6ff; border-left: 3px solid #2563eb;">
+          <div class="flex items-center gap-3">
+            <span class="w-2 h-2 rounded-full dot-running"></span>
+            <div class="flex-1">
+              <div class="font-medium text-sm text-gray-800">win-local-1</div>
+              <div class="text-xs text-gray-500 mt-0.5">OS: windows · IP: 192.168.2.152 · Heartbeat: 2026-08-01T00:17:22</div>
+            </div>
+            <div class="text-xs text-gray-500">6 profiles</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: agent detail (modal-closed state: just shows the list of profiles) -->
+    <div class="col-span-5 bg-white rounded-lg border border-gray-200" style="max-height: 540px; display: flex; flex-direction: column; overflow: hidden;">
+      <div style="flex: 0 0 auto; padding: 1rem 1.25rem; border-bottom: 1px solid #f3f4f6;">
+        <div class="flex items-start justify-between">
+          <div>
+            <div class="text-xs text-gray-500 uppercase tracking-wide">Agent</div>
+            <h2 class="text-lg font-bold text-gray-800">win-local-1</h2>
+            <div class="text-xs text-gray-500 mt-1">OS: windows · IP: 192.168.2.152 · Heartbeat: 2026-08-01T00:17:22</div>
+          </div>
+          <span class="pill-online text-xs px-2 py-0.5 rounded">verified</span>
+        </div>
+      </div>
+      <!-- Agent settings (top, sticky-feel) -->
+      <div style="flex: 0 0 auto; padding: 0.75rem 1.25rem; background: #f9fafb; border-bottom: 1px solid #f3f4f6;">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">Agent settings</div>
+        <div class="flex items-center gap-2 flex-wrap">
+          <label class="text-xs text-gray-700">Max concurrent tasks</label>
+          <input type="number" value="1" min="1" max="32" class="text-xs border rounded px-2 py-1 w-16">
+          <button class="text-xs px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">Save</button>
+          <button class="text-xs w-5 h-5 rounded-full border border-gray-300 text-gray-500">?</button>
+        </div>
+      </div>
+      <!-- Profile list (middle, scrolls) -->
+      <div style="flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0.75rem 1.25rem;">
+        <div class="text-xs text-gray-500 uppercase tracking-wide mb-2 flex items-center justify-between">
+          <span>Profiles</span>
+          <span class="text-gray-400">6</span>
+        </div>
+        <div class="space-y-1.5">
+          <div class="profile-selector" onclick="openModal('w3')">
+            <div class="flex items-center gap-2">
+              <div class="font-medium text-sm flex-1">w3</div>
+              <span class="pill-online text-xs px-2 py-0.5 rounded">idle</span>
+              <button class="text-xs px-2 py-0.5 bg-white border border-red-200 text-red-700 rounded hover:bg-red-50" onclick="event.stopPropagation()">Delete</button>
+            </div>
+            <div class="text-xs text-gray-500 mt-1">Model: (not reported)</div>
+          </div>
+          <div class="profile-selector" onclick="openModal('w4')">
+            <div class="flex items-center gap-2">
+              <div class="font-medium text-sm flex-1">w4</div>
+              <span class="pill-online text-xs px-2 py-0.5 rounded">idle</span>
+              <button class="text-xs px-2 py-0.5 bg-white border border-red-200 text-red-700 rounded hover:bg-red-50" onclick="event.stopPropagation()">Delete</button>
+            </div>
+            <div class="text-xs text-gray-500 mt-1">Model: (not reported)</div>
+          </div>
+          <div class="profile-selector" onclick="openModal('w5')">
+            <div class="flex items-center gap-2">
+              <div class="font-medium text-sm flex-1">w5</div>
+              <span class="pill-online text-xs px-2 py-0.5 rounded">idle</span>
+              <button class="text-xs px-2 py-0.5 bg-white border border-red-200 text-red-700 rounded hover:bg-red-50" onclick="event.stopPropagation()">Delete</button>
+            </div>
+            <div class="text-xs text-gray-500 mt-1">Model: (not reported)</div>
+          </div>
+          <div class="profile-selector selected" onclick="openModal('w6')" style="border-left-color: #2563eb; background: #eff6ff;">
+            <div class="flex items-center gap-2">
+              <div class="font-medium text-sm flex-1">w6</div>
+              <span class="pill-online text-xs px-2 py-0.5 rounded">idle</span>
+              <button class="text-xs px-2 py-0.5 bg-white border border-red-200 text-red-700 rounded hover:bg-red-50" onclick="event.stopPropagation()">Delete</button>
+            </div>
+            <div class="text-xs text-gray-500 mt-1">Model: (not reported)</div>
+          </div>
+          <div class="profile-selector" onclick="openModal('win-agent01')">
+            <div class="flex items-center gap-2">
+              <div class="font-medium text-sm flex-1">win-agent01</div>
+              <span class="pill-online text-xs px-2 py-0.5 rounded">idle</span>
+              <button class="text-xs px-2 py-0.5 bg-white border border-red-200 text-red-700 rounded hover:bg-red-50" onclick="event.stopPropagation()">Delete</button>
+            </div>
+            <div class="text-xs text-gray-500 mt-1">Model: MiniMax-M3 · Provider: minimax-oauth</div>
+          </div>
+          <div class="profile-selector" onclick="openModal('win-agent02')">
+            <div class="flex items-center gap-2">
+              <div class="font-medium text-sm flex-1">win-agent02</div>
+              <span class="pill-online text-xs px-2 py-0.5 rounded">idle</span>
+              <button class="text-xs px-2 py-0.5 bg-white border border-red-200 text-red-700 rounded hover:bg-red-50" onclick="event.stopPropagation()">Delete</button>
+            </div>
+            <div class="text-xs text-gray-500 mt-1">Model: MiniMax-M3 · Provider: minimax-oauth</div>
+          </div>
+        </div>
+        <button class="mt-3 text-xs px-2 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded">+ Add profile</button>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<!-- ============ MODAL (initially closed) ============ -->
+<div id="modal" class="modal-overlay modal-closed" onclick="if (event.target === this) closeModal()">
+  <div class="modal-box">
+    <!-- Header -->
+    <div class="px-5 py-3 border-b flex items-center justify-between">
+      <div>
+        <div class="text-xs text-gray-500 uppercase tracking-wide">Profile settings</div>
+        <h2 class="text-base font-bold text-gray-800" id="modal-title">w6 · win-local-1</h2>
+      </div>
+      <button onclick="closeModal()" class="text-gray-400 hover:text-gray-600 text-2xl leading-none" aria-label="Close">×</button>
+    </div>
+    <!-- Tabs -->
+    <div class="flex border-b border-gray-200 px-5" id="modal-tabs">
+      <button class="tab tab-active" data-tab="overview" onclick="switchTab('overview')">Overview</button>
+      <button class="tab" data-tab="mcp" onclick="switchTab('mcp')">MCP</button>
+      <button class="tab" data-tab="skills" onclick="switchTab('skills')">Skills</button>
+      <button class="tab" data-tab="storage" onclick="switchTab('storage')">Storage</button>
+      <button class="tab" data-tab="capabilities" onclick="switchTab('capabilities')">Capabilities</button>
+    </div>
+    <!-- Body -->
+    <div class="px-5 py-4 overflow-y-auto" style="max-height: calc(80vh - 130px);" id="modal-body">
+      <!-- filled by switchTab() -->
+    </div>
+  </div>
+</div>
+
+<!-- ============ INTERACTIVITY ============ -->
+<script>
+const profileData = {
+  'w3':          { model: '(not reported)', provider: '(unknown)', mcp: 0, skills: 0, storage: 0, caps: 0 },
+  'w4':          { model: '(not reported)', provider: '(unknown)', mcp: 0, skills: 0, storage: 0, caps: 0 },
+  'w5':          { model: '(not reported)', provider: '(unknown)', mcp: 0, skills: 0, storage: 0, caps: 0 },
+  'w6':          { model: '(not reported)', provider: '(unknown)', mcp: 0, skills: 0, storage: 0, caps: 0 },
+  'win-agent01': { model: 'MiniMax-M3', provider: 'minimax-oauth', mcp: 2, skills: 5, storage: 1, caps: 4 },
+  'win-agent02': { model: 'MiniMax-M3', provider: 'minimax-oauth', mcp: 2, skills: 3, storage: 0, caps: 2 },
+};
+
+let currentProfile = 'w6';
+let currentTab = 'overview';
+
+function openModal(name) {
+  currentProfile = name;
+  document.getElementById('modal').classList.remove('modal-closed');
+  document.getElementById('modal-title').textContent = name + ' · win-local-1';
+  currentTab = 'overview';
+  switchTab('overview');
+  // mark all tabs as inactive first
+  document.querySelectorAll('#modal-tabs .tab').forEach(b => b.classList.remove('tab-active'));
+  document.querySelector('#modal-tabs .tab[data-tab="overview"]').classList.add('tab-active');
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.add('modal-closed');
+}
+
+function switchTab(name) {
+  currentTab = name;
+  document.querySelectorAll('#modal-tabs .tab').forEach(b => {
+    b.classList.toggle('tab-active', b.dataset.tab === name);
+  });
+  const p = profileData[currentProfile];
+  const body = document.getElementById('modal-body');
+  if (name === 'overview') {
+    body.innerHTML = `
+      <div class="space-y-2 text-sm">
+        <div class="grid grid-cols-2 gap-4">
+          <div class="bg-gray-50 rounded p-3"><div class="text-xs text-gray-500">Model</div><div class="font-mono mt-1">${p.model}</div></div>
+          <div class="bg-gray-50 rounded p-3"><div class="text-xs text-gray-500">Provider</div><div class="mt-1">${p.provider}</div></div>
+          <div class="bg-gray-50 rounded p-3"><div class="text-xs text-gray-500">Status</div><div class="mt-1"><span class="pill-online text-xs px-2 py-0.5 rounded">idle</span></div></div>
+          <div class="bg-gray-50 rounded p-3"><div class="text-xs text-gray-500">Current task</div><div class="font-mono text-xs mt-1 text-gray-400">(idle)</div></div>
+        </div>
+        <div class="mt-3 pt-3 border-t border-gray-200 text-xs text-gray-500">
+          MCP: <strong>${p.mcp}</strong> server${p.mcp===1?'':'s'} ·
+          Skills: <strong>${p.skills}</strong> ·
+          Storage: <strong>${p.storage}</strong> ref${p.storage===1?'':'s'} ·
+          Capabilities: <strong>${p.caps}</strong>
+        </div>
+      </div>
+    `;
+  } else if (name === 'mcp') {
+    body.innerHTML = `
+      <div class="text-xs text-gray-500 mb-3 italic">Edit MCP servers in the agent's <code class="text-[10px] bg-gray-100 px-1">~/.hermes-orchestrator/profiles/&lt;name&gt;/config.yaml</code> → <code class="text-[10px] bg-gray-100 px-1">mcp_servers:</code>. Dashboard reflects what the wrapper reported.</div>
+      <div class="text-sm text-gray-400 italic">No MCP servers reported.</div>
+    `;
+  } else if (name === 'skills') {
+    body.innerHTML = `
+      <div class="text-xs text-gray-500 mb-3 italic">Edit skills in the agent's <code class="text-[10px] bg-gray-100 px-1">~/.hermes-orchestrator/profiles/&lt;name&gt;/skills/</code>. Dashboard reflects what the wrapper reported.</div>
+      <div class="text-sm text-gray-400 italic">No skills reported.</div>
+    `;
+  } else if (name === 'storage') {
+    body.innerHTML = `
+      <div class="text-sm text-gray-700 mb-3">Storage references configured for this profile:</div>
+      <div class="space-y-2">
+        <div class="bg-gray-50 rounded p-3 text-sm">
+          <div class="flex items-center gap-2">
+            <span class="badge">smb</span>
+            <span class="font-mono text-xs">\\\\nas01\\reports</span>
+          </div>
+          <div class="text-xs text-gray-500 mt-1">Shared reports share</div>
+        </div>
+      </div>
+    `;
+  } else if (name === 'capabilities') {
+    body.innerHTML = `
+      <div class="text-sm text-gray-700 mb-3">Capabilities for this profile (operator-curated):</div>
+      <div class="grid grid-cols-2 gap-2 text-sm">
+        <div class="bg-green-50 border border-green-200 rounded p-2 flex items-center gap-2">
+          <span class="w-2 h-2 bg-green-500 rounded-full"></span><span>mt5</span><span class="text-green-700 text-xs ml-auto">enabled</span>
+        </div>
+        <div class="bg-green-50 border border-green-200 rounded p-2 flex items-center gap-2">
+          <span class="w-2 h-2 bg-green-500 rounded-full"></span><span>xauusd_feed</span><span class="text-green-700 text-xs ml-auto">enabled</span>
+        </div>
+        <div class="bg-red-50 border border-red-200 rounded p-2 flex items-center gap-2">
+          <span class="w-2 h-2 bg-red-500 rounded-full"></span><span>fred_csv</span><span class="text-red-700 text-xs ml-auto">disabled</span>
+        </div>
+        <div class="bg-green-50 border border-green-200 rounded p-2 flex items-center gap-2">
+          <span class="w-2 h-2 bg-green-500 rounded-full"></span><span>backtest_engine</span><span class="text-green-700 text-xs ml-auto">enabled</span>
+        </div>
+      </div>
+    `;
+  }
+}
+
+// Keyboard: Esc closes modal
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+});
+
+// Open with w6 by default to show what the user is currently looking at
+openModal('w6');
+</script>
+
+</body>
+</html>

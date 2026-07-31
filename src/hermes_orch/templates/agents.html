@@ -202,14 +202,17 @@
         </div>
         {# v3.6.0 follow-up: the right detail panel now has its own
            max-height (matches the left agent list at 540px) and is
-           a flex column. The header + Agent settings block + per-
-           profile settings tabs are `flex: 0 0 auto` so they stay
-           visible; the middle (profile list) is the only part that
-           scrolls. This way a 50-profile agent doesn't push the
-           settings offscreen — the settings stay glued to the
-           current profile at the bottom of the panel while the
-           user scrolls the list. Same UX pattern as the agent
-           list on the left. #}
+           a flex column. The header + Agent settings block are
+           `flex: 0 0 auto` so they stay visible; the middle (profile
+           list) is the only part that scrolls. This way a 50-profile
+           agent doesn't push the header offscreen — the header stays
+           glued to the top while the user scrolls the list. Same UX
+           pattern as the agent list on the left.
+           v3.6.0-follow-up: the per-profile settings are NO LONGER
+           in this panel — they live in a modal now (see
+           #profile-modal further down). The right panel can dedicate
+           its full middle area to the profile list, which previously
+           was squeezed by the 45% bottom tabs. #}
         <div id="agent-detail-content"
              style="display: none; max-height: 540px; display: flex; flex-direction: column; overflow: hidden;">
             {# --- Top: agent header + Agent settings (sticky-feel) --- #}
@@ -276,36 +279,13 @@
                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">Profiles</div>
                 <div id="detail-profile-list"></div>
             </div>
-            {# --- Bottom: per-profile settings tabs (sticky-feel) --- #}
-            {# v3.2.0: profile settings tabs. Shown when the user clicks a
-               profile card above. Default tab = "overview". The 5 tabs
-               cover everything backend already loads: mcp_servers,
-               skills, storage_refs, capabilities. Overview shows the
-               model + last task; MCP / Skills are read-only (managed
-               by the wrapper on the agent host) and show a hint to
-               edit them in the wrapper; Storage / Capabilities are
-               editable via PATCH /api/agents/{id}/profiles/{name}.
-               The bar is hidden when no profile is selected. #}
-            <div id="profile-tabs-wrap"
-                 class="mt-3 pt-3 border-t border-gray-200 bg-white"
-                 style="display: none; flex: 0 0 auto; max-height: 45%; overflow-y: auto;">
-                <div class="text-xs text-gray-500 uppercase tracking-wide mb-2">
-                    Settings — <span id="profile-tabs-name" class="text-gray-700 font-medium"></span>
-                </div>
-                <div class="flex border-b border-gray-200 mb-2" id="profile-tabs-bar">
-                    <button class="profile-tab profile-tab-active" data-tab="overview"
-                            onclick="switchProfileTab('overview')">Overview</button>
-                    <button class="profile-tab" data-tab="mcp"
-                            onclick="switchProfileTab('mcp')">MCP</button>
-                    <button class="profile-tab" data-tab="skills"
-                            onclick="switchProfileTab('skills')">Skills</button>
-                    <button class="profile-tab" data-tab="storage"
-                            onclick="switchProfileTab('storage')">Storage</button>
-                    <button class="profile-tab" data-tab="capabilities"
-                            onclick="switchProfileTab('capabilities')">Capabilities</button>
-                </div>
-                <div id="profile-tab-content" class="text-xs text-gray-700"></div>
-            </div>
+            {# v3.6.0-follow-up: inline per-profile settings tabs were
+               REMOVED from the right detail panel. The 45% bottom strip
+               squeezed the profile list so only 2-3 cards were visible
+               at a time. The 5 tabs (Overview / MCP / Skills / Storage
+               / Capabilities) now live inside a modal — see the
+               #profile-modal block further down. Click a profile card
+               to open it; close via × button, click outside, or Esc. #}
             {# v3.1.1: inline add-profile form (toggle) + per-profile delete button.
                The form is hidden by default; "+ Add profile" reveals it.
                submitAddProfile() POSTs /api/agents/{id}/profiles then reloads.
@@ -335,6 +315,50 @@
                 </div>
             </div>
         </div>
+    </div>
+</div>
+
+{# v3.6.0-follow-up: profile settings modal. Replaces the inline
+   per-profile settings tabs that used to live at the bottom of the
+   right detail panel. The 5 tabs (Overview / MCP / Skills / Storage
+   / Capabilities) cover everything backend already loads; Overview
+   shows model + last task; MCP / Skills are read-only (managed by
+   the wrapper on the agent host); Storage / Capabilities are
+   editable via PATCH /api/agents/{id}/profiles/{name}.
+
+   Element ids (`profile-tabs-bar`, `profile-tab-content`) are
+   preserved from the inline version so `switchProfileTab()` and
+   all the `render*Tab()` functions work unchanged — we just
+   relocated the DOM container, not the rendering logic.
+
+   Close interactions: × button, click on the backdrop, Esc key.
+   The backdrop-click handler uses `event.target === this` (not
+   `contains()`) so clicks on the modal card or any of its
+   descendants don't accidentally close the modal. #}
+<div id="profile-modal" class="modal-overlay" style="display: none;"
+     onclick="if(event.target===this) closeProfileModal()">
+    <div class="modal-card"
+         style="width: 720px; max-width: 92vw; max-height: 86vh; padding: 0; display: flex; flex-direction: column;">
+        <div class="px-5 py-3 border-b flex items-center justify-between flex-shrink-0">
+            <div>
+                <div class="text-xs text-gray-500 uppercase tracking-wide">Profile settings</div>
+                <h2 class="text-base font-bold text-gray-800" id="profile-modal-name">profile</h2>
+            </div>
+            <button onclick="closeProfileModal()" class="text-gray-400 hover:text-gray-700 text-2xl leading-none" aria-label="Close">&times;</button>
+        </div>
+        <div class="flex border-b border-gray-200 px-5 flex-shrink-0" id="profile-tabs-bar">
+            <button class="profile-tab profile-tab-active" data-tab="overview"
+                    onclick="switchProfileTab('overview')">Overview</button>
+            <button class="profile-tab" data-tab="mcp"
+                    onclick="switchProfileTab('mcp')">MCP</button>
+            <button class="profile-tab" data-tab="skills"
+                    onclick="switchProfileTab('skills')">Skills</button>
+            <button class="profile-tab" data-tab="storage"
+                    onclick="switchProfileTab('storage')">Storage</button>
+            <button class="profile-tab" data-tab="capabilities"
+                    onclick="switchProfileTab('capabilities')">Capabilities</button>
+        </div>
+        <div id="profile-tab-content" class="text-xs text-gray-700 p-5 overflow-y-auto"></div>
     </div>
 </div>
 
@@ -559,8 +583,12 @@ function selectAgent(agentId) {
     // v3.2.0: hide the settings tabs until a profile is picked. If
     // the agent has only one profile, auto-select it so the user
     // sees the settings without an extra click.
+    // v3.6.0-follow-up: the inline tabs are gone (replaced by a
+    // modal). Closing the modal also resets the right-panel
+    // selection state, so the next `selectProfile` call below
+    // re-opens it on the lone profile.
     currentProfileName = null;
-    document.getElementById('profile-tabs-wrap').style.display = 'none';
+    closeProfileModal();
     if (profiles.length === 1) {
         selectProfile(profiles[0].name);
     }
@@ -668,18 +696,68 @@ document.addEventListener('keydown', function(e) {
 // show the settings tabs below. Mirrors the agent-level select on
 // the left panel: blue border-left, light blue background.
 // v3.3.1: use .selected class so dark mode can override.
+// v3.6.0-follow-up: instead of revealing an inline tabs panel at the
+// bottom of the right detail (which squeezed the profile list to 2-3
+// visible cards), we open a modal. The profile list gets the right
+// panel's full vertical space back; the user gets a focused, dedicated
+// view for the per-profile settings. `openProfileModal()` sets the
+// modal title and triggers the default tab render.
 function selectProfile(profileName) {
     currentProfileName = profileName;
     currentTab = 'overview';
     document.querySelectorAll('#detail-profile-list .profile-selector').forEach(el => {
         el.classList.toggle('selected', el.dataset.profileName === profileName);
     });
-    const wrap = document.getElementById('profile-tabs-wrap');
-    wrap.style.display = 'block';
-    document.getElementById('profile-tabs-name').textContent = profileName;
-    // Default to Overview tab
+    openProfileModal(profileName);
+}
+
+// v3.6.0-follow-up: openProfileModal() — show the profile settings
+// modal. Updates the title, sets the Overview tab as active, and
+// renders its content via switchProfileTab(). The existing tab logic
+// and per-tab renderers (renderOverviewTab, renderMcpTab, etc.) work
+// unchanged because we preserved their `profile-tab-content` target
+// id inside the modal — only the DOM container moved.
+//
+// Idempotent: opening the modal for the same profile a second time
+// still works; switchProfileTab() rewrites the content. Re-opening
+// after an edit (e.g. adding a storage ref) re-renders the active
+// tab from the latest currentProfiles, which is the desired UX.
+function openProfileModal(profileName) {
+    if (!profileName) return;
+    const modal = document.getElementById('profile-modal');
+    if (!modal) return;
+    document.getElementById('profile-modal-name').textContent = profileName;
+    modal.style.display = 'flex';
+    // Default to Overview tab; switchProfileTab() also updates the
+    // active-tab styling on the bar.
+    currentTab = 'overview';
     switchProfileTab('overview');
 }
+
+// v3.6.0-follow-up: closeProfileModal() — hide the modal. Used by
+// the × button, the backdrop click handler, the Esc key handler, the
+// agent-switch handler (line 563), and the just-deleted-this-profile
+// handler (~line 1494). All call sites do the same thing (set
+// `display: none`), so this is the single source of truth.
+function closeProfileModal() {
+    const modal = document.getElementById('profile-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+// v3.6.0-follow-up: Esc key closes the profile modal. Bound once on
+// document load; only acts if the modal is currently open. Doesn't
+// interfere with the existing popover-Esc handler (line 683) because
+// the two popovers/modal have different visibility checks. We call
+// preventDefault() so a focused form input doesn't also receive
+// the Esc (e.g. clearing its value via browser default behavior).
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    const modal = document.getElementById('profile-modal');
+    if (modal && modal.style.display === 'flex') {
+        closeProfileModal();
+        e.preventDefault();
+    }
+});
 
 // v3.2.0: switchProfileTab() — toggle which tab content is shown.
 // The actual rendering is per-tab (renderOverview/renderMcp/etc).
@@ -1488,11 +1566,11 @@ async function deleteProfile(agentId, profileName) {
             // have been the one shown there).
             await _refreshAgentAfterProfileChange();
             // If the deleted profile was the one whose settings
-            // were open, hide the tabs (no profile to show).
+            // were open, close the modal (no profile to show).
+            // v3.6.0-follow-up: tabsWrap → closeProfileModal().
             if (currentProfileName === profileName) {
                 currentProfileName = null;
-                const tabsWrap = document.getElementById('profile-tabs-wrap');
-                if (tabsWrap) tabsWrap.style.display = 'none';
+                closeProfileModal();
             }
         } else {
             const data = await r.json().catch(() => ({}));
