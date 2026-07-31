@@ -585,6 +585,60 @@ class Database:
                 pass  # Column already exists, or other harmless error
         await self._conn.commit()
 
+        # === v3.5.1: auto-create bootstrap admin on a fresh install ===
+        # Before v3.5.1, the operator had to run `hermes-orch init` to create
+        # the admin user row. This was easy to forget, and the result was
+        # /login returning 401 "invalid credentials" with no obvious next
+        # step. Now: if the users table is empty (fresh install), we
+        # automatically create the bootstrap admin here. The first web
+        # login as "admin" with any password will still trigger the
+        # /setup-password flow because password_hash is NULL — security
+        # unchanged (no default password).
+        # On an existing DB this is a no-op (the COUNT is non-zero).
+        # Lazy import to avoid a circular dep (auth.cookie imports db).
+        try:
+            row = await self._conn.execute("SELECT COUNT(*) AS n FROM users")
+            row = await row.fetchone()
+            user_count = (row["n"] if row else 0) or 0
+            if user_count == 0:
+                from hermes_orch.auth.cookie import create_user
+                from hermes_orch.core.audit import audit_log
+                admin_id = await create_user(
+                    self,
+                    username="admin",
+                    password=None,
+                    role="admin",
+                    is_bootstrap_admin=True,
+                )
+                # Idempotent: if a previous boot already created it but
+                # crashed before the audit_log, this still logs. The
+                # UNIQUE constraint on users.username protects against
+                # double-insert; the try/except is belt-and-suspenders.
+                try:
+                    await audit_log(
+                        self,
+                        event_type="user_bootstrap_auto",
+                        actor="system",
+                        payload={"admin_id": admin_id, "reason": "fresh_install"},
+                    )
+                except Exception:
+                    pass  # audit_log failure shouldn't block startup
+                import logging as _logging
+                _logging.getLogger("hermes_orch.db").info(
+                    "Bootstrap admin 'admin' created (id=%s). "
+                    "First web login at /login will prompt to set the password.",
+                    admin_id,
+                )
+        except Exception as _bootstrap_exc:
+            # Never let the auto-create fail the boot — log and move on.
+            # Worst case the operator can still run `hermes-orch user add`.
+            import logging as _logging
+            _logging.getLogger("hermes_orch.db").warning(
+                "Bootstrap admin auto-create failed: %s. "
+                "Run `hermes-orch user add admin --admin` to create manually.",
+                _bootstrap_exc,
+            )
+
     async def close(self) -> None:
         if self._conn:
             await self._conn.close()

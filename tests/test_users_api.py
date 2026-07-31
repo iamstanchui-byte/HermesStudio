@@ -32,16 +32,30 @@ async def _bootstrap_admin(app) -> str:
 
     Mimics `hermes-orch init` + first-login /setup-password (we just
     set the password directly here to skip the web flow).
+
+    Idempotent: v3.5.1+ auto-creates the admin row (password=NULL) on
+    a fresh DB before this fixture runs. If the admin already exists
+    (with or without a password), we just set the password on it.
     """
     db = app.state.db
-    user_id = await create_user(
+    existing = await db.fetchone(
+        "SELECT id, password_hash FROM users WHERE username = ?", (ADMIN_USERNAME,)
+    )
+    if existing:
+        if not existing.get("password_hash"):
+            from hermes_orch.auth.cookie import hash_password
+            await db.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (hash_password(ADMIN_PASSWORD), existing["id"]),
+            )
+        return existing["id"]
+    return await create_user(
         db,
         username=ADMIN_USERNAME,
         password=ADMIN_PASSWORD,
         role=ROLE_ADMIN,
         is_bootstrap_admin=True,
     )
-    return user_id
 
 
 async def _login(ac: AsyncClient, username: str, password: str) -> None:

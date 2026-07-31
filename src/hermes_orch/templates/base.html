@@ -735,12 +735,12 @@
                 <span class="sidebar-icon">☑️</span>
                 <span class="sidebar-label">Tasks</span>
             </a>
-            <button type="button" class="sidebar-group-toggle {% if active_page in ('settings', 'models', 'evaluations', 'guardrails', 'integrations', 'token_usage', 'schedules', 'history') %}expanded{% endif %}" onclick="toggleSettingsGroup()">
+            <button type="button" class="sidebar-group-toggle {% if active_page in ('settings', 'models', 'evaluations', 'guardrails', 'integrations', 'token_usage', 'schedules', 'history', 'admin_users') %}expanded{% endif %}" onclick="toggleSettingsGroup()">
                 <span class="sidebar-icon">⚙️</span>
                 <span class="sidebar-label">Settings</span>
                 <span class="caret">▶</span>
             </button>
-            <div class="sidebar-subitems" id="settings-subitems" style="display: {% if active_page in ('settings', 'models', 'evaluations', 'guardrails', 'integrations', 'token_usage', 'schedules', 'history') %}block{% else %}none{% endif %};">
+            <div class="sidebar-subitems" id="settings-subitems" style="display: {% if active_page in ('settings', 'models', 'evaluations', 'guardrails', 'integrations', 'token_usage', 'schedules', 'history', 'admin_users') %}block{% else %}none{% endif %};">
                 <a href="/settings" class="sidebar-subitem {% if active_page == 'settings' %}active{% endif %}">General</a>
                 <a href="/token-usage" class="sidebar-subitem {% if active_page == 'token_usage' %}active{% endif %}">Token Usage</a>
                 <a href="/schedules" class="sidebar-subitem {% if active_page == 'schedules' %}active{% endif %}">Schedules</a>
@@ -749,20 +749,16 @@
                 <a href="/settings#evaluations" class="sidebar-subitem">Evaluations</a>
                 <a href="/settings#guardrails" class="sidebar-subitem">Guardrails</a>
                 <a href="/settings#integrations" class="sidebar-subitem">Integrations</a>
-            </div>
-            {# v3.5.0: Admin section — only rendered for admin users. Hidden for
-               non-admins (the route is also server-gated, but hiding the link
-               keeps the nav uncluttered and signals "you don't have access"). #}
-            {% if current_user_ctx and current_user_ctx.role == 'admin' %}
-            <button type="button" class="sidebar-group-toggle {% if active_page == 'admin_users' %}expanded{% endif %}" onclick="toggleAdminGroup()">
-                <span class="sidebar-icon">🛡️</span>
-                <span class="sidebar-label">Admin</span>
-                <span class="caret">▶</span>
-            </button>
-            <div class="sidebar-subitems" id="admin-subitems" style="display: {% if active_page == 'admin_users' %}block{% else %}none{% endif %};">
+                {# v3.5.1: Users sub-item moved out of a separate Admin
+                   section and inlined under Settings. Only rendered for
+                   admin users (the /admin/users route is also server-gated
+                   via require_admin). For a small fleet this avoids the
+                   two-section sidebar; if we add more admin-only pages
+                   later we can re-introduce a separate Admin group. #}
+                {% if current_user_ctx and current_user_ctx.role == 'admin' %}
                 <a href="/admin/users" class="sidebar-subitem {% if active_page == 'admin_users' %}active{% endif %}">Users</a>
+                {% endif %}
             </div>
-            {% endif %}
         </nav>
         <div class="sidebar-footer">
             <div class="sidebar-status">
@@ -900,43 +896,12 @@
         }
     })();
 
-    // ===== v3.5.0: Admin group (Users sub-page) — same pattern as Settings.
-    // Only present in the DOM for admin users (gated server-side in the
-    // template), so the functions below no-op for everyone else.
-    function toggleAdminGroup() {
-        const subitems = document.getElementById('admin-subitems');
-        if (!subitems) return;
-        if (document.body.classList.contains('sidebar-collapsed')) {
-            document.body.classList.remove('sidebar-collapsed');
-            localStorage.setItem('orch.sidebar', 'expanded');
-        }
-        const isHidden = subitems.style.display === 'none' || subitems.style.display === '';
-        subitems.style.display = isHidden ? 'block' : 'none';
-        // Find the button specifically for the Admin group (second
-        // sidebar-group-toggle if it exists, after Settings).
-        const btns = document.querySelectorAll('.sidebar-group-toggle');
-        const adminBtn = btns[btns.length - 1];  // Admin is rendered last
-        if (adminBtn) adminBtn.classList.toggle('expanded', isHidden);
-        localStorage.setItem('orch.adminGroup', isHidden ? 'open' : 'closed');
-    }
-    (function initAdminGroup() {
-        const subitems = document.getElementById('admin-subitems');
-        if (!subitems) return;  // Non-admin user — section not rendered
-        const saved = localStorage.getItem('orch.adminGroup');
-        const sidebarCollapsed = localStorage.getItem('orch.sidebar') === 'collapsed';
-        const btns = document.querySelectorAll('.sidebar-group-toggle');
-        const adminBtn = btns[btns.length - 1];
-        if (sidebarCollapsed) {
-            subitems.style.display = 'none';
-            if (adminBtn) adminBtn.classList.remove('expanded');
-            return;
-        }
-        if (subitems.style.display === 'none' && saved === 'open') {
-            subitems.style.display = 'block';
-            if (adminBtn) adminBtn.classList.add('expanded');
-        }
-    })();
-
+    // ===== v3.5.1: removed standalone Admin group. Users sub-item is
+    // now inline under Settings (gated to admin role server-side in the
+    // template). The old toggleAdminGroup / initAdminGroup JS is gone;
+    // Settings auto-expands when active_page == 'admin_users' so the
+    // user sees the group open on arrival. The Admin group can be
+    // re-added later if we accumulate more admin-only pages.
     // ===== Smart polling: skip when user is editing a form, or tab is hidden,
     // or any result panel is currently open (so reading a long result
     // doesn't get interrupted by a reload).
