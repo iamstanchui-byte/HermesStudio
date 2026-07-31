@@ -787,10 +787,17 @@ function renderCapabilitiesTab(profile, content) {
     }).join('');
     const customRows = customKeys.map(k => {
         const val = !!caps[k];
+        // v3.3.3: parity with standard caps — checkbox toggles the value,
+        // pill is static decoration (matches the standard row pattern).
+        // × delete lives OUTSIDE the label so it doesn't trigger toggle.
         return `
             <div class="flex items-center gap-2 py-1">
-                <span class="font-mono text-[11px] flex-1">${escapeHtml(k)}</span>
-                <span class="pill-status ${val ? 'pill-healthy' : 'pill-degraded'}" style="font-size: 0.65rem;">${val ? 'enabled' : 'off'}</span>
+                <label class="flex items-center gap-2 flex-1 cursor-pointer">
+                    <input type="checkbox" class="cap-custom" data-cap="${escapeAttr(k)}" ${val ? 'checked' : ''}
+                           onchange="updateCapPill(this)">
+                    <span class="font-mono text-[11px]">${escapeHtml(k)}</span>
+                </label>
+                <span class="pill-status cap-pill ${val ? 'pill-healthy' : 'pill-degraded'}" style="font-size: 0.65rem;">${val ? 'enabled' : 'off'}</span>
                 <button onclick="removeCustomCap('${escapeAttr(k)}')"
                         class="text-xs text-red-600 hover:text-red-800"
                         title="Remove this custom capability">×</button>
@@ -911,20 +918,42 @@ function removeCustomCap(name) {
     renderCapabilitiesTab(profile, document.getElementById('profile-tab-content'));
 }
 
+// v3.3.3: live-update the pill when a custom cap checkbox is toggled,
+// so the visual matches the checkbox state during editing (avoids the
+// "checked but pill says off" momentary inconsistency). Re-render is
+// not needed — just flip the class + text on the sibling pill.
+function updateCapPill(cb) {
+    // Use closest('div') not closest('.flex') — the inner <label> also
+    // has .flex class, so .flex would return the label not the row.
+    const row = cb.closest('div');
+    if (!row) return;
+    const pill = row.querySelector('.cap-pill');
+    if (!pill) return;
+    if (cb.checked) {
+        pill.classList.remove('pill-degraded');
+        pill.classList.add('pill-healthy');
+        pill.textContent = 'enabled';
+    } else {
+        pill.classList.remove('pill-healthy');
+        pill.classList.add('pill-degraded');
+        pill.textContent = 'off';
+    }
+}
+
 async function saveCapabilities() {
     const status = document.getElementById('capabilities-status');
     const profile = currentProfiles.find(p => p.name === currentProfileName);
-    // Collect: standard flags from checkboxes + existing custom ones
-    // (custom ones are still in profile.capabilities; we read those)
+    // Collect: standard + custom flags from their checkboxes. The DOM
+    // is the source of truth at save time (matches the standard cap
+    // pattern). v3.3.3: custom caps now have their own .cap-custom
+    // checkboxes too, so we read both.
     const merged = {};
     document.querySelectorAll('.cap-standard').forEach(cb => {
         merged[cb.dataset.cap] = cb.checked;
     });
-    // Re-add custom caps that weren't in the standard list
-    const standard = ['shell', 'web_search', 'code_exec', 'web_extract', 'file_io'];
-    for (const [k, v] of Object.entries(profile.capabilities || {})) {
-        if (!standard.includes(k)) merged[k] = v;
-    }
+    document.querySelectorAll('.cap-custom').forEach(cb => {
+        merged[cb.dataset.cap] = cb.checked;
+    });
     profile.capabilities = merged;
     status.textContent = 'Saving...';
     status.className = 'text-xs text-gray-500';
