@@ -143,6 +143,18 @@ def create_app() -> FastAPI:
     # HMAC-gated agent paths — wrapper signs them, no user session needed.
     # The endpoints themselves still go through require_hmac_auth Depends;
     # this allowlist just keeps the user-cookie middleware out of the way.
+    #
+    # IMPORTANT: this list must stay in sync with every endpoint that uses
+    # `Depends(require_hmac_auth)`. A path missing here is a silent bug —
+    # the wrapper signs correctly but the user-cookie middleware returns
+    # 401 "Not authenticated" BEFORE the route handler ever runs, so the
+    # agent sees a generic 401 with no audit trail. v3.5.2 (2026-07-31)
+    # bit us on /api/tasks/{id}/start (and the other 2 task endpoints +
+    # 2 project-task endpoints + memory/files/session endpoints) — all
+    # HMAC-authed but not in this list. Tasks sat in `assigned` state
+    # forever because the agent couldn't claim them. See
+    # tests/test_hmac_middleware_allowlist.py for the regression test
+    # that keeps this list honest.
     _HMAC_PATH_PATTERNS = [
         re.compile(r"^/api/agents/[^/]+/heartbeat/?$"),
         re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/configs/pending/?$"),
@@ -152,6 +164,34 @@ def create_app() -> FastAPI:
         re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/tool-output/?$"),
         re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/(?:start|update|complete|fail|log|abort)/?$"),
         re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/(?:skills|mcp|llm)/.*$"),
+        # v3.5.2 follow-up: GET single agent (HMAC-authed, used by
+        # the wrapper for self-lookup / config sync).
+        re.compile(r"^/api/agents/[^/]+/?$"),
+        # v3.5.2 follow-up: agent acks the config it just wrote.
+        # Without this, the wrapper's "ack" call returns 401 and the
+        # config row stays in `pending` forever.
+        re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/configs/[^/]+/ack/?$"),
+        # v3.5.2 follow-up: agent claim / liveness / result on
+        # /api/tasks/{id}/{start,poll,result}. Without these, tasks
+        # assigned to an agent sit in `assigned` forever — the
+        # wrapper can never flip them to `running`. This was the
+        # primary reason the user's proj-56c8e080 plan was stuck
+        # at "Run → all 3 research tasks assigned, none started".
+        re.compile(r"^/api/tasks/[^/]+/(?:start|poll|result)/?$"),
+        # v3.5.2 follow-up: live output streaming + tool-call events
+        # for the dashboard loop_status / output viewer.
+        re.compile(r"^/api/projects/[^/]+/tasks/[^/]+/(?:output-chunk|tool-call)/?$"),
+        # v3.5.2 follow-up: agent reads/writes project files
+        # (output of upstream step → input of downstream step).
+        re.compile(r"^/api/projects/[^/]+/files/"),
+        # v3.5.2 follow-up: agent session get/set (continuity
+        # across tasks in a project).
+        re.compile(r"^/api/projects/[^/]+/session/?$"),
+        # v3.5.2 follow-up: memory endpoints (L1 trace / L2 facts /
+        # L3 state / global recent). Two shapes:
+        #   - /api/projects/memory/recent          (global, no project_id)
+        #   - /api/projects/{id}/memory/{state,facts,trace}  (per-project)
+        re.compile(r"^/api/projects/(?:memory/recent/?$|[^/]+/memory/(?:state|facts|trace)/?$)"),
     ]
     _ALLOWLIST_PREFIXES = (
         "/static/",
