@@ -17,7 +17,7 @@
 {# _visual_workflow.js is loaded by the page at the bottom of <body>;
    it depends on drawflow being parsed first. We use `defer` above so
    the order is preserved. #}
-<script defer src="/static/visual_workflow.js?v=2026-07-30-v220"></script>
+<script defer src="/static/visual_workflow.js?v=2026-08-01-v380"></script>
 <style>
     /* Page-specific layout. The body uses Tailwind, but drawflow
        ships its own styles for nodes + connections which we keep
@@ -221,12 +221,9 @@
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     }
     .vf-palette-chip:hover { background: #dbeafe; }
-    /* Hidden text form (Q4 c) */
-    .vf-json-form {
-        display: none;
-        margin-top: 12px;
-    }
-    .vf-json-form.open { display: block; }
+    /* v3.8.0: JSON form moved to a modal (#vf-json-modal-overlay
+       below). The old .vf-json-form selectors are removed — the
+       modal handles its own visibility via .hidden on the overlay. */
     /* Save status banner */
     .vf-save-banner {
         position: fixed; top: 16px; right: 16px;
@@ -378,20 +375,52 @@
     </div>
 </div>
 
-{# Hidden JSON form (Q4 c): toggled by the button above. Body filled
-   by JS after load. We render the server-side text version inside
-   initially so users who DO flip the toggle see the current state. #}
-<div class="vf-json-form" id="vf-json-form">
-    <label class="text-xs font-semibold text-gray-700">step_template (JSON)</label>
-    <textarea id="vf-step-template-json" class="w-full text-xs font-mono border rounded p-2"
-        style="min-height: 280px;">{{ workflow.step_template_pretty if workflow.step_template_pretty is defined else '[]' }}</textarea>
-    <label class="text-xs font-semibold text-gray-700 mt-3 block">variables (JSON)</label>
-    <textarea id="vf-variables-json" class="w-full text-xs font-mono border rounded p-2"
-        style="min-height: 120px;">{{ workflow.variables_pretty if workflow.variables_pretty is defined else '[]' }}</textarea>
-    <p class="text-xs text-gray-500 mt-1">
-        Edit JSON directly, then click Save. The visual canvas and
-        the JSON stay in sync after each save.
-    </p>
+{# v3.8.0: JSON form moved to a modal. The old .vf-json-form
+   bottom-of-page div was too easy to miss (per user feedback
+   2026-08-01: "JSON text box 位置 還了在下面"). The modal mirrors
+   the v3.8.0 plan editor pattern. Backdrop click closes (exact
+   equality, not contains(), so clicks inside the modal don't
+   accidentally close it). #}
+<div id="vf-json-modal-overlay"
+    class="hidden fixed inset-0 z-50 flex items-center justify-center"
+    style="background-color: rgba(0,0,0,0.5);"
+    onclick="if (event.target === this) window.visualBuilder.closeJsonModal()">
+    <div class="bg-white rounded-lg shadow-xl max-w-3xl w-full mx-4"
+        style="max-height: 86vh; display: flex; flex-direction: column;">
+        <div class="p-5 border-b flex items-center justify-between">
+            <h2 class="text-lg font-semibold text-gray-800">📝 Edit JSON</h2>
+            <button type="button" onclick="window.visualBuilder.closeJsonModal()"
+                class="text-gray-400 hover:text-gray-700 text-2xl leading-none"
+                title="Close">
+                &times;
+            </button>
+        </div>
+        <form onsubmit="event.preventDefault(); window.visualBuilder.save();" class="p-5 flex-1 flex flex-col" style="min-height: 0;">
+            <p class="text-xs text-gray-500 mb-2">
+                Edit <code>step_template</code> and <code>variables</code> directly,
+                then click <strong>Save</strong>. The visual canvas and the JSON
+                stay in sync after each save.
+            </p>
+            <label class="text-xs font-semibold text-gray-700">step_template (JSON)</label>
+            <textarea id="vf-step-template-json" class="border rounded p-2 text-xs font-mono"
+                style="min-height: 220px; resize: vertical;">{{ workflow.step_template_pretty if workflow.step_template_pretty is defined else '[]' }}</textarea>
+            <label class="text-xs font-semibold text-gray-700 mt-3 block">variables (JSON)</label>
+            <textarea id="vf-variables-json" class="border rounded p-2 text-xs font-mono"
+                style="min-height: 120px; resize: vertical;">{{ workflow.variables_pretty if workflow.variables_pretty is defined else '[]' }}</textarea>
+            <p id="vf-json-error" class="hidden text-xs text-red-600 mt-2"></p>
+            <div class="flex items-center gap-2 mt-3">
+                <button type="submit"
+                    class="px-3 py-1.5 text-sm font-medium rounded bg-blue-600 text-white hover:bg-blue-700">
+                    Save
+                </button>
+                <span class="flex-1"></span>
+                <button type="button" onclick="window.visualBuilder.closeJsonModal()"
+                    class="px-3 py-1.5 text-sm font-medium rounded bg-gray-100 text-gray-700 hover:bg-gray-200">
+                    Close
+                </button>
+            </div>
+        </form>
+    </div>
 </div>
 
 {# Add Step palette (Phase 1.4 in design). 4 templates pre-fill a

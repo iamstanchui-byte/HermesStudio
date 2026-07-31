@@ -28,7 +28,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
-<script defer src="/static/visual_plan.js?v=2026-07-30-v220"></script>
+<script defer src="/static/visual_plan.js?v=2026-08-01-v380"></script>
 <style>
     /* Page-specific layout */
     body { background: #f9fafb; }
@@ -41,7 +41,7 @@
         border-radius: 0.5rem;
         position: relative;
     }
-    .vp-canvas-wrap > div:not(.vp-side-panel):not(.vp-minimap):not(.vp-json-form) {
+    .vp-canvas-wrap > div:not(.vp-side-panel):not(.vp-minimap):not(#vp-json-modal-overlay):not(#vp-save-as-workflow-overlay) {
         width: 100% !important;
         height: 100% !important;
     }
@@ -183,14 +183,12 @@
     .vp-side-panel textarea { min-height: 60px; resize: vertical; }
     .vp-side-panel .vp-row { display: flex; gap: 6px; align-items: center; }
     .vp-side-panel .vp-row > * { flex: 1; }
-    /* JSON view (Text mode) */
-    .vp-json-form { display: none; margin-top: 12px; }
-    .vp-json-form.open { display: block; }
-    .vp-json-form textarea {
-        width: 100%; min-height: 320px; padding: 8px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 11px; border: 1px solid #d1d5db; border-radius: 4px;
-    }
+    /* v3.8.0: JSON view moved to a modal (#vp-json-modal-overlay
+       below). The .vp-json-form selectors are kept here for the
+       textarea-style fallback only — nothing should match in the
+       current UI but we don't want to leave the rules pointing at
+       a removed DOM element on the off chance some other code
+       still references the class. #}
     /* Save banner (top-right, fades in/out) */
     .vp-save-banner {
         position: fixed; top: 16px; right: 16px;
@@ -298,11 +296,26 @@
         color: #e2e8f0;
     }
 
-    /* JSON form (Text mode) */
-    body.dark .vp-json-form textarea {
+    /* JSON modal (v3.8.0: was a hidden bottom-of-page form) */
+    body.dark #vp-json-modal-overlay > div {
+        background: #1e293b;
+        color: #e2e8f0;
+    }
+    body.dark #vp-json-textarea {
         background: #0f172a;
         border-color: #334155;
         color: #cbd5e1;
+    }
+    /* Save as workflow modal — same dark treatment */
+    body.dark #vp-save-as-workflow-overlay > div {
+        background: #1e293b;
+        color: #e2e8f0;
+    }
+    body.dark #vp-save-as-workflow-name,
+    body.dark #vp-save-as-workflow-description {
+        background: #0f172a;
+        border-color: #334155;
+        color: #e2e8f0;
     }
 
     /* Save banner — light green/red in light mode → dark green/red */
@@ -389,10 +402,10 @@
             📥 Paste
         </button>
         <span class="w-px h-6 bg-gray-300 mx-1"></span>
-        <button onclick="window.vp.toggleJsonMode()"
+        <button onclick="window.vp.openJsonModal()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
-            title="Toggle the text/JSON editor (for power users who prefer raw JSON)">
-            Text
+            title="Open the JSON editor in a modal (for power users who prefer raw JSON). v3.8.0: was a hidden bottom-of-page form, now a proper modal so the JSON content is visible without scrolling.">
+            📝 Edit JSON
         </button>
         <button onclick="window.vp.validatePlan()"
             class="px-3 py-1.5 text-xs font-medium rounded border border-amber-300 text-amber-700 hover:bg-amber-50"
@@ -435,6 +448,25 @@
             class="px-3 py-1.5 text-xs font-bold rounded border-2 border-cyan-500 text-cyan-700 hover:bg-cyan-50"
             title="Save the plan JSON to the server (PUT /api/projects/{id}/plan)">
             💾 Save
+        </button>
+        {# v3.8.0 (2026-08-01): "Save as workflow" — package the current
+           plan as a reusable workflow template. v3.7.x had this action
+           on the runtime project page (visual_project.html) as
+           "Promote to workflow", but the design-time source is the
+           plan, not the runtime tasks, so it belongs HERE. The action
+           calls POST /api/projects/{id}/plan/to-workflow, which loads
+           the plan, calls the LLM to generalize concrete values into
+           {{var}} placeholders, and writes a workflow_packages row
+           with source_project_id = this project. The user is then
+           redirected to /workflows/{new_id} for review.
+           Different from "Save" (which persists the plan on the
+           project) and "Generate tasks" (which dispatches the plan
+           to the supervisor). This button packages the plan as a
+           TEMPLATE, separate from the project itself. #}
+        <button onclick="window.vp.openSaveAsWorkflowModal()"
+            class="px-3 py-1.5 text-xs font-bold rounded border-2 border-emerald-600 text-emerald-700 hover:bg-emerald-50"
+            title="Package the current plan as a reusable workflow template. POST /api/projects/{id}/plan/to-workflow — LLM generalizes concrete values into {{var}} placeholders. Redirects to the new workflow's detail page.">
+            💼 Save as workflow
         </button>
     </div>
 </div>
@@ -562,21 +594,110 @@
         <p id="vp-f-error" class="hidden text-xs text-red-600 mt-2"></p>
     </div>
     {# Minimap removed 2026-07-28 — see CSS comment. #}
-    {# JSON view — hidden by default, shown when user clicks "Text" #}
-    <div class="vp-json-form" id="vp-json-form">
-        <label class="block text-xs font-medium text-gray-700 mb-1">
-            Plan JSON (advanced — edit then click Save)
-        </label>
-        <textarea id="vp-json-textarea" spellcheck="false"></textarea>
-        <div class="flex items-center gap-2 mt-2">
-            <button onclick="window.vp.applyJsonToCanvas()"
-                class="px-3 py-1.5 text-xs font-medium rounded border border-cyan-300 text-cyan-700 hover:bg-cyan-50">
-                Apply JSON to canvas
-            </button>
-            <button onclick="window.vp.copyCanvasToJson()"
-                class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50">
-                Copy canvas → JSON
-            </button>
+    {# JSON view moved to a modal in v3.8.0. Previously a hidden
+       bottom-of-page div toggled by the "Text" button — too easy
+       to miss (per user feedback 2026-08-01: "JSON text box 位置
+       還了在下面, 應該跟workflow template 的一樣打開edit"). The
+       modal is rendered here so the markup lives near the canvas
+       it overlays (same pattern as the generate-plan modal above).
+       Backdrop click closes the modal (matches the v3.6.0 modal
+       pattern — `if (event.target === this)` exact equality, not
+       contains(), so clicks inside the modal don't accidentally
+       close it). #}
+    <div id="vp-json-modal-overlay"
+        class="hidden fixed inset-0 z-50 flex items-center justify-center"
+        style="background-color: rgba(0,0,0,0.5);"
+        onclick="if (event.target === this) window.vp.closeJsonModal()">
+        <div class="bg-white rounded-lg shadow-xl max-w-3xl w-full mx-4"
+            style="max-height: 86vh; display: flex; flex-direction: column;">
+            <div class="p-5 border-b flex items-center justify-between">
+                <h2 class="text-lg font-semibold text-gray-800">📝 Plan JSON (advanced)</h2>
+                <button type="button" onclick="window.vp.closeJsonModal()"
+                    class="text-gray-400 hover:text-gray-700 text-2xl leading-none"
+                    title="Close">
+                    &times;
+                </button>
+            </div>
+            <form onsubmit="event.preventDefault(); window.vp.applyJsonToCanvas();" class="p-5 flex-1 flex flex-col" style="min-height: 0;">
+                <p class="text-xs text-gray-500 mb-2">
+                    Edit the raw plan JSON, then click <strong>Apply JSON to canvas</strong>
+                    to load it back onto the canvas. Click <strong>Copy canvas → JSON</strong>
+                    to overwrite the textarea with the current canvas state.
+                </p>
+                <textarea id="vp-json-textarea" spellcheck="false"
+                    class="flex-1 border rounded p-2 text-xs font-mono"
+                    style="min-height: 360px; resize: vertical;"></textarea>
+                <p id="vp-json-error" class="hidden text-xs text-red-600 mt-2"></p>
+                <div class="flex items-center gap-2 mt-3">
+                    <button type="submit"
+                        class="px-3 py-1.5 text-sm font-medium rounded border border-cyan-300 text-cyan-700 hover:bg-cyan-50">
+                        Apply JSON to canvas
+                    </button>
+                    <button type="button" onclick="window.vp.copyCanvasToJson()"
+                        class="px-3 py-1.5 text-sm font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50">
+                        Copy canvas → JSON
+                    </button>
+                    <span class="flex-1"></span>
+                    <button type="button" onclick="window.vp.closeJsonModal()"
+                        class="px-3 py-1.5 text-sm font-medium rounded bg-gray-100 text-gray-700 hover:bg-gray-200">
+                        Close
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+    {# v3.8.0 (2026-08-01): "Save as workflow" modal. Mirrors the
+       generate-plan modal pattern. Submits to POST /api/projects/{id}
+       /plan/to-workflow, redirects to /workflows/{new_id} on success.
+       Backdrop click closes (same exact-equality pattern as the
+       JSON modal above). #}
+    <div id="vp-save-as-workflow-overlay"
+        class="hidden fixed inset-0 z-50 flex items-center justify-center"
+        style="background-color: rgba(0,0,0,0.5);"
+        onclick="if (event.target === this) window.vp.closeSaveAsWorkflowModal()">
+        <div class="bg-white rounded-lg shadow-xl max-w-lg w-full mx-4">
+            <form onsubmit="event.preventDefault(); window.vp.submitSaveAsWorkflow();" class="p-5">
+                <h2 class="text-lg font-semibold text-gray-800 mb-1">💼 Save as workflow</h2>
+                <p class="text-sm text-gray-500 mb-4">
+                    Package the current plan as a reusable workflow template. The
+                    LLM will generalize concrete values into <code>{{ '{{var}}' }}</code>
+                    placeholders (e.g. "research-langgraph" stays concrete, but a
+                    specific topic or city becomes a variable). The new workflow's
+                    detail page opens when it's ready — review and edit the
+                    variables / steps there. The plan on this project is unchanged.
+                </p>
+                <label class="block text-sm font-medium text-gray-700 mb-1">
+                    Workflow name <span class="text-red-500">*</span>
+                </label>
+                <input id="vp-save-as-workflow-name" type="text" required
+                    pattern="^[a-z0-9][a-z0-9-]*$" maxlength="80"
+                    placeholder="my-workflow-template"
+                    class="w-full border rounded px-2 py-1 text-sm font-mono">
+                <p class="text-xs text-gray-500 mt-1">
+                    kebab-case, must be unique. Used in <code>/workflows/{name}</code>
+                    and as the <code>source_workflow_id</code> on spawned projects.
+                </p>
+                <label class="block text-sm font-medium text-gray-700 mb-1 mt-3">
+                    Description <span class="text-xs text-gray-500">(optional)</span>
+                </label>
+                <textarea id="vp-save-as-workflow-description" rows="2" maxlength="500"
+                    class="w-full border rounded px-2 py-1 text-sm"
+                    placeholder="What this workflow does (overrides the LLM-generated summary)"></textarea>
+                <p id="vp-save-as-workflow-status" class="hidden text-xs text-red-600 mt-2"></p>
+                <div class="mt-4 flex items-center gap-2">
+                    <button id="vp-save-as-workflow-submit" type="submit"
+                        class="px-4 py-2 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700">
+                        Save as workflow
+                    </button>
+                    <button type="button" onclick="window.vp.closeSaveAsWorkflowModal()"
+                        class="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm hover:bg-gray-200">
+                        Cancel
+                    </button>
+                    <span id="vp-save-as-workflow-spinner" class="hidden text-sm text-gray-500 ml-2">
+                        <span class="inline-block animate-pulse">LLM is generalizing…</span>
+                    </span>
+                </div>
+            </form>
         </div>
     </div>
 </div>
@@ -621,7 +742,14 @@
    before including the partial; submitApplyWorkflow() checks
    this flag and dispatches to the right action (plan update
    vs task creation). #}
-<script>window._VP_CONTEXT = 'plan';</script>
+<script>
+window._VP_CONTEXT = 'plan';
+// v3.8.0: project id exposed to JS for the "Save as workflow"
+// submit (POST /api/projects/{id}/plan/to-workflow). The visual_plan.js
+// uses window._VP_PROJECT_ID to build the URL. Kept on window so the
+// function can find it without an extra parameter.
+window._VP_PROJECT_ID = {{ project.id | tojson }};
+</script>
 {% with total_count = (project.plan.steps | length) if (project.plan and project.plan.steps) else 0 %}
 {% include "_workflow_actions.html" %}
 {% endwith %}

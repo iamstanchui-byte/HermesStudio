@@ -1450,3 +1450,236 @@ async def generate_plan_from_llm(
         plan=plan,
         updated_at=_now_iso(),
     )
+
+
+# ===== Phase E (v3.8.0, 2026-08-01): Save plan as workflow =====
+#
+# Per user feedback after v3.7.1: the runtime "Promote to workflow"
+# button on the visual project page is the only useful action there,
+# and it doesn't belong on the runtime page anyway — the design-time
+# source (the plan) lives in the visual plan editor. The new flow:
+#
+#   - User opens the visual plan editor
+#   - User edits the plan (steps, agent_role, action, depends_on, etc.)
+#   - User clicks "Save as workflow" (in the toolbar, next to Save)
+#   - Modal opens: workflow name + optional description
+#   - POST /api/projects/{id}/plan/to-workflow
+#       - Load the project's plan
+#       - Build evidence block (companion helper in workflows.py)
+#       - Call LLM to generalize the plan (add {{var}} placeholders)
+#       - Validate the LLM's package
+#       - Write workflow_packages row with source_project_id
+#   - Redirect user to /workflows/{new_id}
+#
+# Differences from the OLD `from-project` endpoint (workflows.py):
+#   - Source is the plan, not the project's tasks
+#   - Project does NOT need to be in a terminal state (a plan can
+#     exist on a freshly created project). The OLD endpoint required
+#     `state in (completed, failed, cancelled, interrupted)`.
+#   - Variables list: starts empty (the plan doesn't declare any
+#     yet; the LLM synthesizes them based on the plan's params_template
+#     values + operator_hints).
+#   - Variable hints: pulled from the plan's own variables[] if the
+#     operator added some (currently always empty in Phase A, but
+#     reserved for Phase B+ when plan variables are editable in the
+#     side panel).
+#
+# Both endpoints coexist (Q4 sign-off 2026-08-01): the old one
+# handles the "I ran a project and now want to template-ize it" path,
+# this new one handles the "I designed a plan and want to template-ize
+# it before running" path. Different use cases, both legitimate.
+
+
+class PlanToWorkflowBody(BaseModel):
+    """Body for POST /api/projects/{id}/plan/to-workflow.
+
+    `name` is the workflow package name (kebab-case, unique).
+    `description` is optional (overrides the LLM-generated one).
+    `variable_hints` are optional operator hints fed to the LLM
+    (same shape as PromoteToWorkflowBody.variable_hints).
+    """
+    name: str = Field(
+        ..., min_length=1, max_length=80, pattern=r"^[a-z0-9][a-z0-9-]*$"
+    )
+    description: str = Field("", max_length=500)
+    variable_hints: list[dict] = Field(default_factory=list)
+
+
+@router.post(
+    "/projects/{project_id}/plan/to-workflow",
+    response_model=None,  # returns the WorkflowDetail shape from workflows.py
+)
+async def save_plan_as_workflow(
+    project_id: str, body: PlanToWorkflowBody, request: Request,
+) -> dict:
+    """Synthesize a workflow package from a project's plan (v3.8.0).
+
+    The plan is the design-time source — the user has been editing
+    steps on the canvas, and clicks "Save as workflow" to package
+    the plan as a reusable template. LLM generalizes concrete values
+    into {{var}} placeholders.
+
+    Does NOT require the project to be in a terminal state — the
+    plan can be saved as a workflow even on a freshly-created project
+    (the plan is a design-time artifact, separate from execution).
+    """
+    from fastapi import HTTPException as _HTTPException
+    # Late import: avoid circular import (workflows.py imports from
+    # plans.py via _project_id/_projects_root/_serialize_plan_md in
+    # apply-workflow, so we keep the boundary in one direction).
+    from hermes_orch.api.workflows import (
+        _call_llm_for_workflow_synthesis,
+        _gather_workflow_evidence_from_plan,
+        _row_to_workflow_detail,
+        _validate_workflow_package,
+    )
+    from hermes_orch.core.audit import audit_log
+
+    db = request.app.state.db
+    cfg = request.app.state.config
+
+    # 1. Load project
+    proj = await db.fetchone(
+        "SELECT id, name, state, goal, coordinator_role, plan_json "
+        "FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    if not proj:
+        raise HTTPException(404, f"project {project_id} not found")
+
+    # 2. Load plan (must be non-NULL + non-empty)
+    raw = proj.get("plan_json")
+    if not raw:
+        raise _HTTPException(
+            400,
+            f"project {project_id} has no plan yet. Open the visual "
+            f"plan editor, add some steps, click Save, then try "
+            f"Save as workflow again.",
+        )
+    try:
+        plan_dict = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise _HTTPException(
+            400,
+            f"plan_json is malformed: {e}; the plan must be valid JSON "
+            f"before it can be promoted to a workflow.",
+        )
+    steps = plan_dict.get("steps") or []
+    if not steps:
+        raise _HTTPException(
+            400,
+            f"project {project_id} has a plan but it has no steps. "
+            f"Add at least one step in the visual plan editor, then "
+            f"try Save as workflow again.",
+        )
+
+    # 3. Name uniqueness
+    existing = await db.fetchone(
+        "SELECT id FROM workflow_packages WHERE name = ?", (body.name,)
+    )
+    if existing:
+        raise _HTTPException(
+            409,
+            f"workflow package name={body.name!r} already exists "
+            f"(id={existing['id']}); pick a different name or PATCH "
+            f"the existing one.",
+        )
+
+    # 4. Build evidence (plan-shaped) + call LLM
+    evidence = _gather_workflow_evidence_from_plan(plan_dict, proj)
+    llm_cfg = cfg.get("llm", {})
+
+    try:
+        pkg = await _call_llm_for_workflow_synthesis(
+            evidence, llm_cfg, body.variable_hints
+        )
+    except _HTTPException:
+        raise
+    except Exception as e:
+        raise _HTTPException(
+            502, f"workflow LLM synthesis from plan failed: {type(e).__name__}: {e}"
+        )
+
+    # 5. Operator description overrides LLM description if provided.
+    if body.description:
+        pkg["description"] = body.description
+
+    # Defensive: the LLM sometimes forgets the top-level `description`
+    # wrapper key. Synthesize a sensible default rather than failing.
+    # Same logic as the from-project endpoint (workflows.py:~920).
+    if not pkg.get("description"):
+        try:
+            n_steps = len(pkg.get("step_template", []))
+            first_action = (pkg["step_template"][0].get("action", "")
+                            if pkg.get("step_template") else "")
+            plan_name = (plan_dict.get("name") or "").strip()
+            project_name = (proj.get("name") or proj.get("id") or project_id)
+            source_label = (f"plan '{plan_name}' of project " if plan_name
+                            else "plan of project ")
+            if first_action:
+                pkg["description"] = (
+                    f"{first_action} workflow (synthesized from "
+                    f"{source_label}{project_name}, {n_steps} step"
+                    f"{'s' if n_steps != 1 else ''})"
+                )
+            else:
+                pkg["description"] = (
+                    f"Workflow synthesized from {source_label}{project_name} "
+                    f"({n_steps} step{'s' if n_steps != 1 else ''})"
+                )
+        except Exception:
+            pkg["description"] = (
+                f"Workflow synthesized from project {project_id}"
+            )
+
+    # 6. Validate the LLM's package
+    ok, err = _validate_workflow_package(pkg)
+    if not ok:
+        # Same UX as the from-project endpoint: include the LLM output
+        # in the error so the operator can see what came back.
+        llm_dump = json.dumps(pkg, ensure_ascii=False)[:1500]
+        raise _HTTPException(
+            422,
+            f"LLM-produced workflow failed validation: {err}. "
+            f"Try again or hand-craft the workflow via PATCH. "
+            f"LLM output: {llm_dump}",
+        )
+
+    # 7. Write to DB
+    wid = f"wf-{secrets.token_hex(6)}"
+    now = _now_iso()
+    try:
+        await db.execute(
+            "INSERT INTO workflow_packages "
+            "(id, name, version, description, step_template, variables, "
+            " source_project_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                wid, body.name, pkg.get("version", "0.1.0"),
+                pkg["description"],
+                json.dumps(pkg["step_template"], ensure_ascii=False),
+                json.dumps(pkg["variables"], ensure_ascii=False),
+                project_id, now, now,
+            ),
+        )
+    except Exception as e:
+        raise _HTTPException(500, f"DB insert failed: {e}")
+
+    # 8. Audit
+    try:
+        await audit_log(
+            db, "workflow.created", actor="operator", project_id=project_id,
+            payload={
+                "workflow_id": wid, "name": body.name,
+                "step_count": len(pkg["step_template"]),
+                "variable_count": len(pkg["variables"]),
+                "source": "save-as-workflow-from-plan",
+            },
+        )
+    except Exception:
+        pass
+
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (wid,)
+    )
+    return _row_to_workflow_detail(row)

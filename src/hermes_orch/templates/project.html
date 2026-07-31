@@ -97,11 +97,19 @@
                UI cleanup 2026-07-27: this toolbar used to have 11 buttons in
                2 rows. The Promote to workflow + Apply workflow buttons
                moved to the visual project page (where tasks live, and
-               the blast-radius makes more sense). The Visual view button
-               (task canvas) is hidden — the visual page is still
-               reachable via the /projects/{id}/visual URL for power
-               users. The Plan (JSON) modal is hidden because the
-               Visual plan editor covers the same surface. #}
+               the blast-radius makes more sense). The Plan (JSON) modal
+               is hidden because the Visual plan editor covers the same
+               surface.
+
+               v3.8.0 (2026-08-01): the "Visual view" (task canvas) link
+               is also removed. Per user feedback "個visual task canvas
+               可以不顯示" — the runtime canvas is read-only and the
+               "Promote to workflow" action moved to the visual plan
+               editor (renamed "Save as workflow"). The visual task
+               canvas page (visual_project.html) is still reachable at
+               /projects/{id}/visual for power users / debugging, but
+               no longer linked from the nav. The plan editor at
+               /api/projects/{id}/plan/visual is the primary surface. #}
             <div class="flex flex-col gap-1.5 items-end">
                 <div class="flex gap-1.5 flex-wrap justify-end">
                     <button onclick="openProjectFolder('{{ project.id }}')"
@@ -196,17 +204,16 @@
                     </button>
                     {% endif %}
                 </div>
-                {# UI cleanup 2026-07-27: small secondary link to the
-                   visual project page (task canvas) for power users.
-                   The big entry button was removed because the user
-                   said the toolbar is too crowded; this small link
-                   keeps the page reachable without making it a
-                   primary action. #}
-                <div class="text-xs text-gray-400 flex items-center gap-1">
-                    <a href="/projects/{{ project.id }}/visual" class="hover:underline">
-                        Open visual task canvas →
-                    </a>
-                </div>
+                {# v3.8.0 (2026-08-01): the "Open visual task canvas"
+                   link was removed (per user feedback 2026-08-01:
+                   "個visual task canvas 可以不顯示, 並把Promote to
+                   workflow 搬入visual plan"). The runtime canvas
+                   is read-only and the "Promote to workflow"
+                   action moved to the visual plan editor
+                   (renamed "Save as workflow"). The visual task
+                   canvas URL /projects/{id}/visual is still
+                   reachable for power users / debugging, just
+                   not linked from here. #}
             </div>
 
             {# UI cleanup 2026-07-27: replan hidden fields removed

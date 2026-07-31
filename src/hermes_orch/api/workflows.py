@@ -387,6 +387,100 @@ async def _gather_workflow_evidence(db, pdir: Path, project_id: str, proj: dict)
     return "".join(parts)
 
 
+def _gather_workflow_evidence_from_plan(plan: dict, proj: dict) -> str:
+    """Build the evidence block for workflow LLM synthesis FROM A PLAN.
+
+    Companion to _gather_workflow_evidence (which uses project tasks).
+    Used by the "Save as workflow" flow in visual_plan.html (v3.8.0)
+    where the source is the project's design-time plan, not its
+    runtime tasks. The plan JSON shape is the same as workflow's
+    step_template (per plans.py docstring §portable), so the LLM
+    prompt is structurally identical — only the framing differs
+    (this evidence talks about "the plan's steps", not "the
+    project's completed tasks").
+
+    Differences from _gather_workflow_evidence:
+      - No tasks to scan (no skills_used from hermes transcripts)
+      - No L0/L1 "completed/failed" framing — the plan is design-time
+        intent, not a record of what happened
+      - Plan-level metadata (plan name, plan description) included
+        so the LLM has more context than the project's own metadata
+      - skills the plan steps reference are extracted from
+        step.skill and listed separately (the LLM should preserve
+        them, same Rule 11/12 as the task-based path)
+
+    Returns: a markdown block the LLM consumes via the
+    _WORKFLOW_SYNTHESIS_PROMPT's {evidence} slot.
+    """
+    parts: list[str] = ["# Plan evidence\n"]
+    parts.append("## Project metadata\n")
+    project_id = proj.get("id") or "?"
+    parts.append(f"- id: {project_id}\n")
+    parts.append(f"- name: {proj.get('name') or project_id}\n")
+    parts.append(f"- state: {proj.get('state', '?')}\n")
+    parts.append(f"- goal: {(proj.get('goal') or '(none)')[:500]}\n")
+    parts.append(f"- coordinator_role: {proj.get('coordinator_role') or '(none)'}\n")
+
+    plan_name = plan.get("name") or ""
+    plan_desc = plan.get("description") or ""
+    plan_version = plan.get("version") or "1.0"
+    steps = plan.get("steps") or []
+
+    parts.append("\n## Plan metadata\n")
+    if plan_name:
+        parts.append(f"- name: {plan_name}\n")
+    if plan_desc:
+        parts.append(f"- description: {plan_desc[:500]}\n")
+    parts.append(f"- version: {plan_version}\n")
+    parts.append(f"- step_count: {len(steps)}\n")
+
+    # Skills referenced by the plan's steps. Mirrors the
+    # "Skills the source agent loaded" section in _gather_workflow_evidence
+    # (the same Rule 11/12 applies — preserve them in the synthesized step).
+    seen_skills: set[str] = set()
+    skills_used: list[str] = []
+    for s in steps:
+        sk = s.get("skill") or ""
+        if sk and sk not in seen_skills:
+            seen_skills.add(sk)
+            skills_used.append(sk)
+    if skills_used:
+        parts.append("\n## Skills referenced by the plan (PRESERVE ALL of these in your synthesized step)\n")
+        for s in skills_used:
+            parts.append(f"- `{s}`\n")
+
+    def _shape_step(s: dict) -> str:
+        deps = s.get("depends_on") or []
+        deps_str = f" (after: {', '.join(deps)})" if deps else ""
+        params = s.get("params_template") or {}
+        # Trim params for the prompt; the LLM only needs to see the
+        # SHAPE (key names + which values are literals vs {{var}})
+        # so it can decide which keys to parameterize.
+        try:
+            params_preview = json.dumps(params, ensure_ascii=False)[:400] if params else "{}"
+        except Exception:
+            params_preview = "{}"
+        op = s.get("output_path") or "(none)"
+        sk = s.get("skill") or ""
+        skill_part = f", skill=`{sk}`" if sk else ""
+        fb = s.get("feedback_to") or []
+        fb_part = f", feedback_to={fb}" if fb else ""
+        return (
+            f"- **{s.get('name') or 'step'}** [{s.get('agent_role') or '?'}]"
+            f"{deps_str}: action=`{s.get('action') or '?'}`, "
+            f"output=`{op}`{skill_part}{fb_part}, params={params_preview}\n"
+        )
+
+    if steps:
+        parts.append("\n## Plan steps (design-time intent — L0 structure + L1 actions, NO L2 values yet)\n")
+        for s in steps:
+            parts.append(_shape_step(s))
+    else:
+        parts.append("\n## Plan steps\n(none — the plan is empty. Refuse to synthesize a workflow from an empty plan.)\n")
+
+    return "".join(parts)
+
+
 async def _call_llm_for_workflow_synthesis(
     evidence: str, llm_cfg: dict, operator_hints: list[dict] | None
 ) -> dict:

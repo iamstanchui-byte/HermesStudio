@@ -279,8 +279,24 @@
         document.addEventListener('keydown', (e) => {
             const ctrl = e.ctrlKey || e.metaKey;
             if (!ctrl) {
-                // Escape closes the side panel (no modifier needed)
+                // Escape: close whichever modal/sheet is open (top-most
+                // wins). v3.8.0: JSON modal + Save-as-workflow modal
+                // were added; same pattern as closeSidePanel — only
+                // acts on the visible one so we coexist with other
+                // Esc handlers the user may have installed.
                 if (e.key === 'Escape') {
+                    const jsonOv = document.getElementById('vp-json-modal-overlay');
+                    if (jsonOv && !jsonOv.classList.contains('hidden')) {
+                        closeJsonModal();
+                        e.preventDefault();
+                        return;
+                    }
+                    const sawOv = document.getElementById('vp-save-as-workflow-overlay');
+                    if (sawOv && !sawOv.classList.contains('hidden')) {
+                        closeSaveAsWorkflowModal();
+                        e.preventDefault();
+                        return;
+                    }
                     const sp = document.getElementById('vp-side-panel');
                     if (sp && !sp.classList.contains('hidden')) {
                         closeSidePanel();
@@ -1240,37 +1256,153 @@
     }
 
     // ===== JSON mode toggle =====
+    // v3.8.0: the "Edit JSON" button now opens a modal overlay
+    // (#vp-json-modal-overlay in visual_plan.html) instead of toggling
+    // a hidden bottom-of-page div. The user feedback was that the
+    // bottom-of-page form was too easy to miss — operators would
+    // click "Text" and not see anything happen because the form
+    // appeared below the canvas fold. A modal makes the JSON editor
+    // immediately visible.
+    //
+    // toggleJsonMode() is kept as a no-op for backward compat with
+    // any old bookmarks / test scripts that still call it (the old
+    // "Text" button was wired to it). The new button calls
+    // openJsonModal() directly.
     function toggleJsonMode() {
-        _jsonMode = !_jsonMode;
-        const form = $('vp-json-form');
-        if (_jsonMode) {
-            // Sync current plan to the textarea
-            $('vp-json-textarea').value = JSON.stringify(_plan, null, 2);
-            form.classList.add('open');
-        } else {
-            form.classList.remove('open');
-        }
+        // Backward-compat shim: open the modal instead of toggling
+        // a removed bottom-of-page form. Old button (now removed from
+        // the toolbar) called this; new "Edit JSON" calls openJsonModal.
+        openJsonModal();
+    }
+
+    function openJsonModal() {
+        // Sync the textarea with the current plan state so the user
+        // sees what's on the canvas (or makes targeted edits and
+        // clicks "Apply JSON to canvas" to push changes back).
+        $('vp-json-textarea').value = JSON.stringify(_plan, null, 2);
+        // Clear any previous error
+        const errEl = $('vp-json-error');
+        if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
+        $('vp-json-modal-overlay').classList.remove('hidden');
+    }
+
+    function closeJsonModal() {
+        $('vp-json-modal-overlay').classList.add('hidden');
     }
 
     function applyJsonToCanvas() {
         try {
             const newPlan = JSON.parse($('vp-json-textarea').value);
             // Minimal validation (the server is the real authority)
-            if (!newPlan.steps) { alert('Plan must have a steps array'); return; }
+            if (!newPlan.steps) { _showJsonError('Plan must have a steps array'); return; }
             _plan = newPlan;
             $('vp-plan-name').value = _plan.name || '';
             $('vp-plan-description').value = _plan.description || '';
             renderAllSteps();
             updateMinimap();
             showBanner('JSON applied to canvas', 'success');
+            closeJsonModal();
         } catch (e) {
-            showBanner('Invalid JSON: ' + e.message, 'error');
+            _showJsonError('Invalid JSON: ' + e.message);
         }
+    }
+
+    function _showJsonError(msg) {
+        const errEl = $('vp-json-error');
+        if (!errEl) { showBanner(msg, 'error'); return; }
+        errEl.textContent = msg;
+        errEl.classList.remove('hidden');
     }
 
     function copyCanvasToJson() {
         $('vp-json-textarea').value = JSON.stringify(_plan, null, 2);
         showBanner('Canvas → JSON copied', 'success');
+    }
+
+    // ===== v3.8.0: Save plan as workflow =====
+    // Opens a modal that asks for a workflow name + optional
+    // description, then POSTs to /api/projects/{id}/plan/to-workflow.
+    // The LLM generalizes concrete values into {{var}} placeholders.
+    // On success, redirect to /workflows/{new_id}.
+    function openSaveAsWorkflowModal() {
+        // Pre-fill the name input with the plan name (kebab-case it
+        // if it isn't already). Operator can override.
+        const planName = (_plan && _plan.name) ? _plan.name : '';
+        const suggested = (planName || (window._VP_PROJECT_ID || 'workflow') + '-template')
+            .toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+        $('vp-save-as-workflow-name').value = suggested;
+        $('vp-save-as-workflow-description').value =
+            (_plan && _plan.description) ? _plan.description : '';
+        // Reset status
+        const status = $('vp-save-as-workflow-status');
+        if (status) { status.classList.add('hidden'); status.textContent = ''; }
+        $('vp-save-as-workflow-spinner').classList.add('hidden');
+        $('vp-save-as-workflow-submit').disabled = false;
+        $('vp-save-as-workflow-overlay').classList.remove('hidden');
+        // Focus the name field for quick keyboard entry
+        setTimeout(() => $('vp-save-as-workflow-name').focus(), 50);
+    }
+
+    function closeSaveAsWorkflowModal() {
+        $('vp-save-as-workflow-overlay').classList.add('hidden');
+    }
+
+    async function submitSaveAsWorkflow() {
+        const nameEl = $('vp-save-as-workflow-name');
+        const descEl = $('vp-save-as-workflow-description');
+        const name = (nameEl.value || '').trim();
+        const description = (descEl.value || '').trim();
+        const status = $('vp-save-as-workflow-status');
+        const submit = $('vp-save-as-workflow-submit');
+        const spinner = $('vp-save-as-workflow-spinner');
+
+        // Defensive validation (the input has pattern= but Safari
+        // sometimes lets bad input through on form submit)
+        if (!name || !/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+            status.textContent = 'Name must be kebab-case (lowercase letters, digits, hyphens; start with letter or digit).';
+            status.classList.remove('hidden');
+            return;
+        }
+
+        submit.disabled = true;
+        spinner.classList.remove('hidden');
+        status.classList.add('hidden');
+
+        const projectId = window._VP_PROJECT_ID;
+        if (!projectId) {
+            status.textContent = 'Internal: project id not in window._VP_PROJECT_ID.';
+            status.classList.remove('hidden');
+            submit.disabled = false;
+            spinner.classList.add('hidden');
+            return;
+        }
+
+        try {
+            const r = await _fetchWithTimeout(
+                `/api/projects/${projectId}/plan/to-workflow`,
+                {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name, description}),
+                },
+                90_000  // LLM synthesis can take 30-60s
+            );
+            const j = await r.json();
+            if (r.status !== 200 && r.status !== 201) {
+                throw new Error(_errDetailToString(j.detail, r.status));
+            }
+            // Close the modal, then redirect to the new workflow
+            closeSaveAsWorkflowModal();
+            showBanner('Workflow created: ' + (j.name || name), 'success');
+            setTimeout(() => {
+                window.location.href = '/workflows/' + j.id;
+            }, 800);
+        } catch (e) {
+            status.textContent = e.message || String(e);
+            status.classList.remove('hidden');
+            submit.disabled = false;
+            spinner.classList.add('hidden');
+        }
     }
 
     // ===== Event wiring =====
@@ -1511,9 +1643,18 @@
         savePlan: savePlan,
         generateTasks: generateTasks,
         validatePlan: validatePlan,
+        // v3.8.0: Edit JSON is now a modal (openJsonModal/closeJsonModal)
+        // — toggleJsonMode is kept as a backward-compat shim that
+        // delegates to openJsonModal().
         toggleJsonMode: toggleJsonMode,
+        openJsonModal: openJsonModal,
+        closeJsonModal: closeJsonModal,
         applyJsonToCanvas: applyJsonToCanvas,
         copyCanvasToJson: copyCanvasToJson,
+        // v3.8.0: Save as workflow
+        openSaveAsWorkflowModal: openSaveAsWorkflowModal,
+        closeSaveAsWorkflowModal: closeSaveAsWorkflowModal,
+        submitSaveAsWorkflow: submitSaveAsWorkflow,
         saveStepEdits: saveStepEdits,
         deleteSelectedStep: deleteSelectedStep,
         // v2.2 (2026-07-30): Undo / Redo / Copy / Paste — mirror the

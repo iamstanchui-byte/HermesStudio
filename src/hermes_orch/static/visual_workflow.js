@@ -564,8 +564,18 @@
     // ---- DOM lookup ----
     function _canvas() { return document.getElementById('vf-canvas'); }
     function _sidePanel() { return document.getElementById('vf-side-panel'); }
-    function _jsonForm() { return document.getElementById('vf-json-form'); }
+    // v3.8.0: was `#vf-json-form` (the bottom-of-page div, removed).
+    // The JSON editor is now a modal — toggleJsonForm() opens it,
+    // closeJsonModal() hides it. We keep _jsonForm() returning the
+    // modal overlay so the save() path's "is JSON form open?" check
+    // still works (same truthy semantics — classList.contains('hidden')
+    // is the new test).
+    function _jsonForm() { return document.getElementById('vf-json-modal-overlay'); }
     function _saveBanner() { return document.getElementById('vf-save-banner'); }
+    function _jsonFormIsOpen() {
+        const f = _jsonForm();
+        return f && !f.classList.contains('hidden');
+    }
 
     // ---- helpers ----
     function _showBanner(text, kind) {
@@ -1863,6 +1873,13 @@
         window._vfShortcutsBound = true;
         document.addEventListener('keydown', (ev) => {
             if (ev.key === 'Escape') {
+                // v3.8.0: JSON editor is now a modal. Close the
+                // topmost open sheet (modal > side panel) so Esc
+                // works the way users expect.
+                if (_jsonFormIsOpen()) {
+                    closeJsonModal();
+                    return;
+                }
                 const sp = _sidePanel();
                 if (sp.classList.contains('open')) {
                     closeSidePanel();
@@ -1872,11 +1889,51 @@
     }
 
     function toggleJsonForm() {
-        _jsonForm().classList.toggle('open');
+        // v3.8.0: was a toggle on a bottom-of-page div (.open class).
+        // Now the JSON editor is a modal overlay. toggleJsonForm()
+        // opens the modal (re-renders the textareas from the in-memory
+        // mirror if needed) — closeJsonModal() closes it.
+        if (_jsonFormIsOpen()) {
+            closeJsonModal();
+        } else {
+            openJsonModal();
+        }
+    }
+
+    function openJsonModal() {
+        // Sync the textareas from the in-memory mirror so the user
+        // sees the current state when they open the modal. The
+        // server-side rendered text version is the initial value of
+        // the textareas, but edits made via the canvas after the page
+        // loaded wouldn't be reflected without this re-sync.
+        if (typeof _stepTemplate !== 'undefined') {
+            const stEl = document.getElementById('vf-step-template-json');
+            if (stEl) stEl.value = JSON.stringify(_stepTemplate, null, 2);
+        }
+        if (typeof _variables !== 'undefined') {
+            const vEl = document.getElementById('vf-variables-json');
+            if (vEl) vEl.value = JSON.stringify(_variables, null, 2);
+        }
+        const errEl = document.getElementById('vf-json-error');
+        if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
+        _jsonForm().classList.remove('hidden');
+    }
+
+    function closeJsonModal() {
+        _jsonForm().classList.add('hidden');
+    }
+
+    function _showJsonError(msg) {
+        const errEl = document.getElementById('vf-json-error');
+        if (!errEl) { _showBanner(msg, 'error'); return; }
+        errEl.textContent = msg;
+        errEl.classList.remove('hidden');
     }
 
     async function save() {
-        // Q4 c: if the JSON form is open, the user may have edited it.
+        // v3.8.0: was "Q4 c" — the JSON form was a hidden bottom-of-page
+        // div. Now it's a modal; we use _jsonFormIsOpen() to detect.
+        // If the JSON modal is open, the user may have edited it.
         // Prefer JSON form content over the canvas when it's open.
         // v2.1: checkpoint once at the top of save() so undo can
         // revert the entire save operation (including the JSON-form
@@ -1884,12 +1941,17 @@
         // effects) back to the pre-save state.
         _checkpoint('Save (before persist)');
         let stepTemplate, variables;
-        if (_jsonForm().classList.contains('open')) {
+        if (_jsonFormIsOpen()) {
             try {
                 stepTemplate = JSON.parse(
                     document.getElementById('vf-step-template-json').value || '[]'
                 );
             } catch (e) {
+                // v3.8.0: also show in the modal's inline error
+                // element so the user sees the error next to the
+                // textarea they were editing, not just at the top
+                // of the page (the banner is easy to miss).
+                _showJsonError('Bad JSON in step_template: ' + e.message);
                 _showBanner('Bad JSON in step_template: ' + e.message, 'error');
                 return;
             }
@@ -1898,6 +1960,7 @@
                     document.getElementById('vf-variables-json').value || '[]'
                 );
             } catch (e) {
+                _showJsonError('Bad JSON in variables: ' + e.message);
                 _showBanner('Bad JSON in variables: ' + e.message, 'error');
                 return;
             }
@@ -1946,7 +2009,7 @@
         // If the user used the canvas path, capture the live positions
         // one more time so the most recent drag is included.
         let visualLayoutToSend;
-        if (_jsonForm().classList.contains('open')) {
+        if (_jsonFormIsOpen()) {
             visualLayoutToSend = _visualLayout;
         } else {
             _captureAllNodePositions();
@@ -2065,7 +2128,11 @@
         openSidePanel,
         closeSidePanel,
         applyEdit,
+        // v3.8.0: JSON form is now a modal. toggleJsonForm opens/closes
+        // the modal; openJsonModal/closeJsonModal are explicit.
         toggleJsonForm,
+        openJsonModal,
+        closeJsonModal,
         // v2.1 (2026-07-30): undo / redo exposed for the toolbar
         // buttons + future keyboard shortcuts. State is the snapshot
         // model: a single "checkpoint(label)" call before any
