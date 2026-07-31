@@ -1026,14 +1026,19 @@ async def plan_visual_page(project_id: str, request: Request) -> HTMLResponse:
     # base.html "Mock mode" banner hides when LLM is configured.
     # Without this, plan_visual_page always shows the "running in
     # mock mode" yellow banner even with API key set.
-    from hermes_orch.api.dashboard import _llm_configured
+    from hermes_orch.api.dashboard import _base_context, _llm_configured
     templates: Jinja2Templates = request.app.state.templates
     return templates.TemplateResponse(
         request, "visual_plan.html",
         {
+            # _base_context supplies current_user_ctx + active_page +
+            # llm_configured. Without it, base.html falls back to the
+            # "Sign in" link in the topbar even when the user is logged
+            # in (v3.4 introduced the user pill, but visual_plan was
+            # still passing a hand-built context that omitted it).
+            **(await _base_context(request, "projects")),
             "project": proj_view,
             "available_roles": available_roles,
-            "active_page": "projects",
             "llm_configured": _llm_configured(
                 getattr(request.app.state, "config", None)
             ),
