@@ -337,8 +337,24 @@
    descendants don't accidentally close the modal. #}
 <div id="profile-modal" class="modal-overlay" style="display: none;"
      onclick="if(event.target===this) closeProfileModal()">
+    {# v3.7.2: fixed-height modal so all 5 tabs (Overview / MCP / Skills /
+       Storage / Capabilities) are visually consistent. Previously the
+       card's height followed its content — the Skills tab (77 entries)
+       was ~600px tall while Overview / MCP / Storage (~280px) shrank to
+       match, so switching tabs made the modal "jitter" up and down.
+
+       Mechanism: a flex column where the header and tab bar use
+       `flex-shrink-0` (fixed size) and the content fills remaining
+       space and scrolls when needed (`flex: 1; min-height: 0;
+       overflow-y: auto`). We override the base `.modal-card`'s
+       `overflow-y: auto` with `overflow: hidden` here so the card
+       itself never scrolls — only the inner content does, keeping
+       the header and tab bar pinned at the top.
+
+       600px is the tallest comfortable content (Skills tab); `max-height:
+       86vh` still caps the card on short viewports. #}
     <div class="modal-card"
-         style="width: 720px; max-width: 92vw; max-height: 86vh; padding: 0; display: flex; flex-direction: column;">
+         style="width: 720px; max-width: 92vw; height: 600px; max-height: 86vh; padding: 0; display: flex; flex-direction: column; overflow: hidden;">
         <div class="px-5 py-3 border-b flex items-center justify-between flex-shrink-0">
             <div>
                 <div class="text-xs text-gray-500 uppercase tracking-wide">Profile settings</div>
@@ -358,7 +374,13 @@
             <button class="profile-tab" data-tab="capabilities"
                     onclick="switchProfileTab('capabilities')">Capabilities</button>
         </div>
-        <div id="profile-tab-content" class="text-xs text-gray-700 p-5 overflow-y-auto"></div>
+        {# v3.7.2: `flex: 1; min-height: 0` makes the content fill the
+           remaining flex space; without `min-height: 0` the flex item
+           refuses to shrink below its content size, so the long Skills
+           list would push the modal past 600px instead of scrolling
+           inside. `overflow-y: auto` then handles the scrollbar. #}
+        <div id="profile-tab-content" class="text-xs text-gray-700 p-5"
+             style="flex: 1; min-height: 0; overflow-y: auto;"></div>
     </div>
 </div>
 
