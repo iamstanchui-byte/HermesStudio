@@ -255,6 +255,178 @@
     }
     .vf-minimap svg { border-radius: 4px; }
     .vf-minimap-dot:hover { stroke: #111827; stroke-width: 1.5; }
+
+    /* ====================================================================
+       v3.8.1: dark mode for the visual workflow builder
+       --------------------------------------------------------------------
+       Sister page to v3.7.0 (visual project page) and v3.7.1 (visual
+       plan editor). Same slate palette, so the three "visual *" pages
+       look consistent in dark mode.
+
+       Palette (matches v3.7.0 + v3.7.1 — the canvas is the canvas, no
+       matter which surface you're on):
+         canvas       = slate-900  #0f172a
+         node card    = slate-800  #1e293b
+         border       = slate-700  #334155
+         text primary = slate-200  #e2e8f0
+         text strong  = slate-100  #f1f5f9
+         text muted   = slate-400  #94a3b8
+         sunken input = slate-900  #0f172a
+         accent (action link) = blue-300 #93c5fd (one step brighter
+                         than the light-mode #2563eb — same hue family)
+         accent (skill) = purple-300 #d8b4fe
+
+       body.dark selector beats drawflow's 2-class `.drawflow .drawflow-node`
+       rule (3 classes + 1 tag = 0,3,1 specificity). The page-level
+       `.vf-node` already uses `!important` for the white-mode default
+       (to beat drawflow's 2-class specificity at 0,2,0). The body.dark
+       rules also need `!important` to win against the page-level rules
+       when both use `!important` — source order resolves the tie
+       (dark block is appended at the bottom).
+
+       Mini-map's `<svg>` has an inline style="background:#f9fafb;..."
+       from visual_workflow.js. That inline style is higher priority
+       than any CSS rule, so the override MUST use `!important`.
+
+       Toolbar buttons use Tailwind utility classes (text-gray-700,
+       border-gray-300, etc.) — base.html's `body.dark` rules
+       automatically re-skin those. The Save button is bg-blue-600
+       (Tailwind pre-defined) and base.html doesn't override bg-blue-600
+       in dark mode (per the v3.7.0 "status pill colors are content"
+       pattern, the blue submit button stays blue in both modes).
+       ==================================================================== */
+    body.dark .vf-canvas-wrap {
+        background: #0f172a;
+        border-color: #334155;
+    }
+    body.dark .vf-node {
+        background: #1e293b !important;
+        border-color: #334155 !important;
+    }
+    body.dark .vf-node-name { color: #f1f5f9; }
+    body.dark .vf-node-role {
+        color: #cbd5e1;
+        background: #334155;
+    }
+    body.dark .vf-node-action { color: #93c5fd; }   /* blue-300 — same hue as light's #2563eb, one step brighter */
+    body.dark .vf-node-skill { color: #d8b4fe; }    /* purple-300 */
+    body.dark .vf-node-delete {
+        color: #94a3b8;
+    }
+    body.dark .vf-node-delete:hover {
+        background: #450a0a;     /* red-950 */
+        color: #fca5a5;          /* red-300 */
+    }
+    /* Connection handles: keep gray/red in dark mode but brighten the
+       hover state. The red dashed loop-back handle is a "data signal"
+       not a surface — keep red in both modes (same lesson as the
+       status pill colors from v3.7.0: signals are content, not chrome). */
+    body.dark .drawflow .drawflow-node .input_1,
+    body.dark .drawflow .drawflow-node .output_1 {
+        background: #94a3b8 !important;
+        border-color: #1e293b !important;
+    }
+    body.dark .drawflow .drawflow-node .output_1:hover {
+        background: #cbd5e1 !important;
+    }
+    /* Loop-back handle (output_2): keep red-600 base + brighten border */
+    body.dark .drawflow .drawflow-node .output_2 {
+        background: #ef4444 !important;        /* red-500 (slightly brighter for dark bg) */
+        border-color: #fca5a5 !important;       /* red-300 */
+    }
+    body.dark .drawflow .drawflow-node .output_2:hover {
+        background: #f87171 !important;        /* red-400 */
+    }
+    /* Side panel: matches the plan editor's "elevated layer" treatment
+       (slate-800 card on slate-900 canvas). Inputs are slate-900
+       (sunken) for clear visual hierarchy. */
+    body.dark .vf-side-panel {
+        background: #1e293b;
+        border-left-color: #334155;
+        box-shadow: -4px 0 16px rgba(0,0,0,0.4);
+    }
+    body.dark .vf-side-panel h3 { color: #f1f5f9; }
+    body.dark .vf-side-panel label { color: #94a3b8; }
+    body.dark .vf-side-panel input,
+    body.dark .vf-side-panel select,
+    body.dark .vf-side-panel textarea {
+        background: #0f172a;
+        border-color: #334155;
+        color: #e2e8f0;
+    }
+    /* The "?" tooltip span uses .text-gray-400 which base.html already
+       auto-darkens to text-gray-500. The amber-50/.bg-amber-50 banner
+       base.html also auto-darkens. So no override needed. */
+    /* Add step palette chips (v3.7.0 pattern: keep as data signal with
+       a small brightness boost on dark) */
+    body.dark .vf-palette-chip {
+        background: #1e3a8a;       /* blue-900 */
+        border-color: #1d4ed8;     /* blue-700 */
+        color: #bfdbfe;            /* blue-200 */
+    }
+    body.dark .vf-palette-chip:hover {
+        background: #1d4ed8;       /* blue-700 */
+    }
+    /* Save status banner */
+    body.dark .vf-save-banner.success {
+        background: #064e3b;       /* emerald-900 */
+        color: #86efac;            /* emerald-300 */
+    }
+    body.dark .vf-save-banner.error {
+        background: #450a0a;       /* red-950 */
+        color: #fca5a5;            /* red-300 */
+    }
+    /* Mini-map: translucent slate-800 over the slate-900 canvas.
+       The SVG inside has an inline style="background:#f9fafb;..." set
+       by visual_workflow.js, so the override MUST use !important. */
+    body.dark .vf-minimap {
+        background: rgba(30, 41, 59, 0.92);
+        border-color: #334155;
+    }
+    body.dark .vf-minimap svg {
+        background: #0f172a !important;       /* beat the inline style */
+    }
+    body.dark .vf-minimap-dot:hover {
+        stroke: #f1f5f9;
+    }
+    /* Connection wires (drawflow's default stroke #4682b4 looks dim on
+       a slate-900 canvas). Brighten to blue-400 (visible but not
+       overpowering — the node cards are the focus, the wires are
+       structure). Output_2 (loop-back, red dashed) is a data signal
+       and stays red — the v3.7.0 "status colors are content" rule. */
+    body.dark .drawflow .connection .main-path {
+        stroke: #60a5fa !important;            /* blue-400 */
+    }
+    body.dark .drawflow .connection .main-path:hover {
+        stroke: #93c5fd !important;            /* blue-300 (hover) */
+    }
+    body.dark .drawflow .connection .main-path.selected {
+        stroke: #86efac !important;            /* emerald-300 (selected) */
+    }
+    /* "Add step" wrapper card (white bg + border) */
+    body.dark .vf-canvas-wrap + div.bg-white,
+    body.dark > div > div.bg-white.border {
+        background-color: #1e293b;
+        border-color: #334155;
+    }
+    /* v3.8.0 JSON modal — same dark treatment as the plan editor's
+       modal. Apply body.dark overrides here too (the page-level rules
+       already use slate palette, just need slate-800/700 swaps). */
+    body.dark #vf-json-modal-overlay > div {
+        background: #1e293b;
+        color: #e2e8f0;
+    }
+    body.dark #vf-step-template-json,
+    body.dark #vf-variables-json,
+    body.dark #vf-json-error {
+        background: #0f172a;
+        border-color: #334155;
+        color: #cbd5e1;
+    }
+    /* Modal labels use text-gray-700 — base.html auto-darkens to
+       text-gray-200 in body.dark. Override inline-style on the SVG that
+       visual_workflow.js injects into the minimap placeholder
+       (color: #9ca3af → already light, no override needed in dark). */
 </style>
 {% endblock %}
 
