@@ -1513,6 +1513,41 @@ async def settings_page(request: Request) -> HTMLResponse:
     )
 
 
+@router.get("/admin/users", response_class=HTMLResponse)
+async def admin_users_page(request: Request) -> HTMLResponse:
+    """Admin-only Users management page (v3.5.0).
+
+    Lists all dashboard users, with per-row actions:
+    - Reset password (admin can set any user's password)
+    - Disable / Enable (admins can't disable themselves — handled in
+      the UI by greying out the button, and the server enforces it
+      too with a 400)
+
+    Non-admin users get a 403. The sidebar Admin section is also
+    server-gated (only rendered when current_user.role == 'admin'),
+    so most users won't even see the link.
+    """
+    ctx = await _base_context(request, "admin_users")
+    user = ctx.get("current_user_ctx")
+    if not user or user.get("role") != "admin":
+        # 403 keeps the URL working for link-sharing but blocks
+        # unauthorized access. JSON API endpoints return 403 too.
+        from fastapi.responses import HTMLResponse as _HTML  # local
+        return _HTML(
+            "<h1 style='font-family:sans-serif;padding:2rem;'>403 — Admin role required</h1>"
+            "<p style='font-family:sans-serif;padding:0 2rem;color:#666;'>"
+            "This page is for admin users only. Ask an admin to grant you the admin role, "
+            "or use the CLI: <code>hermes-orch user add --admin --username &lt;you&gt; --password &lt;pw&gt;</code>"
+            "</p>",
+            status_code=403,
+        )
+    return templates.TemplateResponse(
+        request=request,
+        name="admin_users.html",
+        context=ctx,
+    )
+
+
 @router.get("/schedules", response_class=HTMLResponse)
 async def schedules_page(
     request: Request,

@@ -750,6 +750,19 @@
                 <a href="/settings#guardrails" class="sidebar-subitem">Guardrails</a>
                 <a href="/settings#integrations" class="sidebar-subitem">Integrations</a>
             </div>
+            {# v3.5.0: Admin section — only rendered for admin users. Hidden for
+               non-admins (the route is also server-gated, but hiding the link
+               keeps the nav uncluttered and signals "you don't have access"). #}
+            {% if current_user_ctx and current_user_ctx.role == 'admin' %}
+            <button type="button" class="sidebar-group-toggle {% if active_page == 'admin_users' %}expanded{% endif %}" onclick="toggleAdminGroup()">
+                <span class="sidebar-icon">🛡️</span>
+                <span class="sidebar-label">Admin</span>
+                <span class="caret">▶</span>
+            </button>
+            <div class="sidebar-subitems" id="admin-subitems" style="display: {% if active_page == 'admin_users' %}block{% else %}none{% endif %};">
+                <a href="/admin/users" class="sidebar-subitem {% if active_page == 'admin_users' %}active{% endif %}">Users</a>
+            </div>
+            {% endif %}
         </nav>
         <div class="sidebar-footer">
             <div class="sidebar-status">
@@ -887,6 +900,43 @@
         }
     })();
 
+    // ===== v3.5.0: Admin group (Users sub-page) — same pattern as Settings.
+    // Only present in the DOM for admin users (gated server-side in the
+    // template), so the functions below no-op for everyone else.
+    function toggleAdminGroup() {
+        const subitems = document.getElementById('admin-subitems');
+        if (!subitems) return;
+        if (document.body.classList.contains('sidebar-collapsed')) {
+            document.body.classList.remove('sidebar-collapsed');
+            localStorage.setItem('orch.sidebar', 'expanded');
+        }
+        const isHidden = subitems.style.display === 'none' || subitems.style.display === '';
+        subitems.style.display = isHidden ? 'block' : 'none';
+        // Find the button specifically for the Admin group (second
+        // sidebar-group-toggle if it exists, after Settings).
+        const btns = document.querySelectorAll('.sidebar-group-toggle');
+        const adminBtn = btns[btns.length - 1];  // Admin is rendered last
+        if (adminBtn) adminBtn.classList.toggle('expanded', isHidden);
+        localStorage.setItem('orch.adminGroup', isHidden ? 'open' : 'closed');
+    }
+    (function initAdminGroup() {
+        const subitems = document.getElementById('admin-subitems');
+        if (!subitems) return;  // Non-admin user — section not rendered
+        const saved = localStorage.getItem('orch.adminGroup');
+        const sidebarCollapsed = localStorage.getItem('orch.sidebar') === 'collapsed';
+        const btns = document.querySelectorAll('.sidebar-group-toggle');
+        const adminBtn = btns[btns.length - 1];
+        if (sidebarCollapsed) {
+            subitems.style.display = 'none';
+            if (adminBtn) adminBtn.classList.remove('expanded');
+            return;
+        }
+        if (subitems.style.display === 'none' && saved === 'open') {
+            subitems.style.display = 'block';
+            if (adminBtn) adminBtn.classList.add('expanded');
+        }
+    })();
+
     // ===== Smart polling: skip when user is editing a form, or tab is hidden,
     // or any result panel is currently open (so reading a long result
     // doesn't get interrupted by a reload).
@@ -945,7 +995,15 @@
         setTheme(dark);
     }
     (function initTheme() {
-        const dark = localStorage.getItem('orch.theme') === 'dark';
+        // Same priority as the /login template (v3.4.1): explicit
+        // localStorage override wins, otherwise follow the OS preference.
+        // Without the matchMedia fallback, first-time visitors with
+        // `prefers-color-scheme: dark` would see the light dashboard
+        // until they manually click the toggle.
+        const stored = localStorage.getItem('orch.theme');
+        const dark = stored
+            ? stored === 'dark'
+            : window.matchMedia('(prefers-color-scheme: dark)').matches;
         if (dark) document.body.classList.add('dark');
         setTheme(dark);
     })();
