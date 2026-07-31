@@ -101,6 +101,35 @@
             font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;
             color: #1f2937;
         }
+        /* Forgot password collapse/expand */
+        .forgot-toggle {
+            font-size: 0.8125rem; color: #6b7280;
+        }
+        .forgot-toggle > summary {
+            list-style: none; cursor: pointer;
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 0.5rem 0.625rem; margin: -0.5rem -0.625rem;
+            border-radius: 0.375rem;
+            color: #4b5563; font-weight: 500;
+            user-select: none;
+        }
+        .forgot-toggle > summary::-webkit-details-marker { display: none; }
+        .forgot-toggle > summary:hover { background: rgba(0, 0, 0, 0.03); }
+        .forgot-toggle .chevron { transition: transform 0.2s; opacity: 0.6; }
+        .forgot-toggle[open] > summary .chevron { transform: rotate(180deg); }
+        .forgot-content {
+            padding: 0.625rem 0.75rem; margin-top: 0.5rem;
+            background: #f9fafb; border-radius: 0.375rem;
+            border: 1px solid #f3f4f6;
+            font-size: 0.75rem; line-height: 1.5;
+        }
+        .forgot-content code {
+            display: inline-block; margin-top: 0.25rem;
+            background: #ffffff; padding: 0.25rem 0.5rem; border-radius: 0.25rem;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.7rem; color: #1f2937;
+            border: 1px solid #e5e7eb; word-break: break-all;
+        }
         .theme-toggle {
             position: fixed; top: 1.25rem; right: 1.25rem; z-index: 50;
             width: 40px; height: 40px; border-radius: 50%;
@@ -160,6 +189,16 @@
         body.dark .help-text { color: #94a3b8; }
         body.dark .help-text code {
             background: rgba(15, 23, 42, 0.6); color: #e2e8f0;
+        }
+        body.dark .forgot-toggle { color: #94a3b8; }
+        body.dark .forgot-toggle > summary { color: #cbd5e1; }
+        body.dark .forgot-toggle > summary:hover { background: rgba(255, 255, 255, 0.04); }
+        body.dark .forgot-content {
+            background: rgba(15, 23, 42, 0.4); border-color: rgba(148, 163, 184, 0.15);
+        }
+        body.dark .forgot-content code {
+            background: rgba(15, 23, 42, 0.6); color: #e2e8f0;
+            border-color: rgba(148, 163, 184, 0.2);
         }
         body.dark .theme-toggle {
             background: rgba(30, 41, 59, 0.8);
@@ -257,13 +296,18 @@
 
             <div class="divider">or</div>
 
-            <div class="help-text">
-                <div class="font-medium mb-1.5" style="color: #374151;">Forgot your password?</div>
-                <div>
-                    Ask your admin to reset it on the server:
-                    <code>hermes-orch user passwd &lt;username&gt;</code>
+            <details class="forgot-toggle">
+                <summary>
+                    <span>Forgot your password?</span>
+                    <svg class="chevron" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="6 9 12 15 18 9"></polyline>
+                    </svg>
+                </summary>
+                <div class="forgot-content">
+                    <div class="mb-1">Ask your admin to reset it on the server:</div>
+                    <code>hermes-orch user passwd &lt;username&gt; --password &lt;new&gt;</code>
                 </div>
-            </div>
+            </details>
         </div>
 
         <p class="footer-text text-[11px] mt-5 text-center">
