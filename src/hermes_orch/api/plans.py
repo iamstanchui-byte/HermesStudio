@@ -31,9 +31,12 @@ Per the design contract:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -1289,6 +1292,111 @@ async def generate_plan_from_llm(
             params_template=raw_params,
             output_path=str(t.get("output_path") or ""),
         ))
+    # v3.5.2 follow-up: resolve depends_on / feedback_to references to
+    # the actual step names we just produced.
+    #
+    # The LLM (especially MiniMax M3) is inconsistent about naming
+    # conventions: it often uses kebab-case for `name` ("research-langgraph")
+    # but Title Case + space for `depends_on` references
+    # ("Research LangGraph"). The planner's own validation at
+    # core/planner.py:640 only checks "this ref exists earlier in the
+    # plan" — it can't catch a case where the LLM is internally
+    # consistent (Title Case everywhere) but the *endpoint* kebab-cases
+    # the names (turning "Research LangGraph" into "research-langgraph")
+    # while leaving depends_on untouched. Net result: the plan validates
+    # and saves, but the canvas can't draw wires because the names
+    # don't match. User saw this on proj-56c8e080 with the
+    # "LangGraph vs AutoGen vs CrewAI 分析..." goal — 5 steps, 7
+    # dangling depends_on refs, no wires.
+    #
+    # Strategy: for each step's depends_on / feedback_to entry, try
+    # (1) exact match, (2) kebab-case the ref then match, (3) lowercase
+    # comparison after kebab-casing. If no match, drop the ref with a
+    # warning. The user keeps a usable plan (steps still run, just
+    # without the broken wire) and we get a logger trail for debugging
+    # future LLM regressions.
+    if steps:
+        _step_names_set: set[str] = {s.name for s in steps}
+        # Precompute a lowercased index for the case-insensitive fallback
+        # so we don't lowercase every step.name on every ref. Keeps the
+        # resolver O(n + m) instead of O(n*m) for n steps and m refs.
+        _step_names_lower_index: dict[str, str] = {
+            s.name.lower(): s.name for s in steps
+        }
+        def _resolve_step_ref(ref: str) -> str | None:
+            """Resolve a depends_on / feedback_to ref to an actual step
+            name in this plan, or None if no match.
+
+            Tries (in order):
+              1. exact match against step names
+              2. kebab-case the ref, then exact match
+              3. case-insensitive match (after kebab-casing both sides)
+
+            Returns the original step name (preserves the convention
+            chosen by the endpoint's _to_kebab + dedup pipeline).
+            """
+            if ref in _step_names_set:
+                return ref
+            ref_kebab = _to_kebab(ref)
+            if ref_kebab in _step_names_set:
+                return ref_kebab
+            return _step_names_lower_index.get(ref_kebab.lower())
+        _resolved_count = 0
+        _dropped_count = 0
+        for s in steps:
+            new_deps: list[str] = []
+            for d in s.depends_on:
+                resolved = _resolve_step_ref(d)
+                if resolved is None:
+                    logger.warning(
+                        "from-llm: dropping dangling depends_on ref %r "
+                        "on step %r (no step with that name in this "
+                        "plan; available: %s)",
+                        d, s.name, sorted(_step_names_set),
+                    )
+                    _dropped_count += 1
+                    continue
+                if resolved != d:
+                    logger.info(
+                        "from-llm: resolved depends_on ref %r -> %r "
+                        "on step %r (LLM used inconsistent casing/"
+                        "spacing; normalised to match step name)",
+                        d, resolved, s.name,
+                    )
+                    _resolved_count += 1
+                new_deps.append(resolved)
+            # PlanStep is a Pydantic v2 BaseModel without
+            # model_config = ConfigDict(frozen=True), so the list
+            # fields are mutable in place.
+            s.depends_on = new_deps
+            new_fb: list[str] = []
+            for f in s.feedback_to:
+                resolved = _resolve_step_ref(f)
+                if resolved is None:
+                    logger.warning(
+                        "from-llm: dropping dangling feedback_to ref %r "
+                        "on step %r (no step with that name in this "
+                        "plan; available: %s)",
+                        f, s.name, sorted(_step_names_set),
+                    )
+                    _dropped_count += 1
+                    continue
+                if resolved != f:
+                    logger.info(
+                        "from-llm: resolved feedback_to ref %r -> %r "
+                        "on step %r (LLM used inconsistent casing/"
+                        "spacing; normalised to match step name)",
+                        f, resolved, s.name,
+                    )
+                    _resolved_count += 1
+                new_fb.append(resolved)
+            s.feedback_to = new_fb
+        if _resolved_count or _dropped_count:
+            logger.info(
+                "from-llm: depends_on/feedback_to resolution pass: "
+                "%d ref(s) normalised, %d dangling ref(s) dropped",
+                _resolved_count, _dropped_count,
+            )
     # v3.5.2 safety net: even with dedup, the LLM might produce
     # something that fails another field validator (bad agent_role,
     # missing required field, etc.). If the ProjectPlan constructor
