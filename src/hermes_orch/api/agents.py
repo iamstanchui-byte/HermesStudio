@@ -1739,3 +1739,93 @@ async def copy_skill_to_profile(
     )
     return _row_to_config(row)
 
+
+# v3.3.2: bulk "publish to all profiles" — one click, all wrappers
+# get it. Backend equivalent: for each OTHER profile on the same
+# agent, copy the skill content (overwrite=true so re-runs are
+# idempotent). The wrappers see new profile_configs rows on their
+# next /configs/pending poll and apply them in parallel.
+@router.post(
+    "/{agent_id}/profiles/{profile_name}/skills/{skill_name:path}/sync-to-all",
+)
+async def sync_skill_to_all_profiles(
+    agent_id: str,
+    profile_name: str,
+    skill_name: str,
+    request: Request,
+    x_agent_id: str = Depends(require_hmac_auth),
+) -> dict[str, Any]:
+    """Copy a skill from `profile_name` to EVERY OTHER profile on the agent.
+
+    Idempotent: existing skills are overwritten (overwrite=true). The
+    "src == dst" profile is skipped (no self-copy). The response lists
+    per-profile results so the dashboard can show "pushed to 3/4
+    profiles" without re-fetching.
+
+    This is a "publish" action — useful for team-wide skills that
+    every agent profile should have. Distinct from the per-target
+    `copy` endpoint (line ~1664) which requires a single destination.
+    """
+    if x_agent_id != agent_id:
+        raise HTTPException(
+            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+        )
+    db = request.app.state.db
+    src_profile = await _find_profile(db, agent_id, profile_name)
+    src_cfg = await _latest_skill_config(db, src_profile["id"], skill_name)
+    if not src_cfg:
+        raise HTTPException(404, f"Skill not found: {skill_name} in {profile_name}")
+    src_content = src_cfg.get("desired_content") or ""
+    if not src_content:
+        raise HTTPException(400, f"Source skill {skill_name!r} has empty content (deleted?)")
+    name = _validate_skill_name(skill_name)
+    file_path = _skill_file_path(name)
+    sha = hashlib.sha256(src_content.encode("utf-8")).hexdigest()
+
+    other_profiles = await db.fetchall(
+        "SELECT id, name FROM agent_profiles WHERE agent_id = ? AND name != ?",
+        (agent_id, profile_name),
+    )
+    results: list[dict[str, Any]] = []
+    for prof in other_profiles:
+        # Always overwrite (idempotent re-run; the `delete` button is
+        # the way to remove, this is the way to install/push).
+        cfg_id = str(uuid.uuid4())
+        await db.insert(
+            "profile_configs",
+            {
+                "id": cfg_id,
+                "profile_id": prof["id"],
+                "file_path": file_path,
+                "desired_sha256": sha,
+                "desired_content": src_content,
+                "status": "pending",
+            },
+        )
+        results.append(
+            {
+                "profile": prof["name"],
+                "config_id": cfg_id,
+                "status": "queued",
+            }
+        )
+    await audit_log(
+        db, "profile.skill_synced_to_all",
+        actor="operator",
+        agent_id=agent_id,
+        payload={
+            "src_profile": profile_name,
+            "skill_name": name,
+            "file_path": file_path,
+            "bytes": len(src_content),
+            "profiles_pushed": len(results),
+        },
+    )
+    return {
+        "ok": True,
+        "skill_name": name,
+        "src_profile": profile_name,
+        "pushed_count": len(results),
+        "pushed_to": results,
+    }
+

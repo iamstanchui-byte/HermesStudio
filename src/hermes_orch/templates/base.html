@@ -649,6 +649,23 @@
         body.dark .profile-tab { color: #9ca3af; }
         body.dark .profile-tab:hover { color: #f3f4f6; }
         body.dark .profile-tab-active { color: #60a5fa; border-bottom-color: #60a5fa; }
+
+        /* v3.3.2: skill row action buttons (× delete, → all profiles).
+           Small (10px) + dim so they don't compete with the skill
+           name or status pill. The `→` is the publish action (push
+           this skill to every other profile on the agent); the `×`
+           is the local delete (marks the file for removal by the
+           wrapper on next poll). */
+        .skill-action-btn {
+            font-size: 0.7rem; line-height: 1;
+            color: #6b7280;
+            padding: 0 0.3rem;
+            border-radius: 0.2rem;
+            transition: background 0.1s, color 0.1s;
+        }
+        .skill-action-btn:hover { background: #f3f4f6; }
+        body.dark .skill-action-btn { color: #9ca3af; }
+        body.dark .skill-action-btn:hover { background: #374151; }
         {# v3.3.1: removed duplicate #profile-tab-content rule that
            lived further down (the v3.2.0 320px version). The v3.3.1
            rule above (line ~474, max-height: 360px + padding-right: 6px

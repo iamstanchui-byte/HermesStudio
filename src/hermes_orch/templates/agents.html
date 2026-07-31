@@ -542,6 +542,10 @@ function renderMcpTab(profile, content) {
 //       icon. Now we render the column only when size is known.
 //   (b) "+ N more" was static italic text — user couldn't open it.
 //       Make it a real button that toggles the hidden rows.
+//   (c) v3.3.2: add × (delete) and → (sync to all) buttons per
+//       skill row. The delete endpoint already exists
+//       (DELETE /api/agents/{id}/profiles/{name}/skills/{name}) and
+//       the sync-to-all endpoint was added alongside this change.
 function renderSkillsTab(profile, content) {
     const skills = profile.skills || [];
     let html = `<div class="text-[11px] text-gray-500 mb-2 italic">
@@ -551,7 +555,7 @@ function renderSkillsTab(profile, content) {
         html += `<div class="text-xs text-gray-400 italic">No skills applied yet.</div>`;
     } else {
         const visible = 10;
-        html += `<div class="space-y-1">`;
+        html += `<div class="space-y-1" id="skills-list">`;
         skills.forEach((s, i) => {
             const parts = (s.file_path || '').split('/');
             const name = parts.length >= 2 ? parts[parts.length - 2] : (s.file_path || 'unknown');
@@ -566,11 +570,31 @@ function renderSkillsTab(profile, content) {
             // Rows past `visible` are hidden by default; the toggle
             // button below reveals them.
             const hiddenCls = i >= visible ? ' skill-extra hidden' : '';
+            // v3.3.2: per-row action buttons. Both are small + use
+            // the same dim color so they don't compete with the
+            // status pill. `→` pushes the skill to every other
+            // profile on the same agent (publish); `×` marks the
+            // skill as deleted (wrapper removes the file on next
+            // poll). `event.stopPropagation` not needed because the
+            // row has no parent click handler — the whole row IS
+            // the action surface.
+            const safeName = escapeAttr(name);
+            const actionsHtml = `
+                <button type="button"
+                        onclick="syncSkillToAll('${safeName}')"
+                        title="Push this skill to every other profile on this agent"
+                        class="skill-action-btn">→</button>
+                <button type="button"
+                        onclick="deleteSkill('${safeName}')"
+                        title="Delete this skill (wrapper removes the file on next poll)"
+                        class="skill-action-btn text-red-600 hover:text-red-800 dark:text-red-400">×</button>
+            `;
             html += `
                 <div class="flex items-center gap-2${hiddenCls}" data-skill-idx="${i}">
                     <span class="font-mono text-[11px] flex-1 truncate">${escapeHtml(name)}</span>
                     ${sizeHtml}
                     <span class="pill-status ${statusClass}" style="font-size: 0.65rem; padding: 0 0.3rem;">${escapeHtml(status)}</span>
+                    <span class="flex items-center gap-1">${actionsHtml}</span>
                 </div>
             `;
         });
@@ -585,6 +609,81 @@ function renderSkillsTab(profile, content) {
         }
     }
     content.innerHTML = html;
+}
+
+// v3.3.2: delete a skill — marks it as deleted in profile_configs
+// (empty desired_content, status=pending). The wrapper polls
+// /configs/pending, sees the empty content, removes the file, and
+// acks. The skill row disappears from the list on the next dashboard
+// reload (the list_skills query filters out applied+empty rows).
+async function deleteSkill(skillName) {
+    if (!currentAgentId || !currentProfileName) {
+        alert('No agent/profile selected. Pick an agent + profile first.');
+        return;
+    }
+    if (!confirm(`Delete skill "${skillName}" on profile "${currentProfileName}"?\n\nThe wrapper will remove the file on the next poll (~1 min). This cannot be undone from the UI; you would need to POST the skill content again to restore it.`)) {
+        return;
+    }
+    try {
+        const r = await fetch(
+            `/api/agents/${encodeURIComponent(currentAgentId)}/profiles/${encodeURIComponent(currentProfileName)}/skills/${encodeURIComponent(skillName)}`,
+            { method: 'DELETE' }
+        );
+        if (!r.ok) {
+            const body = await r.json().catch(() => ({}));
+            throw new Error(body.detail || `HTTP ${r.status}`);
+        }
+        // Optimistic: drop the row from the local cache + re-render
+        // so the user sees the action took effect immediately. The
+        // wrapper may take a minute to actually remove the file, but
+        // the dashboard's "next reload" will reflect the server state.
+        if (currentProfiles) {
+            const prof = currentProfiles.find(p => p.name === currentProfileName);
+            if (prof && prof.skills) {
+                prof.skills = prof.skills.filter(s => {
+                    const n = (s.file_path || '').split('/');
+                    const nm = n.length >= 2 ? n[n.length - 2] : (s.file_path || '');
+                    return nm !== skillName;
+                });
+            }
+        }
+        switchProfileTab('skills');
+    } catch (err) {
+        alert('Delete failed: ' + err.message);
+    }
+}
+
+// v3.3.2: push a skill to every other profile on the same agent.
+// Backend endpoint: POST .../skills/{name}/sync-to-all. Returns a
+// per-profile result list; we surface a summary in the alert.
+async function syncSkillToAll(skillName) {
+    if (!currentAgentId || !currentProfileName) {
+        alert('No agent/profile selected. Pick an agent + profile first.');
+        return;
+    }
+    if (!confirm(`Push skill "${skillName}" from "${currentProfileName}" to ALL OTHER profiles on this agent?\n\nThis will overwrite the skill on every other profile. The wrappers will pick it up on their next poll (~1 min).`)) {
+        return;
+    }
+    try {
+        const r = await fetch(
+            `/api/agents/${encodeURIComponent(currentAgentId)}/profiles/${encodeURIComponent(currentProfileName)}/skills/${encodeURIComponent(skillName)}/sync-to-all`,
+            { method: 'POST' }
+        );
+        if (!r.ok) {
+            const body = await r.json().catch(() => ({}));
+            throw new Error(body.detail || `HTTP ${r.status}`);
+        }
+        const data = await r.json();
+        const count = data.pushed_count || 0;
+        if (count === 0) {
+            alert(`No other profiles to push to. "${skillName}" only exists on "${currentProfileName}".`);
+        } else {
+            const names = (data.pushed_to || []).map(p => p.profile).join(', ');
+            alert(`Pushed "${skillName}" to ${count} profile(s): ${names}\n\nThe wrappers will apply on their next poll.`);
+        }
+    } catch (err) {
+        alert('Sync failed: ' + err.message);
+    }
 }
 
 // v3.3.1: expand/collapse the hidden skills. The button is created
