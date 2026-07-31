@@ -324,6 +324,44 @@ async def set_user_disabled(db, user_id: str, disabled: bool) -> None:
     )
 
 
+async def count_active_admins(db, exclude_user_id: str | None = None) -> int:
+    """Count users with role='admin' AND disabled=0. Optionally exclude
+    a user by id (used by delete to compute "would this delete leave
+    zero admins?"). Disabled admins are not counted — they can't act
+    as admins even if their row still says role='admin'.
+
+    Bootstrap admins ARE counted here. They count as admins, but the
+    delete endpoint separately blocks deleting bootstrap admins (see
+    `api/users.py`). So the last-admin guard + bootstrap guard are
+    independent: bootstrap protection is absolute, last-admin is the
+    backstop for non-bootstrap admins.
+    """
+    if exclude_user_id is None:
+        row = await db.fetchone(
+            "SELECT COUNT(*) AS n FROM users "
+            "WHERE role = ? AND disabled = 0",
+            (ROLE_ADMIN,),
+        )
+    else:
+        row = await db.fetchone(
+            "SELECT COUNT(*) AS n FROM users "
+            "WHERE role = ? AND disabled = 0 AND id != ?",
+            (ROLE_ADMIN, exclude_user_id),
+        )
+    return int(row["n"]) if row else 0
+
+
+async def delete_user(db, user_id: str) -> None:
+    """Hard-delete a user row. No FK from other tables references
+    `users.id`, so this is safe. `audit_log.actor` is a TEXT column
+    (not a FK), so historical audit entries keep the username string
+    intact after the row is gone — they're just orphaned free text.
+    Callers must enforce all the guards (self, bootstrap, last-admin)
+    before calling this; the helper just runs the DELETE.
+    """
+    await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+
 def constant_time_eq(a: str, b: str) -> bool:
     """Constant-time string comparison. Used for the bootstrap admin
     username check (we don't want to leak username length via timing).

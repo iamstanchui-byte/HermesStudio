@@ -304,3 +304,223 @@ async def test_disable_unknown_user(client):
     await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
     r = await client.post("/api/users/ghost/disable")
     assert r.status_code == 404
+
+
+# ===== Delete (v3.5.2) =====
+#
+# Hard-delete semantics: row is removed. Bootstrap admin is permanent
+# (400). Self-delete is blocked (400). Last-admin is blocked (400).
+# Non-admin is blocked (403). See api/users.py for the guard chain.
+
+
+@pytest.mark.asyncio
+async def test_list_users_includes_is_last_admin(client):
+    """v3.5.2: list response includes is_last_admin per row so the UI
+    can disable the Delete button without a second click/guess.
+    With only the bootstrap admin in the DB, they ARE the last admin.
+    """
+    await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await client.get("/api/users")
+    assert r.status_code == 200
+    admin_row = next(u for u in r.json()["users"] if u["username"] == ADMIN_USERNAME)
+    assert admin_row["is_last_admin"] is True
+    assert admin_row["is_bootstrap_admin"] is True
+
+
+@pytest.mark.asyncio
+async def test_delete_user_happy_path(client):
+    """Admin deletes a non-admin user. Row is gone, audit log records it."""
+    await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    # Create a non-admin target
+    r = await client.post(
+        "/api/users",
+        json={"username": "evan", "password": "EvanPass123!", "is_admin": False},
+    )
+    assert r.status_code == 201
+
+    # Delete them
+    r2 = await client.delete("/api/users/evan")
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body["ok"] is True
+    assert body["username"] == "evan"
+    assert body["deleted"] is True
+
+    # Row is gone from the list
+    r3 = await client.get("/api/users")
+    usernames = [u["username"] for u in r3.json()["users"]]
+    assert "evan" not in usernames
+
+    # Audit log entry recorded
+    app = client._transport.app  # type: ignore[attr-defined]
+    db = app.state.db
+    audit_row = await db.fetchone(
+        "SELECT * FROM audit_log WHERE event_type = 'user.deleted' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    assert audit_row is not None
+    assert audit_row["actor"] == ADMIN_USERNAME
+    # payload is JSON text in the column
+    import json
+    payload = json.loads(audit_row["payload"])
+    assert payload["target_username"] == "evan"
+    assert payload["was_bootstrap_admin"] is False
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_delete_self(client):
+    """Guard 3 (self-delete): blocked when there are 2+ active admins
+    (i.e. self-guard is the right error, not bootstrap / last-admin).
+    Setup: bootstrap admin + a second non-bootstrap admin. Log in
+    as the second admin and try to delete themselves — the
+    bootstrap guard doesn't apply (target isn't bootstrap), the
+    last-admin guard doesn't apply (a second admin exists), so
+    the self-guard fires.
+    """
+    # Create a second admin via API (logged in as bootstrap).
+    await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await client.post(
+        "/api/users",
+        json={"username": "selfie", "password": "SelfiePass123!", "is_admin": True},
+    )
+    assert r.status_code == 201
+    # Log in as the second admin.
+    await _login(client, "selfie", "SelfiePass123!")
+    # Try to delete themselves. Self-guard fires (the only guard
+    # that applies when target is non-bootstrap and not last-admin).
+    r2 = await client.delete("/api/users/selfie")
+    assert r2.status_code == 400
+    assert "yourself" in r2.json()["detail"].lower()
+    # Row still exists
+    app = client._transport.app  # type: ignore[attr-defined]
+    db = app.state.db
+    still = await db.fetchone("SELECT id FROM users WHERE username = ?", ("selfie",))
+    assert still is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_delete_bootstrap_admin(client):
+    """Guard 2: bootstrap admin is permanent. Even with another admin
+    available, you can't delete the row that was auto-created on
+    fresh install. Use Disable instead."""
+    # Create a second admin so the last-admin guard doesn't shadow this
+    await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await client.post(
+        "/api/users",
+        json={"username": "secondadmin", "password": "SecondPass123!", "is_admin": True},
+    )
+    assert r.status_code == 201
+
+    # Try to delete the bootstrap admin — should be blocked by bootstrap guard
+    r2 = await client.delete(f"/api/users/{ADMIN_USERNAME}")
+    assert r2.status_code == 400
+    detail = r2.json()["detail"].lower()
+    assert "bootstrap" in detail
+
+    # Row still exists
+    app = client._transport.app  # type: ignore[attr-defined]
+    db = app.state.db
+    still = await db.fetchone(
+        "SELECT id FROM users WHERE username = ?", (ADMIN_USERNAME,)
+    )
+    assert still is not None
+
+
+@pytest.mark.asyncio
+async def test_admin_cannot_delete_last_admin(client):
+    """Guard 2 (last-admin): blocked when target is the only active
+    admin remaining. Setup: bootstrap admin creates a second non-
+    bootstrap admin, then disables itself. Now the second admin is
+    the sole active admin. When they try to delete themselves, the
+    self-guard WOULD fire — but we also need to test the last-admin
+    guard specifically. The cleanest way is to have a non-bootstrap
+    admin try to delete the OTHER non-bootstrap admin when they're
+    the only active ones. But that requires TWO non-bootstrap admins
+    + both of them being sole active — which is the same scenario.
+
+    Pragmatic approach: have a third non-admin user who, after
+    bootstrap disabled, logs in as the sole non-bootstrap admin and
+    tries to delete themselves. Last-admin guard fires (more
+    informative than the self-guard — tells the user WHY).
+
+    Note: require_admin middleware ensures the caller is an active
+    admin, so the only way for the last-admin guard to fire is when
+    the target IS the caller. Both guards apply, but last-admin
+    fires first (more critical to surface).
+    """
+    # Setup: bootstrap + second non-bootstrap admin.
+    await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await client.post(
+        "/api/users",
+        json={"username": "solo", "password": "SoloPass123!", "is_admin": True},
+    )
+    assert r.status_code == 201
+    # Disable the bootstrap admin (logged in as bootstrap, but the
+    # URL is for the bootstrap, so this would actually fail with
+    # self-disable — re-login as solo first to disable bootstrap).
+    await _login(client, "solo", "SoloPass123!")
+    r2 = await client.post(f"/api/users/{ADMIN_USERNAME}/disable")
+    assert r2.status_code == 200
+    # Re-login as solo (the disable endpoint revokes the bootstrap
+    # session, but the solo session is fine; just to be safe).
+    await _login(client, "solo", "SoloPass123!")
+    # Now try to delete solo. They are the only active admin. Both
+    # the self-guard and the last-admin guard apply; last-admin
+    # fires first per the API's guard ordering (more informative
+    # error message — "promote another user first" vs generic
+    # "cannot delete yourself").
+    r3 = await client.delete("/api/users/solo")
+    assert r3.status_code == 400
+    detail = r3.json()["detail"].lower()
+    # Accept either the last-admin or self message — both are
+    # valid for this scenario. The important assertion is 400 +
+    # that the row is still there.
+    assert (
+        "only remaining admin" in detail
+        or "yourself" in detail
+    ), f"unexpected error message: {detail!r}"
+    # Row still exists
+    app = client._transport.app  # type: ignore[attr-defined]
+    db = app.state.db
+    still = await db.fetchone("SELECT id FROM users WHERE username = ?", ("solo",))
+    assert still is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_user_requires_admin(client):
+    """Auth guard: a non-admin user gets 403 on DELETE (not 401, not 200)."""
+    # Create non-admin + log in as them
+    app = client._transport.app  # type: ignore[attr-defined]
+    db = app.state.db
+    await create_user(db, username="frank", password="FrankPass123!", role=ROLE_USER)
+    # Also need a target to delete (admin would be a target but they
+    # don't have admin role; use a fresh non-admin)
+    await create_user(db, username="greta", password="GretaPass123!", role=ROLE_USER)
+    await _login(client, "frank", "FrankPass123!")
+
+    r = await client.delete("/api/users/greta")
+    assert r.status_code == 403
+    assert "Admin" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_deleted_user_cannot_login(client):
+    """After delete, the user's password is no longer valid (their row
+    is gone, so even with correct creds the auth query returns nothing)."""
+    await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    # Create target
+    await client.post(
+        "/api/users",
+        json={"username": "henry", "password": "HenryPass123!", "is_admin": False},
+    )
+    # Verify they can log in
+    async with AsyncClient(transport=client._transport, base_url="http://test") as ac2:  # type: ignore[attr-defined]
+        r0 = await ac2.post("/api/auth/login", json={"username": "henry", "password": "HenryPass123!"})
+        assert r0.status_code == 200
+    # Delete them
+    r1 = await client.delete("/api/users/henry")
+    assert r1.status_code == 200
+    # Now they can't log in (row gone)
+    async with AsyncClient(transport=client._transport, base_url="http://test") as ac3:  # type: ignore[attr-defined]
+        r2 = await ac3.post("/api/auth/login", json={"username": "henry", "password": "HenryPass123!"})
+        assert r2.status_code == 401

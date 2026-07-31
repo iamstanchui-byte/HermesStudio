@@ -33,9 +33,11 @@
 </div>
 
 <p class="text-xs text-gray-400 mt-3">
-    Deleted users aren't possible in v1 — disabling keeps the user row + their
-    audit trail intact. Use <code>hermes-orch user add/list/disable/enable/passwd</code>
-    on the server for any operation not exposed here.
+    Disable keeps the user row + audit trail intact. Delete is irreversible —
+    the row is gone but <code>audit_log</code> entries keep the username as a
+    string. The bootstrap admin can only be disabled, not deleted. Use
+    <code>hermes-orch user add/list/disable/enable/passwd</code> on the server
+    for any operation not exposed here.
 </p>
 
 <!-- ===== Modals ===== -->
@@ -114,6 +116,33 @@
         <div class="flex justify-end gap-2">
             <button type="button" class="modal-cancel" data-close="disable-confirm-modal">Cancel</button>
             <button type="button" id="disable-confirm-btn" class="modal-danger">Disable</button>
+        </div>
+    </div>
+</div>
+
+<!-- Delete confirm modal (v3.5.2) -->
+<div id="delete-confirm-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+        <h2 class="text-lg font-semibold text-gray-800 mb-1">Delete user</h2>
+        <p class="text-sm text-gray-700 mb-1">
+            Delete <code id="delete-username" class="bg-gray-100 px-1 rounded font-semibold"></code>?
+        </p>
+        <p class="text-xs text-gray-500 mb-3">
+            This is <span class="font-semibold text-red-700">permanent</span>.
+            The user row is removed and they can't log in anymore. Audit log
+            entries keep the username as a string for historical reference.
+        </p>
+        <div class="mb-3">
+            <label class="block text-xs font-medium text-gray-700 mb-1">
+                Type <code id="delete-username-confirm" class="bg-gray-100 px-1 rounded font-semibold"></code> to confirm
+            </label>
+            <input id="delete-confirm-input" type="text" autocomplete="off"
+                   class="block w-full border rounded px-2 py-1.5 text-sm">
+        </div>
+        <div id="delete-error" class="hidden text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-3"></div>
+        <div class="flex justify-end gap-2">
+            <button type="button" class="modal-cancel" data-close="delete-confirm-modal">Cancel</button>
+            <button type="button" id="delete-confirm-btn" class="modal-danger" disabled>Delete permanently</button>
         </div>
     </div>
 </div>
@@ -237,6 +266,23 @@
         const disableBtn = u.disabled
             ? `<button class="action-btn" onclick="enableUser('${escapeAttr(u.username)}')">Enable</button>`
             : `<button class="action-btn action-btn-danger" ${isSelf ? 'disabled title="You cannot disable yourself"' : ''} onclick="confirmDisable('${escapeAttr(u.username)}')">Disable</button>`;
+        // v3.5.2: Delete button with three independent disabled reasons.
+        // Each tooltip explains why — the user can see "why is this grey"
+        // without having to click. Server is still source of truth, so
+        // an unexpected 400 is possible (e.g. another admin was deleted
+        // in a different tab between page load and click), but the
+        // modal renders the server error inline.
+        let deleteDisabledReason = null;
+        if (isSelf) {
+            deleteDisabledReason = 'You cannot delete yourself';
+        } else if (u.is_bootstrap_admin) {
+            deleteDisabledReason = 'Bootstrap admin cannot be deleted. Disable instead.';
+        } else if (u.is_last_admin) {
+            deleteDisabledReason = 'Cannot delete the only remaining admin. Promote another user first.';
+        }
+        const deleteBtn = deleteDisabledReason
+            ? `<button class="action-btn action-btn-danger" disabled title="${escapeAttr(deleteDisabledReason)}">Delete</button>`
+            : `<button class="action-btn action-btn-danger" onclick="confirmDelete('${escapeAttr(u.username)}')">Delete</button>`;
         return `
             <tr>
                 <td class="px-4 py-2.5 font-medium text-gray-800">${escapeHtml(u.username)}${u.is_bootstrap_admin ? ' <span class="text-[10px] text-gray-400" title="Bootstrap admin (created by hermes-orch init)">(bootstrap)</span>' : ''}</td>
@@ -247,6 +293,7 @@
                 <td class="px-4 py-2.5 text-right whitespace-nowrap">
                     <button class="action-btn" onclick="openResetPw('${escapeAttr(u.username)}')">Reset password</button>
                     ${disableBtn}
+                    ${deleteBtn}
                 </td>
             </tr>
         `;
@@ -419,6 +466,58 @@
             alert('Network error: ' + err.message);
         }
     }
+
+    // Delete (v3.5.2): open confirm modal, require user to type the
+    // username, then DELETE. Per user decision (sign-off 2026-07-31):
+    // simple confirm like disable, not GitHub-style typed-name gate.
+    // We keep "must type to confirm" anyway because the same modal is
+    // already proven pattern for irreversible ops in the v3.5.1 era;
+    // removing it would lower the safety floor.
+    function confirmDelete(username) {
+        document.getElementById('delete-username').textContent = username;
+        document.getElementById('delete-username-confirm').textContent = username;
+        const input = document.getElementById('delete-confirm-input');
+        input.value = '';
+        document.getElementById('delete-confirm-btn').disabled = true;
+        clearModalError('delete-error');
+        openModal('delete-confirm-modal');
+        setTimeout(() => input.focus(), 50);
+    }
+    // Live-gate the Delete button on whether the typed value matches
+    // the target username (case-insensitive — usernames are NOCASE in
+    // the DB so we match the same way for the confirm input).
+    document.getElementById('delete-confirm-input').addEventListener('input', (e) => {
+        const typed = e.target.value.trim();
+        const target = document.getElementById('delete-username').textContent.trim();
+        document.getElementById('delete-confirm-btn').disabled =
+            typed.toLowerCase() !== target.toLowerCase();
+    });
+    document.getElementById('delete-confirm-btn').addEventListener('click', async () => {
+        const btn = document.getElementById('delete-confirm-btn');
+        btn.disabled = true;
+        clearModalError('delete-error');
+        const target = document.getElementById('delete-username').textContent;
+        try {
+            const r = await fetch(`/api/users/${encodeURIComponent(target)}`, {
+                method: 'DELETE',
+                credentials: 'same-origin',
+            });
+            if (!r.ok) {
+                const data = await r.json().catch(() => ({}));
+                const detail = data.detail;
+                const msg = typeof detail === 'string' ? detail : (detail?.message || `Failed (${r.status})`);
+                showModalError('delete-error', msg);
+                // Re-enable the button so the user can retry / close.
+                btn.disabled = false;
+                return;
+            }
+            closeModal('delete-confirm-modal');
+            await loadUsers();
+        } catch (err) {
+            showModalError('delete-error', 'Network error: ' + err.message);
+            btn.disabled = false;
+        }
+    });
 
     // ===== Init =====
     (async function init() {

@@ -1,5 +1,5 @@
 # coding: utf-8
-"""Dashboard user management API (v3.5.0, 2026-07-31).
+"""Dashboard user management API (v3.5.2, 2026-07-31).
 
 Admin-only CRUD endpoints for managing the human users that can sign
 into the dashboard. Lives separately from `auth.py` because:
@@ -13,11 +13,13 @@ Endpoints (all require cookie auth + role=admin):
   POST   /api/users/{username}/password   — admin reset (no old password)
   POST   /api/users/{username}/disable    — set disabled=1
   POST   /api/users/{username}/enable     — set disabled=0
+  DELETE /api/users/{username}            — hard delete (v3.5.2)
 
-Out of scope for v3.5.0 (CLI only):
-  - delete (intentionally — disable is the soft-delete semantic)
+Out of scope (CLI only or future):
   - role change (intentionally — admin demoting self could lock out)
   - "change my own password" (already exists at /api/auth/password)
+  - bulk delete
+  - CLI parity for delete (v3.5.2: UI only; CLI later)
 """
 from __future__ import annotations
 
@@ -29,7 +31,9 @@ from pydantic import BaseModel, Field
 from hermes_orch.auth.cookie import (
     ROLE_ADMIN,
     ROLE_USER,
+    count_active_admins,
     create_user,
+    delete_user,
     get_user_by_username,
     list_users,
     set_user_disabled,
@@ -118,10 +122,30 @@ async def list_all_users(request: Request, admin: dict[str, Any] = Depends(requi
             "created_at": r["created_at"],
             "last_login_at": r.get("last_login_at"),
             "has_password": password_status.get(r["username"], False),
+            # v3.5.2: pre-compute is_last_admin on the server so the UI
+            # can disable the Delete button without second-guessing
+            # (avoids a "click → 400" loop). A user is "last admin" if
+            # they are currently an active admin AND no other active
+            # admin exists. Disabled admins don't count.
+            "is_last_admin": (
+                r["role"] == ROLE_ADMIN
+                and not r.get("disabled")
+                and await _is_only_active_admin(
+                    request.app.state.db, exclude_user_id=r["id"]
+                )
+            ),
         }
         for r in rows
     ]
     return {"users": users}
+
+
+async def _is_only_active_admin(db, exclude_user_id: str) -> bool:
+    """True if excluding this user leaves zero active admins. Used by
+    list_all_users() to compute is_last_admin per row. Wraps
+    count_active_admins for a cleaner read at the call site.
+    """
+    return (await count_active_admins(db, exclude_user_id=exclude_user_id)) == 0
 
 
 @router.post("", status_code=201)
@@ -253,3 +277,98 @@ async def enable_user(
     except Exception:
         pass
     return {"ok": True, "username": username, "disabled": False}
+
+
+@router.delete("/{username}")
+async def delete_existing_user(
+    username: str,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """Hard-delete a user (v3.5.2). IRREVERSIBLE — the row is gone.
+
+    Guard order matters for which error message the user sees. The
+    three guards target distinct, non-overlapping concerns, so the
+    order is: most-specific-row-property first, then safety
+    invariants, then UX niceties.
+
+      1. Bootstrap admin (row property) — "Disable instead"
+      2. Last-admin (safety) — "Promote another user first"
+      3. Self-delete (UX) — "Ask another admin"
+
+    Why this order: if the caller is the only admin AND is the
+    bootstrap admin, the bootstrap guard fires (more specific).
+    If the caller is the only non-bootstrap admin and tries to
+    delete themselves, the last-admin guard fires (most critical
+    to surface — they would lock out the system). Self-guard only
+    fires when there's a second admin around to take over.
+
+    Returns 404 if the user doesn't exist (so you can re-call with
+    the same id without a 500).
+
+    The user's session is invalidated on next request (the cookie's
+    signed user_id is rejected because the row is gone). The audit
+    log entry keeps the username string for historical reference —
+    it's TEXT, not FK, so deleting the row doesn't cascade.
+    """
+    db = request.app.state.db
+    user = await get_user_by_username(db, username)
+    if not user:
+        raise HTTPException(404, f"User '{username}' not found")
+
+    # Guard 1: bootstrap admin is permanent (v3.5.2 user decision).
+    # The bootstrap flag is historical metadata meaning "this row was
+    # auto-created on fresh install" — the user can promote other admins
+    # and then disable (not delete) the bootstrap row if needed.
+    if user.get("is_bootstrap_admin"):
+        raise HTTPException(
+            400,
+            "Cannot delete the bootstrap admin. Disable instead if you "
+            "want to revoke access.",
+        )
+
+    # Guard 2: last-admin protection. If the target is an active admin
+    # and removing them would leave zero active admins, reject. Backstop
+    # against accidental lock-out. Disabled admins don't count (they
+    # can't act as admin even if role='admin'). Without this guard
+    # in this position, a sole-admin could delete themselves — the
+    # self-guard below would catch it, but with a less-informative
+    # error message ("you cannot delete yourself" doesn't tell the
+    # user *why* — they'd wonder if it's a permissions issue).
+    if user["role"] == ROLE_ADMIN and not user.get("disabled"):
+        remaining = await count_active_admins(db, exclude_user_id=user["id"])
+        if remaining == 0:
+            raise HTTPException(
+                400,
+                "Cannot delete the only remaining admin. Promote "
+                "another user to admin first.",
+            )
+
+    # Guard 3: self-delete would invalidate the caller's own session
+    # mid-request. The signed cookie would be orphaned, and the admin
+    # would have to log back in just to verify the delete went through.
+    # This guard only fires when guards 1 and 2 didn't, which means
+    # the caller has at least one other active admin available.
+    if user["id"] == admin["id"]:
+        raise HTTPException(400, "You cannot delete yourself. Ask another admin.")
+
+    await delete_user(db, user["id"])
+    try:
+        await audit_log(
+            db,
+            "user.deleted",
+            actor=admin["username"],
+            payload={
+                "target_username": user["username"],
+                "target_user_id": user["id"],
+                "target_role": user["role"],
+                "was_bootstrap_admin": bool(user.get("is_bootstrap_admin")),
+            },
+        )
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "username": user["username"],
+        "deleted": True,
+    }
