@@ -28,7 +28,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/drawflow@0.0.59/dist/drawflow.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
-<script defer src="/static/visual_plan.js?v=2026-08-01-v380"></script>
+<script defer src="/static/visual_plan.js?v=2026-08-01-v3100"></script>
 <style>
     /* Page-specific layout */
     body { background: #f9fafb; }
@@ -102,6 +102,34 @@
         padding: 1px 5px;
         border-radius: 3px;
         display: inline-block;
+    }
+    /* v3.9.0 (Phase 2 UX): SOUL binding pill on each step card.
+       Sits next to .vp-node-role. Two visual states:
+         - .vp-node-soul.bound   = preset row exists for this role
+                                  (green background, ready to dispatch)
+         - .vp-node-soul.unbound = no preset yet (gray, the orch
+                                  server will auto-populate on first
+                                  dispatch via soul_dispatch.py)
+       Informational only (read-only, no click target). The emoji
+       prefix 🎯 matches the spec's "🎯 SOUL: cpi-analyst" example.
+       Mirrors the dark-mode palette lock from v3.7.1
+       (slate-900 canvas, slate-800 cards, slate-700 borders) —
+       green-300 for bound, slate-500 for unbound, both readable
+       on slate-900. */
+    .vp-node-soul {
+        font-size: 10px;
+        padding: 1px 5px;
+        border-radius: 3px;
+        display: inline-block;
+        margin-left: 2px;
+    }
+    .vp-node-soul.bound {
+        color: #065f46;
+        background: #d1fae5;
+    }
+    .vp-node-soul.unbound {
+        color: #4b5563;
+        background: #f3f4f6;
     }
     .vp-node-action {
         color: #2563eb;
@@ -254,6 +282,23 @@
     body.dark .vp-node-role {
         background: #334155;
         color: #cbd5e1;
+    }
+    /* v3.9.0 (Phase 2 UX): SOUL pill dark-mode treatment.
+       Light-mode .bound = #d1fae5 bg / #065f46 text. On slate-900
+       canvas that becomes a bright green chip that looks like an
+       unrelated notification. Use the v3.7.1 sister-page palette:
+         - bound:   #064e3b bg / #86efac text  (dark green-800 /
+                    green-300; matches .pill-healthy in base.html)
+         - unbound: #334155 bg / #94a3b8 text  (slate-700 / slate-400;
+                    matches .vp-node-role in dark mode)
+       Both have > 4.5:1 contrast against the slate-800 card. */
+    body.dark .vp-node-soul.bound {
+        background: #064e3b;
+        color: #86efac;
+    }
+    body.dark .vp-node-soul.unbound {
+        background: #334155;
+        color: #94a3b8;
     }
     body.dark .vp-node-action { color: #60a5fa; }  /* blue-400 */
     body.dark .vp-node-deps { color: #94a3b8; }

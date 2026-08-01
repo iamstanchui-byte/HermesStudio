@@ -329,6 +329,70 @@
     }
 
     // ===== Init =====
+    // v3.9.0 (Phase 2 UX): SOUL-preset cache. The plan editor needs
+    // to know which step.agent_roles have a project_soul_presets row
+    // (so the pill on each card can render green vs gray). We fetch
+    // /api/projects/{id}/plan/presets once, cache for `ttl_s`
+    // seconds, and re-render the canvas when the cache fills so the
+    // pills appear without forcing the user to wait. On a cache miss
+    // after TTL expiry (the user keeps the editor open for a long
+    // time and saves a new preset) the next re-render triggers a
+    // background re-fetch. The cache key is per-project so switching
+    // projects (via Save as workflow + load) doesn't leak state.
+    let _presetCache = null;        // {project_id, presets, fetched_at, ttl_s}
+    const _PRESET_TTL_DEFAULT_S = 30;
+
+    async function _loadPresets(force) {
+        if (!_projectId) return;
+        const now = Date.now() / 1000;
+        if (!force && _presetCache
+            && _presetCache.project_id === _projectId
+            && (now - _presetCache.fetched_at) < (_presetCache.ttl_s || _PRESET_TTL_DEFAULT_S)) {
+            return _presetCache.presets;
+        }
+        try {
+            const r = await fetch('/api/projects/' + encodeURIComponent(_projectId) + '/plan/presets',
+                { credentials: 'same-origin' });
+            if (!r.ok) {
+                // 404 (project gone) or 5xx — leave the cache empty
+                // so the pill falls back to "unbound" (gray). The
+                // next render will retry.
+                _presetCache = { project_id: _projectId, presets: [], fetched_at: now, ttl_s: _PRESET_TTL_DEFAULT_S };
+                return [];
+            }
+            const body = await r.json();
+            _presetCache = {
+                project_id: _projectId,
+                presets: (body && body.presets) || [],
+                fetched_at: now,
+                ttl_s: (body && body.ttl_seconds) || _PRESET_TTL_DEFAULT_S,
+            };
+            return _presetCache.presets;
+        } catch (e) {
+            // Network error — leave the cache empty, fall through
+            // to "unbound" pill until the next render. Don't surface
+            // a banner for a background fetch; the user can save
+            // and reload if they need the freshest data.
+            _presetCache = { project_id: _projectId, presets: [], fetched_at: now, ttl_s: _PRESET_TTL_DEFAULT_S };
+            return [];
+        }
+    }
+
+    // Build a role_name -> "bound"|"unbound" lookup for the canvas
+    // render. A role is "bound" if ANY preset has that role_name
+    // (multiple profiles can have the same role; presence of one
+    // is enough to mark the step as bound). Empty agent_role is
+    // never bound (no preset can match the empty string by design).
+    function _presetBoundMap(presets) {
+        const m = {};
+        for (const p of presets || []) {
+            const rn = p && p.role_name;
+            if (!rn) continue;
+            m[rn] = true;
+        }
+        return m;
+    }
+
     function init() {
         const wrap = $('vp-wrap');
         if (!wrap) return;
@@ -421,6 +485,24 @@
         // Render initial nodes
         renderAllSteps();
         updateMinimap();
+        // v3.9.0 (Phase 2 UX): kick off the preset fetch in the
+        // background so the SOUL pill on each card gets a bound vs
+        // unbound color. We render once above (pills default to
+        // "unbound" / gray), then re-render once the fetch resolves
+        // so bound pills switch to green. The user sees a brief
+        // gray-then-green flash on first paint — acceptable because
+        // the page-load fetch is sub-50ms on local LAN and the user
+        // is reading the plan name, not the pill, in that window.
+        // We don't await — keep init() synchronous so the editor
+        // becomes interactive immediately. The re-render is gated
+        // by `_history._isRendering` to avoid creating an
+        // undo-stack entry for the background re-render.
+        _loadPresets(false).then(() => {
+            if (!_editor) return;  // user navigated away before fetch
+            _history._isRendering = true;
+            try { renderAllSteps(); }
+            finally { _history._isRendering = false; }
+        });
         // v2.2: bind global keyboard shortcuts (Ctrl+Z/Y/C/V, Escape)
         // and initialize the undo/redo button states (both disabled
         // at start because undo stack is empty).
@@ -580,6 +662,48 @@
         const rolePill = step.agent_role
             ? `<span class="vp-node-role">${escapeHtml(step.agent_role)}</span>`
             : `<span class="vp-node-role" style="opacity:0.5">any</span>`;
+        // v3.9.0 (Phase 2 UX): SOUL binding pill. "🎯" emoji + the
+        // role_name, colored by whether a project_soul_presets row
+        // exists. bound = green (preset exists, will apply on
+        // dispatch), unbound = gray (orch server will auto-populate
+        // on first dispatch). The pill sits in the same .vp-node-header
+        // row as the role pill so the user can scan role + SOUL state
+        // at a glance. data-soul-bound is set so Playwright / e2e
+        // tests can assert the visual state without re-parsing the
+        // CSS class.
+        //
+        // The bound map is built from _presetCache (populated by
+        // _loadPresets at init time). On a fresh page load the cache
+        // is empty so all pills render as "unbound" briefly; the
+        // background fetch completes in <50ms and the init()
+        // wrapper re-renders to swap them to "bound" where
+        // applicable. We keep the API of nodeHtml synchronous so
+        // the renderAllSteps re-render doesn't need to await.
+        //
+        // Bug history: an earlier version used `\\'` (backslash +
+        // apostrophe) inside the single-quoted "unbound" title
+        // string. The `\\` becomes a single backslash, and the
+        // trailing `'` closes the string early — leaving
+        // `s default_soul...` as invalid JS source. Symptom was
+        // "Missing } in template expression" (the browser's way of
+        // saying the template literal's ${...} expression was
+        // unclosed because the syntax error was at the inner
+        // string boundary). We use `&apos;` HTML entity in the
+        // attribute value instead — safer than escape-sequence
+        // gymnastics.
+        let soulPill = '';
+        if (step.agent_role) {
+            const boundMap = _presetBoundMap(_presetCache && _presetCache.presets);
+            const isBound = !!boundMap[step.agent_role];
+            const cls = isBound ? 'bound' : 'unbound';
+            const label = isBound
+                ? `🎯 SOUL: ${step.agent_role}`
+                : `🎯 auto-SOUL`;
+            const tip = isBound
+                ? 'A SOUL preset is bound to this role — the orch server will apply it on dispatch.'
+                : 'No preset yet — the orch server will auto-populate a SOUL on first dispatch (from the workflow step&apos;s default_soul or a generic role template).';
+            soulPill = `<span class="vp-node-soul ${cls}" data-soul-bound="${isBound ? '1' : '0'}" title="${tip}">${escapeHtml(label)}</span>`;
+        }
         const action = step.action
             ? `<div class="vp-node-action">${escapeHtml(step.action)}</div>`
             : '';
@@ -599,6 +723,7 @@
                 <div class="vp-node-header">
                     <span class="vp-node-name">${escapeHtml(step.name)}</span>
                     ${rolePill}
+                    ${soulPill}
                 </div>
                 ${action}
                 ${depsHtml}
@@ -1096,6 +1221,16 @@
                 showBanner('Save failed: ' + _errDetailToString(d.detail, r.status), 'error');
                 return;
             }
+            // v3.9.0 (Phase 2 UX): the plan may have a brand-new
+            // step.agent_role that needs a fresh preset lookup
+            // (e.g. user added a "reviewer" step to a project that
+            // has no reviewer preset yet). Invalidate the cache so
+            // the next render fetches the new state. We don't
+            // re-render here — the user-visible state didn't change
+            // (pills are still "unbound" until they save a preset on
+            // the project page); the next drag/edit will re-render
+            // with the fresh data.
+            _presetCache = null;
             showBanner('Plan saved (' + _plan.steps.length + ' step(s))', 'success');
         } catch (e) {
             showBanner('Network error: ' + e.message, 'error');
@@ -1519,7 +1654,12 @@
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({goal: goal}),
                 },
-                180_000,  // 3 min for LLM
+                480_000,  // 8 min — LLM can be slow for long Chinese prompts
+                            // + complex plans. The server-side planner
+                            // has its own 60s timeout and falls back to
+                            // mock on LLM failure, so a "real" timeout
+                            // here usually means the planner is in a
+                            // queue/retry loop on the LLM provider side.
             );
             // v3.5.2: defensive JSON parsing. The fetch() itself
             // succeeded (got a Response object), but the body might
@@ -1668,6 +1808,15 @@
         openGeneratePlanModal: openGeneratePlanModal,
         closeGeneratePlanModal: closeGeneratePlanModal,
         generatePlanFromLlm: generatePlanFromLlm,
+        // v3.9.0 (Phase 2 UX): expose preset-cache hooks so e2e
+        // tests can wait for the cache to fill and re-render. The
+        // cache is module-private otherwise (no need for app code
+        // to read it). `loadPresets(force)` returns the presets
+        // array (cached or fresh-fetched). `getPresetCache()` is
+        // a sync accessor for tests that need to assert the cache
+        // state without awaiting a fetch.
+        loadPresets: _loadPresets,
+        getPresetCache: function() { return _presetCache; },
         // Per 2026-07-28: called by the "Apply workflow" modal when
         // the plan editor is the host page. Appends the supplied
         // step dicts to _plan.steps, re-renders the canvas so
