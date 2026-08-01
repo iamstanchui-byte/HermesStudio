@@ -163,7 +163,36 @@ def create_app() -> FastAPI:
         re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/tool-ack/?$"),
         re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/tool-output/?$"),
         re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/(?:start|update|complete|fail|log|abort)/?$"),
-        re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/(?:skills|mcp|llm)/.*$"),
+        # v3.10.3 (2026-08-02) BUGFIX: `/(?:skills|mcp|llm)/.*$` requires
+        # at least a `/` after the resource name. The wrapper calls
+        # `/api/agents/{id}/profiles/{name}/skills` (NO trailing slash,
+        # query string `?include_deleted=1` is stripped to the path
+        # before regex.match), which doesn't match this pattern, so
+        # the user-cookie middleware returns 401 "Not authenticated"
+        # BEFORE the route handler (or `require_hmac_auth`) ever runs.
+        # The endpoint itself is HMAC-authed via Depends — there's no
+        # reason the middleware should be blocking it. Add `/?` before
+        # `.*$` so the path is allowed with or without a trailing
+        # slash (and with arbitrary query string after, since the
+        # middleware strips the query before testing).
+        re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/(?:skills|mcp|llm)/?.*$"),
+        # v3.10.3 (2026-08-02) BUGFIX: bootstrap secret endpoint
+        # `/api/agents/{id}/secret` was missing from the allowlist
+        # (the endpoint itself is intentionally unauthenticated
+        # per the inline docstring in api/agents.py — it's the
+        # one-shot HMAC bootstrap that pushes the wrapper's shared
+        # secret into the DB on wrapper startup). Without this
+        # entry, the user-cookie middleware returned 401 BEFORE
+        # the route handler, so every wrapper restart printed
+        # `[hmac] WARNING: bootstrap returned 401` and the operator
+        # saw a noisy startup log. The endpoint is harmless to
+        # allowlist: it accepts a body, validates the agent exists,
+        # and only mutates `hmac_secret` if the supplied value
+        # matches (idempotent 200) or is NULL (one-shot 201); a
+        # mismatched value returns 409 with no DB change. So an
+        # allowlist entry here only blocks the middleware's
+        # cookie check, not the endpoint's own consistency logic.
+        re.compile(r"^/api/agents/[^/]+/secret/?$"),
         # v3.5.2 follow-up: GET single agent (HMAC-authed, used by
         # the wrapper for self-lookup / config sync).
         re.compile(r"^/api/agents/[^/]+/?$"),
