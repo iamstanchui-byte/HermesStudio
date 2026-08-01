@@ -544,12 +544,20 @@ they target different agent profiles. -->
     <div class="mt-2 text-xs text-gray-500">
         Apply loads the preset's content into that profile's <code>SOUL.md</code> on the agent host. Wrapper picks it up within 5s.
     </div>
+    {% else %}
+    <div class="text-xs text-gray-400">
+        No presets yet. Click "+ New preset" to save a SOUL.md draft for one of this project's roles. Multiple projects can target different agent profiles and run in parallel.
+    </div>
+    {% endif %}
     {# v3.9.0 (Phase 3): "From template" modal. Lives inside the
-       SOUL editor section so it disappears when the editor is
-       hidden (the toggle is per-user, and the modal is part of
-       the editor UX). Lists published templates, lets the
-       operator preview the content, and creates a preset bound
-       to a chosen profile. #}
+       SOUL editor section (so it disappears when the editor is
+       hidden — the toggle is per-user) but OUTSIDE the
+       `{% if soul_presets %}` block above. The first-time use case
+       is "no presets yet → click From template to create the
+       first one", so the modal must render in the empty state
+       too. Previously the modal was nested inside the if block,
+       which made the button a no-op until at least one preset
+       existed — exactly backwards. #}
     <div id="from-template-modal-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center" style="background-color: rgba(0,0,0,0.5);">
         <div class="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-screen overflow-y-auto p-5">
             <h2 class="text-lg font-semibold text-gray-800 mb-1">📚 Pick a SOUL template</h2>
@@ -577,11 +585,6 @@ they target different agent profiles. -->
             <div id="from-template-status" class="mt-2 text-xs"></div>
         </div>
     </div>
-    {% else %}
-    <div class="text-xs text-gray-400">
-        No presets yet. Click "+ New preset" to save a SOUL.md draft for one of this project's roles. Multiple projects can target different agent profiles and run in parallel.
-    </div>
-    {% endif %}
 </div>
 {% endif %}
 
