@@ -699,10 +699,37 @@
             const label = isBound
                 ? `🎯 SOUL: ${step.agent_role}`
                 : `🎯 auto-SOUL`;
-            const tip = isBound
-                ? 'A SOUL preset is bound to this role — the orch server will apply it on dispatch.'
-                : 'No preset yet — the orch server will auto-populate a SOUL on first dispatch (from the workflow step&apos;s default_soul or a generic role template).';
-            soulPill = `<span class="vp-node-soul ${cls}" data-soul-bound="${isBound ? '1' : '0'}" title="${tip}">${escapeHtml(label)}</span>`;
+            // For the unbound case, surface the LLM-drafted
+            // `default_soul` (set by the chat planner when the
+            // role has no preset yet — v3.10.0 "both" mode). We
+            // truncate to ~200 chars for the tooltip; the full
+            // text is shown in the SOUL preview modal that opens
+            // on click (see `openSoulPreview`).
+            let tip;
+            if (isBound) {
+                tip = 'A SOUL preset is bound to this role — the orch server will apply it on dispatch.';
+            } else if (step.default_soul && step.default_soul.trim()) {
+                const preview = step.default_soul.trim();
+                const short = preview.length > 200
+                    ? preview.slice(0, 200).replace(/\s+/g, ' ').trim() + '…'
+                    : preview;
+                tip = 'No preset yet — the LLM drafted this default_soul at plan time. ' +
+                    'Click to view the full text.\n\n' + short;
+            } else {
+                tip = 'No preset yet — the orch server will auto-populate a SOUL on first dispatch ' +
+                    '(from a generic role template). Click to add one.';
+            }
+            // data-soul-default holds the full text for the
+            // preview modal (the title attribute is HTML-escaped
+            // by the browser so the full text is fine here as
+            // long as we JSON-encode the surrounding quotes).
+            const dataDefault = step.default_soul
+                ? escapeHtmlAttr(JSON.stringify(step.default_soul))
+                : '';
+            const onclick = isBound
+                ? ''
+                : ' onclick="window.VP_SOUL_PREVIEW && window.VP_SOUL_PREVIEW(this)"';
+            soulPill = `<span class="vp-node-soul ${cls}" data-soul-bound="${isBound ? '1' : '0'}" data-soul-default='${dataDefault}' title="${escapeHtmlAttr(tip)}"${onclick}>${escapeHtml(label)}</span>`;
         }
         const action = step.action
             ? `<div class="vp-node-action">${escapeHtml(step.action)}</div>`
@@ -1870,6 +1897,119 @@
             return true;
         },
     };
+
+    // ===== SOUL preview modal (v3.10.0) =====
+    // Click on the "🎯 auto-SOUL" pill on a step card to see the
+    // full default_soul text the LLM drafted at plan time. The
+    // pill itself only fits ~5 chars in the title attribute;
+    // longer SOULs need a real modal. Bound below as
+    // `window.VP_SOUL_PREVIEW` so the inline `onclick` on each
+    // pill (added in nodeHtml) can call it.
+    //
+    // v3.10.0: in the "both" mode, the LLM writes a default_soul
+    // for every step whose role has no preset yet. The user
+    // needs a way to read that text — it's the persona the agent
+    // will adopt on first dispatch. The modal also lets them
+    // copy it to clipboard (for editing into a SOUL template
+    // later).
+    function _openSoulPreview(pillEl) {
+        if (!pillEl) return;
+        // data-soul-default is JSON-encoded (so the value is
+        // safe to embed in an HTML attribute even when the
+        // default_soul contains quotes, newlines, etc.).
+        let raw = '';
+        try {
+            raw = pillEl.getAttribute('data-soul-default') || '';
+            if (raw) raw = JSON.parse(raw);
+        } catch (e) {
+            raw = '';
+        }
+        const role = (pillEl.closest('.drawflow-node')?.querySelector('.vp-node-role')?.textContent
+            || pillEl.parentElement?.querySelector('.vp-node-role')?.textContent
+            || '?').trim();
+        const hasSoul = !!(raw && raw.trim());
+        // Build the modal markup. Lazy-create the element so the
+        // visual_plan.html template doesn't need a new block.
+        let overlay = document.getElementById('vp-soul-preview-overlay');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = 'vp-soul-preview-overlay';
+            overlay.className = 'hidden fixed inset-0 z-50 flex items-center justify-center';
+            overlay.style.backgroundColor = 'rgba(0,0,0,0.5)';
+            overlay.innerHTML = `
+<div class="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-[80vh] flex flex-col" onclick="event.stopPropagation()">
+    <div class="px-5 py-3 border-b flex items-center justify-between flex-shrink-0">
+        <h2 class="text-base font-semibold text-gray-800 dark:text-gray-100">
+            🎯 default_soul — <span id="vp-soul-preview-role" class="font-mono"></span>
+        </h2>
+        <button type="button" id="vp-soul-preview-close"
+                class="text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 text-2xl leading-none"
+                aria-label="Close">×</button>
+    </div>
+    <div class="p-5 overflow-y-auto flex-1">
+        <p id="vp-soul-preview-blurb" class="text-xs text-gray-500 dark:text-gray-400 mb-3"></p>
+        <textarea id="vp-soul-preview-text" readonly
+                  class="block w-full border rounded p-3 text-sm font-mono whitespace-pre-wrap"
+                  style="min-height: 200px;"></textarea>
+    </div>
+    <div class="px-5 py-3 border-t flex items-center justify-end gap-2 flex-shrink-0">
+        <button type="button" id="vp-soul-preview-copy"
+                class="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-sm hover:bg-gray-200">
+            Copy
+        </button>
+        <button type="button" id="vp-soul-preview-ok"
+                class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+            Close
+        </button>
+    </div>
+</div>`;
+            document.body.appendChild(overlay);
+            // Wire close handlers (idempotent — only the first call
+            // actually attaches since the element persists).
+            overlay.addEventListener('click', (ev) => {
+                if (ev.target === overlay) overlay.classList.add('hidden');
+            });
+            document.getElementById('vp-soul-preview-close').onclick = () => overlay.classList.add('hidden');
+            document.getElementById('vp-soul-preview-ok').onclick = () => overlay.classList.add('hidden');
+            document.getElementById('vp-soul-preview-copy').onclick = () => {
+                const ta = document.getElementById('vp-soul-preview-text');
+                if (!ta) return;
+                ta.select();
+                try {
+                    const ok = document.execCommand('copy');
+                    const btn = document.getElementById('vp-soul-preview-copy');
+                    const orig = btn.textContent;
+                    btn.textContent = ok ? 'Copied!' : 'Copy failed';
+                    setTimeout(() => { btn.textContent = orig; }, 1500);
+                } catch (e) { /* clipboard not available */ }
+            };
+            // Esc closes the modal.
+            document.addEventListener('keydown', (ev) => {
+                if (ev.key === 'Escape' && !overlay.classList.contains('hidden')) {
+                    overlay.classList.add('hidden');
+                }
+            });
+        }
+        // Populate the modal contents.
+        document.getElementById('vp-soul-preview-role').textContent = role;
+        const blurb = document.getElementById('vp-soul-preview-blurb');
+        const ta = document.getElementById('vp-soul-preview-text');
+        if (hasSoul) {
+            blurb.textContent = 'The LLM drafted this default_soul at plan time. ' +
+                'The orch server will write it to the agent\u2019s SOUL.md on first dispatch ' +
+                '(via _ensure_soul_preset in dispatch_step). You can also save it as a SOUL template ' +
+                'for reuse in other projects.';
+            ta.value = raw;
+        } else {
+            blurb.textContent = 'No default_soul was set by the LLM for this step. The orch server ' +
+                'will use a generic role template on first dispatch. Click "SOUL presets" on the project ' +
+                'page to add a real preset for this role.';
+            ta.value = '';
+        }
+        overlay.classList.remove('hidden');
+    }
+    // Expose for the inline onclick on each pill.
+    window.VP_SOUL_PREVIEW = _openSoulPreview;
 
     // ===== Bootstrap =====
     if (document.readyState === 'loading') {
