@@ -628,6 +628,56 @@ MIGRATIONS = [
     # this value (10s timeout), which is how we confirm the write
     # actually landed without guessing with a sleep.
     "ALTER TABLE project_soul_presets ADD COLUMN last_applied_mtime TEXT DEFAULT NULL",
+    # ===== v3.9.0 (Phase 3): SOUL preset versioning =====
+    # New `project_soul_preset_versions` table — one row per edit
+    # to a preset's `content` or `default_soul`. The "head" columns
+    # on `project_soul_presets` stay denormalized (fast read at
+    # dispatch time) but every change is recorded here so the user
+    # can see "preset v3 of 5" and roll back. The `version_number`
+    # is monotonic per preset (1, 2, 3, ...). `applied_at` is set
+    # when a dispatch writes this version to a host's SOUL.md
+    # (NULL while the version is still "pending head"). Created
+    # via IF NOT EXISTS (idempotent on re-run; safe with the
+    # 'duplicate table' / 'duplicate column' swallow in connect()).
+    # Backward compat: existing presets with no version history
+    # get a synthetic v1 row on the first edit post-migration
+    # (see api/projects.py::_backfill_preset_v1).
+    "CREATE TABLE IF NOT EXISTS project_soul_preset_versions ("
+    "  id TEXT PRIMARY KEY,"
+    "  preset_id TEXT NOT NULL,"
+    "  version_number INTEGER NOT NULL,"
+    "  content TEXT NOT NULL,"
+    "  default_soul TEXT,"
+    "  applied_at TIMESTAMP,"
+    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+    "  created_by TEXT NOT NULL DEFAULT 'orch_server',"
+    "  FOREIGN KEY (preset_id) REFERENCES project_soul_presets(id) ON DELETE CASCADE,"
+    "  UNIQUE (preset_id, version_number)"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_preset_versions_preset_num "
+    "ON project_soul_preset_versions(preset_id, version_number DESC)",
+    # ===== v3.9.0 (Phase 3): SOUL template library =====
+    # Admin-published persona templates that workflow authors can
+    # pull into a project preset by name (e.g. "cpi-analyst",
+    # "code-reviewer"). Distinct from per-project presets: the
+    # template is the "design" and a preset is the "instance" —
+    # editing the template does NOT change existing presets that
+    # were instantiated from it. The `category` column is for
+    # browse/filter UI; the `description` is a 1-line summary
+    # for the template list. created_by tracks the admin user
+    # who published it (for audit).
+    "CREATE TABLE IF NOT EXISTS project_soul_templates ("
+    "  id TEXT PRIMARY KEY,"
+    "  name TEXT NOT NULL UNIQUE COLLATE NOCASE,"
+    "  category TEXT NOT NULL DEFAULT '',"
+    "  content TEXT NOT NULL,"
+    "  description TEXT NOT NULL DEFAULT '',"
+    "  created_by TEXT NOT NULL DEFAULT '',"
+    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+    "  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_soul_templates_category "
+    "ON project_soul_templates(category)",
 ]
 
 

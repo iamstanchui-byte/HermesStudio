@@ -1262,6 +1262,37 @@ async def project_page(
         (project_id,),
     )
     soul_presets = [dict(r) for r in preset_rows]
+    # v3.9.0 (Phase 3): per-preset version count + current (head)
+    # version number, so the project page can show "v3 of 5" next
+    # to each preset without a second roundtrip from the JS. The
+    # head is always MAX(version_number) — the SQL runs in one
+    # shot per project, indexed by (preset_id, version_number DESC).
+    if soul_presets:
+        version_rows = await db.fetchall(
+            "SELECT preset_id, MAX(version_number) AS head, "
+            "       COUNT(*) AS total "
+            "FROM project_soul_preset_versions "
+            "WHERE preset_id IN ("
+            "  SELECT id FROM project_soul_presets WHERE project_id = ?"
+            ") "
+            "GROUP BY preset_id",
+            (project_id,),
+        )
+        version_map = {
+            vr["preset_id"]: {
+                "current_version": int(vr["head"]),
+                "version_count": int(vr["total"]),
+            }
+            for vr in version_rows
+        }
+        for sp in soul_presets:
+            v = version_map.get(sp["id"], {})
+            sp["current_version"] = v.get("current_version", 1)
+            sp["version_count"] = v.get("version_count", 1)
+    else:
+        for sp in soul_presets:
+            sp["current_version"] = 1
+            sp["version_count"] = 1
     # Per-project token totals (so the user can see "this project used X
     # tokens" without going to the agents page). Broken down by call_kind
     # so the breakdown is visible (planner + synthesis + agent_task).
@@ -1341,6 +1372,15 @@ async def project_page(
                     })
     except Exception:
         pass  # best-effort; missing dir = no archive yet
+    # v3.9.0 (Phase 2 UX): read the user's UI-prefs cookie so the
+    # template's `session.get('show_soul_editor')` can decide whether
+    # to render the SOUL presets section. The cookie is per-user
+    # (not per-project) so the opt-in is sticky across project
+    # switches. Imported lazily to avoid a circular import with
+    # ui_prefs (which itself imports from auth/cookie).
+    from hermes_orch.api.ui_prefs import get_session_ui_prefs
+    ui_prefs = get_session_ui_prefs(request)
+
     return templates.TemplateResponse(
         request=request,
         name="project.html",
@@ -1364,6 +1404,11 @@ async def project_page(
             "archived_tasks": archived_rows,
             "archived_count": archived_count,
             "show_archived": show_archived,
+            # v3.9.0 Phase 2 UX: per-user UI flags. The template
+            # calls `session.get('show_soul_editor')` — we synthesize
+            # a `session` dict here rather than wiring a full Starlette
+            # SessionMiddleware (overkill for one boolean).
+            "session": ui_prefs,
         },
     )
 

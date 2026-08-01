@@ -345,10 +345,74 @@
 </div>
 {% endif %}
 
-<!-- Create task (collapsed) -->
-<button onclick="toggleForm('new-task-form')" class="mb-3 text-sm text-blue-600 hover:underline">
-    + Create task in this project
-</button>
+<!-- v3.9.0 (Phase 2 UX): "Create task" + advanced SOUL editor
+     toggle sit side-by-side at the top of the project page. The
+     SOUL editor is OFF by default (the orch server manages
+     presets in the v3.9.0 model — only expert users need to
+     hand-edit them). The toggle is a small form that POSTs to
+     /api/users/me/ui-prefs and reloads; the server reads the
+     response cookie on the next render and shows the section.
+     Matches the existing v3.7.0/v3.7.1 dark-mode palette
+     (text-blue-600 → text-blue-400 in dark, handled by base.html). -->
+<div class="mb-3 flex items-center gap-3 flex-wrap">
+    <button onclick="toggleForm('new-task-form')" class="text-sm text-blue-600 hover:underline">
+        + Create task in this project
+    </button>
+    {% if session.get('show_soul_editor') %}
+    <form method="post" action="/api/users/me/ui-prefs" class="inline"
+          onsubmit="event.preventDefault(); _vpSetSoulEditor(false); return false;">
+        <input type="hidden" name="show_soul_editor" value="false">
+        <button type="submit" class="text-xs text-blue-600 hover:underline"
+            title="Hide the SOUL presets editor. The orch server manages presets by default — only opt in if you need to hand-edit a SOUL.md draft.">
+            🔧 Hide SOUL editor
+        </button>
+    </form>
+    <span class="text-xs text-gray-400" title="SOUL editor is on. The orch server still owns preset management; this view lets you hand-edit drafts.">
+        SOUL editor on
+    </span>
+    {% else %}
+    <form method="post" action="/api/users/me/ui-prefs" class="inline"
+          onsubmit="event.preventDefault(); _vpSetSoulEditor(true); return false;">
+        <input type="hidden" name="show_soul_editor" value="true">
+        <button type="submit" class="text-xs text-blue-600 hover:underline"
+            title="Show the SOUL presets editor (advanced). Off by default — the orch server manages presets. Only opt in if you need to hand-edit a SOUL.md draft.">
+            🔧 Show SOUL editor
+        </button>
+    </form>
+    {% endif %}
+</div>
+<script>
+    // v3.9.0 (Phase 2 UX): client-side handler for the SOUL editor
+    // toggle. The form uses preventDefault() and posts via fetch so
+    // the page reload is clean (POST + reload = form submission with
+    // the new cookie). On success the page reloads; on failure we
+    // surface the message so the user knows to retry.
+    (function() {
+        async function _setSoulEditor(value) {
+            try {
+                const r = await fetch('/api/users/me/ui-prefs', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ show_soul_editor: !!value }),
+                });
+                if (!r.ok) {
+                    alert('Failed to toggle SOUL editor (HTTP ' + r.status + ')');
+                    return;
+                }
+                // Reload so the server reads the new cookie via
+                // Jinja's session.get(...) on render.
+                window.location.reload();
+            } catch (e) {
+                alert('Failed to toggle SOUL editor: ' + (e && e.message || e));
+            }
+        }
+        // Expose for the inline onsubmit handlers above. We use
+        // window.* to avoid a global-namespace collision with the
+        // visual plan editor (which also uses _vp* names).
+        window._vpSetSoulEditor = _setSoulEditor;
+    })();
+</script>
 
 <form id="new-task-form" class="hidden bg-white border rounded-lg p-4 mb-4 shadow-sm">
     <h3 class="text-lg font-semibold mb-3 text-gray-800">New task</h3>
@@ -384,6 +448,19 @@
     </div>
 </form>
 
+<!-- v3.9.0 (Phase 2 UX): the SOUL presets editor is HIDDEN by
+     default. The orch server manages presets in the v3.9.0 model
+     (it auto-populates them on first dispatch from the workflow
+     step's `default_soul` or a generic role template — see
+     docs/soul-routing-design.md §"Phased plan → Phase 2"). The
+     "Show SOUL editor" toggle at the top of the page sets the
+     `show_soul_editor` flag in the user's session, which makes
+     the section appear. The flag is per-user (cookie), not
+     per-project, so switching projects doesn't reset the user's
+     opt-in. The toggle button at the top of the page is the only
+     way in — there's no per-project link. -->
+
+{% if session.get('show_soul_editor') %}
 <!-- SOUL presets: per-project agent identity snapshots. Click "Apply" to
 load the preset's content into that profile's SOUL.md (via the wrapper
 apply-config flow). Multiple projects can run in parallel as long as
@@ -421,6 +498,17 @@ they target different agent profiles. -->
                     <span class="font-mono font-semibold">{{ preset.agent_id }} / {{ preset.profile_name }}</span>
                     <span class="text-gray-500 text-xs">{{ preset.content|length }}b</span>
                     <span class="text-gray-400 text-xs">updated {{ (preset.updated_at or preset.created_at or '')[:16] }}</span>
+                    {# v3.9.0 (Phase 3): version pill. Click expands
+                       the version-history list for this preset. The
+                       button is type="button" so it doesn't accidentally
+                       submit the new-preset form (which is hidden by
+                       default but shares the same parent). #}
+                    <button type="button"
+                            onclick="togglePresetHistory('{{ preset.id }}', '{{ preset.agent_id }}', '{{ preset.profile_name }}')"
+                            class="text-xs px-1.5 py-0.5 bg-indigo-100 text-indigo-800 rounded font-mono hover:bg-indigo-200"
+                            title="Show version history for this preset">
+                        v{{ preset.current_version }} of {{ preset.version_count }}
+                    </button>
                 </div>
                 <div class="flex items-center gap-1">
                     <button onclick="togglePresetEdit('{{ preset.id }}')" class="text-xs text-blue-600 hover:underline">edit</button>
@@ -435,6 +523,11 @@ they target different agent profiles. -->
                     <button onclick="togglePresetEdit('{{ preset.id }}')" class="text-xs px-2 py-0.5 bg-gray-200 rounded">Cancel</button>
                 </div>
             </div>
+            {# v3.9.0 (Phase 3): version history list, hidden by
+               default. The JS hydrates the list on first click. #}
+            <div id="preset-history-{{ preset.id }}" class="hidden mt-2 border-t pt-2">
+                <div class="preset-history-body text-xs text-gray-500">loading…</div>
+            </div>
         </div>
         {% endfor %}
     </div>
@@ -447,6 +540,7 @@ they target different agent profiles. -->
     </div>
     {% endif %}
 </div>
+{% endif %}
 
 <div class="bg-white border rounded-lg p-6 shadow-sm mb-4">
     <div class="flex items-center justify-between mb-3">
@@ -1320,6 +1414,84 @@ async function deletePreset(agentId, profileName, btn) {
         }
     } catch (err) {
         alert('Error: ' + err.message);
+    }
+}
+
+// v3.9.0 (Phase 3): version history toggle. First click fetches
+// the version list (newest first) and hydrates the history panel;
+// subsequent clicks just toggle visibility. The Restore button on
+// each row hits the rollback endpoint, which creates a new version
+// row (append-only history, like git commits).
+let _presetHistoryLoaded = new Set();
+
+async function togglePresetHistory(presetId, agentId, profileName) {
+    const panel = document.getElementById('preset-history-' + presetId);
+    if (!panel) return;
+    if (!panel.classList.contains('hidden')) {
+        panel.classList.add('hidden');
+        return;
+    }
+    panel.classList.remove('hidden');
+    if (_presetHistoryLoaded.has(presetId)) {
+        // Already hydrated; just reveal.
+        return;
+    }
+    const body = panel.querySelector('.preset-history-body');
+    if (body) body.textContent = 'loading…';
+    try {
+        const r = await fetch(
+            `/api${window.location.pathname}/soul-presets/${encodeURIComponent(agentId)}/${encodeURIComponent(profileName)}/versions`
+        );
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            if (body) body.textContent = 'Failed: ' + (err.detail || r.status);
+            return;
+        }
+        const versions = await r.json();
+        if (!Array.isArray(versions) || versions.length === 0) {
+            if (body) body.textContent = 'No version history yet.';
+            _presetHistoryLoaded.add(presetId);
+            return;
+        }
+        if (body) {
+            body.innerHTML = versions.map((v) => {
+                const created = (v.created_at || '').slice(0, 16) || '?';
+                const author = v.created_by || '?';
+                const isHead = v.version_number === versions[0].version_number;
+                const restoreBtn = isHead
+                    ? '<span class="text-gray-400 text-xs">(head)</span>'
+                    : `<button type="button" onclick="rollbackPreset(${v.version_number}, '${agentId}', '${profileName}')" class="text-xs text-blue-600 hover:underline">Restore</button>`;
+                return (
+                    '<div class="flex items-center justify-between py-0.5">' +
+                    `<span class="font-mono">v${v.version_number}</span>` +
+                    `<span class="text-gray-500">${created}</span>` +
+                    `<span class="text-gray-500">${author}</span>` +
+                    `<span class="text-gray-400">${v.content.length}b</span>` +
+                    restoreBtn +
+                    '</div>'
+                );
+            }).join('');
+        }
+        _presetHistoryLoaded.add(presetId);
+    } catch (err) {
+        if (body) body.textContent = 'Error: ' + err.message;
+    }
+}
+
+async function rollbackPreset(versionNumber, agentId, profileName) {
+    if (!confirm(`Restore v${versionNumber} of ${agentId}/${profileName}? This creates a new version with the older content; existing versions are kept.`)) return;
+    try {
+        const r = await fetch(
+            `/api${window.location.pathname}/soul-presets/${encodeURIComponent(agentId)}/${encodeURIComponent(profileName)}/rollback/${versionNumber}`,
+            {method: 'POST'}
+        );
+        if (r.ok) location.reload();
+        else {
+            const err = await r.json().catch(() => ({}));
+            alert('Rollback failed: ' + (err.detail || r.status));
+        }
+    } catch (err) {
+        alert('Rollback error: ' + err.message);
     }
 }
 </script>

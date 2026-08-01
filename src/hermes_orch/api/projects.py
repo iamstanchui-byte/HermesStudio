@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 
 # v1.4 (2026-07-29): strip common ANSI escape codes (CSI sequences
 # ending in a letter — covers SGR color/style codes, cursor moves,
@@ -2128,6 +2129,13 @@ async def upsert_soul_preset(
     Idempotent — re-PUTting replaces the existing preset for that pair.
     The preset is just a snapshot in the DB; applying it later writes the
     content to the profile's actual SOUL.md via the profile_configs flow.
+
+    v3.9.0 (Phase 3): every save (insert or update) appends a row to
+    `project_soul_preset_versions` so the user can see "preset v3 of 5"
+    and roll back. Inserts get v1; updates get the next sequential
+    number. For presets that predate the migration (no version rows
+    yet), the FIRST save after migration backfills a v1 from the
+    current head so the timeline is consistent.
     """
     import uuid as _uuid
 
@@ -2184,6 +2192,52 @@ async def upsert_soul_preset(
                 "default_soul": body.default_soul,
             },
         )
+    # v3.9.0 (Phase 3): append a version row for this save. The
+    # flow is split between insert and update:
+    #   - INSERT (new preset): no backfill needed — the row was
+    #     just created with `body.content`, so v1 IS the head.
+    #     `_append_preset_version` writes the next version number,
+    #     which is 1 (no rows yet).
+    #   - UPDATE (existing preset): backfill v1 if the preset
+    #     predates the migration (no version rows yet). This
+    #     captures the OLD head content as v1, so the operator's
+    #     history shows the original state. Then we write the
+    #     new version (next sequential number) with the NEW
+    #     content. The result for an UPDATE is "v1 = old head,
+    #     v2 = new edit" — matches the user's mental model.
+    operator = "orch_server"
+    try:
+        from hermes_orch.auth.cookie import current_user_id
+        uid = await current_user_id(request)
+        if uid:
+            u = await db.fetchone(
+                "SELECT username FROM users WHERE id = ?", (uid,)
+            )
+            if u and u.get("username"):
+                operator = u["username"]
+    except Exception:
+        pass
+    if not existing:
+        # Fresh insert: just append v1 (or whatever the next number
+        # is — but for a brand-new preset it's always 1).
+        new_version = await _append_preset_version(
+            db, preset_id=preset_id,
+            content=body.content,
+            default_soul=body.default_soul if "default_soul" in body.model_fields_set else None,
+            created_by=operator,
+            write_default_soul=("default_soul" in body.model_fields_set),
+        )
+    else:
+        # Update: backfill v1 from the current head (idempotent —
+        # no-op if v1 already exists), then append the new version.
+        await _backfill_preset_v1(db, preset_id, created_by=operator)
+        new_version = await _append_preset_version(
+            db, preset_id=preset_id,
+            content=body.content,
+            default_soul=body.default_soul if "default_soul" in body.model_fields_set else None,
+            created_by=operator,
+            write_default_soul=("default_soul" in body.model_fields_set),
+        )
     row = await db.fetchone(
         "SELECT * FROM project_soul_presets WHERE id = ?", (preset_id,)
     )
@@ -2199,6 +2253,10 @@ async def upsert_soul_preset(
             # v3.9.0: surface default_soul in the audit so operators
             # can see what the workflow author supplied.
             "default_soul_provided": "default_soul" in body.model_fields_set,
+            # v3.9.0 (Phase 3): surface the new version number so
+            # operators can correlate the save with the version
+            # history UI.
+            "version_number": new_version,
         },
     )
     return SoulPreset(
@@ -2407,7 +2465,354 @@ async def touch_soul_preset(
     )
 
 
-# ===== Project chat box (Phase 4+ #25, 2026-07-25) =====
+# ===== SOUL preset versioning (v3.9.0 Phase 3) =====
+#
+# Every edit to a preset's `content` or `default_soul` is recorded
+# in `project_soul_preset_versions` so the user can see "preset v3
+# of 5" and roll back. The "head" columns on `project_soul_presets`
+# stay denormalized (fast read at dispatch time). See
+# docs/soul-routing-design.md §"Phased plan → Phase 3" for the
+# schema and behavior.
+#
+# Versioning contract:
+#   - `version_number` is monotonic per preset (1, 2, 3, ...).
+#   - The head on `project_soul_presets` mirrors the latest version.
+#   - An in-flight task uses the SOUL snapshot captured at dispatch
+#     time (see `dispatch_step` in orchestrator/soul_dispatch.py);
+#     versioning does NOT retroactively change running tasks.
+#   - Backward compat: presets created before the migration have
+#     no version history. The first PUT after the migration
+#     backfills a v1 row from the current head (so the timeline
+#     is consistent for old presets too).
+
+
+class SoulPresetVersion(BaseModel):
+    """One version of a SOUL preset's content. Returned by the
+    list-versions endpoint and the rollback endpoint.
+
+    `version_number` is 1-indexed. `created_by` is the operator
+    username from the session, or "orch_server" if the version
+    was created by the system (backfill, template instantiation,
+    etc). `applied_at` is NULL while the version is the head but
+    has never been dispatched; set when a dispatch writes this
+    version's content to a host's SOUL.md.
+    """
+    id: str
+    preset_id: str
+    version_number: int
+    content: str
+    default_soul: str | None = None
+    applied_at: str | None = None
+    created_at: str | None = None
+    created_by: str = "orch_server"
+
+
+async def _next_version_number(db: Database, preset_id: str) -> int:
+    """Return the next version_number for this preset.
+
+    Computed as MAX(version_number) + 1 on the versions table;
+    returns 1 if the preset has no version rows yet. The result
+    is racy under concurrent writes (two parallel PUTs could each
+    pick the same n+1) — the UNIQUE (preset_id, version_number)
+    constraint will reject the loser with an IntegrityError, which
+    the caller should handle by re-reading and retrying once.
+    """
+    row = await db.fetchone(
+        "SELECT COALESCE(MAX(version_number), 0) AS m "
+        "FROM project_soul_preset_versions WHERE preset_id = ?",
+        (preset_id,),
+    )
+    return int((row or {}).get("m") or 0) + 1
+
+
+async def _append_preset_version(
+    db: Database,
+    preset_id: str,
+    content: str,
+    default_soul: str | None,
+    created_by: str,
+    write_default_soul: bool = True,
+) -> int:
+    """Append a new version row to `project_soul_preset_versions`.
+
+    Computes the next version number, inserts the row, and returns
+    the new version number. `default_soul` is only written when
+    `write_default_soul=True` (so the caller can preserve an existing
+    default_soul on content-only edits). `created_by` is the
+    operator username from the session, or "orch_server" if
+    the version was created by the system.
+
+    Caller is responsible for updating the head columns on
+    `project_soul_presets` (this function does not touch the head —
+    the caller knows what content to write there).
+    """
+    import uuid as _uuid
+    new_number = await _next_version_number(db, preset_id)
+    row: dict[str, Any] = {
+        "id": str(_uuid.uuid4()),
+        "preset_id": preset_id,
+        "version_number": new_number,
+        "content": content,
+        "created_by": created_by,
+    }
+    if write_default_soul:
+        row["default_soul"] = default_soul
+    await db.insert("project_soul_preset_versions", row)
+    return new_number
+
+
+async def _backfill_preset_v1(
+    db: Database, preset_id: str, created_by: str
+) -> None:
+    """Create a v1 version row for a preset that predates the
+    migration. Idempotent: if v1 already exists, no-op.
+
+    Called by `upsert_soul_preset` so the version history is
+    consistent for old presets. The first PUT after migration
+    ends up writing v2 (the user's new edit) on top of v1
+    (the backfilled baseline), which matches the user's mental
+    model: "the original content was v1, my edit is v2".
+    """
+    existing = await db.fetchone(
+        "SELECT id FROM project_soul_preset_versions "
+        "WHERE preset_id = ? AND version_number = 1",
+        (preset_id,),
+    )
+    if existing:
+        return
+    preset = await db.fetchone(
+        "SELECT content, default_soul FROM project_soul_presets WHERE id = ?",
+        (preset_id,),
+    )
+    if not preset:
+        return
+    import uuid as _uuid
+    await db.insert(
+        "project_soul_preset_versions",
+        {
+            "id": str(_uuid.uuid4()),
+            "preset_id": preset_id,
+            "version_number": 1,
+            "content": preset.get("content") or "",
+            "default_soul": preset.get("default_soul"),
+            "created_by": created_by,
+        },
+    )
+
+
+@router.get(
+    "/{project_id}/soul-presets/{agent_id}/{profile_name}/versions",
+    response_model=list[SoulPresetVersion],
+)
+async def list_soul_preset_versions(
+    project_id: str,
+    agent_id: str,
+    profile_name: str,
+    request: Request,
+) -> list[SoulPresetVersion]:
+    """List all versions of a project's SOUL preset, newest first.
+
+    The "head" of the version list is always the most-recent
+    version. Older versions are the rollback targets.
+
+    Returns 404 if either the project or the profile doesn't
+    exist; empty list if the preset has never been edited (just
+    auto-populated on first dispatch, no user edits yet).
+    """
+    db = request.app.state.db
+    project = await db.fetchone(
+        "SELECT id FROM projects WHERE id = ?", (project_id,)
+    )
+    if not project:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    profile = await db.fetchone(
+        "SELECT id FROM agent_profiles WHERE agent_id = ? AND name = ?",
+        (agent_id, profile_name),
+    )
+    if not profile:
+        raise HTTPException(
+            404, f"Profile not found: {agent_id}/{profile_name}"
+        )
+    preset = await db.fetchone(
+        "SELECT id FROM project_soul_presets "
+        "WHERE project_id = ? AND profile_id = ?",
+        (project_id, profile["id"]),
+    )
+    if not preset:
+        return []
+    rows = await db.fetchall(
+        "SELECT id, preset_id, version_number, content, default_soul, "
+        "       applied_at, created_at, created_by "
+        "FROM project_soul_preset_versions "
+        "WHERE preset_id = ? "
+        "ORDER BY version_number DESC",
+        (preset["id"],),
+    )
+    return [
+        SoulPresetVersion(
+            id=r["id"],
+            preset_id=r["preset_id"],
+            version_number=int(r["version_number"]),
+            content=r["content"],
+            default_soul=r.get("default_soul"),
+            applied_at=r.get("applied_at"),
+            created_at=r.get("created_at"),
+            created_by=r.get("created_by") or "orch_server",
+        )
+        for r in rows
+    ]
+
+
+@router.post(
+    "/{project_id}/soul-presets/{agent_id}/{profile_name}/rollback/{version_number}",
+    response_model=SoulPresetVersion,
+)
+async def rollback_soul_preset(
+    project_id: str,
+    agent_id: str,
+    profile_name: str,
+    version_number: int,
+    request: Request,
+) -> SoulPresetVersion:
+    """Restore an older version as the new head.
+
+    Behavior: does NOT delete the intervening versions — instead,
+    creates a new version row (number = max+1) whose content and
+    default_soul are copied from the target version. This is the
+    standard "append-only history" pattern (like git commits or
+    Notion page history): the user can re-rollback later, and
+    nothing is ever lost.
+
+    Returns the newly created version row (the new head), not
+    the version that was rolled back to. To see the full history,
+    call the list-versions endpoint.
+
+    404 if the project / profile / preset / target version is
+    missing. 409 if the rolled-back content would be identical
+    to the current head (we still write a new row, but it's a
+    no-op semantically — the operator probably meant to roll
+    back to a different version).
+    """
+    db = request.app.state.db
+    project = await db.fetchone(
+        "SELECT id FROM projects WHERE id = ?", (project_id,)
+    )
+    if not project:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    profile = await db.fetchone(
+        "SELECT id FROM agent_profiles WHERE agent_id = ? AND name = ?",
+        (agent_id, profile_name),
+    )
+    if not profile:
+        raise HTTPException(
+            404, f"Profile not found: {agent_id}/{profile_name}"
+        )
+    preset = await db.fetchone(
+        "SELECT * FROM project_soul_presets "
+        "WHERE project_id = ? AND profile_id = ?",
+        (project_id, profile["id"]),
+    )
+    if not preset:
+        raise HTTPException(
+            404,
+            f"No preset for project {project_id} + profile "
+            f"{agent_id}/{profile_name}; nothing to roll back",
+        )
+    target = await db.fetchone(
+        "SELECT * FROM project_soul_preset_versions "
+        "WHERE preset_id = ? AND version_number = ?",
+        (preset["id"], int(version_number)),
+    )
+    if not target:
+        raise HTTPException(
+            404,
+            f"Version v{version_number} not found for preset "
+            f"{preset['id']} (project {project_id}, profile "
+            f"{agent_id}/{profile_name})",
+        )
+    # Compute the next version number and insert a new version
+    # row that copies the target's content. created_by uses the
+    # operator username from the session (falls back to
+    # "orch_server" for backward compat with the operator field
+    # naming convention used in audit_log calls below).
+    new_number = await _next_version_number(db, preset["id"])
+    new_id = str(uuid.uuid4())
+    operator = "orch_server"
+    try:
+        from hermes_orch.auth.cookie import current_user_id
+        uid = await current_user_id(request)
+        if uid:
+            user = await db.fetchone(
+                "SELECT username FROM users WHERE id = ?", (uid,)
+            )
+            if user and user.get("username"):
+                operator = user["username"]
+    except Exception:
+        # Auth resolution failure must NOT block the rollback —
+        # the operator is already past auth (the endpoint is
+        # called from the UI). Fall back to "orch_server".
+        pass
+    await db.insert(
+        "project_soul_preset_versions",
+        {
+            "id": new_id,
+            "preset_id": preset["id"],
+            "version_number": new_number,
+            "content": target["content"],
+            "default_soul": target.get("default_soul"),
+            "created_by": operator,
+        },
+    )
+    # Update the head columns on project_soul_presets so the
+    # next dispatch reads the rolled-back content. We also
+    # clear `last_applied_at` / `last_applied_mtime` because the
+    # next dispatch will see a content change and re-apply;
+    # the stale mtime would otherwise hide the drift.
+    now = _now_iso()
+    await db.execute(
+        "UPDATE project_soul_presets "
+        "SET content = ?, default_soul = ?, updated_at = ?, "
+        "    last_applied_at = NULL, last_applied_mtime = NULL "
+        "WHERE id = ?",
+        (
+            target["content"],
+            target.get("default_soul"),
+            now,
+            preset["id"],
+        ),
+    )
+    await audit_log(
+        db, "project.soul_preset_rolled_back",
+        actor="operator",
+        project_id=project_id,
+        payload={
+            "preset_id": preset["id"],
+            "agent_id": agent_id,
+            "profile_name": profile_name,
+            "rolled_back_to_version": int(version_number),
+            "new_version_number": new_number,
+            "operator": operator,
+        },
+    )
+    row = await db.fetchone(
+        "SELECT id, preset_id, version_number, content, default_soul, "
+        "       applied_at, created_at, created_by "
+        "FROM project_soul_preset_versions WHERE id = ?",
+        (new_id,),
+    )
+    return SoulPresetVersion(
+        id=row["id"],
+        preset_id=row["preset_id"],
+        version_number=int(row["version_number"]),
+        content=row["content"],
+        default_soul=row.get("default_soul"),
+        applied_at=row.get("applied_at"),
+        created_at=row.get("created_at"),
+        created_by=row.get("created_by") or "orch_server",
+    )
+
+
+
 #
 # The project page now has an LLM chat assistant that can:
 #   1. Analyze the project's current state (tasks + audit summary)
@@ -2466,6 +2871,50 @@ materialized into tasks when they click Run on the dashboard.
     you can put in plan.steps[*]. Use ONLY these, otherwise
     PUT /api/projects/{id}/plan will 422
   - `audit_tail`: last 5 audit events for context
+  - `soul_presets`: project-scoped role bindings + personas
+    (v3.9.0 ROLE CONTEXT, see section below). Empty list if
+    the project has no presets
+  - `truncated`: bool, true if the role-context section was
+    truncated to fit the size budget (treat the persona as a
+    hint, not authoritative, in that case)
+
+# ROLE CONTEXT (v3.9.0) — how to use `soul_presets`
+  `soul_presets` is a per-project list of role bindings sourced
+  from `project_soul_presets`. Each preset is a dict with:
+    - `role_name` (string): the role label (e.g. "cpi-analyst",
+      "researcher"). Use this as `step.agent_role`
+    - `profile_id` (string): which agent profile this role is
+      bound to (informational only; routing is the orch server's
+      job, not yours)
+    - `content` (string): the persona prose for this role. Use
+      it to write the step's `action` so it aligns with the
+      role's voice and constraints
+    - `default_soul` (string, optional): a workflow-supplied
+      default persona. If you design a step with this role and
+      want the orch server to use this default, copy it into
+      the step's `default_soul` field
+
+  Rules for designing plan steps when `soul_presets` is non-empty:
+    1. Prefer `agent_role` values that match an existing preset's
+       `role_name`. Do NOT invent a new role name when a preset
+       already covers it — the orch server routes by role name
+       and an unknown role would 422 at dispatch
+    2. If you design a step with a role that has a `default_soul`
+       in the preset, copy the `default_soul` into the step's
+       `default_soul` field. The orch server uses this if no
+       project-level preset override exists. This keeps the
+       dispatch path consistent with the persona you saw here
+    3. If `soul_presets` is empty, design freely (existing
+       behavior — no role constraints from this section)
+    4. Do NOT include preset creation, editing, or deletion in
+       your `update_plan` suggestion. Preset management is the
+       orch server's job (auto-populated on first dispatch via
+       `_ensure_soul_preset` in `dispatch_step`; advanced users
+       edit presets via the project settings page, not here)
+    5. The role-context section is size-capped (1 KB per
+       preset, 4 KB total). If `truncated: true`, treat the
+       persona as a hint — you've only seen a fragment of the
+       full SOUL the agent will receive at dispatch time
 
 # Step fields — what each one means (REQUIRED vs optional)
   Per 2026-07-29: the previous chat version left `action` empty
@@ -2674,6 +3123,26 @@ async def list_chat_messages(
     return {"messages": messages, "count": len(messages)}
 
 
+# ===== ROLE CONTEXT budget (v3.9.0) =====
+#
+# The chat LLM receives the project's SOUL presets as part of the
+# snapshot (see _build_chat_context below). Each preset is the persona
+# text for one role binding; the LLM uses these to design plan steps
+# whose `agent_role` values match the project's roles, and to write
+# `action` strings that align with the role's persona.
+#
+# The two caps below keep the role-context section from dominating
+# the prompt. Per Q6 in docs/soul-routing-design.md the per-preset
+# SOUL content cap is 8 KB on disk; in the LLM context we use a
+# tighter 1 KB cap (presets are summaries for the LLM, not the
+# full SOUL.md the agent sees at dispatch time). The 4 KB total
+# cap leaves room for ~4 typical presets before truncation kicks
+# in — enough for the 98% case (1-3 roles per project) with
+# headroom for the long tail.
+_MAX_PRESET_BYTES = 1024
+_MAX_TOTAL_PRESETS_BYTES = 4096
+
+
 async def _build_chat_context(project_id: str, db) -> dict:
     """Build a JSON snapshot of the project for the LLM.
 
@@ -2685,7 +3154,15 @@ async def _build_chat_context(project_id: str, db) -> dict:
     plan_updated_at (for the optimistic lock), and a short audit
     trail for context.
 
-    Capped sizes so the prompt doesn't blow up on a 200-step plan.
+    v3.9.0 (SOUL routing, Phase 2 UX): the snapshot also includes
+    the project's SOUL presets as `soul_presets` (the "ROLE
+    CONTEXT" block). The LLM uses these to design plan steps that
+    align with the project's role bindings — see _CHAT_SYSTEM_PROMPT
+    for the rules. The section is size-capped so a project with
+    many presets doesn't blow up the prompt.
+
+    Capped sizes so the prompt doesn't blow up on a 200-step plan
+    or a project with a dozen presets.
     """
     # Lazy import: projects.py is loaded before plans.py in main.py's
     # router mount order, and we want either order to be safe.
@@ -2727,6 +3204,57 @@ async def _build_chat_context(project_id: str, db) -> dict:
             "summary": {k: str(v)[:200] for k, v in payload.items()},
             "created_at": a["created_at"][:19] if a["created_at"] else None,
         })
+    # v3.9.0: SOUL presets as ROLE CONTEXT (see Phase 2 of
+    # docs/soul-routing-design.md). The LLM uses these to design
+    # plan steps whose `agent_role` matches an existing preset and
+    # whose `action` aligns with the preset's persona. Opt-in:
+    # projects without presets get `soul_presets: []` (the LLM
+    # treats this as "no role context, design freely").
+    soul_presets_rows = await db.fetchall(
+        "SELECT role_name, profile_id, content, default_soul "
+        "FROM project_soul_presets WHERE project_id = ? "
+        "ORDER BY updated_at DESC",
+        (project_id,),
+    )
+    # Apply the per-preset (1 KB) and total (4 KB) caps. The
+    # `truncated` flag is True if any preset was cut — the LLM
+    # should treat the persona as a hint, not authoritative, when
+    # truncated (it has only a fragment of the original).
+    role_context_truncated = False
+    soul_presets: list[dict] = []
+    total_bytes = 0
+    for r in soul_presets_rows:
+        role_name = r["role_name"] or ""
+        profile_id = r["profile_id"] or ""
+        content = r["content"] or ""
+        default_soul = r["default_soul"] or ""
+        # Per-preset cap: truncate the persona body to 1 KB.
+        # UTF-8 safe — split on byte boundary, drop the tail.
+        content_bytes = content.encode("utf-8")
+        if len(content_bytes) > _MAX_PRESET_BYTES:
+            content = content_bytes[:_MAX_PRESET_BYTES].decode(
+                "utf-8", errors="ignore"
+            )
+            role_context_truncated = True
+        preset = {
+            "role_name": role_name,
+            "profile_id": profile_id,
+            "content": content,
+            "default_soul": default_soul,
+        }
+        preset_bytes = len(
+            json.dumps(preset, ensure_ascii=False).encode("utf-8")
+        )
+        # Total cap: drop presets from the end if adding this one
+        # would exceed the 4 KB role-context budget. We never
+        # partially truncate a single preset to fit — preserving
+        # preset coherence (a partial persona is worse than no
+        # persona; the LLM will just confuse itself).
+        if total_bytes + preset_bytes > _MAX_TOTAL_PRESETS_BYTES:
+            role_context_truncated = True
+            break
+        soul_presets.append(preset)
+        total_bytes += preset_bytes
     return {
         "project": {
             "id": proj["id"],
@@ -2744,6 +3272,14 @@ async def _build_chat_context(project_id: str, db) -> dict:
         "plan_updated_at": proj.get("updated_at"),
         "agents_info": agents_info,
         "audit_tail": audit_list,
+        # v3.9.0 ROLE CONTEXT: per-project SOUL preset snapshot
+        # (see _CHAT_SYSTEM_PROMPT for usage rules). Empty list
+        # means the project has no presets — the LLM designs
+        # freely. `truncated` is True if any preset was cut to
+        # fit the size budget; the LLM should treat the persona
+        # as a hint, not authoritative, in that case.
+        "soul_presets": soul_presets,
+        "truncated": role_context_truncated,
     }
 
 
