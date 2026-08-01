@@ -3365,6 +3365,39 @@ def start(
             assigned = [t for t in tasks if t.get("status") == "assigned"]
             if assigned:
                 click.echo(f"[daemon] got {len(assigned)} assigned task(s)")
+            # v3.10.4 (2026-08-02) BUGFIX: apply pending profile configs
+            # (soul.md) BEFORE the task pool, not after. The previous
+            # order (heartbeat -> run tasks -> apply configs) meant a
+            # long-running task (3+ min hermes subprocess) blocked the
+            # config poll for the entire task duration. The supervisor's
+            # 30s dispatch timeout would fire before the wrapper got a
+            # chance to claim the pending config, and the new task would
+            # fail with `dispatch.soul_apply_failed: SOUL apply timed
+            # out (status=pending)` — even though the wrapper was
+            # healthy and would have applied the config in 1-7s if it
+            # had been polled.
+            #
+            # Real-world repro: proj-e05e89e9 (analyst 2) on 2026-08-02.
+            # Task 365463c4 (research-hk-market-context, super profile)
+            # started at 02:23:39 and was running. The super-b config
+            # 89449e75 was queued at 02:23:35 — the wrapper was busy
+            # with 365463c4, never polled super-b, the 30s dispatch
+            # timeout fired at 02:24:05, compare-features failed,
+            # finalize-hk-view-report was skipped as a downstream
+            # consequence. Two tasks lost to a one-line ordering bug.
+            #
+            # Safe to call before the task pool: the apply writes to
+            # <profile.root>/<file_path> (typically soul.md), and the
+            # task reads its profile's soul.md at start time (cached for
+            # the task's lifetime). No shared lock needed; concurrent
+            # apply + read is benign — the task will see either the
+            # old or the new soul.md, and either is a valid working
+            # state.
+            #
+            # Cheap when nothing pending — the inner loop is one HTTP
+            # GET per profile that returns `None`, then breaks. So
+            # adding this pre-tick cost is ~0ms in the common case.
+            _apply_pending_configs_inline()
             # v3.6.0: per-agent concurrent task cap. We rebuild the
             # ThreadPoolExecutor on every tick so cap changes (via
             # PUT /api/agents/{id}) take effect within `interval`
@@ -3436,9 +3469,11 @@ def start(
             if once:
                 click.echo("[daemon] --once: exiting after one tick")
                 return
-            # Apply pending profile configs (e.g. soul.md) every tick.
-            # Cheap when nothing pending; no separate loop needed.
-            _apply_pending_configs_inline()
+            # (v3.10.4: `_apply_pending_configs_inline()` moved ABOVE
+            # the task pool — see the comment in the pre-tick block.
+            # The old call here is gone; configs are now applied every
+            # tick, BEFORE the workers start, so a long-running task
+            # can never starve a new profile's SOUL apply.)
             # Periodic zombie-session sweep (Plan B for the long-standing
             # "49 active sessions in super/state.db" issue). Throttled to
             # once per day per profile — the SQL scan is cheap but the
