@@ -103,6 +103,16 @@ class PlanStep(BaseModel):
     feedback_to: list[str] = Field(default_factory=list)
     params_template: dict[str, Any] = Field(default_factory=dict)
     output_path: str = ""
+    # v3.10.4 (2026-08-02): LLM-drafted SOUL persona text for this
+    # step's role. When the LLM generates a plan, it produces a
+    # `default_soul` per step. We pre-seed the project_soul_presets
+    # table from this field at plan-save time so the user can see
+    # + edit the SOUL on the project page BEFORE clicking [▶ Run].
+    # The dispatch path also reads this field as a fallback (see
+    # orchestrator.soul_dispatch._step_default_soul).
+    # v3.9.0's "both" mode (chat planner) sets this on the step
+    # dict via raw JSON; the Pydantic model just round-trips it.
+    default_soul: str = ""
 
     @field_validator("name")
     @classmethod
@@ -273,6 +283,172 @@ def _load_plan_from_row(row: dict[str, Any]) -> tuple[bool, ProjectPlan | None, 
     return True, plan, updated_at
 
 
+async def _seed_soul_presets_from_plan(
+    db: Any,
+    project_id: str,
+    plan: "ProjectPlan",
+) -> dict[str, Any]:
+    """Auto-seed `project_soul_presets` rows from a plan's `default_soul`.
+
+    v3.10.4 (2026-08-02) UX fix: when the LLM generates a plan, each
+    step carries a `default_soul` (the LLM-drafted persona text).
+    Previously, the SOUL only materialized AT dispatch time via
+    `_ensure_soul_preset` in orchestrator.soul_dispatch — by the
+    time the user could see it in the project page's "Show SOUL
+    editor" toggle, the task was already running with the
+    auto-generated content. The user had no chance to edit the
+    soul before the agent started.
+
+    This helper pre-creates presets at plan-save time so the user
+    can see + edit them BEFORE clicking the green [▶ Run] button.
+
+    Behavior:
+      1. Iterate over plan.steps. Collect unique (role, default_soul)
+         pairs (same role can appear in multiple steps with the
+         same soul — we only need one preset per profile).
+      2. For each unique role, resolve to a profile using the
+         routing engine (same logic dispatch uses).
+      3. Upsert project_soul_presets row for (project, profile) IF
+         it doesn't already exist (preserves any manual edits).
+         content = step.default_soul, default_soul = same (so
+         a future "reset to default" can find it).
+      4. Skip steps without a `default_soul` (the dispatch path
+         will use the generic role template as a fallback).
+      5. Skip roles where routing returns no profile (the
+         dispatch path will resolve it later; preset creation
+         happens lazily on first dispatch).
+
+    Returns a stats dict so the caller can include it in the
+    response or audit log. Best-effort: any error is caught and
+    logged, never raised (we don't want a soul-seed failure to
+    break the plan save).
+    """
+    import logging
+    log = logging.getLogger(__name__)
+    stats = {
+        "roles_seen": 0,
+        "presets_created": 0,
+        "presets_skipped_existing": 0,
+        "roles_skipped_no_default_soul": 0,
+        "roles_skipped_no_profile": 0,
+        "errors": [],
+    }
+    try:
+        # Lazy import — heavy module, only load when actually used
+        from hermes_orch.orchestrator.routing import resolve_role_to_profile
+
+        # Collect unique (role, default_soul) pairs. The LLM may
+        # produce the same soul for the same role across multiple
+        # steps; we only need one preset per (project, profile).
+        # Two places to look for the soul:
+        #   1. step.default_soul (top-level — v3.10.4 Pydantic field)
+        #   2. step.params_template.get("default_soul") (legacy
+        #      chatbox form, see orchestrator.soul_dispatch._step_default_soul)
+        seen_roles: dict[str, str] = {}  # role -> default_soul
+        for step in plan.steps:
+            role = (step.agent_role or "").strip()
+            if not role:
+                continue
+            default_soul = (step.default_soul or "").strip()
+            if not default_soul and isinstance(step.params_template, dict):
+                # Legacy fallback for plans produced by the chat
+                # planner before the v3.10.4 Pydantic field was added.
+                default_soul = (
+                    str(step.params_template.get("default_soul") or "").strip()
+                )
+            if not default_soul:
+                stats["roles_skipped_no_default_soul"] += 1
+                continue
+            # If the same role has different default_souls in
+            # different steps, we keep the FIRST one (deterministic
+            # by step order). The user can manually edit the
+            # preset to merge them.
+            if role not in seen_roles:
+                seen_roles[role] = default_soul
+        stats["roles_seen"] = len(seen_roles)
+
+        for role, default_soul in seen_roles.items():
+            try:
+                # Resolve the role to a profile using the same
+                # routing engine that dispatch uses. If routing
+                # fails (e.g., no agent available right now), we
+                # skip — dispatch will create the preset later
+                # when an agent is available.
+                step_like = type("_S", (), {
+                    "agent_role": role,
+                    "target_profiles": [],
+                    "required_capabilities": [],
+                })()
+                try:
+                    profile = await resolve_role_to_profile(
+                        project_id, step_like, db,
+                    )
+                except Exception as e:
+                    log.info(
+                        "soul seed: skip role=%s (routing failed: %s); "
+                        "dispatch will create preset lazily",
+                        role, e,
+                    )
+                    stats["roles_skipped_no_profile"] += 1
+                    continue
+                if not profile or not profile.get("id"):
+                    stats["roles_skipped_no_profile"] += 1
+                    continue
+                profile_id = profile["id"]
+                # Check if a preset already exists for this
+                # (project, profile). If yes, leave it alone
+                # (the user may have edited the content).
+                existing = await db.fetchone(
+                    "SELECT id FROM project_soul_presets "
+                    "WHERE project_id = ? AND profile_id = ?",
+                    (project_id, profile_id),
+                )
+                if existing:
+                    stats["presets_skipped_existing"] += 1
+                    continue
+                # Create the preset. Content = default_soul; we
+                # also store default_soul on the preset so a
+                # future "reset to default" UI can find it.
+                import uuid as _uuid
+                preset_id = str(_uuid.uuid4())
+                now = _now_iso()
+                await db.insert(
+                    "project_soul_presets",
+                    {
+                        "id": preset_id,
+                        "project_id": project_id,
+                        "profile_id": profile_id,
+                        "role_name": role,
+                        "content": default_soul,
+                        "default_soul": default_soul,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+                stats["presets_created"] += 1
+            except Exception as e:
+                log.warning(
+                    "soul seed: error for role=%s: %s",
+                    role, e,
+                )
+                stats["errors"].append({"role": role, "error": str(e)})
+        # Audit the seeding summary (best-effort)
+        try:
+            from hermes_orch.core.audit import audit_log
+            await audit_log(
+                db, "project.soul_presets.seeded", actor="operator",
+                project_id=project_id,
+                payload=stats,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        # Never let a soul-seed failure break the plan save
+        log.warning("soul seed: top-level error: %s", e)
+        stats["errors"].append({"error": str(e)})
+    return stats
+
+
 # ===== API endpoints =====
 
 
@@ -402,6 +578,85 @@ async def _compute_plan_agents(db, project_id: str) -> dict:
     }
 
 
+# v3.10.4 (2026-08-02): "Generate SOUL" fallback endpoint. The
+# primary path auto-seeds project_soul_presets at plan-save time
+# (see put_project_plan below). This endpoint exists for the cases
+# where the auto-seed couldn't run or the user wants to refresh:
+#   1. Plan was saved before v3.10.4 (no auto-seed happened)
+#   2. Routing at save time had no idle profile (routing now
+#      succeeds after agents came online)
+#   3. User edited the plan and wants to re-seed (preserves any
+#      manual edits to existing presets — same idempotency as
+#      the auto-seed)
+#   4. User wants to (re)generate SOUL after the LLM plan was
+#      updated externally
+class GenerateSoulFromPlanResponse(BaseModel):
+    """Response shape for POST /api/projects/{id}/plan/generate-soul.
+
+    Mirrors the stats dict from `_seed_soul_presets_from_plan` so
+    the UI can show a confirmation: "Created 3 preset(s), skipped
+    2 already-existing, 1 role had no profile available".
+    """
+    project_id: str
+    presets_created: int
+    presets_skipped_existing: int
+    roles_seen: int
+    roles_skipped_no_default_soul: int
+    roles_skipped_no_profile: int
+    errors: list[dict[str, str]]
+
+
+@router.post(
+    "/projects/{project_id}/plan/generate-soul",
+    response_model=GenerateSoulFromPlanResponse,
+)
+async def generate_soul_from_plan(
+    project_id: str, request: Request,
+) -> GenerateSoulFromPlanResponse:
+    """Seed project_soul_presets from the project's plan_json.
+
+    The "Generate SOUL" button on the project page calls this. It
+    reuses the same `_seed_soul_presets_from_plan` helper that
+    runs automatically at plan-save time, so the behavior is
+    identical: idempotent, preserves manual edits, skips roles
+    that can't be routed, never raises (best-effort).
+
+    Behavior:
+      200 with the stats dict on success (even if 0 presets
+        were created — caller can show a friendly message)
+      404 if the project doesn't exist
+      409 if the project has no plan_json (call /plan/from-llm
+        first to create one)
+
+    Side effect: same as put_project_plan's auto-seed — creates
+    project_soul_presets rows. No new tasks are created.
+    """
+    db = request.app.state.db
+    proj = await db.fetchone(
+        "SELECT id, plan_json FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    has_plan, plan, _ = _load_plan_from_row(proj)
+    if not has_plan or plan is None:
+        raise HTTPException(
+            409,
+            "No plan to generate SOUL from. Call POST /api/projects/{id}/plan/from-llm "
+            "first, or save a plan via PUT /api/projects/{id}/plan."
+        )
+    stats = await _seed_soul_presets_from_plan(db, project_id, plan)
+    return GenerateSoulFromPlanResponse(
+        project_id=project_id,
+        presets_created=stats["presets_created"],
+        presets_skipped_existing=stats["presets_skipped_existing"],
+        roles_seen=stats["roles_seen"],
+        roles_skipped_no_default_soul=stats["roles_skipped_no_default_soul"],
+        roles_skipped_no_profile=stats["roles_skipped_no_profile"],
+        errors=stats["errors"],
+    )
+
+
 @router.put("/projects/{project_id}/plan", response_model=ProjectPlanResponse)
 async def put_project_plan(
     project_id: str,
@@ -479,6 +734,25 @@ async def put_project_plan(
         "UPDATE projects SET plan_json = ?, updated_at = ? WHERE id = ?",
         (plan_json_str, now, project_id),
     )
+    # v3.10.4 (2026-08-02): auto-seed project_soul_presets from
+    # the LLM-drafted `default_soul` on each plan step. The user
+    # can then see + edit the SOUL presets on the project page
+    # BEFORE clicking the green [▶ Run] button (which dispatches).
+    # Without this, the SOUL only materializes AT dispatch time
+    # (via `_ensure_soul_preset` in orchestrator.soul_dispatch) —
+    # by the time the user sees the soul in the project page's
+    # "Show SOUL editor" toggle, the task is already running with
+    # the auto-generated content. The user can still edit it on
+    # the project page; the dispatch sees the existing preset and
+    # uses the edited content.
+    #
+    # Idempotent: only creates presets that don't already exist
+    # (preserves any manual edits the user has made on the
+    # project page). Skips steps without a `default_soul`.
+    # Skips roles where the routing engine can't resolve a
+    # profile (the dispatch path will create the preset later
+    # with a generic template).
+    await _seed_soul_presets_from_plan(db, project_id, plan)
     # Audit
     try:
         from hermes_orch.core.audit import audit_log
@@ -894,13 +1168,22 @@ async def run_project_plan(
             raise HTTPException(
                 500, f"failed to insert task {t['name']!r}: {e}"
             )
-    # 5. Set project state → 'ready' (so supervisor's next tick
-    # dispatches). Same transition as /api/projects/{id}/run —
-    # we reuse the existing flow, no new state introduced.
-    await db.execute(
-        "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
-        (now, project_id),
-    )
+    # 5. v3.10.4 (2026-08-02): do NOT auto-dispatch. The project
+    # stays in 'planned' state so the user can review the new
+    # tasks + their SOUL presets (auto-seeded from the plan's
+    # `default_soul` fields; see _seed_soul_presets_from_plan in
+    # the plan-save handler) before clicking the green [▶ Run]
+    # button. Previously this UPDATE flipped state to 'ready'
+    # and the supervisor's next tick dispatched — too aggressive
+    # for an LLM-generated plan where the user often wants to
+    # tweak the auto-seeded SOUL content first.
+    #
+    # The existing /api/projects/{id}/run endpoint is the
+    # explicit dispatch path; it still flips planned→ready.
+    # v3.10.4 pre-merge behavior was: this UPDATE ran first, so
+    # the project went straight from plan-run to running. Now
+    # the user has an explicit review step between plan-run and
+    # actual dispatch.
     # 6. Audit: per-task created + top-level plan.ran
     try:
         from hermes_orch.core.audit import audit_log

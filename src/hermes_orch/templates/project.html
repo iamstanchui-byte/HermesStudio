@@ -148,6 +148,22 @@
                         title="Start dispatch: transitions project from 'planned' to 'ready'. Supervisor's next tick (within ~5s) will pick up pending tasks. Idempotent on ready/running (no-op); errors out on terminal states (completed/failed/cancelled). Requires at least one task.">
                         ▶️ Run
                     </button>
+                    {# v3.10.4 (2026-08-02): "Generate SOUL" button —
+                       explicit fallback for the auto-seed that runs
+                       at plan-save time. Use this if the plan was
+                       saved before v3.10.4 (no auto-seed happened),
+                       or if routing at save time had no idle
+                       profile (now succeeds). Idempotent: skips
+                       existing presets to preserve manual edits.
+                       Only shown when the project has a plan_json
+                       (no point seeding from no plan). #}
+                    {% if project.plan_json %}
+                    <button onclick="generateSoulFromPlan('{{ project.id }}')"
+                        class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
+                        title="Generate project_soul_presets from the plan's per-step default_soul. Idempotent — skips existing presets. Run this if the auto-seed at plan-save time couldn't run (e.g., no idle profile at save time, plan was created before v3.10.4).">
+                        🧠 Generate SOUL
+                    </button>
+                    {% endif %}
                 </div>
                 <div class="flex gap-1.5 flex-wrap justify-end">
                     {% if project.state == 'archived' %}
@@ -1149,6 +1165,54 @@ async function openProjectFolder(projectId) {
             msg += '\n\n(source: ' + data.source + ')';
         }
         alert(msg);
+    } catch (err) {
+        alert('Network error: ' + err.message);
+    }
+}
+// v3.10.4 (2026-08-02): explicit "Generate SOUL" button handler.
+// The primary path auto-seeds project_soul_presets at plan-save
+// time. This button is the fallback for the cases where the
+// auto-seed couldn't run (no idle profile at save time, plan
+// created before v3.10.4, etc.). Idempotent: skips existing
+// presets to preserve any manual edits the user has made on
+// the project page.
+async function generateSoulFromPlan(projectId) {
+    if (!confirm(
+        'Generate SOUL presets from the plan?\n\n' +
+        'This will:\n' +
+        '  • Resolve each role in the plan to a profile (using the routing engine)\n' +
+        '  • Create a project_soul_preset for any role that doesn\'t have one yet\n' +
+        '  • Skip existing presets (your manual edits are preserved)\n\n' +
+        'Continue?'
+    )) return;
+    try {
+        const r = await fetch('/api/projects/' + projectId + '/plan/generate-soul', {
+            method: 'POST',
+        });
+        const data = await r.json().catch(() => ({}));
+        if (r.status === 404) {
+            alert('Project not found: ' + projectId);
+            return;
+        }
+        if (r.status === 409) {
+            alert('No plan to generate SOUL from. Click "Edit plan" to create one first.');
+            return;
+        }
+        if (!r.ok) {
+            alert('Generate SOUL failed: ' + (data.detail || r.status));
+            return;
+        }
+        // Build a human-friendly summary
+        const parts = [];
+        if (data.presets_created > 0) parts.push('Created ' + data.presets_created + ' new preset(s)');
+        if (data.presets_skipped_existing > 0) parts.push('skipped ' + data.presets_skipped_existing + ' already-existing (your edits are preserved)');
+        if (data.roles_skipped_no_default_soul > 0) parts.push(data.roles_skipped_no_default_soul + ' role(s) had no default_soul in the plan');
+        if (data.roles_skipped_no_profile > 0) parts.push(data.roles_skipped_no_profile + ' role(s) had no idle profile to route to');
+        if (data.errors && data.errors.length > 0) parts.push(data.errors.length + ' error(s)');
+        if (parts.length === 0) parts.push('No roles found in the plan to seed');
+        alert(parts.join('.\n') + '.\n\nThe "Show SOUL editor" toggle (top of the page) now lets you review and edit them before dispatching.');
+        // Reload so the SOUL editor reflects the new presets
+        location.reload();
     } catch (err) {
         alert('Network error: ' + err.message);
     }

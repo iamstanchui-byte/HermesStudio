@@ -1303,12 +1303,22 @@
         }
         // Save first
         await savePlan();
+        // v3.10.4 (2026-08-02): confirm dialog text changed to
+        // reflect the new "no auto-dispatch" behavior. Project
+        // stays in 'planned' state after Generate tasks so the
+        // user can review the auto-seeded SOUL presets on the
+        // project page before clicking the green [▶ Run] button.
+        // Old behavior flipped state to 'ready' here and the
+        // supervisor's next tick auto-dispatched — too aggressive
+        // for LLM-generated plans where the user often wants to
+        // tweak the auto-generated SOUL first.
         if (!confirm(
             'Generate tasks from plan?\n\n' +
             'This will:\n' +
             '  • Archive the project\'s existing non-running tasks\n' +
             '  • Create ' + _plan.steps.length + ' new pending task(s) from the plan\n' +
-            '  • Set project state → ready (supervisor will dispatch on next tick)\n\n' +
+            '  • Auto-seed project_soul_presets from each step\'s default_soul\n' +
+            '  • Leave project state at "planned" — you click [▶ Run] on the project page to dispatch\n\n' +
             'Continue?'
         )) return;
         try {
@@ -1359,7 +1369,13 @@
                                 return;
                             }
                             const d2 = await r2.json();
-                            showBanner('Generated ' + d2.tasks_created + ' task(s) — going to project...', 'success');
+                            // v3.10.4: clarify that the user must
+                            // click [▶ Run] on the project page to
+                            // dispatch. Previously this banner
+                            // implied auto-dispatch ("going to
+                            // project...") which was misleading
+                            // after the no-auto-dispatch change.
+                            showBanner('Generated ' + d2.tasks_created + ' task(s). Click [▶ Run] on the project page to dispatch.', 'success');
                             setTimeout(() => { location.href = '/projects/' + _projectId; }, 1500);
                             return;
                         } catch (e2) {
@@ -1371,7 +1387,11 @@
                 return;
             }
             const d = await r.json();
-            showBanner('Generated ' + d.tasks_created + ' task(s) — going to project...', 'success');
+            // v3.10.4: clarify that the user must click [▶ Run]
+            // on the project page to dispatch. Previously this
+            // banner implied auto-dispatch which was misleading
+            // after the no-auto-dispatch change.
+            showBanner('Generated ' + d.tasks_created + ' task(s). Click [▶ Run] on the project page to dispatch.', 'success');
             setTimeout(() => { location.href = '/projects/' + _projectId; }, 1500);
         } catch (e) {
             showBanner('Network error: ' + e.message, 'error');
