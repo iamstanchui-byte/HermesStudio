@@ -61,36 +61,6 @@
             panel.classList.add('hidden');
             try { localStorage.setItem(_chatStateKey, '0'); } catch (e) {}
         }
-        renderFloatingToggle();
-    }
-
-    // Floating "💬" button — replaces the auto-open behavior with
-    // a discoverable-but-not-intrusive trigger. Always renders a
-    // single button at the bottom-right of the page; visible
-    // only when the chat panel is closed (so the user can open
-    // it), hidden when the panel is open (the panel has its own
-    // X / "Close" affordance at the top).
-    //
-    // The button is added to <body> (not the panel) so it survives
-    // panel re-renders and works on pages where the chat panel
-    // is lazy-mounted. Idempotent: calling this twice just updates
-    // the same element's hidden state.
-    function renderFloatingToggle() {
-        let btn = document.getElementById('chat-floating-toggle');
-        if (!btn) {
-            btn = document.createElement('button');
-            btn.id = 'chat-floating-toggle';
-            btn.type = 'button';
-            btn.setAttribute('aria-label', 'Open Orchestrator assistant');
-            btn.title = 'Open Orchestrator assistant';
-            btn.className = 'fixed bottom-4 right-4 z-40 w-12 h-12 rounded-full ' +
-                'bg-blue-600 hover:bg-blue-700 text-white text-xl ' +
-                'shadow-lg flex items-center justify-center transition-colors';
-            btn.innerHTML = '💬';
-            btn.onclick = function () { toggleChatPanel(); };
-            document.body.appendChild(btn);
-        }
-        btn.classList.toggle('hidden', _chatPanelOpen);
     }
 
     // Default to CLOSED. User feedback (2026-08-01): the chat
@@ -99,9 +69,10 @@
     // who had it open keep seeing it open until they close
     // it once (which sets the key to '0' and overrides the
     // default). New visitors see the chat closed by default.
-    // Discoverability is provided by the floating "💬" button
-    // we render below; that button is always visible at the
-    // bottom-right of the page when the panel is closed.
+    // Discoverability is provided by the existing
+    // #chat-toggle-btn in project.html (the floating "💬"
+    // button at the bottom-right) — we don't render a
+    // duplicate here.
     (function _restoreChatState() {
         let saved = '0';
         try { saved = localStorage.getItem(_chatStateKey) || '0'; } catch (e) {}
@@ -118,7 +89,6 @@
                 }, 200);
             }
         }
-        renderFloatingToggle();
     })();
 
     // ========== history ==========

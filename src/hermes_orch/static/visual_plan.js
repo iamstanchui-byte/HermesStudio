@@ -720,16 +720,20 @@
                     '(from a generic role template). Click to add one.';
             }
             // data-soul-default holds the full text for the
-            // preview modal (the title attribute is HTML-escaped
-            // by the browser so the full text is fine here as
-            // long as we JSON-encode the surrounding quotes).
+            // preview modal. JSON-encode so quote/newline chars
+            // survive attribute embedding, then HTML-escape the
+            // JSON itself for the surrounding attribute quotes.
+            // (visual_plan.js only has `escapeHtml`; the
+            // from-template modal in project.html uses
+            // `escapeHtmlAttr` but they're identical — both
+            // escape & < > " '. We use escapeHtml here.)
             const dataDefault = step.default_soul
-                ? escapeHtmlAttr(JSON.stringify(step.default_soul))
+                ? escapeHtml(JSON.stringify(step.default_soul))
                 : '';
             const onclick = isBound
                 ? ''
                 : ' onclick="window.VP_SOUL_PREVIEW && window.VP_SOUL_PREVIEW(this)"';
-            soulPill = `<span class="vp-node-soul ${cls}" data-soul-bound="${isBound ? '1' : '0'}" data-soul-default='${dataDefault}' title="${escapeHtmlAttr(tip)}"${onclick}>${escapeHtml(label)}</span>`;
+            soulPill = `<span class="vp-node-soul ${cls}" data-soul-bound="${isBound ? '1' : '0'}" data-soul-default='${dataDefault}' title="${escapeHtml(tip)}"${onclick}>${escapeHtml(label)}</span>`;
         }
         const action = step.action
             ? `<div class="vp-node-action">${escapeHtml(step.action)}</div>`
