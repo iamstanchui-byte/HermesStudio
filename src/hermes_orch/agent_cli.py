@@ -3209,14 +3209,26 @@ def start(
                             _ack_body3 = json.dumps(
                                 {"status": "applied", "actual_sha256": actual_sha}
                             ).encode("utf-8")
+                            _ack_headers = _auth_headers(
+                                "POST",
+                                f"/api/agents/{agent_id}/profiles/{pname}/configs/{cfg_row['id']}/ack",
+                                _ack_body3,
+                            )
+                            # v3.10.2 (2026-08-02) BUGFIX: Content-Type is
+                            # required for FastAPI to parse the body as
+                            # JSON for the ProfileConfigAck Pydantic model.
+                            # Without it, the server returns 422 "Input
+                            # should be a valid dictionary" and the wrapper
+                            # silently swallows the failure in the try/except
+                            # below, leaving the config row stuck in
+                            # 'applying' until the supervisor reaper clears it
+                            # (60s later). Reproduced across both linux-a-01
+                            # and win-local-1 wrappers.
+                            _ack_headers["Content-Type"] = "application/json"
                             ack = client.post(
                                 f"{orchestrator_url}/api/agents/{agent_id}"
                                 f"/profiles/{pname}/configs/{cfg_row['id']}/ack",
-                                headers=_auth_headers(
-                                    "POST",
-                                    f"/api/agents/{agent_id}/profiles/{pname}/configs/{cfg_row['id']}/ack",
-                                    _ack_body3,
-                                ),
+                                headers=_ack_headers,
                                 content=_ack_body3,
                                 timeout=10,
                             )
@@ -3228,14 +3240,19 @@ def start(
                                 _ack_body4 = json.dumps(
                                     {"status": "failed", "error": str(e)}
                                 ).encode("utf-8")
+                                _ack_h4 = _auth_headers(
+                                    "POST",
+                                    f"/api/agents/{agent_id}/profiles/{pname}/configs/{cfg_row['id']}/ack",
+                                    _ack_body4,
+                                )
+                                # See applied-ack path above for the
+                                # Content-Type rationale. Both ack POSTs
+                                # in this function need it.
+                                _ack_h4["Content-Type"] = "application/json"
                                 client.post(
                                     f"{orchestrator_url}/api/agents/{agent_id}"
                                     f"/profiles/{pname}/configs/{cfg_row['id']}/ack",
-                                    headers=_auth_headers(
-                                        "POST",
-                                        f"/api/agents/{agent_id}/profiles/{pname}/configs/{cfg_row['id']}/ack",
-                                        _ack_body4,
-                                    ),
+                                    headers=_ack_h4,
                                     content=_ack_body4,
                                     timeout=10,
                                 )
