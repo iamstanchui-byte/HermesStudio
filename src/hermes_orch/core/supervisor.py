@@ -417,6 +417,69 @@ class Supervisor:
         # wrapper never sees the orphan to retry it). We give configs
         # 60s to ack (3x the documented 10s SoulApplyError timeout) then
         # mark them 'failed' so the profile is freed.
+
+        # Plan-task promote (v3.10.3, 2026-08-02): the dispatch flow
+        # (`_dispatch_via_soul_dispatch`) marks the plan task with
+        # `status='dispatched'` as a sentinel ("we've routed this step,
+        # don't re-dispatch on the next tick") and creates a new
+        # execution task with `status='pending'` for the wrapper to
+        # actually run. If we NEVER promote the plan task past
+        # 'dispatched', any dependent tasks (e.g. the project's final
+        # aggregation step) stay 'pending' forever because their
+        # `_find_ready_tasks` check sees the parent still in 'dispatched'.
+        # The execution task does eventually reach a terminal state
+        # ('completed' / 'failed' / 'cancelled' / 'interrupted') via the
+        # wrapper's /result POST or the stuck-task reaper, but nothing
+        # propagates that back to the plan task. Fix: scan all 'dispatched'
+        # plan tasks each tick; for each, find the most recent execution
+        # task sharing (name, assigned_profile_id) and copy its terminal
+        # status over. Idempotent (the UPDATE has a status='dispatched'
+        # guard) and side-effect-free (purely a status promotion).
+        try:
+            promoted_rows = await self.db.fetchall(
+                "SELECT t.id AS plan_id, t.name, t.assigned_profile_id, "
+                "       t.assigned_agent_id, t.project_id, t.created_at AS plan_created "
+                "FROM tasks t "
+                "WHERE t.status = 'dispatched' AND t.assigned_profile_id IS NOT NULL"
+            )
+            for p in promoted_rows:
+                # Find the execution task: same name, same profile, created
+                # AFTER the plan task (the dispatch flow inserts the new row
+                # a moment after marking the plan 'dispatched'). Pick the
+                # most recent one that's reached a terminal state.
+                exec_row = await self.db.fetchone(
+                    "SELECT id, status FROM tasks "
+                    "WHERE name = ? AND assigned_profile_id = ? "
+                    "  AND created_at > ? "
+                    "  AND status IN ('completed','failed','cancelled','interrupted') "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (p["name"], p["assigned_profile_id"], p["plan_created"]),
+                )
+                if not exec_row:
+                    continue
+                await self.db.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? "
+                    "WHERE id = ? AND status = 'dispatched'",
+                    (exec_row["status"], _now_iso(), p["plan_id"]),
+                )
+                await audit_log(
+                    self.db, "task.plan_promoted",
+                    actor="supervisor",
+                    project_id=p["project_id"],
+                    task_id=p["plan_id"],
+                    payload={
+                        "plan_id": p["plan_id"],
+                        "execution_id": exec_row["id"],
+                        "promoted_to": exec_row["status"],
+                        "name": p["name"],
+                    },
+                )
+                log.info(
+                    f"plan task {p['plan_id']} ({p['name']!r}) promoted "
+                    f"{exec_row['status']!r} (from execution {exec_row['id']})"
+                )
+        except Exception as e:
+            log.exception(f"plan-task promote scan failed: {e}")
         try:
             stuck_cfg_cutoff = (now_aware() - timedelta(seconds=60)).isoformat()
             stuck_cfgs = await self.db.fetchall(
