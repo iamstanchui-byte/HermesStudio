@@ -27,6 +27,7 @@ import platform
 import re
 import subprocess
 import time
+import fnmatch
 from pathlib import Path
 
 import click
@@ -2707,7 +2708,25 @@ def start(
                     # .pytest_cache, .mypy_cache, .ruff_cache), JS/TS
                     # build outputs (dist, build, out), Rust (target),
                     # tox.
-                    _SKIP_DIR_NAMES = frozenset({
+                    #
+                    # v3.10.4 follow-up (2026-08-02): added glob pattern
+                    # support. v3.10.3's exact-name list missed
+                    # `.pdfvenv/` (an agent-created venv for PDF build
+                    # tools) — 1403 files / 36MB got uploaded as
+                    # "artifacts" for proj-e05e89e9's
+                    # finalize-hk-view-report step. Whack-a-mole
+                    # (adding `.pdfvenv` to the explicit list) is the
+                    # wrong fix — agents will create more custom-named
+                    # venvs (`.myvenv`, `proj-venv`, `tool_venv`,
+                    # `.sandbox-venv`, etc.) forever. The right fix is
+                    # to match any dir whose name contains "venv"
+                    # (case-insensitive). Added as a glob pattern.
+                    # Also added `*.egg-info` and `*.dist-info` for
+                    # Python package metadata (pip install creates
+                    # these next to every installed package — easy to
+                    # miss without the pattern).
+                    _SKIP_DIR_PATTERNS = (
+                        # Exact names (most common cases)
                         "node_modules",
                         ".git",
                         "__pycache__",
@@ -2731,7 +2750,11 @@ def start(
                         ".svelte-kit",
                         "coverage",
                         ".nyc_output",
-                    })
+                        # Glob patterns (catches custom-named variants)
+                        "*venv*",         # .pdfvenv, my-venv, proj_venv, etc.
+                        "*.egg-info",     # Python package metadata
+                        "*.dist-info",    # Python package metadata (PEP 376)
+                    )
                     try:
                         cache_root = cache_dir.resolve()
                         # Find files modified during this task run. We use a
@@ -2776,8 +2799,30 @@ def start(
                             # `node_modules/foo.js`,
                             # `web/node_modules/foo.js`,
                             # `__pycache__/bar.cpython-311.pyc`.
+                            #
+                            # v3.10.4 follow-up: support glob patterns
+                            # in `_SKIP_DIR_PATTERNS`. Exact names are
+                            # matched as-is, patterns use `fnmatch`
+                            # (case-insensitive). Catches custom-named
+                            # variants like `.pdfvenv`, `proj-venv`,
+                            # `.sandbox-venv` without a maintenance
+                            # burden of adding each to the explicit list.
                             rel_parts = rel.split("/")
-                            if any(p.lower() in _SKIP_DIR_NAMES for p in rel_parts[:-1]):
+                            _skip = False
+                            for p in rel_parts[:-1]:
+                                pl = p.lower()
+                                for pat in _SKIP_DIR_PATTERNS:
+                                    if "*" in pat:
+                                        if fnmatch.fnmatchcase(pl, pat.lower()):
+                                            _skip = True
+                                            break
+                                    else:
+                                        if pl == pat:
+                                            _skip = True
+                                            break
+                                if _skip:
+                                    break
+                            if _skip:
                                 continue
                             if rel.startswith("__pycache__/"):
                                 continue
