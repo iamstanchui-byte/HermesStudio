@@ -10,8 +10,8 @@ Decouple **profile** (a registered capability resource) from **role** (a
 project-context label assigned by the orch server at dispatch time). The
 orch server routes workflow steps to profiles, then writes a **clean,
 unambiguous SOUL** to the target profile's `SOUL.md` before each task —
-serialized per-profile with heartbeat confirmation, so concurrent projects
-on the same fleet never clobber each other.
+serialized per-profile via the existing `profile_configs` claim→ack flow,
+so concurrent projects on the same fleet never clobber each other.
 
 This is the central architectural change for v3.9.0. Everything else
 (LLM planner context, project-level override UI, workflow authoring) is
@@ -89,8 +89,10 @@ binds it to whatever fleet is available at run time.
   a SOUL snapshot in their payload; live `SOUL.md` can drift but the
   task won't see the drift.
 - **No cross-process distributed locks.** The orch server is
-  single-process for now; an in-process asyncio.Lock per profile is
-  enough. If we ever go multi-process, swap for etcd/Redis (Phase 4+).
+  single-process for now; the existing `profile_configs` flow already
+  serializes per-profile via the atomic UPDATE in `claim_pending_config`
+  (`api/agents.py:1229-1237`). If we ever go multi-process, the lock
+  primitives need to be re-evaluated (Phase 4+).
 
 ## Architecture
 
@@ -107,9 +109,7 @@ flowchart TB
 
     subgraph "Orch server (routing engine)"
         RR[resolve_role_to_profile]
-        SA[soul_dispatch.apply]
-        LK[profile_locks dict]
-        HB[heartbeat confirm]
+        SA[soul_dispatch.dispatch_step]
     end
 
     subgraph "Agent host (executor)"
@@ -248,11 +248,14 @@ async def resolve_role_to_profile(
 ## Lifecycle: SOUL apply before dispatch
 
 ```python
-profile_locks: dict[str, asyncio.Lock] = {}
-
-
 async def dispatch_step(project_id: str, step: PlanStep) -> Task:
-    """Resolve, apply SOUL, dispatch."""
+    """Resolve, apply SOUL, dispatch.
+
+    Uses the EXISTING `profile_configs` flow for serialization and
+    confirmation — no custom lock, no heartbeat mtime poll. The wrapper
+    claims the row via atomic UPDATE (api/agents.py:1229) and acks
+    when the file is written. We just poll `status='applied'`.
+    """
 
     # 1. Resolve profile (hybrid routing above)
     profile = await resolve_role_to_profile(project_id, step)
@@ -260,27 +263,32 @@ async def dispatch_step(project_id: str, step: PlanStep) -> Task:
     # 2. Ensure project preset exists (auto-populate on first dispatch)
     preset = await _ensure_soul_preset(project_id, step, profile)
 
-    # 3. Acquire per-profile lock (serialize with other projects' applies)
-    lock = profile_locks.setdefault(profile.id, asyncio.Lock())
-    async with lock:
-        # 4. Compose clean SOUL.md (full replace, no merge)
-        soul_md = _compose_soul_md(
-            role_name=preset.role_name,
-            project_id=project_id,
-            content=preset.content or preset.default_soul,
-        )
-        # 5. Apply via wrapper (POST /soul-presets/apply, ~5s typical)
-        await _apply_soul_to_profile(profile, soul_md)
-        # 6. Heartbeat confirm: wrapper reports SOUL.md mtime
-        await _wait_soul_md_updated(profile, preset, timeout_s=10)
-        # 7. Dispatch with SOUL snapshot in payload
-        task = await _send_task(
-            profile=profile,
-            step=step,
-            soul_content=preset.content,  # snapshot, decoupled from live file
-        )
-    # 8. Lock released; update preset.last_applied_at
-    await db.touch_soul_preset(preset.id, applied_mtime=...)
+    # 3. Compose clean SOUL.md (full replace, no merge)
+    soul_md = _compose_soul_md(
+        role_name=preset.role_name,
+        project_id=project_id,
+        content=preset.content or preset.default_soul,
+    )
+
+    # 4. Insert profile_configs row (file_path='soul.md'). Idempotent on
+    #    identical content (sha256 dedup). The wrapper claims it via
+    #    atomic UPDATE WHERE status='pending' → status='applying' →
+    #    status='applied'/'failed'. This is the per-profile mutex.
+    cfg_id = await _submit_soul_to_profile(profile, soul_md)
+
+    # 5. Poll status until applied (typically <2s; timeout 10s)
+    if not await _wait_for_soul_applied(cfg_id, timeout_s=10):
+        raise SoulApplyError(cfg_id, "timeout waiting for wrapper ack")
+
+    # 6. Update preset.last_applied_at + last_applied_mtime
+    await touch_soul_preset(db, preset.id, applied_mtime=wrapper_mtime_str)
+
+    # 7. Dispatch task with SOUL snapshot in payload
+    task = await _send_task(
+        profile=profile,
+        step=step,
+        soul_content=preset.content,  # snapshot, decoupled from live file
+    )
     return task
 
 
@@ -302,34 +310,40 @@ def _compose_soul_md(role_name: str, project_id: str, content: str) -> str:
 - Merge needs a known delimiter schema. Brittle.
 - Replace is deterministic and the header primes the role context.
 
-**Why per-profile lock (not per-project or per-role):**
+**Why use the `profile_configs` flow (not a custom lock or heartbeat):**
 
-- Same profile can be bound to multiple roles across projects (that's
-  the whole point of the design).
-- The lock scope is "who can write to this host's SOUL.md right now".
-- One project, one role, one profile → one lock holder. Other projects
-  targeting the same profile wait.
+- The existing `profile_configs` table already serializes per-profile
+  via the atomic UPDATE in `claim_pending_config` (api/agents.py:1229).
+  Adding our own `asyncio.Lock` would be duplicating this.
+- The wrapper's ack endpoint (`/configs/{id}/ack`) confirms the file
+  was written. Polling `status='applied'` is the natural confirmation
+  signal — no need to also poll heartbeat mtime.
+- One fewer moving part: no heartbeat timer to maintain, no race
+  between the lock release and the next apply.
 
-**Why heartbeat confirm (not 5s sleep):**
+**Why no heartbeat mtime confirm (despite the spec originally saying so):**
 
-- "5s" is a guess. Slow networks make it wrong.
-- Wrapper already reports `SOUL.md` mtime in heartbeat (existing field).
-- Orch polls heartbeat until mtime > `last_applied_mtime`, or 10s
-  timeout (failure → task fails with clear error).
+- The wrapper acks the apply with the file's mtime in the ack body.
+  We persist this in `project_soul_presets.last_applied_mtime` for
+  audit but don't use it for confirmation — the ack is authoritative.
+- Heartbeat mtime poll would add latency and a second timer; the ack
+  endpoint already provides the signal we need.
 
 ## Concurrency model
 
-Single-process orch server. `asyncio.Lock` per profile_id. Lock is held
-only for the duration of apply + heartbeat confirm (typically <2s on
-a healthy network).
+Single-process orch server. The existing `profile_configs` flow
+provides per-profile serialization via the atomic UPDATE in
+`claim_pending_config` (api/agents.py:1229). Two `dispatch_step` calls
+targeting the same profile are ordered by the wrapper's claim→ack loop
+— no custom lock needed.
 
 Race scenarios covered:
 
 | Scenario | Behavior |
 |---|---|
-| Two projects, same profile, same role | Serialize via lock; second project sees fresh mtime, no reapply |
+| Two projects, same profile, same role | Serialize via `profile_configs` claim→ack; second project sees fresh status, no reapply |
 | Two projects, same profile, different roles | Serialize; second project gets overwrite (its role wins until next apply) |
-| Project A applies, project B already has preset from previous run | Lock + mtime check; if B's preset.content == currently applied, skip apply |
+| Project A applies, project B already has preset from previous run | SHA256 check on submit; if B's preset.content == currently applied, skip submit |
 | Apply times out (>10s) | Task dispatch fails with `SOUL_APPLY_TIMEOUT` error; user can retry |
 | Orch server restarts mid-apply | Lock lost; in-flight apply may complete on the host but orch doesn't know; next dispatch will detect stale mtime and reapply |
 
@@ -369,9 +383,9 @@ Race scenarios covered:
 2. **`orchestrator/routing.py`** (1.5d): new module, hybrid routing
    algorithm above. Pure async, takes `(db, project_id, step)` returns
    `Profile`. Comprehensive docstrings.
-3. **`orchestrator/soul_dispatch.py`** (1d): new module, apply +
-   heartbeat confirm. Imports existing `_apply_pending_configs_inline`
-   from `agent_cli.py` (or refactor to a shared helper).
+3. **`orchestrator/soul_dispatch.py`** (1d): new module, apply via
+   the existing `profile_configs` flow. Polls `status='applied'` for
+   confirmation (no custom lock, no heartbeat mtime poll).
 4. **Hook into dispatch path** (0.5d): modify the existing step
    dispatch in `api/projects.py` (or wherever tasks are launched) to
    call routing + apply before `_send_task`.
@@ -416,8 +430,8 @@ agent host change cleanly per role.
 
 | Layer | Coverage | Tooling |
 |---|---|---|
-| Unit | Routing algorithm, lock contention, mtime check, preset auto-populate | pytest + pytest-asyncio |
-| Integration | `_apply_soul_to_profile` against the running wrapper, heartbeat confirm | pytest with the dev server on 8765 |
+| Unit | Routing algorithm, profile_configs claim contention, SHA256 dedup, preset auto-populate | pytest + pytest-asyncio |
+| Integration | `_submit_soul_to_profile` against the running wrapper, ack polling | pytest with the dev server on 8765 |
 | E2E | Two projects, same profile, serialized applies; mid-run preset edit doesn't affect in-flight task | Playwright + multi-process test |
 | Backward compat | Existing project without `agent_profiles.skills` set → generic capability match; project with no preset → auto-populate | Manual + smoke test |
 | Load | 10 projects × 5 tasks each, all on one profile, lock contention ≤ 2s p99 | Locust (deferred to Phase 4) |
