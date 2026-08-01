@@ -332,7 +332,7 @@ async def _submit_soul_to_profile(
 async def _wait_for_soul_applied(
     cfg_id: str,
     db: Database,
-    timeout_s: float = 10.0,
+    timeout_s: float = 30.0,
     poll_interval_s: float = 0.2,
 ) -> bool:
     """Poll the profile_configs row until the wrapper acks.
@@ -351,8 +351,14 @@ async def _wait_for_soul_applied(
     Args:
         cfg_id: the profile_configs row to watch.
         db: the orchestrator's Database connection.
-        timeout_s: max seconds to wait before giving up. Default 10s
-            (per the design spec §"Heartbeat confirm").
+        timeout_s: max seconds to wait before giving up. Default 30s
+            (was 10s in v3.10.0; bumped 2026-08-02 after observing the
+            real-world ack latency of 8-12s on win-local-1 — the 10s
+            ceiling left no headroom for slow host I/O or the
+            skills-sync thread blocking the ack POST). The supervisor
+            reaper still reaps anything stuck in 'applying' after 60s
+            (3x safety margin), so a true wrapper hang is still
+            caught and the profile is freed.
         poll_interval_s: seconds between polls. Default 200ms.
 
     Returns:
@@ -535,7 +541,7 @@ async def dispatch_step(
     cfg_id = await _submit_soul_to_profile(profile["id"], soul_md, db)
 
     # 5. Wait for wrapper to claim + ack
-    applied = await _wait_for_soul_applied(cfg_id, db, timeout_s=10.0)
+    applied = await _wait_for_soul_applied(cfg_id, db, timeout_s=30.0)
     if not applied:
         # Fetch the wrapper's error message (or fall back to
         # timeout). Use a fresh fetch rather than caching the row
