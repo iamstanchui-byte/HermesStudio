@@ -161,9 +161,35 @@ async def resolve_role_to_profile(
 
     # 3. Capability match — scan all online profiles, find one whose
     #    skills ⊇ step.required_capabilities AND is idle.
+    #
+    # v3.10.1 (2026-08-02) BUGFIX: prefer profiles whose `name` exactly
+    # matches the step's `agent_role` before falling back to the
+    # alphabetical-by-id first-match. Without this preference, a step
+    # with empty `required_capabilities` (the common case for
+    # general-purpose roles like "super" or "win-agent01") would
+    # silently land on the lexicographically first idle profile in
+    # the system — which is usually the WRONG agent (e.g. a step
+    # requesting `agent_role="win-agent01"` ended up on
+    # `linux-a-01/super-b` because `l < w` in agent_id sort order, and
+    # `linux-a-01/super-b` came up first as both idle and skills⊇[]).
+    # The matching-by-name scan runs first; only if NO profile has
+    # `name == role` do we fall back to the legacy skills-match loop
+    # (so workflows that rely on skills for routing keep working).
     required: list[str] = list(
         _step_field(step, "required_capabilities", None) or []
     )
+    # 3a. Prefer same-name profile — if any agent has registered a
+    # profile with the exact name the step requested, that's almost
+    # always what the operator wants.
+    for prof in await _list_online_profiles(db):
+        if prof.get("name") != role:
+            continue
+        if not await _is_profile_idle(prof["id"], db):
+            continue
+        if _skills_cover(_parse_skills(prof.get("skills")), required):
+            return prof
+    # 3b. Legacy capability-only match (kept for skills-based routing
+    # of roles that don't have a same-name profile registered).
     for prof in await _list_online_profiles(db):
         if not await _is_profile_idle(prof["id"], db):
             continue
