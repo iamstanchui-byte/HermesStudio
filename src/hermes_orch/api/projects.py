@@ -2915,6 +2915,23 @@ materialized into tasks when they click Run on the dashboard.
        preset, 4 KB total). If `truncated: true`, treat the
        persona as a hint — you've only seen a fragment of the
        full SOUL the agent will receive at dispatch time
+    6. (v3.10.0 — both-preset-and-llm behavior) If you design a
+       step with a role that has NO preset in `soul_presets`,
+       draft a 3-5 sentence persona for the step's
+       `default_soul` field. Be specific: domain expertise,
+       tone, output style, citation habits. The orch server
+       auto-populates a preset at dispatch time using this
+       value (via `_ensure_soul_preset` in `dispatch_step`).
+       The persona is the "voice" the agent adopts — e.g.
+       for role `code-reviewer`:
+         "You are a senior code reviewer specializing in Python
+          and FastAPI. You focus on correctness, readability,
+          and test coverage. You cite specific line numbers
+          and explain the why, not just the what. Your output
+          is concise markdown with severity tags."
+       Only add `default_soul` for roles that have NO matching
+       preset; for roles that do, copy the preset's
+       `default_soul` (rule 2)
 
 # Step fields — what each one means (REQUIRED vs optional)
   Per 2026-07-29: the previous chat version left `action` empty
