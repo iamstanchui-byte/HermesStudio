@@ -1,0 +1,247 @@
+{% extends "base.html" %}
+{% block title %}SOUL templates — Hermes Orchestrator{% endblock %}
+{% block content %}
+
+<div class="mb-4 flex items-center justify-between">
+    <div>
+        <h1 class="text-2xl font-bold text-gray-800">SOUL templates</h1>
+        <p class="text-sm text-gray-500 mt-0.5">
+            Admin-published persona templates. Workflow authors pull these into project presets
+            by name (the "From template" button in a project's SOUL editor).
+            Admin-only.
+        </p>
+    </div>
+    <button id="new-template-btn"
+            class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium">
+        + New template
+    </button>
+</div>
+
+<div class="bg-white border rounded-lg shadow-sm overflow-hidden">
+    <table class="w-full text-sm">
+        <thead class="bg-gray-50 text-gray-600 text-xs uppercase tracking-wider">
+            <tr>
+                <th class="text-left px-4 py-2.5 font-medium">Name</th>
+                <th class="text-left px-4 py-2.5 font-medium">Category</th>
+                <th class="text-left px-4 py-2.5 font-medium">Description</th>
+                <th class="text-left px-4 py-2.5 font-medium">Size</th>
+                <th class="text-left px-4 py-2.5 font-medium">Created by</th>
+                <th class="text-left px-4 py-2.5 font-medium">Updated</th>
+                <th class="text-right px-4 py-2.5 font-medium">Actions</th>
+            </tr>
+        </thead>
+        <tbody id="templates-tbody" class="divide-y divide-gray-100">
+            <tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">Loading…</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<p class="text-xs text-gray-400 mt-3">
+    Templates are <strong>designs</strong>; presets are <strong>instances</strong>. Editing a
+    template does not change presets that were already instantiated from it (those are
+    independent snapshots). To push new content to existing presets, the operator re-runs
+    "From template" for the project, which creates a new version row.
+    <br>
+    <a href="/docs/api/soul-templates" class="text-blue-600 hover:underline">API docs</a>
+</p>
+
+<!-- ===== Modals ===== -->
+
+<!-- New / edit template modal -->
+<div id="template-modal" class="modal-overlay hidden">
+    <div class="modal-card" style="max-width: 640px;">
+        <h2 id="template-modal-title" class="text-lg font-semibold text-gray-800 mb-3">New SOUL template</h2>
+        <form id="template-form">
+            <input type="hidden" id="template-original-name" value="">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
+                <div>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">Name <span class="text-red-500">*</span></label>
+                    <input id="tpl-name" type="text" required minlength="1" maxlength="128"
+                           pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+                           class="block w-full border rounded px-2 py-1.5 text-sm font-mono"
+                           placeholder="e.g. cpi-analyst" autocomplete="off">
+                    <p class="text-[10px] text-gray-400 mt-1">kebab-case; case-insensitive unique.</p>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">Category</label>
+                    <input id="tpl-category" type="text" maxlength="64"
+                           class="block w-full border rounded px-2 py-1.5 text-sm"
+                           placeholder="e.g. finance, engineering, research" autocomplete="off">
+                </div>
+            </div>
+            <div class="mb-3">
+                <label class="block text-xs font-medium text-gray-700 mb-1">Description</label>
+                <input id="tpl-description" type="text" maxlength="512"
+                       class="block w-full border rounded px-2 py-1.5 text-sm"
+                       placeholder="1-line summary for browsing" autocomplete="off">
+            </div>
+            <div class="mb-3">
+                <label class="block text-xs font-medium text-gray-700 mb-1">Content (SOUL body) <span class="text-red-500">*</span></label>
+                <textarea id="tpl-content" required rows="10"
+                          class="block w-full border rounded px-2 py-1.5 text-sm font-mono"
+                          placeholder="You are a ..."></textarea>
+            </div>
+            <div class="flex items-center justify-end gap-2">
+                <button type="button" onclick="closeTemplateModal()" class="px-3 py-1.5 bg-gray-100 text-gray-700 rounded text-sm hover:bg-gray-200">
+                    Cancel
+                </button>
+                <button type="submit" class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                    Save
+                </button>
+            </div>
+            <div id="template-status" class="mt-2 text-xs"></div>
+        </form>
+    </div>
+</div>
+
+<script>
+let _tplEditing = null;  // {name, category, content, description} or null
+
+async function loadTemplates() {
+    const tbody = document.getElementById('templates-tbody');
+    if (!tbody) return;
+    try {
+        const r = await fetch('/api/soul-templates');
+        if (!r.ok) {
+            tbody.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-red-600">Failed: HTTP ' + r.status + '</td></tr>';
+            return;
+        }
+        const tpls = await r.json();
+        if (!tpls || tpls.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">No templates yet. Click "+ New template" to publish one.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = tpls.map((t) => {
+            const updated = (t.updated_at || t.created_at || '').slice(0, 16) || '?';
+            const cat = t.category || '<span class="text-gray-300">—</span>';
+            const desc = t.description || '<span class="text-gray-300">—</span>';
+            const tplNameJson = JSON.stringify(t.name);
+            return (
+                '<tr>' +
+                `<td class="px-4 py-2 font-mono font-semibold">${escapeHtml(t.name)}</td>` +
+                `<td class="px-4 py-2 text-gray-700">${cat}</td>` +
+                `<td class="px-4 py-2 text-gray-600">${escapeHtml(desc)}</td>` +
+                `<td class="px-4 py-2 text-gray-500">${(t.content || '').length}b</td>` +
+                `<td class="px-4 py-2 text-gray-500">${escapeHtml(t.created_by || '?')}</td>` +
+                `<td class="px-4 py-2 text-gray-500">${escapeHtml(updated)}</td>` +
+                '<td class="px-4 py-2 text-right whitespace-nowrap">' +
+                `<button type="button" onclick='openEditTemplate(${tplNameJson})' class="text-blue-600 hover:underline text-xs mr-2">edit</button>` +
+                `<button type="button" onclick='deleteTemplate(${tplNameJson})' class="text-red-600 hover:underline text-xs">&times;</button>` +
+                '</td>' +
+                '</tr>'
+            );
+        }).join('');
+    } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-red-600">Error: ' + (e && e.message || e) + '</td></tr>';
+    }
+}
+
+function escapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function openNewTemplate() {
+    _tplEditing = null;
+    document.getElementById('template-modal-title').textContent = 'New SOUL template';
+    document.getElementById('tpl-name').value = '';
+    document.getElementById('tpl-name').readOnly = false;
+    document.getElementById('tpl-category').value = '';
+    document.getElementById('tpl-description').value = '';
+    document.getElementById('tpl-content').value = '';
+    document.getElementById('template-original-name').value = '';
+    document.getElementById('template-status').textContent = '';
+    document.getElementById('template-modal').classList.remove('hidden');
+}
+
+async function openEditTemplate(name) {
+    try {
+        const r = await fetch('/api/soul-templates/' + encodeURIComponent(name));
+        if (!r.ok) {
+            alert('Failed: HTTP ' + r.status);
+            return;
+        }
+        const t = await r.json();
+        _tplEditing = t;
+        document.getElementById('template-modal-title').textContent = 'Edit SOUL template';
+        document.getElementById('tpl-name').value = t.name || '';
+        document.getElementById('tpl-name').readOnly = false;  // allow rename
+        document.getElementById('tpl-category').value = t.category || '';
+        document.getElementById('tpl-description').value = t.description || '';
+        document.getElementById('tpl-content').value = t.content || '';
+        document.getElementById('template-original-name').value = t.name || '';
+        document.getElementById('template-status').textContent = '';
+        document.getElementById('template-modal').classList.remove('hidden');
+    } catch (e) {
+        alert('Error: ' + (e && e.message || e));
+    }
+}
+
+function closeTemplateModal() {
+    document.getElementById('template-modal').classList.add('hidden');
+    _tplEditing = null;
+}
+
+async function deleteTemplate(name) {
+    if (!confirm('Delete template "' + name + '"?\n\nExisting presets instantiated from it are NOT affected (they are independent snapshots).')) return;
+    try {
+        const r = await fetch('/api/soul-templates/' + encodeURIComponent(name), {method: 'DELETE'});
+        if (r.status === 204 || r.ok) {
+            await loadTemplates();
+        } else {
+            const err = await r.json().catch(() => ({}));
+            alert('Failed: ' + (err.detail || r.status));
+        }
+    } catch (e) {
+        alert('Error: ' + (e && e.message || e));
+    }
+}
+
+document.getElementById('new-template-btn').addEventListener('click', openNewTemplate);
+document.getElementById('template-form').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const status = document.getElementById('template-status');
+    const originalName = document.getElementById('template-original-name').value;
+    const body = {
+        name: document.getElementById('tpl-name').value.trim(),
+        category: document.getElementById('tpl-category').value.trim(),
+        description: document.getElementById('tpl-description').value.trim(),
+        content: document.getElementById('tpl-content').value,
+    };
+    status.textContent = 'saving...';
+    status.className = 'mt-2 text-xs text-gray-500';
+    try {
+        const r = originalName
+            ? await fetch('/api/soul-templates/' + encodeURIComponent(originalName), {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body),
+            })
+            : await fetch('/api/soul-templates', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body),
+            });
+        if (r.ok) {
+            status.textContent = 'saved!';
+            status.className = 'mt-2 text-xs text-green-600';
+            setTimeout(() => {
+                closeTemplateModal();
+                loadTemplates();
+            }, 300);
+        } else {
+            const err = await r.json().catch(() => ({}));
+            status.textContent = 'Error: ' + (err.detail || r.status);
+            status.className = 'mt-2 text-xs text-red-600';
+        }
+    } catch (e) {
+        status.textContent = 'Network error: ' + (e && e.message || e);
+        status.className = 'mt-2 text-xs text-red-600';
+    }
+});
+
+loadTemplates();
+</script>
+
+{% endblock %}

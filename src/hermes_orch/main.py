@@ -271,7 +271,9 @@ def create_app() -> FastAPI:
     from hermes_orch.api.settings import router as settings_router
     from hermes_orch.api.single_tasks import router as single_tasks_router
     from hermes_orch.api.single_tasks_pages import router as single_tasks_pages_router
+    from hermes_orch.api.soul_templates import router as soul_templates_router
     from hermes_orch.api.tasks import router as tasks_router
+    from hermes_orch.api.ui_prefs import router as ui_prefs_router
     from hermes_orch.api.users import router as users_router
     from hermes_orch.api.workflows import router as workflows_router
 
@@ -291,6 +293,18 @@ def create_app() -> FastAPI:
     app.include_router(tasks_router, prefix="/api/tasks", tags=["tasks"])
     # v3.5.0: admin user CRUD (list, create, reset password, disable/enable)
     app.include_router(users_router, prefix="/api/users", tags=["users"])
+    # v3.9.0 (Phase 2 UX): per-user UI prefs + plan-presets lookup.
+    # Mounted WITHOUT a prefix because the routes already include the
+    # full /api/... path (`/api/users/me/ui-prefs` and
+    # `/api/projects/{id}/plan/presets`). Adding a prefix would
+    # double-mount them.
+    app.include_router(ui_prefs_router, tags=["ui-prefs"])
+    # v3.9.0 (Phase 3): SOUL template library — admin CRUD on
+    # reusable personas + the from-template instantiator. Mounted
+    # WITHOUT a prefix because the routes already include the
+    # full /api/... path (`/api/soul-templates/...` and the
+    # project-scoped `/api/projects/{id}/soul-presets/from-template/{name}`).
+    app.include_router(soul_templates_router, tags=["soul-templates"])
     app.include_router(workflows_router, tags=["workflows"])
     app.include_router(dashboard_router, tags=["dashboard"])
     app.include_router(single_tasks_pages_router, tags=["pages"])

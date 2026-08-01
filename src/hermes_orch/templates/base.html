@@ -757,6 +757,11 @@
                    later we can re-introduce a separate Admin group. #}
                 {% if current_user_ctx and current_user_ctx.role == 'admin' %}
                 <a href="/admin/users" class="sidebar-subitem {% if active_page == 'admin_users' %}active{% endif %}">Users</a>
+                {# v3.9.0 (Phase 3): SOUL template library — admin-only
+                   page for publishing reusable personas. The page is
+                   server-gated (returns 403 for non-admins), so the
+                   sidebar link is only shown to admins as a UX nicety. #}
+                <a href="/admin/soul-templates" class="sidebar-subitem {% if active_page == 'admin_soul_templates' %}active{% endif %}">SOUL Templates</a>
                 {% endif %}
             </div>
         </nav>

@@ -1625,6 +1625,37 @@ async def admin_users_page(request: Request) -> HTMLResponse:
     )
 
 
+@router.get("/admin/soul-templates", response_class=HTMLResponse)
+async def admin_soul_templates_page(request: Request) -> HTMLResponse:
+    """Admin-only SOUL template library page (v3.9.0 Phase 3).
+
+    Lists all published SOUL templates, grouped by category, with
+    per-row edit / delete actions. Includes a "New template" form
+    at the top.
+
+    The JSON CRUD is at /api/soul-templates/* (api/soul_templates.py);
+    this page is a thin render layer that hydrates from that API.
+    Non-admin users get 403.
+    """
+    from fastapi.responses import HTMLResponse as _HTML  # local
+    ctx = await _base_context(request, "admin_soul_templates")
+    user = ctx.get("current_user_ctx")
+    if not user or user.get("role") != "admin":
+        return _HTML(
+            "<h1 style='font-family:sans-serif;padding:2rem;'>403 — Admin role required</h1>"
+            "<p style='font-family:sans-serif;padding:0 2rem;color:#666;'>"
+            "This page is for admin users only. Ask an admin to grant you the admin role, "
+            "or use the CLI: <code>hermes-orch user add --admin --username &lt;you&gt; --password &lt;pw&gt;</code>"
+            "</p>",
+            status_code=403,
+        )
+    return templates.TemplateResponse(
+        request=request,
+        name="admin_soul_templates.html",
+        context=ctx,
+    )
+
+
 @router.get("/schedules", response_class=HTMLResponse)
 async def schedules_page(
     request: Request,
