@@ -835,22 +835,127 @@ async def open_project_folder(project_id: str, request: Request) -> dict[str, An
     Cross-platform: dispatches via `hermes_orch.core.platform_compat`,
     so the same endpoint works on Windows (Explorer), macOS (Finder),
     and Linux (xdg-open / gio / kde-open / nautilus fallback chain).
+
+    v3.10.4 (2026-08-02): prefer the project's deliverable dir over
+    the orchestrator's metadata dir. The user wants to see the file
+    they just produced (in the share folder / storage_refs), not the
+    orchestrator's internal cache.
+
+    Resolution order (first match wins):
+      1. ``projects.deliverable_path`` if set and exists on disk
+         (operator-curated deliverable location for this project)
+      2. First ``agent_profiles.storage_refs`` of kind=local or
+         kind=smb that exists, for any profile this project has
+         used (via ``tasks.assigned_profile_id`` or active
+         ``project_sessions.profile_id``)
+      3. Project metadata dir (orchestrator's cache — what older
+         versions of this endpoint always opened)
     """
     from hermes_orch.core.platform_compat import (
         file_manager_label,
         open_path,
         platform_name,
     )
+    from hermes_orch.core.platform_compat import IS_WINDOWS
+
     pdir = _project_dir(request, project_id)
-    ok, err = open_path(pdir)
+    db = request.app.state.db
+
+    chosen_path: Path | None = None
+    chosen_source: str | None = None
+
+    # 1) project.deliverable_path (operator-curated)
+    try:
+        proj_row = await db.fetchone(
+            "SELECT deliverable_path FROM projects WHERE id = ?",
+            (project_id,),
+        )
+        deliverable = (proj_row or {}).get("deliverable_path") or ""
+        if deliverable:
+            cand = Path(deliverable)
+            if cand.exists():
+                chosen_path = cand
+                chosen_source = "project.deliverable_path"
+    except Exception:
+        pass
+
+    # 2) profile storage_refs (deliverable share folder)
+    if chosen_path is None:
+        try:
+            profile_rows = await db.fetchall(
+                "SELECT DISTINCT ap.storage_refs, ap.name "
+                "FROM agent_profiles ap "
+                "WHERE ap.id IN ("
+                "  SELECT DISTINCT t.assigned_profile_id FROM tasks t "
+                "  WHERE t.project_id = ? AND t.assigned_profile_id IS NOT NULL "
+                "  UNION "
+                "  SELECT DISTINCT ps.profile_id FROM project_sessions ps "
+                "  WHERE ps.project_id = ? AND ps.profile_id IS NOT NULL "
+                "  AND ps.deleted_at IS NULL"
+                ")",
+                (project_id, project_id),
+            )
+            for pr in profile_rows:
+                raw = pr["storage_refs"]
+                if not raw:
+                    continue
+                try:
+                    refs = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(refs, list):
+                    continue
+                for r in refs:
+                    if not isinstance(r, dict):
+                        continue
+                    kind = r.get("kind")
+                    ref = r.get("ref")
+                    if not kind or not ref:
+                        continue
+                    # Skip URL-only refs (gdrive, s3, http); we can
+                    # only open local paths in the file manager.
+                    if kind not in ("local", "smb"):
+                        continue
+                    # SMB \\server\share only opens on Windows.
+                    if kind == "smb" and not IS_WINDOWS:
+                        continue
+                    cand = Path(ref)
+                    # For local paths, require existence (otherwise
+                    # explorer.exe shows "folder not found" modal).
+                    # For SMB paths, we don't probe (network share
+                    # availability is unreliable); let explorer.exe
+                    # handle the error.
+                    if kind == "smb":
+                        chosen_path = cand
+                        chosen_source = f"profile:{pr['name']}:{kind}"
+                        break
+                    if cand.exists():
+                        chosen_path = cand
+                        chosen_source = f"profile:{pr['name']}:{kind}"
+                        break
+                if chosen_path:
+                    break
+        except Exception:
+            pass  # fall through to metadata dir
+
+    # 3) Fallback: metadata dir (orchestrator's cache)
+    target = chosen_path or pdir
+    ok, err = open_path(target)
     result: dict[str, Any] = {
         "ok": ok,
-        "path": str(pdir),
+        "path": str(target),
         "platform": platform_name(),
         "file_manager": file_manager_label(),
     }
     if not ok:
         result["error"] = err or "unknown error"
+    # Surface the resolution so the UI can show the user which
+    # folder we opened AND the alternative (metadata dir) for the
+    # "open in orchestrator" case.
+    if chosen_source:
+        result["source"] = chosen_source
+    result["metadata_path"] = str(pdir)
+    result["deliverable_opened"] = chosen_path is not None
     return result
 
 

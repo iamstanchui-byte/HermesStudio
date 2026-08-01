@@ -2686,6 +2686,52 @@ def start(
                     # Larger files should go to share folder (see
                     # agent_profiles.storage_refs), not through orch.
                     MAX_AUTO_UPLOAD_BYTES = 15 * 1024 * 1024
+                    # v3.10.4 (2026-08-02) BUGFIX: skip well-known
+                    # dependency / build / VCS directories. Previously the
+                    # auto-upload loop did `cache_root.rglob("*")` and
+                    # only filtered `__pycache__/` + dotfiles, so an
+                    # agent that ran `npm install` to build a docx
+                    # uploaded 373 node_modules/* files (each
+                    # `artifact.registered` audit event + DB row) in
+                    # ~1s, polluting the artifacts list. The wrapper
+                    # should only upload deliverables the user cares
+                    # about — actual code from `cache_root` is rarely
+                    # a deliverable, and a `node_modules/` upload
+                    # definitely isn't. Skip if ANY path component
+                    # matches one of these names (case-insensitive,
+                    # since Windows is case-insensitive and Linux
+                    # wrappers can also be on case-sensitive fs).
+                    #
+                    # Directory names: package managers (npm, pnpm, yarn),
+                    # VCS (.git), Python (venv, .venv, __pycache__,
+                    # .pytest_cache, .mypy_cache, .ruff_cache), JS/TS
+                    # build outputs (dist, build, out), Rust (target),
+                    # tox.
+                    _SKIP_DIR_NAMES = frozenset({
+                        "node_modules",
+                        ".git",
+                        "__pycache__",
+                        ".pytest_cache",
+                        ".mypy_cache",
+                        ".ruff_cache",
+                        "venv",
+                        ".venv",
+                        "env",
+                        ".env",
+                        "dist",
+                        "build",
+                        "out",
+                        "target",
+                        ".tox",
+                        ".nox",
+                        ".parcel-cache",
+                        ".turbo",
+                        ".next",
+                        ".nuxt",
+                        ".svelte-kit",
+                        "coverage",
+                        ".nyc_output",
+                    })
                     try:
                         cache_root = cache_dir.resolve()
                         # Find files modified during this task run. We use a
@@ -2720,6 +2766,19 @@ def start(
                             rel = f.relative_to(cache_root).as_posix()
                             if rel in (output_path,):
                                 continue  # already uploaded
+                            # v3.10.4: skip any file under a known
+                            # dependency / build / VCS directory. Check
+                            # the PARENT components only (not the leaf
+                            # filename), so a file literally named
+                            # `build.py` at the cache root is NOT
+                            # skipped — only files inside a `build/`
+                            # subdirectory are. Example matches:
+                            # `node_modules/foo.js`,
+                            # `web/node_modules/foo.js`,
+                            # `__pycache__/bar.cpython-311.pyc`.
+                            rel_parts = rel.split("/")
+                            if any(p.lower() in _SKIP_DIR_NAMES for p in rel_parts[:-1]):
+                                continue
                             if rel.startswith("__pycache__/"):
                                 continue
                             if f.name.startswith("."):

@@ -1121,13 +1121,34 @@ async function interruptTask(taskId) {
 }
 async function openProjectFolder(projectId) {
     // Shell out from the server. Only works if browser is on the orchestrator host.
+    // v3.10.4 (2026-08-02): the endpoint now opens the project's
+    // deliverable dir (storage_refs / deliverable_path) when available,
+    // and falls back to the orchestrator's metadata dir otherwise. We
+    // surface the resolved path + the metadata fallback in the alert
+    // so the user always knows where to look, and a one-click "open
+    // metadata dir" is offered when we opened a deliverable dir.
     try {
         const r = await fetch('/api/projects/' + projectId + '/open', {method: 'POST'});
         const data = await r.json();
         if (!data.ok) {
             alert('Failed to open folder: ' + (data.error || r.status) +
                   '\n\nNote: this only works if your browser is running on the same host as the orchestrator.');
+            return;
         }
+        // Success: build a small status block. If we opened a
+        // deliverable dir, the user can also open the metadata dir
+        // (orchestrator's cache) from this alert.
+        let msg = 'Opened in ' + (data.file_manager || 'file manager') + ':\n  ' + data.path;
+        if (data.deliverable_opened && data.metadata_path && data.metadata_path !== data.path) {
+            msg += '\n\nThis is the deliverable folder (your project output).';
+            msg += '\nThe orchestrator metadata folder is at:\n  ' + data.metadata_path;
+        } else {
+            msg += '\n\nThis is the orchestrator metadata folder (cache, plan, status).';
+        }
+        if (data.source) {
+            msg += '\n\n(source: ' + data.source + ')';
+        }
+        alert(msg);
     } catch (err) {
         alert('Network error: ' + err.message);
     }
