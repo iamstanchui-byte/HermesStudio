@@ -425,10 +425,16 @@ async def create_preset_from_template(
             f"it (or the from-template flow is not the right "
             f"tool for this case).",
         )
-    # 5. Insert the preset with the template's content. role_name
-    #    is the template's name (per the design: a preset
-    #    "instantiated from" a template carries the template's
-    #    identity as its role_name).
+    # 5. Insert the preset with the template's content.
+    #    role_name defaults to the PROFILE's name (not the template's
+    #    name) so that routing.lookup_preset_by_role() finds it when
+    #    a plan step declares agent_role=<profile_name> (the common
+    #    case: a project plan authored for the "super" profile uses
+    #    a SOUL template whose name is descriptive, e.g. "research
+    #    analyst", but routing must still match). The template's name
+    #    is preserved in the audit log payload + version history, so
+    #    operators can trace "this preset came from template X" if
+    #    they need to.
     preset_id = str(_uuid.uuid4())
     await db.insert(
         "project_soul_presets",
@@ -436,7 +442,7 @@ async def create_preset_from_template(
             "id": preset_id,
             "project_id": project_id,
             "profile_id": profile["id"],
-            "role_name": template["name"],
+            "role_name": profile["name"],
             "content": template["content"],
             "default_soul": None,
         },
