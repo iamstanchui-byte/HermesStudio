@@ -407,6 +407,47 @@ class Supervisor:
         except Exception as e:
             log.exception(f"stuck-task scan failed: {e}")
 
+        # Stuck-config reaper: a profile_configs row stuck in 'applying'
+        # (claimed by a wrapper but never acked) holds the profile
+        # hostage forever — the next dispatch creates a fresh row, but
+        # the wrapper may have already died mid-apply, leaving the
+        # original row orphaned. Without this scan, every subsequent
+        # task on that profile creates yet another stuck 'applying' row
+        # (the GET /configs/pending only returns 'pending' rows, so the
+        # wrapper never sees the orphan to retry it). We give configs
+        # 60s to ack (3x the documented 10s SoulApplyError timeout) then
+        # mark them 'failed' so the profile is freed.
+        try:
+            stuck_cfg_cutoff = (now_aware() - timedelta(seconds=60)).isoformat()
+            stuck_cfgs = await self.db.fetchall(
+                "SELECT id, profile_id FROM profile_configs "
+                "WHERE status = 'applying' AND created_at < ?",
+                (stuck_cfg_cutoff,),
+            )
+            for sc in stuck_cfgs:
+                await self.db.execute(
+                    "UPDATE profile_configs SET status='failed', "
+                    "       error='wrapper did not ack within 60s; auto-reaped by supervisor', "
+                    "       applied_at = ? "
+                    "WHERE id = ? AND status = 'applying'",
+                    (_now_iso(), sc["id"]),
+                )
+                await audit_log(
+                    self.db, "profile.config_reaped",
+                    actor="supervisor",
+                    payload={
+                        "config_id": sc["id"],
+                        "profile_id": sc["profile_id"],
+                        "reason": "applying > 60s without ack",
+                    },
+                )
+                log.warning(
+                    f"profile_config {sc['id']} for profile "
+                    f"{sc['profile_id']} reaped (applying > 60s)"
+                )
+        except Exception as e:
+            log.exception(f"stuck-config scan failed: {e}")
+
         projects = await self.db.fetchall(
             "SELECT * FROM projects WHERE state IN ('planning','ready','running')"
         )
