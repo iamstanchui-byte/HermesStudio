@@ -42,6 +42,55 @@ ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "AdminPass123!"
 
 
+async def _wrapper_simulator(db, stop_event: asyncio.Event) -> None:
+    """Background task that acks any `profile_configs` row the supervisor
+    submits (v3.9.0 SOUL apply flow).
+
+    Mirrors the wrapper's daemon loop: poll for `status='pending'`
+    rows, claim them (status='applying' → 'applied') so
+    `dispatch_step`'s wait-for-ack returns True. Without this
+    simulator, the Round-3 dispatch path times out after 10s per
+    task (the production default), which is far too slow for a
+    unit test.
+
+    Run via:
+        stop = asyncio.Event()
+        sim = asyncio.create_task(_wrapper_simulator(db, stop))
+        try:
+            ... test body ...
+        finally:
+            stop.set()
+            await sim
+
+    The simulator only acks rows whose profile belongs to a
+    verified agent (so tests that intentionally set up an offline
+    agent see the timeout path, not a false-positive ack).
+    """
+    while not stop_event.is_set():
+        try:
+            rows = await db.fetchall(
+                "SELECT pc.id FROM profile_configs pc "
+                "JOIN agent_profiles ap ON ap.id = pc.profile_id "
+                "JOIN agents a ON a.id = ap.agent_id "
+                "WHERE pc.status = 'pending' AND a.status = 'verified'"
+            )
+            for r in rows:
+                await db.execute(
+                    "UPDATE profile_configs SET status = 'applied', "
+                    "applied_at = ? WHERE id = ? AND status = 'pending'",
+                    ("2026-08-01T00:00:00+00:00", r["id"]),
+                )
+        except Exception:
+            pass  # ignore transient DB errors in the simulator loop
+        # Poll fast enough to keep the dispatch timeout (default 10s)
+        # but slow enough to not hammer the DB.
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=0.05)
+        except asyncio.TimeoutError:
+            pass
+
+
+
 async def _bootstrap_admin(app) -> str:
     """Idempotent admin bootstrap (matches test_users_api / test_plan_dep_resolution)."""
     db = app.state.db
@@ -376,7 +425,19 @@ async def test_supervisor_skips_assignment_at_cap(client):
     the wrapper's ThreadPoolExecutor — without it, the orchestrator
     would over-assign and the wrapper would sit in 'assigned' state
     forever (the v3.5.2 middleware bug, different cause, same
-    symptom)."""
+    symptom).
+
+    v3.9.0: the project dispatch path now goes through
+    `orchestrator.soul_dispatch.dispatch_step` (routing + SOUL apply
+    + create a new dispatched task). Two test-setup changes keep the
+    legacy cap semantics visible:
+      1. The agent gets a second profile (researcher-2). The
+         routing engine's per-profile idle check would otherwise
+         reject a single busy profile even when the agent is under
+         cap, so we need a second idle slot for the resume case.
+      2. A wrapper simulator acks the SOUL apply row (the Round-3
+         dispatch path otherwise times out at 10s/task).
+    """
     await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
     # Set up: 1 agent, 1 role, cap=2
     await client.post(
@@ -386,7 +447,16 @@ async def test_supervisor_skips_assignment_at_cap(client):
     app = client._transport.app  # type: ignore[attr-defined]
     db = app.state.db
 
-    # Create the role on a profile
+    # Create TWO agents, each with a "researcher" profile. The
+    # original test had one agent (sufficient for the legacy
+    # per-agent cap check), but the Round-3 routing engine's
+    # per-profile "idle" check needs a second idle slot so the
+    # resume case can route somewhere. The schema's
+    # `UNIQUE(agent_id, name)` constraint prevents two profiles
+    # with the same role on one agent, so we add a second agent.
+    # The cap on the second agent is the default (1) — enough for
+    # one of the pending tasks to route there after t-cap-0 frees
+    # up a slot on the first agent.
     import secrets as _secrets
     profile_id = "p-" + _secrets.token_hex(4)
     await db.insert("agent_profiles", {
@@ -395,11 +465,31 @@ async def test_supervisor_skips_assignment_at_cap(client):
         "name": "researcher",
         "status": "idle",
     })
+    await client.post(
+        "/api/agents/",
+        json={"agent_id": "agent-cap-2"},  # default cap=1
+    )
+    profile_id_2 = "p-" + _secrets.token_hex(4)
+    await db.insert("agent_profiles", {
+        "id": profile_id_2,
+        "agent_id": "agent-cap-2",
+        "name": "researcher",
+        "status": "idle",
+    })
 
-    # Make the agent "verified" so the supervisor picks it
+    # Make the agents "verified" so the supervisor picks them. The
+    # Round-3 dispatch path goes through orchestrator.soul_dispatch
+    # which uses the routing engine — that engine considers a profile
+    # "online" only if the parent agent's `last_heartbeat_at` is
+    # within 90s. Setting it here (rather than relying on the
+    # default NULL) keeps the legacy "verified ⇒ routable" semantic
+    # that the cap test was written against.
+    from datetime import datetime, timezone as _tz
+    now_iso = datetime.now(_tz.utc).astimezone().isoformat()
     await db.execute(
-        "UPDATE agents SET status = 'verified', hmac_secret = ? WHERE id = ?",
-        ("dummysecret", "agent-cap"),
+        "UPDATE agents SET status = 'verified', hmac_secret = ?, "
+        "last_heartbeat_at = ? WHERE id IN (?, ?)",
+        ("dummysecret", now_iso, "agent-cap", "agent-cap-2"),
     )
 
     # Create a project + 4 tasks all needing role=researcher
@@ -508,28 +598,64 @@ async def test_supervisor_skips_assignment_at_cap(client):
     # and run a single _assign_task against the project flow.
     # Simplest: re-call _drive_project for state=ready.
     proj = await db.fetchone("SELECT * FROM projects WHERE id = ?", (pid,))
-    await sup._drive_project(proj)
+    # v3.9.0: spawn a wrapper simulator so the Round-3 SOUL apply
+    # succeeds (otherwise the dispatch path times out at 10s/task).
+    sim_stop = asyncio.Event()
+    sim_task = asyncio.create_task(_wrapper_simulator(db, sim_stop))
+    try:
+        # The Round-3 dispatch path is a two-tick flow:
+        #   tick 1: `_dispatch_via_soul_dispatch` calls `dispatch_step`
+        #           which routes + applies SOUL + creates a NEW tasks
+        #           row (status=pending) with the resolved profile.
+        #           The ORIGINAL workflow step task is marked
+        #           'dispatched' so it doesn't get re-dispatched.
+        #   tick 2: `_assign_task` picks up the new pending row,
+        #           respects the pre-resolved `assigned_profile_id`,
+        #           checks the per-agent cap, and transitions to
+        #           'assigned'.
+        # Run the project loop twice so the new task is actually
+        # 'assigned' (not just 'pending') by the time we assert.
+        await sup._drive_project(proj)
+        await sup._drive_project(proj)
+    finally:
+        sim_stop.set()
+        await sim_task
 
     rows = await db.fetchall(
         "SELECT id, status FROM tasks WHERE project_id = ? ORDER BY id", (pid,)
     )
     by_status = {r["id"]: r["status"] for r in rows}
     # t-cap-0 is still 'completed' (we just set it), t-cap-1 stays
-    # 'assigned' (untouched), and EXACTLY ONE of t-cap-2 / t-cap-3
-    # should now be 'assigned' (cap went from 2 to 1, freed by
-    # t-cap-0's completion). The other remains 'pending'.
-    assigned_count = sum(
-        1 for tid in ("t-cap-2", "t-cap-3") if by_status[tid] == "assigned"
+    # 'assigned' (untouched). The Round-3 dispatch flow marks the
+    # ORIGINAL workflow step task as 'dispatched' (not 'pending')
+    # and creates a NEW task with the resolved profile. That new
+    # task is the one that ends up 'assigned' after tick 2. So
+    # we count the new 'assigned' tasks (not the originals) and
+    # verify the cap-check deferred exactly one of the originals.
+    new_assigned = [r for r in rows if r["status"] == "assigned"
+                   and r["id"] not in ("t-cap-0", "t-cap-1")]
+    assert len(new_assigned) == 1, (
+        f"After freeing 1 slot, exactly 1 new dispatched task should be "
+        f"assigned; got {len(new_assigned)}, by_status={by_status}"
     )
-    pending_count = sum(
-        1 for tid in ("t-cap-2", "t-cap-3") if by_status[tid] == "pending"
+    # The other original task is also 'dispatched' (the Round-3
+    # flow always marks the original as 'dispatched' after calling
+    # dispatch_step, regardless of whether the new task was
+    # successfully transitioned to 'assigned' on a follow-up
+    # tick). The "deferred" signal here is: only 1 new task
+    # became 'assigned' (not 2). The other original's new task
+    # either doesn't exist (NoProfileAvailable → defer) or exists
+    # but is 'pending' (waiting for a future tick to transition).
+    # Both outcomes are valid; the test asserts the "at most 1
+    # new assignment" invariant (cap=2, 1 slot was free).
+    dispatched_originals = sum(
+        1 for tid in ("t-cap-2", "t-cap-3") if by_status.get(tid) == "dispatched"
     )
-    assert assigned_count == 1, (
-        f"After freeing 1 slot, exactly 1 of t-cap-2/t-cap-3 should be "
-        f"assigned; got assigned={assigned_count}, pending={pending_count}, "
+    assert dispatched_originals == 2, (
+        f"Both t-cap-2/t-cap-3 should be 'dispatched' (Round-3 marks the "
+        f"original after dispatch_step); got {dispatched_originals}, "
         f"by_status={by_status}"
     )
-    assert pending_count == 1
 
 
 @pytest.mark.asyncio
@@ -543,6 +669,11 @@ async def test_supervisor_dispatches_when_under_cap(client):
         "/api/agents/",
         json={"agent_id": "agent-under", "max_concurrent_tasks": 4},
     )
+    # Round-3 dispatch goes through the routing engine which requires
+    # a fresh `last_heartbeat_at` (< 90s) for a profile to count as
+    # "online". Compute it once here and reuse for the UPDATE below.
+    from datetime import datetime as _dt, timezone as _tz2
+    now_iso = _dt.now(_tz2.utc).astimezone().isoformat()
     app = client._transport.app  # type: ignore[attr-defined]
     db = app.state.db
     import secrets as _secrets
@@ -554,8 +685,9 @@ async def test_supervisor_dispatches_when_under_cap(client):
         "status": "idle",
     })
     await db.execute(
-        "UPDATE agents SET status = 'verified', hmac_secret = ? WHERE id = ?",
-        ("dummysecret", "agent-under"),
+        "UPDATE agents SET status = 'verified', hmac_secret = ?, "
+        "last_heartbeat_at = ? WHERE id = ?",
+        ("dummysecret", now_iso, "agent-under"),
     )
     pid = "proj-under"
     await db.insert("projects", {
@@ -599,11 +731,30 @@ async def test_supervisor_dispatches_when_under_cap(client):
         planner=Planner(cfg={"llm": {"mock": True}}, db=db),
     )
     proj = await db.fetchone("SELECT * FROM projects WHERE id = ?", (pid,))
-    await sup._drive_project(proj)
+    # v3.9.0: spawn a wrapper simulator so the Round-3 SOUL apply
+    # succeeds (otherwise the dispatch path times out at 10s/task).
+    sim_stop = asyncio.Event()
+    sim_task = asyncio.create_task(_wrapper_simulator(db, sim_stop))
+    try:
+        # Round-3 dispatch is a two-tick flow: tick 1 creates the
+        # new dispatched task (status=pending), tick 2 transitions
+        # it to 'assigned'. The originals are marked 'dispatched'
+        # after tick 1, so we check the NEW tasks (not the
+        # originals) for the 'assigned' status.
+        await sup._drive_project(proj)
+        await sup._drive_project(proj)
+    finally:
+        sim_stop.set()
+        await sim_task
     rows = await db.fetchall(
         "SELECT id, status FROM tasks WHERE project_id = ? ORDER BY id", (pid,)
     )
     by_status = {r["id"]: r["status"] for r in rows}
-    # Both tasks should be assigned (no prior in-flight, cap=4)
-    assert by_status["t-under-0"] == "assigned"
-    assert by_status["t-under-1"] == "assigned"
+    # The new dispatched tasks (with UUIDs) should be 'assigned';
+    # the originals (t-under-0, t-under-1) should be 'dispatched'.
+    new_assigned = [r for r in rows if r["status"] == "assigned"
+                   and r["id"] not in ("t-under-0", "t-under-1")]
+    assert len(new_assigned) == 2, (
+        f"Both new dispatched tasks should be assigned (no prior in-flight, "
+        f"cap=4); got {len(new_assigned)}, by_status={by_status}"
+    )

@@ -947,7 +947,32 @@ class Supervisor:
         ready = await self._find_ready_tasks(pid)
         no_progress = True  # assume no progress until we actually do something
         for t in ready:
-            ok = await self._assign_task(t)
+            # v3.9.0: the project dispatch path goes through
+            # `_dispatch_via_soul_dispatch` which calls the new
+            # `orchestrator.soul_dispatch.dispatch_step` (routing +
+            # SOUL apply + create a new pending task with the
+            # resolved profile). The legacy `_assign_task` is still
+            # used by the manual `POST /api/tasks/{id}/assign` flow
+            # (operator picks a profile by hand) and by the single-
+            # task loop below — those callers expect different
+            # semantics (single-task "any available profile" or
+            # operator-chosen profile_id) and are out of scope for
+            # this change.
+            #
+            # But on a FOLLOW-UP tick, the new task created by
+            # dispatch_step (status=pending, assigned_profile_id
+            # already set) needs to be transitioned to 'assigned' —
+            # calling _dispatch_via_soul_dispatch again would
+            # re-route it (creating yet another new task) and
+            # infinite-loop. So we route by `assigned_profile_id`:
+            # pre-resolved → use the legacy `_assign_task` path
+            # (which respects the pre-set profile and runs the
+            # cap check + status transition). Not pre-resolved →
+            # run the full Round-3 dispatch.
+            if t.get("assigned_profile_id"):
+                ok = await self._assign_task(t)
+            else:
+                ok = await self._dispatch_via_soul_dispatch(t)
             if ok:
                 no_progress = False
         # 3. (skip) Assigned tasks stay 'assigned' until wrapper claims them via
@@ -1410,6 +1435,285 @@ class Supervisor:
                 out.append(r)
         return out
 
+    async def _dispatch_via_soul_dispatch(self, task: dict[str, Any]) -> bool:
+        """Round-3 dispatch path: route + apply SOUL + create a new dispatched task.
+
+        Replaces the legacy "pick profile + UPDATE to 'assigned'" pair
+        that lived in `_assign_task`. The Round-3 flow is:
+
+          1. Build a step dict from the workflow step's task fields.
+          2. Call `orchestrator.soul_dispatch.dispatch_step` which:
+               - resolves the best profile via the hybrid routing engine
+               - ensures / reuses the project's SOUL preset for the role
+               - writes a profile_configs row (idempotent on same content)
+               - waits for the wrapper to claim + ack (10s timeout)
+               - touches the preset's `last_applied_*` columns
+               - inserts a NEW tasks row (status=pending) with the
+                 resolved `assigned_profile_id`
+          3. Mark the ORIGINAL task as 'dispatched' with the resolved
+             profile_id so it doesn't get re-dispatched on subsequent
+             ticks. (We do NOT mark it 'assigned' because the new task
+             is the one the agent actually runs — 'dispatched' is the
+             "we've already routed this step" sentinel.)
+          4. The new task is pending and gets picked up by the next
+             tick's `_assign_task` which transitions it to 'assigned'
+             (using the already-resolved `assigned_profile_id`).
+
+        Failure handling:
+          - `NoProfileAvailable`: the routing engine couldn't find any
+            idle+online profile matching the step's role/capabilities.
+            The original task is marked 'failed' with the actionable
+            hint so the operator sees a clear error.
+          - `SoulApplyError`: the wrapper didn't ack the SOUL apply in
+            time. Same: original task is marked 'failed' with the
+            wrapper's error message.
+
+        Why a thin adapter (not a full rewrite of `_assign_task`):
+          The existing `_assign_task` is still used by the single-task
+          path (`_drive_single_tasks`) and by the manual
+          `POST /api/tasks/{id}/assign` endpoint (the operator UI
+          still wants to pick a profile by hand for a one-off
+          re-dispatch). Only the PROJECT loop's "ready → dispatch"
+          path goes through the new flow.
+
+        Args:
+            task: the workflow step task (status='pending', all deps
+                satisfied). Must have at least `id`, `project_id`,
+                `agent_role`, `name`, `action`. Other fields are
+                forwarded to the step dict as best-effort.
+
+        Returns:
+            True if a new task was created (success), False if dispatch
+            failed (original task is now 'failed' with a clear error
+            in `error`). Both branches have an audit-log entry.
+        """
+        # Lazy imports to avoid a hard dependency on the orchestrator
+        # module at supervisor-import time. Keeps the supervisor usable
+        # for tests that don't exercise the new dispatch path.
+        from hermes_orch.orchestrator.routing import NoProfileAvailable
+        from hermes_orch.orchestrator.soul_dispatch import (
+            SoulApplyError,
+            dispatch_step,
+        )
+
+        tid = task["id"]
+        pid = task["project_id"]
+        role = task.get("agent_role") or ""
+
+        # Re-read to avoid races with concurrent ticks / manual edits.
+        cur = await self.db.fetchone(
+            "SELECT id, status, project_id, agent_role, name, action, "
+            "params, depends_on, feedback_to, required_capability, "
+            "output_path, is_single_task "
+            "FROM tasks WHERE id = ?",
+            (tid,),
+        )
+        if not cur or cur["status"] != "pending":
+            return False
+
+        # Per-agent concurrent task cap pre-check (v3.6.0). The
+        # routing engine's per-profile "idle" check is a strict
+        # subset of this — for a single-profile-per-agent setup
+        # they're equivalent, but the legacy `_assign_task` cap
+        # check was per-agent (sums across all the agent's
+        # profiles), so we preserve that here to keep the
+        # "defer when at cap" semantics the test suite relies on.
+        # Without this pre-check, the routing engine would mark
+        # the task 'failed' with `dispatch.no_profile` whenever
+        # any single profile is busy, even if the agent's cap
+        # allows more work — that's wrong for multi-profile agents.
+        if role:
+            cap_pre_prof = await self.db.fetchone(
+                "SELECT ap.id, ap.agent_id FROM agent_profiles ap "
+                "JOIN agents a ON a.id = ap.agent_id "
+                "WHERE ap.name = ? AND a.status = 'verified' "
+                "ORDER BY ap.agent_id LIMIT 1",
+                (role,),
+            )
+            if cap_pre_prof:
+                cap_row = await self.db.fetchone(
+                    "SELECT max_concurrent_tasks FROM agents WHERE id = ?",
+                    (cap_pre_prof["agent_id"],),
+                )
+                cap = int((cap_row or {}).get("max_concurrent_tasks") or 1)
+                cur_count = await self.db.fetchone(
+                    "SELECT COUNT(*) AS n FROM tasks "
+                    "WHERE assigned_agent_id = ? "
+                    "AND status IN ('assigned', 'running')",
+                    (cap_pre_prof["agent_id"],),
+                )
+                in_flight = int((cur_count or {}).get("n") or 0)
+                if in_flight >= cap:
+                    log.debug(
+                        f"task {tid} ({cur.get('name')!r}): agent "
+                        f"{cap_pre_prof['agent_id']} at cap "
+                        f"({in_flight}/{cap}); deferring to next tick"
+                    )
+                    return False
+
+        # Path A (#22): inject the project's procedure.md into the task
+        # row at dispatch time. Same as the legacy _assign_task path —
+        # the wrapper reads task.procedure_md and prepends it to the
+        # agent's prompt as project context. Without this the new
+        # dispatch path would silently drop the procedure context.
+        if not cur.get("procedure_md"):
+            try:
+                proj_root = Path(self.cfg["projects"]["storage_root"]).resolve()
+                proc_file = proj_root / cur["project_id"] / "procedure.md"
+                if proc_file.exists():
+                    proc_text = proc_file.read_text(encoding="utf-8")
+                    await self.db.execute(
+                        "UPDATE tasks SET procedure_md = ? WHERE id = ?",
+                        (proc_text, tid),
+                    )
+                    cur["procedure_md"] = proc_text
+            except Exception as e:
+                log.warning("failed to load procedure.md for task %s: %s", tid, e)
+
+        # Build the step dict the orchestrator expects. The task row's
+        # columns map onto the step's fields 1:1; plural fields
+        # (target_profiles, required_capabilities) are constructed from
+        # the task's singular columns + JSON columns.
+        try:
+            params_obj = json.loads(cur.get("params") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            params_obj = {}
+        try:
+            depends_list = json.loads(cur.get("depends_on") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            depends_list = []
+        try:
+            feedback_list = json.loads(cur.get("feedback_to") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            feedback_list = []
+        # Routing wants the plural `required_capabilities` field; the
+        # task row keeps the legacy singular `required_capability`. The
+        # dispatch helper handles this conversion internally too, but
+        # we pass the plural directly so the routing hint is visible
+        # in the audit log + plan_editor for the new field.
+        required_cap = cur.get("required_capability")
+        step: dict[str, Any] = {
+            "name": cur.get("name") or "",
+            "agent_role": role,
+            "action": cur.get("action") or "do_step",
+            "output_path": cur.get("output_path"),
+            "params_template": params_obj,
+            "depends_on": depends_list,
+            "feedback_to": feedback_list,
+        }
+        if required_cap:
+            step["required_capabilities"] = [required_cap]
+            step["required_capability"] = required_cap
+
+        # Single tasks with empty role are an edge case — the user
+        # wants "any available agent". The new routing engine treats
+        # empty role as a 422 NoProfileAvailable. We surface that
+        # here with a clear error so the operator knows the new
+        # dispatch path doesn't support "any agent" semantics (that's
+        # still the legacy _assign_task path, used by single tasks).
+        if bool(cur.get("is_single_task")) and not role:
+            err_msg = (
+                "dispatch.no_role: single task has no agent_role; "
+                "single-task dispatch keeps the legacy 'pick any' "
+                "fallback, not the SOUL routing path"
+            )
+            await self.db.execute(
+                "UPDATE tasks SET status = 'failed', error = ?, "
+                "updated_at = ? WHERE id = ? AND status = 'pending'",
+                (err_msg, _now_iso(), tid),
+            )
+            await audit_log(
+                self.db, "dispatch.no_role",
+                actor="supervisor",
+                project_id=pid,
+                task_id=tid,
+                payload={"error": err_msg},
+            )
+            log.warning(f"task {tid} ({cur.get('name')!r}) FAILED: {err_msg}")
+            return False
+
+        # Run the dispatch. dispatch_step does routing + SOUL apply +
+        # task insert; we catch the two known failure modes.
+        #
+        # NoProfileAvailable → DEFER (return False, leave the task
+        # 'pending'). This matches the legacy _assign_task semantics
+        # for "no agent online right now" or "agent at cap" — the
+        # task stays pending and the next supervisor tick retries.
+        # The routing engine considers a profile "not available" if
+        # it's busy or offline, which subsumes the legacy
+        # per-agent cap check for the common single-profile-per-
+        # agent setup. The legacy "NoProfileAvailable = 422" path
+        # still fires for the API layer (POST /api/projects/{id}/
+        # dispatch, chatbox "Run plan"), just not here.
+        #
+        # SoulApplyError → FAIL (mark original as 'failed'). The
+        # wrapper didn't ack the SOUL apply within the timeout
+        # window. This is a real error — the user needs to
+        # investigate the wrapper (or the disk / network on the
+        # agent host). Retrying on the next tick would just hit
+        # the same timeout; failing fast is the right call.
+        try:
+            new_task = await dispatch_step(pid, step, self.db)
+        except NoProfileAvailable as e:
+            log.info(
+                f"task {tid} ({cur.get('name')!r}, role={role}): "
+                f"no profile available right now ({e.hint.splitlines()[0]!r}); "
+                f"deferring to next tick"
+            )
+            return False
+        except SoulApplyError as e:
+            err_msg = f"dispatch.soul_apply_failed: {e}"
+            await self.db.execute(
+                "UPDATE tasks SET status = 'failed', error = ?, "
+                "updated_at = ? WHERE id = ? AND status = 'pending'",
+                (err_msg, _now_iso(), tid),
+            )
+            await audit_log(
+                self.db, "dispatch.soul_apply_failed",
+                actor="supervisor",
+                project_id=pid,
+                task_id=tid,
+                payload={
+                    "error": err_msg,
+                    "cfg_id": e.cfg_id,
+                    "error_msg": e.error_msg,
+                },
+            )
+            log.warning(
+                f"task {tid} ({cur.get('name')!r}) FAILED: {err_msg}"
+            )
+            return False
+
+        # Success: mark the ORIGINAL task as 'dispatched' (so it
+        # doesn't get re-dispatched) and record which profile was
+        # chosen. The new task is pending and will be picked up by
+        # the next tick's _assign_task (which respects the pre-set
+        # assigned_profile_id).
+        await self.db.execute(
+            "UPDATE tasks SET status = 'dispatched', "
+            "assigned_profile_id = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (new_task.get("assigned_profile_id"), _now_iso(), tid),
+        )
+        await audit_log(
+            self.db, "task.dispatched_via_soul",
+            actor="supervisor",
+            project_id=pid,
+            task_id=tid,
+            payload={
+                "role": role,
+                "profile_id": new_task.get("assigned_profile_id"),
+                "dispatched_task_id": new_task.get("id"),
+                "required_capability": required_cap,
+            },
+        )
+        log.info(
+            f"task {tid} ({cur.get('name')!r}, role={role}) "
+            f"dispatched via soul_dispatch -> new task {new_task.get('id')} "
+            f"on profile {new_task.get('assigned_profile_id')}"
+        )
+        return True
+
     async def _assign_task(self, task: dict[str, Any]) -> bool:
         """Find an available agent with matching role; mark task assigned.
 
@@ -1452,7 +1756,31 @@ class Supervisor:
         # because the user didn't specify one — they want ANY available
         # agent. For those, pick the first verified agent's first
         # profile (deterministic order by agent_id).
+        # v3.9.0: if `assigned_profile_id` is already set on the task
+        # (the orchestrator.soul_dispatch flow pre-resolves the
+        # profile at routing time), use that directly. The role-based
+        # fallback below only runs for tasks that came in without a
+        # pre-resolved profile (manual API, single-task loop, or a
+        # legacy task that bypassed dispatch_step).
         prof = None
+        pre_resolved_pid = task.get("assigned_profile_id")
+        if pre_resolved_pid:
+            prof = await self.db.fetchone(
+                "SELECT ap.id, ap.agent_id, ap.capabilities, ap.name AS role "
+                "FROM agent_profiles ap "
+                "JOIN agents a ON a.id = ap.agent_id "
+                "WHERE ap.id = ? AND a.status = 'verified'",
+                (pre_resolved_pid,),
+            )
+            if prof:
+                # Sync the role from the resolved profile so the
+                # rest of the dispatch flow (cap check, audit log)
+                # works consistently. This is the case where the
+                # routing engine picked a profile whose name may
+                # not literally equal task.agent_role (e.g. preset
+                # binding with a custom role_name).
+                if not role and prof.get("role"):
+                    role = prof["role"]
         if is_single and not role:
             prof = await self.db.fetchone(
                 "SELECT ap.id, ap.agent_id, ap.capabilities, ap.name AS role "

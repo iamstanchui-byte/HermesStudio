@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     status TEXT NOT NULL DEFAULT 'idle',
     current_task_id TEXT,
     capabilities TEXT NOT NULL DEFAULT '{}',
+    -- v3.9.0: profile capability tags (JSON list of strings, e.g.
+    -- '["web_search", "python"]'). Used by the SOUL routing engine
+    -- (orchestrator/routing.py) for capability-match dispatch. Distinct
+    -- from the file-based skills under `profile_configs` (which are
+    -- hermes 0.17+ SKILL.md files); this is a flat tag list the
+    -- workflow author can match against `required_capabilities`.
+    -- Default '[]' = no capabilities declared (old profile behavior;
+    -- routing falls back to "any online profile" with a warning).
+    skills TEXT NOT NULL DEFAULT '[]',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
@@ -207,6 +216,22 @@ CREATE TABLE IF NOT EXISTS project_soul_presets (
     profile_id TEXT NOT NULL,  -- which agent profile this preset is for
     role_name TEXT NOT NULL,   -- denormalized for display (profile.role)
     content TEXT NOT NULL,
+    -- v3.9.0 (SOUL routing): workflow-supplied default SOUL. The orch
+    -- server uses this as the initial content for `content` if the
+    -- preset is auto-populated on first dispatch (no human override
+    -- yet). Workflow authors set this per-step in the plan JSON.
+    -- NULL = no workflow default (fall back to generic role template).
+    default_soul TEXT DEFAULT NULL,
+    -- v3.9.0: when the orch server last wrote THIS preset to a host's
+    -- SOUL.md. Used by the dispatch path to detect stale state and
+    -- by the dashboard to show "last applied 5 min ago" badges.
+    last_applied_at TIMESTAMP DEFAULT NULL,
+    -- v3.9.0: host-side SOUL.md mtime after the last apply. Used by
+    -- orchestrator/soul_dispatch.py for heartbeat confirmation —
+    -- we poll the wrapper's heartbeat until mtime advances past
+    -- this value, instead of guessing with a sleep. Stored as
+    -- the wrapper's reported mtime string (no normalization).
+    last_applied_mtime TEXT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
@@ -574,6 +599,35 @@ MIGRATIONS = [
     # capacity; the wrapper reads the value from the heartbeat
     # response and sizes its ThreadPoolExecutor accordingly.
     "ALTER TABLE agents ADD COLUMN max_concurrent_tasks INTEGER NOT NULL DEFAULT 1",
+    # ===== v3.9.0: SOUL routing & dispatch =====
+    # See docs/soul-routing-design.md for the full data model.
+    #
+    # agent_profiles.skills: flat list of capability tags
+    # (e.g. '["web_search", "python"]') used by the routing engine
+    # (orchestrator/routing.py) to match workflow steps that declare
+    # `required_capabilities`. Stored as JSON text. Default '[]' =
+    # no capabilities declared (old profiles; routing falls back to
+    # "any online profile" with a warning). Idempotent: the
+    # 'duplicate column' error is caught silently in connect().
+    "ALTER TABLE agent_profiles ADD COLUMN skills TEXT NOT NULL DEFAULT '[]'",
+    # project_soul_presets.default_soul: workflow-supplied default
+    # persona. The orch server seeds `content` with this value when
+    # auto-populating a preset on first dispatch (see
+    # orchestrator/soul_dispatch.py). NULL = no workflow default
+    # (fall back to a generic role template).
+    "ALTER TABLE project_soul_presets ADD COLUMN default_soul TEXT DEFAULT NULL",
+    # project_soul_presets.last_applied_at: server-side timestamp
+    # captured right after soul_dispatch confirms the SOUL.md write
+    # via the wrapper heartbeat. Dashboard reads this to show
+    # "applied 5 min ago" badges; routing consults it to skip a
+    # re-apply when the preset content hasn't changed.
+    "ALTER TABLE project_soul_presets ADD COLUMN last_applied_at TIMESTAMP DEFAULT NULL",
+    # project_soul_presets.last_applied_mtime: host-side SOUL.md
+    # mtime as reported by the wrapper on its last heartbeat. The
+    # dispatch path polls the heartbeat until mtime advances past
+    # this value (10s timeout), which is how we confirm the write
+    # actually landed without guessing with a sleep.
+    "ALTER TABLE project_soul_presets ADD COLUMN last_applied_mtime TEXT DEFAULT NULL",
 ]
 
 

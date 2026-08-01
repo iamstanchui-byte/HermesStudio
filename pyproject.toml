@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-orchestrator"
-version = "0.1.0"
+version = "0.9.0"
 description = "Local network multi-agent orchestrator for Hermes runtime"
 readme = "README.md"
 requires-python = ">=3.10"

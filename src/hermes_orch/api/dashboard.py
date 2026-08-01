@@ -298,6 +298,34 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
         # "str object has no attribute 'items'" when a profile has any
         # capabilities set. Phase 4 (smart dispatch).
         for p in profile_list:
+            # v3.9.0: split the two `skills` concepts cleanly.
+            # - `p["skills"]`       = file-based (list of dicts loaded from
+            #                         <profile>/skills/*/SKILL.md). This is
+            #                         the existing UI semantic — the agents
+            #                         page's "Skills" tab renders this list.
+            # - `p["capability_tags"]` = declared at registration (the
+            #                         new `agent_profiles.skills` JSON
+            #                         column parsed to a list of strings).
+            #                         Surfaced in the Overview tab as a
+            #                         "capabilities" badge.
+            # The DB column is still named `skills` (no migration to
+            # rename); we parse it once here into a list and stash it
+            # under `capability_tags` so the rest of the template +
+            # the JSON API response don't confuse the two.
+            skills_raw = p.get("skills")
+            capability_tags: list[str] = []
+            if skills_raw:
+                try:
+                    parsed = json.loads(skills_raw) if isinstance(skills_raw, str) else skills_raw
+                    if isinstance(parsed, list):
+                        capability_tags = [str(s) for s in parsed if isinstance(s, (str, int, float))]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            p["capability_tags"] = capability_tags
+            # Now overwrite `p["skills"]` with the file-based list.
+            # The DB column value (a JSON string) is gone from the
+            # template context — the template only ever sees the
+            # file-based list under `p["skills"]`.
             p["skills"] = await _load_profile_skills(db, p["id"])
             # LLM model fields (plain TEXT, no JSON parsing — just pass through).
             # If all three are NULL, the wrapper hasn't reported yet; the

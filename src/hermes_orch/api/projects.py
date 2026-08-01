@@ -52,6 +52,7 @@ from pydantic import BaseModel, Field
 from hermes_orch.core.audit import audit_log
 from hermes_orch.core.loop_status import compute_loop_status
 from hermes_orch.core.sse import publish_event, subscribe
+from hermes_orch.db import Database
 from hermes_orch.utils import now_iso as _now_iso
 
 # Imported here (not at module top) to avoid circular imports
@@ -2036,6 +2037,12 @@ class SoulPresetUpsert(BaseModel):
     agent_id: str
     profile_name: str
     content: str
+    # v3.9.0 (SOUL routing): workflow-supplied default. The orch server
+    # uses this as the initial content when auto-populating a preset on
+    # first dispatch (see orchestrator/soul_dispatch.py). Optional —
+    # old callers (pre-v3.9.0) leave it None and routing falls back
+    # to a generic role template.
+    default_soul: str | None = None
 
 
 class SoulPresetApply(BaseModel):
@@ -2055,6 +2062,12 @@ class SoulPreset(BaseModel):
     profile_name: str | None = None  # joined from agent_profiles
     created_at: str | None = None
     updated_at: str | None = None
+    # v3.9.0 (SOUL routing): three new orchestration-side fields. All
+    # optional / nullable for backward compat with old rows that
+    # pre-date the columns.
+    default_soul: str | None = None
+    last_applied_at: str | None = None
+    last_applied_mtime: str | None = None
 
 
 @router.get(
@@ -2072,7 +2085,11 @@ async def list_soul_presets(project_id: str, request: Request) -> list[SoulPrese
     if not project:
         raise HTTPException(404, f"Project not found: {project_id}")
     rows = await db.fetchall(
+        # v3.9.0: include the 3 new SOUL-routing columns so the dashboard
+        # can show "last applied 5 min ago" badges. Default-soul comes
+        # through for the read-only display next to content.
         "SELECT sp.id, sp.project_id, sp.profile_id, sp.role_name, sp.content, "
+        "sp.default_soul, sp.last_applied_at, sp.last_applied_mtime, "
         "sp.created_at, sp.updated_at, ap.agent_id, ap.name AS profile_name "
         "FROM project_soul_presets sp "
         "JOIN agent_profiles ap ON ap.id = sp.profile_id "
@@ -2091,6 +2108,9 @@ async def list_soul_presets(project_id: str, request: Request) -> list[SoulPrese
             profile_name=r.get("profile_name"),
             created_at=r.get("created_at"),
             updated_at=r.get("updated_at"),
+            default_soul=r.get("default_soul"),
+            last_applied_at=r.get("last_applied_at"),
+            last_applied_mtime=r.get("last_applied_mtime"),
         )
         for r in rows
     ]
@@ -2132,11 +2152,21 @@ async def upsert_soul_preset(
         (project_id, profile["id"]),
     )
     if existing:
+        # v3.9.0: also write default_soul on update when the caller
+        # provided it. NULL = keep existing (only an explicit None
+        # preserves the old value; body.default_soul is just str | None).
+        # We treat "caller did not send the field" as "no change" — Pydantic
+        # defaults default_soul to None on the request model, so we
+        # distinguish "absent" via model_fields_set (Pydantic v2).
+        sets = ["content = ?", "role_name = ?", "updated_at = ?"]
+        params: list[Any] = [body.content, profile["name"], now]
+        if "default_soul" in body.model_fields_set:
+            sets.append("default_soul = ?")
+            params.append(body.default_soul)
         await db.execute(
-            "UPDATE project_soul_presets "
-            "SET content = ?, role_name = ?, updated_at = ? "
-            "WHERE id = ?",
-            (body.content, profile["name"], now, existing["id"]),
+            f"UPDATE project_soul_presets SET {', '.join(sets)} "
+            f"WHERE id = ?",
+            (*params, existing["id"]),
         )
         preset_id = existing["id"]
     else:
@@ -2149,6 +2179,9 @@ async def upsert_soul_preset(
                 "profile_id": profile["id"],
                 "role_name": profile["name"],
                 "content": body.content,
+                # v3.9.0: seed the workflow-supplied default at insert
+                # time. NULL is fine (fall back to generic template).
+                "default_soul": body.default_soul,
             },
         )
     row = await db.fetchone(
@@ -2163,6 +2196,9 @@ async def upsert_soul_preset(
             "agent_id": body.agent_id,
             "profile_name": body.profile_name,
             "size": len(body.content),
+            # v3.9.0: surface default_soul in the audit so operators
+            # can see what the workflow author supplied.
+            "default_soul_provided": "default_soul" in body.model_fields_set,
         },
     )
     return SoulPreset(
@@ -2175,6 +2211,9 @@ async def upsert_soul_preset(
         profile_name=body.profile_name,
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
+        default_soul=row.get("default_soul"),
+        last_applied_at=row.get("last_applied_at"),
+        last_applied_mtime=row.get("last_applied_mtime"),
     )
 
 
@@ -2287,6 +2326,85 @@ async def apply_soul_presets(
         },
     )
     return written
+
+
+# ===== SOUL routing helpers (v3.9.0) =====
+#
+# Module-level helpers consumed by orchestrator/routing.py and
+# orchestrator/soul_dispatch.py. Kept in this file (not in db.py)
+# because the project_soul_presets CRUD lives here; moving it would
+# create a circular import (db.py is loaded at app startup, before
+# any routers). The orchestrator modules will import these directly
+# from hermes_orch.api.projects.
+#
+# Both functions are pure DB reads/writes — no FastAPI Request, no
+# HTTP semantics. The async signature matches Database methods so
+# the orchestrator can call them with the same `db: Database`
+# reference it already has.
+
+
+async def get_soul_preset_by_role(
+    db: Database, project_id: str, role_name: str
+) -> dict[str, Any] | None:
+    """Look up a project SOUL preset by (project, role_name).
+
+    Returns the full preset row (including v3.9.0 fields
+    `default_soul`, `last_applied_at`, `last_applied_mtime`) or
+    None if no preset exists for that role in this project.
+
+    Used by orchestrator/routing.py as step 2 of the hybrid routing
+    algorithm: "if a project preset is bound to this role, route
+    to that preset's profile" (strategy #2 of 4).
+
+    Note: the UNIQUE constraint on (project_id, profile_id) means
+    there can be at most one preset per (project, profile). This
+    helper searches by role_name instead, which can in principle
+    match multiple profiles if a project has several presets with
+    the same role_name (rare but possible — e.g. "researcher" bound
+    to two different agents). In that case we return the
+    most-recently-updated one (FIFO behavior, matching the existing
+    "first apply wins" semantics in `apply_soul_presets`).
+    """
+    rows = await db.fetchall(
+        "SELECT * FROM project_soul_presets "
+        "WHERE project_id = ? AND role_name = ? "
+        "ORDER BY updated_at DESC, created_at DESC "
+        "LIMIT 1",
+        (project_id, role_name),
+    )
+    return rows[0] if rows else None
+
+
+async def touch_soul_preset(
+    db: Database,
+    preset_id: str,
+    applied_mtime: str,
+) -> None:
+    """Mark a SOUL preset as just-applied.
+
+    Updates `last_applied_at` to the current server time and
+    `last_applied_mtime` to the value reported by the wrapper
+    heartbeat (typically the host's SOUL.md mtime string).
+
+    Called by orchestrator/soul_dispatch.py after a successful
+    apply + heartbeat confirm. The dispatch path polls the
+    heartbeat's reported SOUL.md mtime against `last_applied_mtime`
+    to decide whether a re-apply is needed — so this function is
+    the source of truth for "what we last wrote, when, and where
+    the host's mtime is now".
+
+    Idempotent: a no-op when the preset id doesn't exist (would
+    only happen if the preset was deleted between dispatch and
+    apply; the orchestrator should treat that as a soft failure
+    elsewhere).
+    """
+    now = _now_iso()
+    await db.execute(
+        "UPDATE project_soul_presets "
+        "SET last_applied_at = ?, last_applied_mtime = ? "
+        "WHERE id = ?",
+        (now, applied_mtime, preset_id),
+    )
 
 
 # ===== Project chat box (Phase 4+ #25, 2026-07-25) =====

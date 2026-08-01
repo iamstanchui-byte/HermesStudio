@@ -115,12 +115,22 @@ class AgentProfileCreate(BaseModel):
     description: str | None = None
     capabilities: dict[str, bool] = Field(default_factory=dict)
     storage_refs: list[StorageRef] = Field(default_factory=list)
+    # v3.9.0 (SOUL routing): flat list of capability tags (e.g.
+    # ["web_search", "python"]). Used by the routing engine to match
+    # workflow steps that declare `required_capabilities`. Distinct
+    # from file-based skills (which live under <profile>/skills/).
+    # Optional — default [] = no capabilities declared.
+    skills: list[str] = Field(default_factory=list)
 
 
 class AgentProfileUpdate(BaseModel):
     description: str | None = None
     capabilities: dict[str, bool] | None = None
     storage_refs: list[StorageRef] | None = None
+    # v3.9.0 (SOUL routing): optional — only update the column when
+    # the caller provides it. None = no change (backward compat for
+    # existing PATCH calls that don't touch skills).
+    skills: list[str] | None = None
 
 
 class HeartbeatBody(BaseModel):
@@ -165,6 +175,22 @@ class AgentProfile(BaseModel):
     # Per orch-as-coordinator principle: agent writes large data
     # directly to these paths; orch only stores metadata + reference.
     storage_refs: list[StorageRef] = Field(default_factory=list)
+    # v3.9.0 (SOUL routing): file-based skills (list of dicts loaded
+    # from <profile>/skills/*/SKILL.md via dashboard's
+    # _load_profile_skills). `_row_to_profile` does NOT populate this —
+    # the dashboard adds it per-render. The API response from the
+    # non-dashboard path (e.g. GET /api/agents/{id}) returns [] here;
+    # the dashboard does its own loading for the agents page.
+    # See api/dashboard.py for the canonical fill-in path.
+    skills: list[dict] = Field(default_factory=list)
+    # v3.9.0 (SOUL routing): profile capability tags (JSON list of
+    # strings, e.g. ["web_search", "python"]). The routing engine
+    # matches workflow step `required_capabilities` against this list.
+    # Distinct from the file-based `skills` above (declared at
+    # registration, not loaded from disk). Default [] = no
+    # capabilities declared; routing engine falls back to "any
+    # online profile" with a warning.
+    capability_tags: list[str] = Field(default_factory=list)
     created_at: str | None = None
 
 
@@ -301,6 +327,25 @@ def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
                         })
         except (json.JSONDecodeError, TypeError):
             pass
+    # v3.9.0 (SOUL routing): profile capability tags. The DB column
+    # is still named `skills` (no migration to rename it) but the
+    # Pydantic response field is `capability_tags` to distinguish it
+    # from the file-based `skills` list (which the dashboard loads
+    # separately via _load_profile_skills). Defensive: schema
+    # guarantees default '[]' on new rows; for pre-migration DBs the
+    # column is missing entirely and row.get() returns None (treated
+    # as empty list). Malformed JSON also falls back to [] — the
+    # routing engine logs a warning and treats the profile as "no
+    # capabilities declared".
+    skills_raw = row.get("skills")
+    capability_tags: list[str] = []
+    if skills_raw:
+        try:
+            parsed = json.loads(skills_raw) if isinstance(skills_raw, str) else skills_raw
+            if isinstance(parsed, list):
+                capability_tags = [str(s) for s in parsed if isinstance(s, (str, int, float))]
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     return AgentProfile(
         id=row["id"],
@@ -316,6 +361,14 @@ def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
         llm_model_provider=row.get("llm_model_provider"),
         mcp_servers=mcps,
         storage_refs=srefs,
+        # File-based skills (skills/<name>/SKILL.md) are NOT loaded
+        # here — the dashboard adds them per-render via
+        # _load_profile_skills. Non-dashboard API consumers that
+        # need the file-based list can hit
+        # GET /api/agents/{id}/profiles/{name}/skills. Empty list
+        # here is the correct "not loaded" sentinel.
+        skills=[],
+        capability_tags=capability_tags,
         created_at=row.get("created_at"),
     )
 
@@ -962,6 +1015,12 @@ async def add_profile(
                 "ref": str(s["ref"]),
                 "description": str(s.get("description", "")),
             })
+    # v3.9.0 (SOUL routing): normalize skills to a list[str] of
+    # non-empty strings. Drop empties / non-string entries silently so
+    # a bad input doesn't 400 the whole profile creation.
+    cleaned_skills: list[str] = [
+        str(s).strip() for s in (body.skills or []) if str(s).strip()
+    ]
     await db.insert(
         "agent_profiles",
         {
@@ -972,6 +1031,7 @@ async def add_profile(
             "status": "idle",
             "capabilities": json.dumps(body.capabilities or {}),
             "storage_refs": json.dumps(cleaned_refs),
+            "skills": json.dumps(cleaned_skills),
         },
     )
     row = await db.fetchone("SELECT * FROM agent_profiles WHERE id = ?", (profile_id,))
@@ -983,6 +1043,7 @@ async def add_profile(
             "profile_name": body.name,
             "description": body.description,
             "capabilities": body.capabilities or {},
+            "skills": cleaned_skills,
         },
     )
     return _row_to_profile(row)
@@ -1041,6 +1102,18 @@ async def update_profile(
         await db.execute(
             "UPDATE agent_profiles SET capabilities = ? WHERE id = ?",
             (json.dumps(body.capabilities), profile["id"]),
+        )
+    # v3.9.0 (SOUL routing): only update skills when the caller
+    # explicitly provided the field. None = leave unchanged (backward
+    # compat). Same defensive normalize as add_profile — drop empties
+    # / non-strings silently.
+    if body.skills is not None:
+        cleaned_skills: list[str] = [
+            str(s).strip() for s in body.skills if str(s).strip()
+        ]
+        await db.execute(
+            "UPDATE agent_profiles SET skills = ? WHERE id = ?",
+            (json.dumps(cleaned_skills), profile["id"]),
         )
     if body.storage_refs is not None:
         # Validate each entry: kind non-empty, ref non-empty. Drop
@@ -1104,6 +1177,9 @@ async def update_profile(
             "description": body.description,
             "capabilities": body.capabilities,
             "storage_refs": srefs_audit,
+            # v3.9.0 (SOUL routing): surface the new skills field too
+            # so the audit log captures what the operator changed.
+            "skills": body.skills,
         },
     )
     return _row_to_profile(row)
