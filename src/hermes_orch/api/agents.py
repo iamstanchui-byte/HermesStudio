@@ -45,6 +45,15 @@ from hermes_orch.auth import require_hmac_auth
 
 from hermes_orch.core.audit import audit_log
 from hermes_orch.utils import now_iso as _now_iso
+# v3.9.0 (Phase 3): reset-live-SOUL is admin-only. The
+# `require_admin` dep lives in api/users.py to keep the
+# admin guard co-located with the other admin-only endpoints.
+# We import lazily inside the function (see reset_live_soul)
+# to avoid the import-time cycle: api/agents.py is mounted
+# at app startup before api/users.py. The Depends() call
+# resolves the function at request time, not at import
+# time, so the lazy import inside the function works.
+from hermes_orch.api.users import require_admin  # noqa: E402
 
 router = APIRouter()
 
@@ -1382,6 +1391,80 @@ async def ack_config(
         },
     )
     return _row_to_config(updated)
+
+
+@router.post(
+    "/{agent_id}/profiles/{profile_name}/soul/reset",
+    response_model=ProfileConfig,
+    status_code=201,
+)
+async def reset_live_soul(
+    agent_id: str,
+    profile_name: str,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> ProfileConfig:
+    """Reset a profile's live SOUL.md to empty (admin only).
+
+    v3.9.0 (Phase 3): writes a `profile_configs` row with
+    `desired_content=''` (sha256 of empty string). The wrapper
+    picks it up on the next tick and writes an empty SOUL.md
+    on the host — the agent then falls back to its default
+    persona (whatever the hermes-agent binary ships with).
+
+    Intended for fleet-reset: the operator just spent a few hours
+    debugging a bad persona and wants the agent to start fresh.
+    The existing preset rows in the DB are NOT touched (the
+    preset is the project's snapshot, not the live file) — the
+    operator can re-apply a preset to restore a persona.
+
+    The `apply` path (api/projects.py::apply_soul_presets) uses
+    the same `profile_configs` flow, so a reset can be safely
+    interleaved with applies (they serialize per-profile via
+    the atomic claim in `claim_pending_config`).
+
+    Idempotent in the sense that two consecutive resets produce
+    the same end state (empty SOUL.md). The two rows are still
+    both written (no SHA256 dedup on the reset path) so the
+    audit trail is intact.
+
+    Admin only — see the dependency. The wrapper's ack
+    endpoint (`/configs/{id}/ack`) confirms the file was
+    written; the caller can poll the row to see `status`.
+    """
+    import hashlib as _hashlib
+    import uuid as _uuid
+
+    db = request.app.state.db
+    profile = await _find_profile(db, agent_id, profile_name)
+    empty_sha = _hashlib.sha256(b"").hexdigest()
+    cfg_id = str(_uuid.uuid4())
+    await db.insert(
+        "profile_configs",
+        {
+            "id": cfg_id,
+            "profile_id": profile["id"],
+            "file_path": "SOUL.md",
+            "desired_sha256": empty_sha,
+            "desired_content": "",
+            "status": "pending",
+        },
+    )
+    row = await db.fetchone(
+        "SELECT * FROM profile_configs WHERE id = ?", (cfg_id,)
+    )
+    await audit_log(
+        db, "profile.soul_reset",
+        actor=admin.get("username") or "admin",
+        agent_id=agent_id,
+        payload={
+            "profile_name": profile_name,
+            "config_id": cfg_id,
+            "desired_sha256": empty_sha,
+            "size": 0,
+        },
+    )
+    return _row_to_config(row)
 
 
 @router.post("/{agent_id}/sessions/{session_id}/cleanup-ack")

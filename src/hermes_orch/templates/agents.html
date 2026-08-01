@@ -839,6 +839,29 @@ function renderOverviewTab(profile, content) {
             <div class="text-[11px] text-gray-500 mb-1">Capability tags (routing):</div>
             ${tagsHtml}
         </div>
+        {# v3.9.0 (Phase 3): reset-live-SOUL action. Lives at the
+           bottom of the Overview tab because it operates on a
+           profile (which is the modal's subject), not on a
+           project preset. The spec said "at the bottom of the
+           SOUL editor section" — there's no SOUL editor on the
+           agents page; we treat the profile-modal's footer as
+           the closest equivalent. Server-side gated to admin
+           (the API returns 403 for non-admins regardless of UI
+           visibility). #}
+        <div class="mt-4 pt-3 border-t border-red-200 bg-red-50 -mx-5 -mb-5 px-5 py-3 rounded-b">
+            <div class="text-[11px] text-red-700 font-semibold uppercase tracking-wide mb-1">Danger zone</div>
+            <p class="text-[11px] text-red-700 mb-2">
+                Reset clears <code class="text-[10px]">SOUL.md</code> on the agent host.
+                The agent will fall back to its default persona. Per-project
+                presets in the DB are NOT touched — re-apply one to restore a persona.
+            </p>
+            <button type="button"
+                    onclick="resetLiveSoul('${escapeAttr(profile.agent_id || '')}', '${escapeAttr(profile.name || '')}', this)"
+                    class="text-[11px] px-2.5 py-1 bg-red-600 text-white rounded hover:bg-red-700">
+                🗑️ Reset live SOUL
+            </button>
+            <span class="reset-soul-status text-[11px] text-red-700 ml-2"></span>
+        </div>
     `;
 }
 
@@ -1617,6 +1640,50 @@ async function deleteProfile(agentId, profileName) {
         }
     } catch (err) {
         alert('Network error: ' + err.message);
+    }
+}
+
+// v3.9.0 (Phase 3): reset-live-SOUL handler. Admin-only
+// (the API returns 403 for non-admins; the button is also
+// in the danger zone so the UI makes the power level clear).
+// The wrapper picks up the new profile_configs row on its
+// next tick (typically <5s) and writes an empty SOUL.md on
+// the host. The operator can verify by reading the file
+// directly or by re-applying a preset.
+async function resetLiveSoul(agentId, profileName, btn) {
+    if (!confirm(`This will clear SOUL.md on the agent host (${agentId}/${profileName}). The agent will fall back to its default persona. Continue?`)) return;
+    const status = btn.parentElement.querySelector('.reset-soul-status');
+    const orig = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '...';
+    if (status) status.textContent = '';
+    try {
+        const r = await fetch(
+            `/api/agents/${encodeURIComponent(agentId)}/profiles/${encodeURIComponent(profileName)}/soul/reset`,
+            {method: 'POST'}
+        );
+        if (r.status === 201 || r.ok) {
+            if (status) {
+                status.textContent = 'queued — wrapper will apply within ~5s';
+                status.className = 'reset-soul-status text-[11px] text-green-700 ml-2';
+            }
+            btn.innerHTML = '✓ queued';
+        } else {
+            const err = await r.json().catch(() => ({}));
+            if (status) {
+                status.textContent = 'Error: ' + (err.detail || r.status);
+                status.className = 'reset-soul-status text-[11px] text-red-700 ml-2';
+            }
+            btn.innerHTML = orig;
+            btn.disabled = false;
+        }
+    } catch (e) {
+        if (status) {
+            status.textContent = 'Network error: ' + (e && e.message || e);
+            status.className = 'reset-soul-status text-[11px] text-red-700 ml-2';
+        }
+        btn.innerHTML = orig;
+        btn.disabled = false;
     }
 }
 
