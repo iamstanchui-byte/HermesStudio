@@ -1600,8 +1600,14 @@ async function submitFromTemplate() {
 }
 
 document.addEventListener('click', (ev) => {
-    const t = ev.target;
-    if (!t || !t.matches || !t.matches('button[data-tpl]')) return;
+    // Find the template card via closest() — clicking a child <div> inside
+    // the button must still register. ev.target is the actual node clicked
+    // (often a <div>), not the <button> itself, so matches() on the target
+    // alone misses every click that lands on the card's name / description
+    // / meta rows. closest() walks up to the button, which is the real
+    // hit-test target.
+    const t = ev.target && ev.target.closest && ev.target.closest('button[data-tpl]');
+    if (!t) return;
     const data = JSON.parse(t.getAttribute('data-tpl'));
     const previewBox = document.getElementById('from-template-preview');
     const previewName = document.getElementById('from-template-preview-name');
