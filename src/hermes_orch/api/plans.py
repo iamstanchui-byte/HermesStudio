@@ -1664,7 +1664,14 @@ async def plan_visual_page(project_id: str, request: Request) -> HTMLResponse:
     from fastapi.templating import Jinja2Templates
     db = request.app.state.db
     proj = await db.fetchone(
-        "SELECT id, name, plan_json FROM projects WHERE id = ?",
+        # v3.10.10: also select max_iterations (and the other
+        # iter-loop fields) so the template can pre-fill the
+        # Generate Tasks modal with the project's current cap.
+        # Before this fix, the visual plan page returned 500
+        # because proj["max_iterations"] raised KeyError.
+        "SELECT id, name, plan_json, coordinator_role, accept_criteria, "
+        "       deliverable_path, max_iterations, current_iteration "
+        "FROM projects WHERE id = ?",
         (project_id,),
     )
     if not proj:
