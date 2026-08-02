@@ -246,6 +246,50 @@ class ProjectPlanAgentsResponse(BaseModel):
 # ===== Helpers =====
 
 
+async def _archive_tasks(
+    db: Any, task_ids: list[str], now_iso: str, *, reason: str = "plan_changed",
+) -> int:
+    """Archive the given tasks in bulk.
+
+    v3.10.6 (2026-08-02): used by `put_project_plan` to clean up
+    stale tasks when the plan structure changes. Also used by
+    `run_project_plan` to archive the previous run's tasks before
+    the new run creates fresh ones.
+
+    Args:
+        db: the database connection.
+        task_ids: list of task IDs to archive.
+        now_iso: ISO timestamp for the `updated_at` column.
+        reason: short label for the archive (logged in audit only).
+
+    Returns:
+        The number of tasks actually archived (may be less than
+        len(task_ids) if some were already archived by a concurrent
+        caller).
+    """
+    if not task_ids:
+        return 0
+    # Use a single bulk UPDATE for efficiency. SQLite supports
+    # `id IN (?, ?, ?)` with a bounded list size; chunking at
+    # 100 keeps the query plan simple.
+    archived = 0
+    CHUNK = 100
+    for i in range(0, len(task_ids), CHUNK):
+        chunk = task_ids[i : i + CHUNK]
+        placeholders = ",".join("?" for _ in chunk)
+        cur = await db.execute(
+            f"UPDATE tasks SET archived = 1, updated_at = ? "
+            f"WHERE id IN ({placeholders}) AND archived = 0 "
+            f"AND status NOT IN ('running', 'dispatched')",
+            (now_iso, *chunk),
+        )
+        # Some DB wrappers expose rowcount; for sqlite3 via our
+        # wrapper, the cursor has .rowcount after execute().
+        if hasattr(cur, "rowcount") and cur.rowcount is not None:
+            archived += int(cur.rowcount)
+    return archived
+
+
 def _load_plan_from_row(row: dict[str, Any]) -> tuple[bool, ProjectPlan | None, str | None]:
     """Parse the raw plan_json column into a ProjectPlan.
 
@@ -883,6 +927,42 @@ async def put_project_plan(
             },
         )
     plan = body.plan
+    # v3.10.6 (2026-08-02): when the plan changes, archive any
+    # non-archived, non-running tasks whose (name, role) doesn't
+    # match the new plan. Without this, the user can edit the plan
+    # in the visual editor (which calls PUT /plan), and the old
+    # tasks stay in the DB with the old role assignments. The
+    # supervisor then dispatches them, executing the wrong role
+    # (e.g. "super" doing cost-analysis when the new plan says
+    # "super-b"). The plan.ran endpoint has the same archive
+    # logic, but it only runs when the user clicks "Generate
+    # tasks" — so editing the plan in the visual editor left
+    # stale tasks behind. Real-world repro on proj-c7ad42e6:
+    # the user changed cost-analysis-vs-programmer from "super"
+    # to "super-b" in the visual editor between plan.runs, and
+    # the old "super" task (79c31a24) was still in the DB. The
+    # supervisor picked it up, dispatched to the super agent,
+    # and the agent produced a "weird" output (just dumped an
+    # L1 trace summary — the cost-analysis content was for the
+    # other role).
+    #
+    # Behavior: any non-archived task whose (name, agent_role)
+    # doesn't appear in the new plan.steps gets archived. Running
+    # tasks are NOT touched (would orphan the agent). The check
+    # is idempotent: if the plan is unchanged, all tasks still
+    # match, nothing is archived.
+    old_plan_steps_set: set[tuple[str, str]] = set()
+    if has_plan_json:
+        try:
+            _, old_plan, _ = _load_plan_from_row(proj)
+            if old_plan is not None:
+                for s in old_plan.steps:
+                    old_plan_steps_set.add((s.name, s.agent_role))
+        except Exception:
+            # Malformed old plan: don't crash the PUT, just skip
+            # the structural comparison. The seed helper will
+            # still work and the user can manually archive.
+            old_plan_steps_set = set()
     # Serialize via Pydantic to ensure we write a clean JSON shape
     # (round-trip removes None, sorts fields, etc.). Then dump with
     # ensure_ascii=False for friendlier display in the JSON view.
@@ -892,6 +972,58 @@ async def put_project_plan(
         "UPDATE projects SET plan_json = ?, updated_at = ? WHERE id = ?",
         (plan_json_str, now, project_id),
     )
+    # v3.10.6: archive stale tasks (structural diff between old and
+    # new plan). The new plan is now in the DB; we compare every
+    # non-archived task's (name, agent_role) against the new plan
+    # steps. Mismatches are stale (either removed step, renamed
+    # step, or role changed) and should not run.
+    new_plan_steps_set: set[tuple[str, str]] = {
+        (s.name, s.agent_role) for s in plan.steps
+    }
+    if new_plan_steps_set != old_plan_steps_set:
+        # The plan structure changed. Archive non-running tasks
+        # whose (name, role) is no longer in the new plan.
+        try:
+            stale_rows = await db.fetchall(
+                "SELECT id, name, agent_role, status FROM tasks "
+                "WHERE project_id = ? AND archived = 0 "
+                "AND status NOT IN ('running', 'dispatched')",
+                (project_id,),
+            )
+            stale_ids = [
+                r["id"] for r in stale_rows
+                if (r["name"], r["agent_role"]) not in new_plan_steps_set
+            ]
+            if stale_ids:
+                archived_count = await _archive_tasks(
+                    db, stale_ids, now, reason="plan_changed",
+                )
+                # Audit the archive (best-effort)
+                try:
+                    from hermes_orch.core.audit import audit_log
+                    await audit_log(
+                        db, "project.tasks_archived_on_plan_change",
+                        actor=audit_actor,
+                        project_id=project_id,
+                        payload={
+                            "archived_count": archived_count,
+                            "old_steps": sorted(
+                                [list(k) for k in old_plan_steps_set]
+                            ),
+                            "new_steps": sorted(
+                                [list(k) for k in new_plan_steps_set]
+                            ),
+                            "source": "put_project_plan",
+                        },
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "plan save: failed to archive stale tasks for %s: %s",
+                project_id, e,
+            )
     # v3.10.4 (2026-08-02): auto-seed project_soul_presets from
     # the LLM-drafted `default_soul` on each plan step. The user
     # can then see + edit the SOUL presets on the project page
