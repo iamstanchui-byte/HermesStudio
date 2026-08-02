@@ -182,13 +182,19 @@
     let _clipboard = null;       // {step: <obj>, ts: <number>}
     function _copySelectedStep() {
         if (!_selectedNodeId) {
-            _showBanner('No card selected to copy (double-click a card first)', 'info');
-            return;
+            // v3.10.9: return false so the keydown handler can
+            // skip preventDefault — let the browser do its default
+            // Ctrl+C text-copy when no card is selected. Previously
+            // the keydown handler called e.preventDefault()
+            // unconditionally, so the user couldn't copy selected
+            // text on the page (e.g. step name in the canvas)
+            // while the editor's keydown was active.
+            return false;
         }
         const step = _findStepByNodeId(_selectedNodeId);
         if (!step) {
             _showBanner('Selected card not in step_template (stale drawflow state)', 'error');
-            return;
+            return false;
         }
         // Deep copy so subsequent edits to the original don't mutate
         // the clipboard. The pasted step will get its own unique
@@ -199,11 +205,13 @@
             ts: Date.now(),
         };
         _showBanner('Copied step "' + step.name + '". Click another card and press Ctrl+V (or click Paste) to clone.', 'success');
+        return true;
     }
     function _pasteClipboard() {
         if (!_clipboard) {
-            _showBanner('Clipboard empty. Copy a step first (Ctrl+C).', 'info');
-            return;
+            // v3.10.9: same pattern as _copySelectedStep — return
+            // false so the keydown handler skips preventDefault.
+            return false;
         }
         // Find a unique name. Try `<name>-copy`, `<name>-copy-2`,
         // ... up to a reasonable cap so we don't loop forever.
@@ -215,7 +223,7 @@
         while (taken.has(candidate)) {
             if (n > 999) {
                 _showBanner('Cannot paste: name collision cap reached (1000 -copy variants)', 'error');
-                return;
+                return false;
             }
             candidate = candidateBase + '-' + n;
             n += 1;
@@ -241,10 +249,19 @@
             openSidePanel(nodeId);
         }
         _showBanner('Pasted as "' + candidate + '". Edits stay in memory until you click Save.', 'success');
+        return true;
     }
     // Ctrl+C / Ctrl+V keyboard shortcuts. We avoid hijacking the
     // browser's native copy/paste when focus is in a text input
     // (so users can still copy-paste within side-panel fields).
+    //
+    // v3.10.9 (2026-08-02): also bail out (no preventDefault) when
+    // no card is selected for copy, or no step in the editor
+    // clipboard for paste. Otherwise the editor swallows Ctrl+C
+    // and the user can't copy text on the page (e.g. the canvas
+    // step labels, an error message). The copy/paste handlers
+    // return a boolean (true = handled, false = nothing to do);
+    // only preventDefault when we actually did the work.
     function _bindCopyPasteShortcuts() {
         if (window._vfCopyPasteBound) return;
         window._vfCopyPasteBound = true;
@@ -257,11 +274,11 @@
             const isTextField = tag === 'input' || tag === 'textarea' || (e.target && e.target.isContentEditable);
             if (isTextField) return;
             if (e.key.toLowerCase() === 'c' && !e.shiftKey) {
-                e.preventDefault();
-                _copySelectedStep();
+                const handled = _copySelectedStep();
+                if (handled) e.preventDefault();
             } else if (e.key.toLowerCase() === 'v' && !e.shiftKey) {
-                e.preventDefault();
-                _pasteClipboard();
+                const handled = _pasteClipboard();
+                if (handled) e.preventDefault();
             }
         });
     }

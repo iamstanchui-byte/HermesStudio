@@ -208,24 +208,35 @@
     // user can drag if they want a similar depends_on pattern).
     function _copySelectedStep() {
         if (!_selectedNodeName) {
-            showBanner('No card selected to copy (double-click a card first)', 'info');
-            return;
+            // v3.10.8: instead of showing a banner (which used to
+            // be paired with `e.preventDefault()` in the keydown
+            // handler and silently broke Ctrl+C text-copy), return
+            // a sentinel value so the keydown handler can decide
+            // whether to preventDefault. If we return false, the
+            // browser keeps its default Ctrl+C behavior — the user
+            // can copy selected text on the page (step names, the
+            // chatbox output, anything else) without the editor
+            // hijacking the keypress.
+            return false;
         }
         const step = _plan.steps.find(s => s.name === _selectedNodeName);
         if (!step) {
             showBanner('Selected card is stale (not in _plan.steps). Re-render to refresh.', 'error');
-            return;
+            return false;
         }
         _clipboard = {
             step: JSON.parse(JSON.stringify(step)),
             ts: Date.now(),
         };
         showBanner('Copied step "' + step.name + '". Click another card or an empty spot, then Ctrl+V (or click Paste) to clone.', 'success');
+        return true;
     }
     function _pasteClipboard() {
         if (!_clipboard) {
-            showBanner('Clipboard empty. Copy a step first (Ctrl+C).', 'info');
-            return;
+            // v3.10.9: return false so the keydown handler knows
+            // to skip preventDefault — the browser keeps its
+            // default Ctrl+V.
+            return false;
         }
         // Find a unique name. Try `<name>-copy`, `<name>-copy-2`, ...
         // Cap at 1000 so we don't loop forever.
@@ -237,7 +248,7 @@
         while (taken.has(candidate)) {
             if (n > 999) {
                 showBanner('Cannot paste: name collision cap reached (1000 -copy variants)', 'error');
-                return;
+                return false;
             }
             candidate = candidateBase + '-' + n;
             n += 1;
@@ -259,14 +270,19 @@
         // rename / tweak before clicking Apply.
         openSidePanel(candidate);
         showBanner('Pasted as "' + candidate + '". Edits stay in memory until you click Apply.', 'success');
+        return true;
     }
 
     // ===== v2.2: Global keyboard shortcuts =====
     // Bound once on init() (idempotent). Handles:
     //   Ctrl+Z            = undo
     //   Ctrl+Y / Ctrl+Shift+Z = redo
-    //   Ctrl+C            = copy selected step (skipped in text fields)
-    //   Ctrl+V            = paste step        (skipped in text fields)
+    //   Ctrl+C            = copy selected step (only if a card is
+    //                        selected; otherwise let the browser
+    //                        do its default text-copy)
+    //   Ctrl+V            = paste step (only if the editor's
+    //                        clipboard has a step; otherwise let
+    //                        the browser do its default text-paste)
     //   Escape            = close side panel
     //
     // v3.10.8 (2026-08-02): undo/redo now ALSO skip text fields
@@ -281,10 +297,17 @@
     // undo). The plan editor's undo still works on the canvas and
     // in the side-panel read-only / non-text controls.
     //
-    // Copy/paste were already text-field-aware in v2.2. Escape
-    // only fires when ctrl is NOT held, so it never collides with
-    // text-field Escape behavior (most text fields treat Esc as
-    // "blur" which is fine to coexist with closing the side panel).
+    // v3.10.9 (2026-08-02): Ctrl+C / Ctrl+V no longer always
+    // preventDefault. The handler used to call e.preventDefault()
+    // unconditionally, which meant if no card was selected and
+    // the user pressed Ctrl+C to copy text on the page (e.g. a
+    // step name in the canvas, the chatbox output, an error
+    // message), the editor hijacked the keypress and the browser
+    // never copied anything. Fix: the copy/paste handlers return
+    // a boolean (true = handled, false = nothing to do). When
+    // false, we DON'T call e.preventDefault(), so the browser
+    // keeps its default Ctrl+C / Ctrl+V behavior and the user
+    // can copy/paste text normally.
     function _bindGlobalShortcuts() {
         if (window._vpShortcutsBound) return;
         window._vpShortcutsBound = true;
@@ -333,15 +356,21 @@
             } else if ((key === 'z' && e.shiftKey) || key === 'y') {
                 e.preventDefault();
                 _redo();
-            } else if (!isTextField) {
-                // Copy / Paste — only outside text fields
-                if (key === 'c' && !e.shiftKey) {
-                    e.preventDefault();
-                    _copySelectedStep();
-                } else if (key === 'v' && !e.shiftKey) {
-                    e.preventDefault();
-                    _pasteClipboard();
-                }
+            } else if (key === 'c' && !e.shiftKey) {
+                // v3.10.9: only preventDefault if we actually
+                // handled the copy. If no card is selected,
+                // return false from _copySelectedStep() and let
+                // the browser do its default Ctrl+C so the user
+                // can copy text on the page.
+                const handled = _copySelectedStep();
+                if (handled) e.preventDefault();
+            } else if (key === 'v' && !e.shiftKey) {
+                // Same pattern for paste. If the editor has no
+                // step in its clipboard, fall through to the
+                // browser's default Ctrl+V (which the text-field
+                // guard above already handles for inputs).
+                const handled = _pasteClipboard();
+                if (handled) e.preventDefault();
             }
         });
     }
