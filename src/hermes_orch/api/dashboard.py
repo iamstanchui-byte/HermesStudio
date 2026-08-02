@@ -1548,7 +1548,8 @@ async def project_visual_page(
 
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request) -> HTMLResponse:
-    """Settings page (LLM + Telegram + Project Storage + Cleanup)."""
+    """Settings page (LLM + Telegram + Project Storage + Cleanup + HTTPS)."""
+    from hermes_orch.api.settings import _https_view
     from hermes_orch.config import LLM_PROVIDERS
     cfg = request.app.state.config or {}
     llm = cfg.get("llm") or {}
@@ -1567,6 +1568,8 @@ async def settings_page(request: Request) -> HTMLResponse:
     if job is not None:
         cleanup_last_run_at = job.last_run_at
         cleanup_last_result = job.last_run_result
+    # v3.12.0: HTTPS view (drives the toggle / cert path / expiry badge)
+    https = _https_view(cfg)
     return templates.TemplateResponse(
         request=request,
         name="settings.html",
@@ -1586,6 +1589,13 @@ async def settings_page(request: Request) -> HTMLResponse:
             "cleanup_daily_sweep": bool(cleanup.get("daily_sweep", True)),
             "cleanup_last_run_at": cleanup_last_run_at,
             "cleanup_last_result": cleanup_last_result,
+            "https_enabled": https.enabled,
+            "https_ready": https.ready,
+            "https_cert_path": https.ssl_cert_path,
+            "https_key_path": https.ssl_key_path,
+            "https_expires_in": https.cert_expires_in_days,
+            "https_cert_cn": https.cert_subject_cn,
+            "https_sans": https.cert_sans,
         },
     )
 

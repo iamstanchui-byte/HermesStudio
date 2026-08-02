@@ -318,6 +318,86 @@
     </form>
 </div>
 
+<!-- v3.12.0: HTTPS / TLS toggle. Default off (HTTP for dev). When enabled
+     and a cert + key are readable, `hermes-orch serve` boots uvicorn
+     with TLS termination, and `set_session_cookie` auto-sets the
+     `Secure` flag on the session cookie. The browser will show a
+     "Not Secure" warning on first visit because the cert is
+     self-signed by default — install the cert in Trusted Root
+     Certification Authorities to silence it, or upload a cert
+     signed by your own internal CA. -->
+<div id="https" class="bg-white border rounded-lg p-6 shadow-sm mb-4 scroll-mt-20">
+    <h2 class="text-lg font-semibold text-gray-800 mb-3">HTTPS / TLS <span class="text-xs text-gray-500 font-normal">(optional, v3.12.0)</span></h2>
+
+    {% if https_ready %}
+    <div class="bg-green-50 border border-green-200 rounded p-3 mb-4">
+        <div class="flex items-center gap-2 mb-1">
+            <span class="px-2 py-0.5 bg-green-600 text-white rounded text-xs font-semibold">ENABLED</span>
+            <span class="text-sm text-green-800">TLS termination active. Session cookies set the <code>Secure</code> flag.</span>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1 text-sm">
+            <div><span class="text-gray-500">Cert subject:</span> <span class="font-mono">{{ https_cert_cn or '(unknown)' }}</span></div>
+            <div><span class="text-gray-500">Expires in:</span> <span class="font-mono">{{ https_expires_in }} day(s)</span></div>
+            <div class="md:col-span-2"><span class="text-gray-500">SANs:</span> <span class="font-mono text-xs">{{ https_sans | join(', ') }}</span></div>
+        </div>
+    </div>
+    {% elif https_enabled %}
+    <div class="bg-yellow-50 border border-yellow-200 rounded p-3 mb-4">
+        <div class="flex items-center gap-2 mb-1">
+            <span class="px-2 py-0.5 bg-yellow-600 text-white rounded text-xs font-semibold">CONFIGURED BUT NOT READY</span>
+            <span class="text-sm text-yellow-800">https.enabled is true but the cert or key file is missing/unreadable. Server will fall back to HTTP on next restart.</span>
+        </div>
+    </div>
+    {% else %}
+    <div class="bg-gray-50 border border-gray-200 rounded p-3 mb-4">
+        <p class="text-sm text-gray-700">HTTPS is <strong>off</strong>. The dashboard is served over plain HTTP — fine for local dev / LAN. Toggle on below when you want to expose the dashboard outside the LAN (Tailscale, Cloudflare Tunnel, public domain, etc.).</p>
+    </div>
+    {% endif %}
+
+    <form id="https-form" class="space-y-3" enctype="multipart/form-data">
+        <div class="flex items-center gap-2">
+            <input type="checkbox" id="https-enabled" {% if https_enabled %}checked{% endif %}>
+            <label for="https-enabled" class="text-sm font-medium text-gray-700">Enable HTTPS (TLS termination at the orchestrator)</label>
+        </div>
+
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">Cert file path (PEM)</label>
+            <input id="https-cert-path" type="text"
+                class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                value="{{ https_cert_path or '' }}"
+                placeholder="e.g. C:/Users/you/.hermes-orchestrator/certs/server.crt">
+        </div>
+        <div>
+            <label class="block text-xs font-medium text-gray-700 mb-1">Key file path (PEM)</label>
+            <input id="https-key-path" type="text"
+                class="block w-full border rounded px-2 py-1 text-sm font-mono"
+                value="{{ https_key_path or '' }}"
+                placeholder="e.g. C:/Users/you/.hermes-orchestrator/certs/server.key">
+        </div>
+
+        <div class="flex items-center gap-2 pt-2">
+            <button type="button" onclick="saveHttps()" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                Save
+            </button>
+            <button type="button" onclick="generateHttpsCert()" class="px-3 py-2 bg-white border text-gray-700 rounded text-sm hover:bg-gray-50"
+                title="Generate a self-signed cert + key with the `hermes-orch gen-cert` subcommand, then save the paths above. Browser will show a 'Not Secure' warning on first visit.">
+                Generate self-signed cert
+            </button>
+            <button type="button" onclick="uploadHttpsCert()" class="px-3 py-2 bg-white border text-gray-700 rounded text-sm hover:bg-gray-50"
+                title="Upload a cert + key pair (e.g. from your internal CA)">
+                Upload cert + key
+            </button>
+            <span id="https-status" class="text-sm text-gray-500"></span>
+        </div>
+
+        <p class="text-xs text-gray-500 pt-2">
+            Changes take effect on the next <code>hermes-orch serve</code> restart. To restart the running server from this UI, see the
+            <a href="/agents" class="text-blue-600 hover:underline">Agents</a> page footer. Wrapper agents must set
+            <code>ORCHESTRATOR_URL=https://&lt;your-host&gt;:8765</code> and (for self-signed) <code>INSECURE_SKIP_TLS_VERIFY=1</code>.
+        </p>
+    </form>
+</div>
+
 <!-- v3.1.0: Placeholder cards for sidebar sub-items /settings#evaluations,
      /settings#guardrails, /settings#integrations. Each gets its own
      `id` so the browser scrolls to the right place when the user
@@ -706,6 +786,102 @@ async function runCleanupNow() {
         status.textContent = 'Network error: ' + err.message;
         status.className = 'text-sm text-red-600';
     }
+}
+
+// ===== v3.12.0: HTTPS / TLS settings =====
+async function saveHttps() {
+    const status = document.getElementById('https-status');
+    const enabled = document.getElementById('https-enabled').checked;
+    const certPath = document.getElementById('https-cert-path').value.trim();
+    const keyPath = document.getElementById('https-key-path').value.trim();
+    if (enabled && (!certPath || !keyPath)) {
+        status.textContent = 'Need both cert and key paths to enable HTTPS.';
+        status.className = 'text-sm text-red-600';
+        return;
+    }
+    status.textContent = 'Saving...';
+    status.className = 'text-sm text-gray-500';
+    try {
+        const r = await fetch('/api/settings/https', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                enabled: enabled,
+                ssl_cert_path: certPath,
+                ssl_key_path: keyPath,
+            }),
+        });
+        const data = await r.json();
+        if (r.ok) {
+            status.textContent = data.ready
+                ? 'Saved. Restart `hermes-orch serve` to apply.'
+                : 'Saved (config persisted). HTTPS will not activate until both files are readable on next restart.';
+            status.className = 'text-sm text-green-600';
+        } else {
+            status.textContent = 'Failed: ' + (data.detail || r.status);
+            status.className = 'text-sm text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-sm text-red-600';
+    }
+}
+
+async function generateHttpsCert() {
+    const status = document.getElementById('https-status');
+    if (!confirm(
+        'Generate a self-signed cert + key?\n\n' +
+        'Files will be written to ~/.hermes-orchestrator/certs/ as server.crt and server.key. ' +
+        'Validity: 365 days. SANs: hostname, localhost, 127.0.0.1.\n\n' +
+        'Browser will show a "Not Secure" warning on first visit — install the cert in Trusted Root Certification Authorities to silence it.'
+    )) return;
+    status.textContent = 'Generating... (run `hermes-orch gen-cert` in a terminal)';
+    status.className = 'text-sm text-gray-500';
+    // The Python CLI is the only way to run gen-cert in this v3.12.0 cut;
+    // we show a one-liner the user can paste. The dashboard can also
+    // surface this via a future /api/settings/https/gen-cert POST.
+    status.textContent = 'Open a terminal in the project root and run:  hermes-orch gen-cert';
+    status.className = 'text-sm text-blue-700';
+}
+
+async function uploadHttpsCert() {
+    const certInput = document.createElement('input');
+    certInput.type = 'file';
+    certInput.accept = '.crt,.pem';
+    certInput.addEventListener('change', () => {
+        if (!certInput.files || !certInput.files[0]) return;
+        const keyInput = document.createElement('input');
+        keyInput.type = 'file';
+        keyInput.accept = '.key,.pem';
+        keyInput.addEventListener('change', async () => {
+            if (!keyInput.files || !keyInput.files[0]) return;
+            const status = document.getElementById('https-status');
+            status.textContent = 'Uploading...';
+            status.className = 'text-sm text-gray-500';
+            const fd = new FormData();
+            fd.append('cert', certInput.files[0]);
+            fd.append('key', keyInput.files[0]);
+            try {
+                const r = await fetch('/api/settings/https/upload', {method: 'POST', body: fd});
+                const data = await r.json();
+                if (r.ok) {
+                    document.getElementById('https-cert-path').value = data.ssl_cert_path;
+                    document.getElementById('https-key-path').value = data.ssl_key_path;
+                    document.getElementById('https-enabled').checked = data.enabled;
+                    status.textContent = 'Uploaded. Restart `hermes-orch serve` to apply.';
+                    status.className = 'text-sm text-green-600';
+                } else {
+                    status.textContent = 'Failed: ' + (data.detail || r.status);
+                    status.className = 'text-sm text-red-600';
+                }
+            } catch (err) {
+                status.textContent = 'Network error: ' + err.message;
+                status.className = 'text-sm text-red-600';
+            }
+        });
+        keyInput.click();
+    });
+    certInput.click();
 }
 </script>
 

@@ -151,7 +151,7 @@ async def login(payload: LoginIn, request: Request, response: Response) -> dict[
         raise HTTPException(401, "Invalid username or password")
 
     # Success: set cookie + touch last_login + audit.
-    set_session_cookie(response, user["id"])
+    set_session_cookie(response, user["id"], request=request)
     await touch_last_login(db, user["id"])
     try:
         await audit_log(
@@ -195,7 +195,7 @@ async def setup_password(payload: SetupIn, request: Request, response: Response)
         raise HTTPException(400, "Setup not allowed for this user")
 
     await set_user_password(db, user["id"], payload.new_password)
-    set_session_cookie(response, user["id"])
+    set_session_cookie(response, user["id"], request=request)
     await touch_last_login(db, user["id"])
     try:
         await audit_log(

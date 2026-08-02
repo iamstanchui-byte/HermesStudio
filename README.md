@@ -96,6 +96,16 @@ LLM 純做 **design-time assistant**（草擬 plan / 建議 route / 評審 audit
 - Bootstrap user auth（v3.4）— `password_hash` NULL → 強制 setup
 - HMAC agent auth 獨立（per-host key rotation）
 
+### 12. HTTPS / TLS（v3.12.0, optional）
+
+- **Default off**（HTTP for dev / LAN）
+- Settings page 加 HTTPS section：toggle + cert/key path + 「Generate self-signed」+「Upload」button
+- `hermes-orch gen-cert` CLI subcommand 整 365-day self-signed cert（SANs: hostname + localhost + 127.0.0.1），寫到 `~/.hermes-orchestrator/certs/server.{crt,key}`
+- uvicorn SSL 自動 pick up（cert + key 兩個 file readable 嗰陣），否則 fallback HTTP + warning
+- Session cookie 自動 set `Secure` flag 喺 HTTPS request 上面（HTTP 保持 backward-compat）
+- HMAC agent auth over TLS 照 work（HMAC 喺 application layer）
+- Wrapper 暫未 auto-pick HTTPS，需要 set `ORCHESTRATOR_URL=https://...`（self-signed 加 `INSECURE_SKIP_TLS_VERIFY=1`，follow-up）
+
 ---
 
 ## API Surface（164 endpoints，18 modules）
@@ -291,6 +301,8 @@ LLM 純做 **design-time assistant**（草擬 plan / 建議 route / 評審 audit
 | Commit | Title |
 |---|---|
 | `cf24d2d` | **v3.11.1** docs: add approval-based task runner design + super profile soul template |
+| `dd935c3` | docs: refresh README — full API catalog + feature list + recent v3.10.x/v3.11.x progress |
+| (pending) | **v3.12.0** HTTPS / TLS: settings toggle + self-signed cert gen + cookie Secure flag |
 | `d932c21` | **v3.11.1** test: cover v3.10.10 'no auto-dispatch on Generate tasks' + Run button flow |
 | `87f16fe` | **v3.11.1** fix feedback_to wire color in dark mode (visual_workflow editor) |
 | `2c6837f` | **v3.11.0** TASK_FAILED marker convention for agent-driven failure |
@@ -349,6 +361,7 @@ LLM 純做 **design-time assistant**（草擬 plan / 建議 route / 評審 audit
 - **v3.11.1 supervisor code fix** — add `AND archived = 0` to 4 sites
   (`_maybe_iterate` nonterm, `_maybe_iterate` review, `_maybe_complete_after_iter_cap` review, `_maybe_advance_project_state` nonterm)
   + `tests/test_supervisor_state_ignores_archived.py` (4 cases)
+- **HTTPS wrapper support (v3.12.0 follow-up)** — `INSECURE_SKIP_TLS_VERIFY=1` + cert pin mode
 - **Sprint B** Approval-based task runner — design 喺 `docs/approval-design.md`（2026-07-31）
 - Single task section UI + code-gen flow（chatbox → 寫 script → 註冊做新 Skill）
 - Promote-to-workflow refactor → 用 `plan` contract 取代 ad-hoc LLM call

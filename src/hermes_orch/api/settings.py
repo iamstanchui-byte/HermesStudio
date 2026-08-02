@@ -18,7 +18,7 @@ import json
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
 from hermes_orch.config import LLM_PROVIDERS, load_config, save_config_section
@@ -511,3 +511,168 @@ async def get_cleanup_preview(request: Request) -> dict[str, Any]:
     if job is None:
         raise HTTPException(503, "cleanup job not initialized")
     return await job.preview()
+
+
+# ===== HTTPS (v3.12.0) =====
+
+
+class HttpsConfigIn(BaseModel):
+    enabled: bool | None = None
+    ssl_cert_path: str | None = None
+    ssl_key_path: str | None = None
+
+
+class HttpsConfigOut(BaseModel):
+    enabled: bool
+    ssl_cert_path: str
+    ssl_key_path: str
+    cert_exists: bool
+    key_exists: bool
+    # Days until cert expires (None if cert unreadable / not present).
+    cert_expires_in_days: int | None = None
+    cert_subject_cn: str | None = None
+    cert_sans: list[str] = Field(default_factory=list)
+    ready: bool   # enabled=true AND cert+key both readable
+
+
+def _https_view(cfg: dict[str, Any]) -> HttpsConfigOut:
+    from pathlib import Path
+
+    https = cfg.get("https") or {}
+    cert_path_str = (https.get("ssl_cert_path") or "").strip()
+    key_path_str = (https.get("ssl_key_path") or "").strip()
+    cert_p = Path(cert_path_str) if cert_path_str else None
+    key_p = Path(key_path_str) if key_path_str else None
+    cert_exists = bool(cert_p and cert_p.is_file())
+    key_exists = bool(key_p and key_p.is_file())
+
+    expires_in: int | None = None
+    subject_cn: str | None = None
+    sans: list[str] = []
+    if cert_exists:
+        try:
+            from cryptography import x509
+            from cryptography.hazmat.primitives import serialization
+            with open(cert_p, "rb") as f:  # type: ignore[arg-type]
+                cert = x509.load_pem_x509_certificate(f.read())
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone.utc)
+            delta = cert.not_valid_after_utc - now
+            expires_in = max(0, int(delta.total_seconds() // 86400))
+            try:
+                cn_attrs = cert.subject.get_attributes_for_oid(
+                    __import__("cryptography.x509.oid", fromlist=["NameOID"]).NameOID.COMMON_NAME
+                )
+                if cn_attrs:
+                    subject_cn = cn_attrs[0].value
+            except Exception:
+                pass
+            try:
+                ext = cert.extensions.get_extension_for_class(
+                    __import__("cryptography.x509", fromlist=["SubjectAlternativeName"]).SubjectAlternativeName
+                ).value
+                sans = [str(n) for n in ext.get_values_for_type(
+                    __import__("cryptography.x509", fromlist=["DNSName"]).DNSName
+                )]
+            except Exception:
+                pass
+        except Exception:
+            expires_in = None  # unreadable / malformed cert
+
+    return HttpsConfigOut(
+        enabled=bool(https.get("enabled", False)),
+        ssl_cert_path=cert_path_str,
+        ssl_key_path=key_path_str,
+        cert_exists=cert_exists,
+        key_exists=key_exists,
+        cert_expires_in_days=expires_in,
+        cert_subject_cn=subject_cn,
+        cert_sans=sans,
+        ready=bool(https.get("enabled", False)) and cert_exists and key_exists,
+    )
+
+
+@router.get("/https", response_model=HttpsConfigOut)
+async def get_https(request: Request) -> HttpsConfigOut:
+    return _https_view(request.app.state.config)
+
+
+@router.post("/https", response_model=HttpsConfigOut)
+async def post_https(body: HttpsConfigIn, request: Request) -> HttpsConfigOut:
+    """Update HTTPS config. Caller must restart `hermes-orch serve`
+    for the change to take effect (we don't kill -9 the server from
+    inside a request handler).
+    """
+    if body.enabled is None and body.ssl_cert_path is None and body.ssl_key_path is None:
+        raise HTTPException(400, "no fields to update")
+    updates: dict[str, Any] = {}
+    if body.enabled is not None:
+        updates["enabled"] = bool(body.enabled)
+    if body.ssl_cert_path is not None:
+        path = body.ssl_cert_path.strip()
+        # Reject obviously bad paths up front (so the user gets an
+        # error here, not a server crash on next restart). Cert files
+        # are read at boot, not at POST time, so a missing file is
+        # not fatal — we just store the path.
+        updates["ssl_cert_path"] = path
+    if body.ssl_key_path is not None:
+        path = body.ssl_key_path.strip()
+        updates["ssl_key_path"] = path
+    save_config_section("https", updates)
+    from hermes_orch.config import load_config
+    request.app.state.config = load_config()
+    return _https_view(request.app.state.config)
+
+
+@router.post("/https/upload")
+async def post_https_upload(
+    request: Request,
+    cert: UploadFile = File(...),  # type: ignore[assignment]
+    key: UploadFile = File(...),   # type: ignore[assignment]
+) -> HttpsConfigOut:
+    """Upload a cert + key PEM pair from the settings page.
+
+    The files are stored under `~/.hermes-orchestrator/certs/` with
+    mode 0600 on the key, and the HTTPS config is updated to point
+    at them. The server is NOT restarted — the user clicks
+    "Restart server" (or runs `hermes-orch serve` again) to apply.
+    """
+    from pathlib import Path
+
+    cert_dir = Path.home() / ".hermes-orchestrator" / "certs"
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    cert_path = cert_dir / "server.crt"
+    key_path = cert_dir / "server.key"
+
+    cert_bytes = await cert.read()
+    key_bytes = await key.read()
+
+    # Sanity: try to parse the cert so we don't store garbage.
+    try:
+        from cryptography import x509
+        x509.load_pem_x509_certificate(cert_bytes)
+    except Exception as e:
+        raise HTTPException(400, f"cert is not a valid PEM X.509 cert: {e}")
+
+    # Sanity: try to parse the key.
+    try:
+        from cryptography.hazmat.primitives import serialization
+        serialization.load_pem_private_key(key_bytes, password=None)
+    except Exception as e:
+        raise HTTPException(400, f"key is not a valid PEM private key: {e}")
+
+    cert_path.write_bytes(cert_bytes)
+    key_path.write_bytes(key_bytes)
+    try:
+        __import__("os").chmod(key_path, 0o600)
+    except Exception:
+        pass
+
+    save_config_section("https", {
+        "enabled": True,
+        "ssl_cert_path": cert_path.as_posix(),
+        "ssl_key_path": key_path.as_posix(),
+    })
+    from hermes_orch.config import load_config
+    request.app.state.config = load_config()
+    return _https_view(request.app.state.config)

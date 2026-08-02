@@ -163,12 +163,21 @@ def parse_session_cookie_value(
 
 # ===== Response helpers =====
 
-def set_session_cookie(response: Response, user_id: str, max_age_sec: int = DEFAULT_MAX_AGE_SEC) -> None:
+def set_session_cookie(
+    response: Response,
+    user_id: str,
+    *,
+    request: Request | None = None,
+    max_age_sec: int = DEFAULT_MAX_AGE_SEC,
+) -> None:
     """Attach the signed session cookie to a response. HttpOnly +
     SameSite=Lax for CSRF mitigation. Secure flag is set ONLY when
-    the request URL is https:// — we don't have a global "are we in
-    production" flag and don't want to lock out dev.
+    the request URL is https:// (or when the operator has explicitly
+    enabled HTTPS in settings — we set Secure based on the live
+    request scheme, not the config, so a misconfigured dev server
+    doesn't accidentally lock out cookies on http://).
     """
+    secure_flag = bool(request is not None and request.url.scheme == "https")
     response.set_cookie(
         key=COOKIE_NAME,
         value=make_session_cookie_value(user_id),
@@ -176,9 +185,7 @@ def set_session_cookie(response: Response, user_id: str, max_age_sec: int = DEFA
         httponly=True,
         samesite="lax",
         path="/",
-        # secure flag set per-request via the response.set_cookie
-        # call site if we know we're on https; for now we omit it
-        # and rely on the LAN-only deployment context.
+        secure=secure_flag,
     )
 
 

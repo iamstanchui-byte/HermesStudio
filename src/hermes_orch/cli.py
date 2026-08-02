@@ -148,17 +148,46 @@ logging:
 @click.option("--port", default=None, type=int, help="Bind port (default from config)")
 @click.option("--reload/--no-reload", default=False, help="Enable auto-reload (dev)")
 def serve(host: str | None, port: int | None, reload: bool) -> None:
-    """Start the FastAPI server."""
+    """Start the FastAPI server.
+
+    If `https.enabled=true` in config and both `ssl_cert_path` +
+    `ssl_key_path` point to readable PEM files, the server boots
+    with TLS termination. Otherwise plain HTTP (default for dev).
+    """
     from hermes_orch.config import load_config
 
     cfg = load_config()
     bind_host = host or cfg["orchestrator"]["host"]
     bind_port = port or cfg["orchestrator"]["port"]
 
-    click.echo(f"Starting Hermes Orchestrator on http://{bind_host}:{bind_port}")
-    click.echo(f"  Dashboard: http://localhost:{bind_port}/")
-    click.echo(f"  API docs:  http://localhost:{bind_port}/docs")
-    click.echo(f"  Health:    http://localhost:{bind_port}/api/health")
+    # v3.12.0: optional HTTPS via self-signed or user-supplied cert.
+    # We pass the SSL kwargs to uvicorn only if enabled + both paths
+    # resolve to readable files; otherwise silently fall back to HTTP
+    # (with a warning) so a typo in the cert path doesn't take the
+    # dashboard offline.
+    ssl_kwargs: dict = {}
+    https_cfg = cfg.get("https") or {}
+    if https_cfg.get("enabled"):
+        cert_path = (https_cfg.get("ssl_cert_path") or "").strip()
+        key_path = (https_cfg.get("ssl_key_path") or "").strip()
+        from pathlib import Path
+        if cert_path and key_path and Path(cert_path).is_file() and Path(key_path).is_file():
+            ssl_kwargs = {"ssl_certfile": cert_path, "ssl_keyfile": key_path}
+            scheme = "https"
+        else:
+            click.echo(
+                click.style("WARN: ", fg="yellow", bold=True)
+                + f"https.enabled=true but cert/key not readable "
+                f"({cert_path!r}, {key_path!r}) — falling back to HTTP."
+            )
+            scheme = "http"
+    else:
+        scheme = "http"
+
+    click.echo(f"Starting Hermes Orchestrator on {scheme}://{bind_host}:{bind_port}")
+    click.echo(f"  Dashboard: {scheme}://localhost:{bind_port}/")
+    click.echo(f"  API docs:  {scheme}://localhost:{bind_port}/docs")
+    click.echo(f"  Health:    {scheme}://localhost:{bind_port}/api/health")
 
     uvicorn.run(
         "hermes_orch.main:app",
@@ -166,7 +195,108 @@ def serve(host: str | None, port: int | None, reload: bool) -> None:
         port=bind_port,
         reload=reload,
         log_level=cfg["orchestrator"]["log_level"].lower(),
+        **ssl_kwargs,
     )
+
+
+# ===== gen-cert subcommand (v3.12.0) =====
+
+@cli.command()
+@click.option("--hostname", default=None, help="SAN hostname (default: socket.gethostname() + 'localhost')")
+@click.option("--days", default=365, type=int, help="Validity in days (default 365)")
+@click.option("--out-dir", default=None, help="Output directory (default: ~/.hermes-orchestrator/certs/)")
+@click.option("--force/--no-force", default=False, help="Overwrite existing cert/key")
+def gen_cert(hostname: str | None, days: int, out_dir: str | None, force: bool) -> None:
+    """Generate a self-signed TLS cert + key for optional HTTPS.
+
+    Writes two PEM files to the output directory:
+      - server.crt  (cert)
+      - server.key  (private key, mode 0600)
+
+    After generation, point the orchestrator at them via:
+      https.enabled=true
+      https.ssl_cert_path=<out_dir>/server.crt
+      https.ssl_key_path=<out_dir>/server.key
+
+    Then `hermes-orch serve` boots with TLS termination. The
+    browser will show a "Not Secure" warning on first visit (it's
+    a self-signed cert) — click through, or install the cert in
+    Trusted Root Certification Authorities to remove the warning.
+    """
+    import datetime as dt
+    import ipaddress
+    import socket
+    from pathlib import Path
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    host = hostname or socket.gethostname()
+    out = Path(out_dir) if out_dir else Path.home() / ".hermes-orchestrator" / "certs"
+    out.mkdir(parents=True, exist_ok=True)
+    cert_path = out / "server.crt"
+    key_path = out / "server.key"
+
+    if (cert_path.exists() or key_path.exists()) and not force:
+        raise click.ClickException(
+            f"cert or key already exists at {out}. Pass --force to overwrite."
+        )
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, host),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Hermes Orchestrator (self-signed)"),
+    ])
+    now = dt.datetime.now(dt.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(minutes=1))
+        .not_valid_after(now + dt.timedelta(days=days))
+        .add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName(host),
+                x509.DNSName("localhost"),
+                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+            ]),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    cert_path.write_bytes(cert_pem)
+    key_path.write_bytes(key_pem)
+    try:
+        os_module = __import__("os")
+        os_module.chmod(key_path, 0o600)
+    except Exception:
+        pass
+
+    click.echo(f"Generated self-signed cert (valid {days} days):")
+    click.echo(f"  cert: {cert_path}")
+    click.echo(f"  key:  {key_path}  (mode 0600)")
+    click.echo()
+    click.echo("To enable HTTPS, add to ~/.hermes-orchestrator/config.yaml:")
+    click.echo("  https:")
+    click.echo("    enabled: true")
+    click.echo(f"    ssl_cert_path: {cert_path.as_posix()}")
+    click.echo(f"    ssl_key_path:  {key_path.as_posix()}")
+    click.echo()
+    click.echo("Then `hermes-orch serve` will boot with TLS. Browser will show")
+    click.echo("'Not Secure' warning on first visit (self-signed) — install the")
+    click.echo("cert in Trusted Root Certification Authorities to silence it.")
 
 
 # ===== sessions subcommand =====
