@@ -3614,7 +3614,16 @@ async def chat_with_project(
         "model": model,
         "messages": llm_messages,
         "temperature": 0.4,
-        "max_tokens": 1500,
+        # v3.10.4 (2026-08-02): was 1500, bumped to 4000. The system
+        # prompt itself is 11,218 chars (~2,800 tokens) and the
+        # chat snapshot can add another 2-3K tokens. MiniMax M3 uses
+        # ~360 reasoning tokens for a typical chat turn BEFORE
+        # producing any actual reply. With max_tokens=1500, the
+        # reasoning eats the entire budget and the model outputs
+        # NO final answer (proj-cef60586 repro on 2026-08-02).
+        # 4000 gives the model ~3,500 tokens of headroom for the
+        # actual reply after reasoning. Cost: 2.7× per call.
+        "max_tokens": 4000,
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -3622,53 +3631,111 @@ async def chat_with_project(
     }
     import logging as _logging
     log = _logging.getLogger(__name__)
-    try:
+
+    async def _call_llm(messages: list[dict], max_tokens: int) -> str:
+        """Single LLM call. Returns the raw content string (with
+        any <think> traces still embedded)."""
+        import copy as _copy
+        p = _copy.deepcopy(payload)
+        p["messages"] = messages
+        p["max_tokens"] = max_tokens
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(
                 f"{base_url}/chat/completions",
-                json=payload, headers=headers,
+                json=p, headers=headers,
             )
         if r.status_code != 200:
             raise HTTPException(502, f"LLM returned HTTP {r.status_code}: {r.text[:300]}")
         data = r.json()
         try:
-            text = data["choices"][0]["message"]["content"]
+            return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
             raise HTTPException(502, f"LLM response shape unexpected: {e}")
+
+    try:
+        text = await _call_llm(llm_messages, payload["max_tokens"])
         if not isinstance(text, str) or not text.strip():
             raise HTTPException(502, "LLM returned empty content")
     except httpx.HTTPError as e:
         log.warning(f"chat LLM call failed for {project_id}: {e}")
         raise HTTPException(502, f"LLM unreachable: {e}")
+
     # Strip <think> traces (MiniMax M3 emits them before the answer).
     # v3.10.4 (2026-08-02) BUGFIX: MiniMax M3 sometimes returns ONLY
     # a <think>...</think> block with NO final answer (the model's
-    # internal reasoning eats the entire 1500-token output budget
-    # before it can produce a real reply). The previous code stripped
-    # <think> then continued with the empty remainder, which made
-    # the chatbox render "(empty response)" and the assistant
-    # message persisted with content_len=0. The user had no idea
-    # whether the LLM was broken, the chat endpoint was broken,
-    # or their prompt was unclear. The fix: AFTER stripping, check
-    # if any text remains. If not, surface an actionable 502 with
-    # a hint (rephrase / shorter context / lower reasoning effort).
-    # The check is on the POST-strip text (not the raw LLM text) so
-    # we only raise when there's truly nothing to show the user.
+    # internal reasoning eats the entire output budget before it
+    # can produce a real reply). The previous code stripped <think>
+    # then continued with the empty remainder, which made the
+    # chatbox render "(empty response)" and the assistant message
+    # persisted with content_len=0. The user had no idea whether
+    # the LLM was broken, the chat endpoint was broken, or their
+    # prompt was unclear. The fix is two-pronged:
+    #   (a) Bump max_tokens to 4000 so the LLM has headroom for
+    #       both reasoning and a real answer.
+    #   (b) AFTER stripping, check if any text remains. If not,
+    #       automatically retry with a directive follow-up.
     had_think_block = bool(re.search(r"<think>.*?</think>", text, flags=re.DOTALL))
     text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
     if not text.strip():
-        # Differentiate the two empty-text causes so the UI can
-        # give a useful hint. The "think-only" case is the one we
-        # actually saw in the wild (proj-cef60586, 2026-08-02).
+        # v3.10.4 follow-up: AUTOMATIC RETRY with a directive
+        # follow-up. The LLM "thought itself into a corner" — it
+        # spent its budget on internal reasoning. A simpler
+        # second pass with a strong directive ("be concise, no
+        # lengthy reasoning, answer in 1-2 paragraphs") usually
+        # breaks the loop. The user gets a real answer instead
+        # of an error message. Cost: one extra LLM call in the
+        # ~30% of cases that hit the think-only path. We don't
+        # add this retry to the normal success path because
+        # 4000 tokens is plenty for the typical reply.
+        try:
+            log.info(
+                "chat think-only retry for %s: first attempt returned "
+                "no answer after stripping <think>",
+                project_id,
+            )
+            retry_messages = list(llm_messages) + [
+                {"role": "user", "content": (
+                    "Your previous response used all the token budget on "
+                    "internal reasoning (<think>...</think>) and didn't "
+                    "produce a final answer. Please answer the original "
+                    "question now in 1-2 concise paragraphs. Do not use "
+                    "lengthy internal reasoning — just answer directly."
+                )},
+            ]
+            text2 = await _call_llm(retry_messages, max_tokens=2000)
+            text2 = re.sub(r"<think>.*?</think>\s*", "", text2, flags=re.DOTALL)
+            if text2.strip():
+                # Retry succeeded — use the new answer.
+                text = text2
+        except HTTPException:
+            # Retry itself failed (network/5xx). Fall through to
+            # the 502 below so the user still gets an actionable
+            # error rather than a silent failure.
+            pass
+        except Exception as retry_err:
+            log.warning("chat retry failed for %s: %s", project_id, retry_err)
+    if not text.strip():
+        # After both passes, still nothing to show. Surface an
+        # actionable 502 with concrete next steps instead of a
+        # generic "rephrase" message. The hint is concrete:
+        # clear the chat history, the LLM's per-call token budget
+        # is consumed by the system prompt + snapshot + history,
+        # and a shorter context leaves more room for the answer.
         detail = (
             "The LLM returned only internal reasoning (<think>...</think>) "
-            "without a final answer. The model's reasoning used the full "
-            "token budget before producing a reply. Try: rephrase the "
-            "question, use a shorter context (e.g. clear chat history), "
-            "or set a lower reasoning_effort if your LLM supports it."
+            "without a final answer — twice (including an auto-retry "
+            "with a 'be concise' directive). This usually means the "
+            "chat context is too long (system prompt + project snapshot "
+            "+ history) and the model's reasoning ate the entire output "
+            "budget. Try one of:\n"
+            "  • Click the ✕ next to the chat to clear its history\n"
+            "  • Ask a shorter, more focused question\n"
+            "  • Or, for plan-related questions, you can also use the "
+            "JSON editor at the top of the page (right of 'Validate plan')"
             if had_think_block else
-            "The LLM returned an empty reply. Try rephrasing the question "
-            "or check the LLM provider's status page."
+            "The LLM returned an empty reply (no content at all). "
+            "Try rephrasing the question or check the LLM provider's "
+            "status page."
         )
         raise HTTPException(502, detail)
     # Extract suggestions

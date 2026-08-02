@@ -209,9 +209,15 @@ async def test_chat_502_when_llm_returns_only_think_block(client, monkeypatch):
         f"502 message must explain the think-only case to the user: "
         f"{detail!r}"
     )
-    assert "rephrase" in detail.lower() or "shorter context" in detail.lower(), (
-        f"502 message must include a rephrase / context-shortening hint: "
-        f"{detail!r}"
+    # v3.10.4 follow-up: the hint now mentions concrete next steps
+    # (clear history / shorter question / JSON editor) — the
+    # earlier "rephrase" wording was too generic to be useful.
+    assert (
+        "clear" in detail.lower()  # "clear its history"
+        or "shorter" in detail.lower()  # "a shorter, more focused question"
+    ), (
+        f"502 message must include a concrete next step "
+        f"(clear history / shorter question / JSON editor): {detail!r}"
     )
     # CRITICAL: the user message IS persisted (they sent it), but
     # NO empty assistant row should be created.
@@ -287,3 +293,165 @@ async def test_chat_200_when_llm_returns_think_block_plus_answer(client, monkeyp
     counts = await _count_chat_rows(app, pid)
     assert counts.get("assistant", 0) == 1
     assert counts.get("user", 0) == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_retry_succeeds_on_second_attempt(client, monkeypatch):
+    """v3.10.4 follow-up: when the 1st LLM call returns think-only,
+    the endpoint automatically retries with a directive "be concise,
+    no lengthy reasoning" follow-up. If the retry returns a real
+    answer, the user gets a 200 (not a 502). This is the most
+    common path: the LLM just needed a nudge to skip the lengthy
+    internal reasoning and produce an answer.
+    """
+    ac, app = client
+    await _login_admin(ac)
+    pid = await _create_project(app)
+
+    # Track how many LLM calls the test makes
+    call_count = {"n": 0}
+
+    class _SequenceAsyncClient:
+        """Returns a different response for each call. The first
+        call is think-only (no answer); the second is the retry
+        with a real answer."""
+        def __init__(self):
+            self._responses = [
+                "<think>\nLots of internal reasoning that consumes the entire output budget.\n</think>",
+                "Here is my concise answer: the agents know about project_temp_folder via their profile's storage_refs. Each agent profile has a list of storage paths the agent can use.",
+            ]
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return None
+        async def post(self, url, json, headers):
+            call_count["n"] += 1
+            idx = min(call_count["n"] - 1, len(self._responses) - 1)
+            m = MagicMock()
+            m.status_code = 200
+            m.json.return_value = _mock_llm_response(self._responses[idx])
+            m.raise_for_status = lambda: None
+            return m
+
+    from hermes_orch.api import projects as projects_mod
+    monkeypatch.setattr(
+        projects_mod.httpx, "AsyncClient",
+        lambda *a, **kw: _SequenceAsyncClient(),
+    )
+
+    r = await ac.post(
+        f"/api/projects/{pid}/chat",
+        json={"message": "我不懂task 要怎樣set 才會放在project_temp_folder"},
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # The retry succeeded — user sees the real answer
+    assert "Here is my concise answer" in data["message"]
+    # Both calls were made (1st think-only, 2nd retry)
+    assert call_count["n"] == 2, (
+        f"expected 2 LLM calls (1st think-only + 1 retry), got "
+        f"{call_count['n']}"
+    )
+    # Assistant row persisted with the real answer
+    counts = await _count_chat_rows(app, pid)
+    assert counts.get("assistant", 0) == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_retry_also_think_only_raises_502_with_actionable_hint(client, monkeypatch):
+    """If BOTH the 1st call and the retry are think-only, the
+    endpoint raises 502 with a concrete, actionable hint (not
+    the generic "rephrase" message). The hint tells the user:
+      - Clear the chat history
+      - Ask a shorter question
+      - Or use the JSON editor directly"""
+    ac, app = client
+    await _login_admin(ac)
+    pid = await _create_project(app)
+
+    class _BothThinkOnlyAsyncClient:
+        def __init__(self):
+            self._responses = [
+                "<think>\nFirst attempt: just thinking.\n</think>",
+                "<think>\nSecond attempt: still just thinking.\n</think>",
+            ]
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return None
+        async def post(self, url, json, headers):
+            m = MagicMock()
+            m.status_code = 200
+            # Round-robin the canned responses
+            idx = 0  # always return first
+            m.json.return_value = _mock_llm_response(self._responses[idx])
+            m.raise_for_status = lambda: None
+            return m
+
+    from hermes_orch.api import projects as projects_mod
+    monkeypatch.setattr(
+        projects_mod.httpx, "AsyncClient",
+        lambda *a, **kw: _BothThinkOnlyAsyncClient(),
+    )
+
+    r = await ac.post(
+        f"/api/projects/{pid}/chat",
+        json={"message": "我不懂task 要怎樣set 才會放在project_temp_folder"},
+    )
+    assert r.status_code == 502, r.text
+    detail = r.json()["detail"]
+    # The actionable hint is more concrete than just "rephrase"
+    assert "clear" in detail.lower() or "history" in detail.lower(), (
+        f"502 hint should mention clearing chat history: {detail!r}"
+    )
+    assert "shorter" in detail.lower() or "focused" in detail.lower(), (
+        f"502 hint should suggest a shorter question: {detail!r}"
+    )
+    # No empty assistant row persisted
+    counts = await _count_chat_rows(app, pid)
+    assert counts.get("assistant", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_max_tokens_is_at_least_4000(client, monkeypatch):
+    """v3.10.4 follow-up: max_tokens was bumped from 1500 to 4000.
+    The 1500 budget was consumed by the LLM's internal reasoning
+    (~360 tokens) leaving ~1140 for the actual reply — not enough
+    for a multi-paragraph answer. 4000 gives the LLM ~3500 tokens
+    of headroom after reasoning. This test pins the value so a
+    future refactor that lowers it again is caught immediately."""
+    ac, app = client
+    await _login_admin(ac)
+    pid = await _create_project(app)
+    captured_max_tokens = {"v": 0}
+
+    class _CaptureMaxTokensAsyncClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return None
+        async def post(self, url, json, headers):
+            captured_max_tokens["v"] = json.get("max_tokens")
+            m = MagicMock()
+            m.status_code = 200
+            m.json.return_value = _mock_llm_response(
+                "Short answer."
+            )
+            m.raise_for_status = lambda: None
+            return m
+
+    from hermes_orch.api import projects as projects_mod
+    monkeypatch.setattr(
+        projects_mod.httpx, "AsyncClient",
+        lambda *a, **kw: _CaptureMaxTokensAsyncClient(),
+    )
+
+    r = await ac.post(
+        f"/api/projects/{pid}/chat",
+        json={"message": "hi"},
+    )
+    # 200 because the LLM returned a real answer
+    assert r.status_code == 200
+    # Critical: max_tokens must be at least 4000
+    assert captured_max_tokens["v"] >= 4000, (
+        f"max_tokens was {captured_max_tokens['v']}, expected >= 4000. "
+        f"With less, MiniMax M3's internal reasoning (~360 tokens) "
+        f"eats too much of the budget and the model produces no final "
+        f"answer (proj-cef60586 repro on 2026-08-02)."
+    )
