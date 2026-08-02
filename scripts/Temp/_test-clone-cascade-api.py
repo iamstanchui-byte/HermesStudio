@@ -117,10 +117,18 @@ assert na["action"] == "act_a", f"action not preserved"
 assert na["params"] == {"k": "v"}, f"params not preserved: {na['params']}"
 print("  fields preserved (name, action, params)")
 
-# Verify project woken
+# Verify project woken to 'planned' (user feedback 2026-07-26:
+# must NOT auto-dispatch — user clicks Run button to start)
 _, p = _api("GET", f"/api/projects/{pid}")
-assert p["state"] == "ready", f"project should be ready, got {p['state']}"
-print(f"  project woken: state={p['state']}")
+assert p["state"] == "planned", f"project should be planned, got {p['state']}"
+print(f"  project woken to planned: state={p['state']}")
+
+# Verify Run endpoint transitions planned -> ready
+status, body = _api("POST", f"/api/projects/{pid}/run", {})
+assert status == 200, f"run should succeed, got {status}: {body}"
+_, p = _api("GET", f"/api/projects/{pid}")
+assert p["state"] == "ready", f"after Run, state should be ready, got {p['state']}"
+print(f"  Run button: planned -> ready")
 
 # ---- TEST 2: Clone from middle with include_downstream=False ----
 print("\n[2] clone B with include_downstream=False (just B, not C)")
@@ -144,17 +152,21 @@ print(f"  new B': {newest_B}, status={n_b['status']}")
 
 # ---- TEST 3: Refuse running ----
 print("\n[3] refuse clone on running task")
-# Use a brand new task so the supervisor doesn't race us. The
-# earlier new_B' might already be completed by now (the supervisor
-# was actively dispatching tasks in the background).
+# Use a brand new task so the supervisor doesn't race us.
 _, t3 = _api("POST", "/api/tasks/", {
     "project_id": pid, "name": "T3: running-test", "agent_role": "win-agent01",
     "action": "act_t3", "depends_on": [],
 })
 t3_id = t3["id"]
-_force(t3_id, "running")
-# Verify it's still running right before the API call
+# Force the project to 'planned' FIRST so the supervisor
+# ignores the new task (supervisor's tick query is
+# state IN 'planning','ready','running'). Then force the
+# task to 'running'. The /clone-and-cascade endpoint
+# checks task.status which is now 'running'.
 conn = sqlite3.connect(DB)
+conn.execute("UPDATE projects SET state='planned' WHERE id=?", (pid,))
+conn.execute("UPDATE tasks SET status='running' WHERE id=?", (t3_id,))
+conn.commit()
 status_in_db = conn.execute("SELECT status FROM tasks WHERE id=?", (t3_id,)).fetchone()[0]
 conn.close()
 assert status_in_db == "running", f"expected running, got {status_in_db} (supervisor raced us?)"

@@ -226,6 +226,67 @@ async def main():
             ok("3 cards on canvas after re-clone", len(cards) == 3,
                f"got {len(cards)} cards")
 
+            # ===== TEST 6: Verify project is in 'planned' state after clone (NOT auto-dispatched) =====
+            print("\n[6] verify project stays 'planned' after clone (not auto-dispatched)")
+            # The user can edit the new chain before clicking Run.
+            # The visual page should now show a Run button.
+            run_btn = page.locator("#vp-run-btn")
+            n_run = await run_btn.count()
+            ok("Run button visible on visual page when state=planned", n_run == 1,
+               f"got {n_run} matching buttons")
+            run_text = await run_btn.text_content() if n_run > 0 else ""
+            ok("Run button has ▶️ Run label", "Run" in (run_text or ""), f"text='{run_text}'")
+
+            # Verify via API: project state is 'planned'
+            _, p = _api("GET", f"/api/projects/{pid}")
+            ok("project state is 'planned' (NOT auto-dispatched)", p["state"] == "planned",
+               f"got {p['state']}")
+            # And the new tasks are still in pending/assigned (not running/completed)
+            for new_id in new_card_ids:
+                _, nt = _api("GET", f"/api/tasks/{new_id}")
+                if nt["status"] not in ("pending", "assigned"):
+                    print(f"  WARNING: new task {new_id} is in {nt['status']} (supervisor raced us)")
+
+            # ===== TEST 7: Click Run button, verify project transitions to 'ready' =====
+            print("\n[7] click Run button, verify planned -> ready")
+            confirm_msgs.clear()
+            # The Run button calls vpRunProject which shows a confirm dialog
+            await run_btn.click()
+            await page.wait_for_timeout(2000)
+            _, p = _api("GET", f"/api/projects/{pid}")
+            ok("after Run click, state=ready", p["state"] == "ready",
+               f"got {p['state']}")
+
+            # ===== TEST 8: Show archived toggle reveals old chain =====
+            print("\n[8] verify 'Show archived' toggle reveals old chain")
+            await page.goto(f"{BASE}/projects/{pid}/visual", wait_until="networkidle")
+            await page.wait_for_timeout(500)
+            # After multiple clones: should have many archived tasks
+            # (the original 3 + the 3 from clone 1 + the 3 from clone 2)
+            # The toggle is an <a> with href ?show_archived=1. Use
+            # the href as a more reliable selector than the emoji text.
+            toggle_link = page.locator("a[href*='show_archived=1']")
+            n_toggle = await toggle_link.count()
+            ok("Show archived toggle visible", n_toggle == 1,
+               f"got {n_toggle} matching links")
+            if n_toggle > 0:
+                await toggle_link.click()
+                await page.wait_for_timeout(1000)
+                cards = await page.locator(".vp-card").all()
+                # Active (3 new) + archived (3 from clone 1 + 3 from clone 2) = 9
+                # But we just re-cloned, so we may have different counts.
+                # Just verify there are MORE cards than before (which was 3).
+                ok("more cards shown when show_archived=1", len(cards) > 3,
+                   f"got {len(cards)} cards (expected > 3)")
+                # Verify some have vp-card-archived class
+                archived_cards = await page.locator(".vp-card.vp-card-archived").count()
+                ok("at least one archived card rendered with vp-card-archived class",
+                   archived_cards >= 1, f"got {archived_cards} archived cards")
+                # Verify ARCHIVED badge is visible
+                archived_badges = await page.locator(".vp-card-archived-badge").count()
+                ok("at least one ARCHIVED badge visible", archived_badges >= 1,
+                   f"got {archived_badges} badges")
+
             await browser.close()
     finally:
         # Cleanup
