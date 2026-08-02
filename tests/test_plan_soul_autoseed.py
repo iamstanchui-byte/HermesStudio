@@ -1176,30 +1176,42 @@ async def test_fill_empty_only_fills_empty_existing_presets(client):
 
 
 @pytest.mark.asyncio
-async def test_fill_empty_only_false_does_not_overwrite(client):
-    """fill_empty_only=False (default, plan-save behavior): existing
-    presets are NEVER overwritten, even if content is empty. Same
-    as the v3.10.4 behavior â€” preserved across the v3.10.5 change."""
+async def test_fill_empty_only_false_overwrites_existing(client):
+    """fill_empty_only=False (run_project_plan behavior): existing
+    presets ARE updated with the new persona. Used at "Generate
+    task" time to overwrite the generic placeholders that
+    plan-save auto-created. v3.10.6 fix for the proj-e8106311
+    repro where the user saved a plan, then clicked Generate
+    task, but the LLM persona was never written because the
+    seed helper was skipping non-empty existing presets.
+
+    Pre-v3.10.6 (buggy) the seed helper had a reversed condition
+    that meant fill_empty_only=False ALSO skipped — the test
+    name at the time was 'does_not_overwrite' reflecting the
+    buggy behavior. Now the test verifies the correct (new)
+    behavior: fill_empty_only=False DOES overwrite.
+    """
     from hermes_orch.api.plans import _seed_soul_presets_from_plan
     ac, app = client
     await _login_admin(ac)
     _, profile_id = await _create_project_with_profile(
         app, profile_name="analyst",
     )
-    pid = f"proj-nooverwrite-{uuid.uuid4().hex[:8]}"
+    pid = f"proj-overwrite-{uuid.uuid4().hex[:8]}"
     await app.state.db.execute(
         "INSERT INTO projects (id, name, goal, state, coordinator_role, "
         "accept_criteria, deliverable_path, max_iterations, "
         "current_iteration, last_iteration_summary) "
-        "VALUES (?, 'nooverwrite', 'x', 'planned', '', '', '', 0, 0, '')",
+        "VALUES (?, 'overwrite test', 'x', 'planned', '', '', '', 0, 0, '')",
         (pid,),
     )
-    # Existing preset (could be empty or not)
+    # Existing preset (with some content, e.g. the generic placeholder
+    # auto-seeded by plan-save)
     existing_id = f"preset-{uuid.uuid4().hex[:8]}"
     await app.state.db.execute(
         "INSERT INTO project_soul_presets (id, project_id, profile_id, "
         "role_name, content, default_soul, created_at, updated_at) "
-        "VALUES (?, ?, ?, 'analyst', 'whatever', 'whatever', ?, ?)",
+        "VALUES (?, ?, ?, 'analyst', 'generic placeholder', 'generic placeholder', ?, ?)",
         (existing_id, pid, profile_id, "2026-08-02 12:00:00+08:00", "2026-08-02 12:00:00+08:00"),
     )
     plan = _build_plan_with_steps([
@@ -1209,10 +1221,16 @@ async def test_fill_empty_only_false_does_not_overwrite(client):
     stats = await _seed_soul_presets_from_plan(
         app.state.db, pid, plan,
         llm_souls={"analyst": "fresh from LLM"},
-        # fill_empty_only NOT passed -> defaults to False
+        # fill_empty_only NOT passed -> defaults to False (overwrite)
     )
-    assert stats["presets_skipped_existing"] == 1
-    assert stats["presets_created"] == 0
+    # v3.10.6 behavior: fill_empty_only=False UPDATES the existing row
+    assert stats["presets_skipped_existing"] == 0
+    assert stats["presets_created"] == 1
+    # Verify the content was actually updated
+    presets = await _get_presets(app, pid)
+    assert len(presets) == 1
+    # The LLM persona wins (priority over step.default_soul)
+    assert presets[0]["content"] == "fresh from LLM"
 
 
 # ===== End-to-end: generate-soul endpoint with mocked LLM =====

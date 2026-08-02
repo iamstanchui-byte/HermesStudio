@@ -502,15 +502,24 @@ async def _seed_soul_presets_from_plan(
                 # Check if a preset already exists for this
                 # (project, profile). Behaviour depends on the
                 # caller's intent:
-                #   - fill_empty_only=False (default, e.g. plan-save):
-                #     skip if ANY preset exists (preserve user edits
-                #     and avoid clobbering content from a prior
-                #     Generate-SOUL run)
+                #   - fill_empty_only=False (e.g. plan-save AND
+                #     run_project_plan): always UPDATE existing
+                #     presets with the new persona. Used for the
+                #     initial seed (plan-save auto-creates generic
+                #     placeholders) and for the LLM run
+                #     (run_project_plan overwrites generic with
+                #     LLM-generated personas). Without this, the
+                #     plan-save generic placeholder would survive
+                #     the LLM run and the user would see "Adapt
+                #     your expertise..." in the SOUL editor
+                #     instead of the LLM persona (proj-e8106311
+                #     repro on 2026-08-02).
                 #   - fill_empty_only=True (e.g. "Generate SOUL"
-                #     button): skip only if the existing preset has
-                #     non-empty content. Empty presets (e.g. the
-                #     user deleted the content, or it was never
-                #     filled) get refilled with the LLM text.
+                #     recovery button): skip only if the existing
+                #     preset has non-empty content (preserves user
+                #     edits). Empty presets (user deleted the
+                #     content, or it was never filled) get refilled
+                #     with the LLM text.
                 existing = await db.fetchone(
                     "SELECT id, content, default_soul "
                     "FROM project_soul_presets "
@@ -523,17 +532,18 @@ async def _seed_soul_presets_from_plan(
                         if isinstance(existing, dict)
                         else ""
                     )
-                    if not fill_empty_only or existing_content:
-                        # Either we're not in fill-empty-only mode
-                        # (preserve everything), or the existing
-                        # preset has real content (user edited it,
-                        # leave alone). Either way, skip.
+                    # Skip logic:
+                    #   - fill_empty_only=True AND existing_content non-empty:
+                    #     user has edited this preset; leave it alone.
+                    #   - Otherwise (fill_empty_only=False, OR existing is empty):
+                    #     proceed to write (overwrite generic placeholders,
+                    #     or fill empty presets with the new persona).
+                    if fill_empty_only and existing_content:
                         stats["presets_skipped_existing"] += 1
                         continue
-                    # fill_empty_only=True AND existing content is
-                    # empty → UPDATE the existing row with the new
-                    # persona text. The id is preserved so any
-                    # pending profile_configs rows (e.g. an in-flight
+                    # UPDATE the existing row with the new persona
+                    # text. The id is preserved so any pending
+                    # profile_configs rows (e.g. an in-flight
                     # dispatch) stay consistent.
                     await db.execute(
                         "UPDATE project_soul_presets SET "
@@ -1042,7 +1052,21 @@ async def put_project_plan(
     # Skips roles where the routing engine can't resolve a
     # profile (the dispatch path will create the preset later
     # with a generic template).
-    await _seed_soul_presets_from_plan(db, project_id, plan)
+    #
+    # v3.10.6 (2026-08-02): fill_empty_only=True so the plan-save
+    # auto-seed doesn't clobber user edits. Pre-v3.10.6 behavior:
+    # plan-save used the default (False) and the seed helper
+    # had a backwards condition that meant NOTHING was ever
+    # updated, so the user edits were preserved by accident
+    # (broken logic). Now that the logic is fixed (False
+    # actually UPDATES), we explicitly pass fill_empty_only=True
+    # to preserve the original "create if missing" semantic
+    # for the plan-save path. The run_project_plan endpoint
+    # uses fill_empty_only=False so the LLM personas overwrite
+    # the generic placeholders (see commit v3.10.6).
+    await _seed_soul_presets_from_plan(
+        db, project_id, plan, fill_empty_only=True,
+    )
     # Audit
     try:
         from hermes_orch.core.audit import audit_log
@@ -1498,7 +1522,7 @@ async def run_project_plan(
     await _seed_soul_presets_from_plan(
         db, project_id, plan,
         llm_souls=llm_souls,
-        fill_empty_only=True,
+        fill_empty_only=False,
     )
     # 5. v3.10.4 (2026-08-02): do NOT auto-dispatch. The project
     # stays in 'planned' state so the user can review the new
