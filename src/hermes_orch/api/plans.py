@@ -1254,9 +1254,19 @@ class RunPlanBody(BaseModel):
     `name_suffix` is appended to the new task names (no effect on
     existing tasks) — useful when you re-run a plan and want to
     visually distinguish the new execution (e.g. "_run_2").
+    `max_iterations` (2026-08-02, v3.10.10): cap on the loop-back
+    counter. The supervisor's `_maybe_loop_back` only fires when
+    `project.max_iterations > 0`; this body field lets the operator
+    set the cap at Generate-task time without leaving the visual
+    plan editor (mirrors the workflow Run modal's "Loop-back cap"
+    field). None = leave the project's existing value unchanged.
+    0 = explicit disable (any step.feedback_to becomes a no-op —
+    same as the old pre-2026-07-25 default). 3+ = enable (3 is the
+    same sensible default the workflow Run modal uses).
     """
     archive_existing: bool = True
     name_suffix: str = ""
+    max_iterations: int | None = None
 
 
 class RunPlanResponse(BaseModel):
@@ -1361,6 +1371,31 @@ async def run_project_plan(
             "WHERE project_id = ? AND archived = 0 "
             "AND status IN ('pending', 'assigned', 'failed', 'skipped', 'cancelled', 'completed')",
             (now, project_id),
+        )
+    # 3.5. v3.10.10 (2026-08-02): apply the operator's loop-back
+    # cap to the project before any tasks are dispatched. The
+    # visual plan editor passes this in via
+    # RunPlanBody.max_iterations. None = leave the project's
+    # existing value unchanged (the operator can still tune via
+    # the workflow detail page or by re-running the plan). 0 is
+    # an explicit opt-out (any step.feedback_to becomes a no-op
+    # until the operator raises it). Negative is meaningless —
+    # reject with 400 to fail fast at the API boundary.
+    if body.max_iterations is not None:
+        if body.max_iterations < 0:
+            raise HTTPException(
+                400,
+                f"max_iterations must be >= 0 (got {body.max_iterations}); "
+                f"0 = disable loop-back, N > 0 = cap at N iterations",
+            )
+        await db.execute(
+            "UPDATE projects SET max_iterations = ?, updated_at = ? "
+            "WHERE id = ?",
+            (int(body.max_iterations), now, project_id),
+        )
+        logger.info(
+            f"run_project_plan: project {project_id} max_iterations "
+            f"set to {body.max_iterations} (was {proj.get('max_iterations', 0)})"
         )
     # 4. Resolve depends_on + create task rows. The plan's step
     # `depends_on` is a list of step NAMES within the same plan
@@ -1565,6 +1600,14 @@ async def run_project_plan(
                 "archived_count": archived_count,
                 "archive_existing": body.archive_existing,
                 "previous_state": proj["state"],
+                # v3.10.10: log the cap the operator set at
+                # Generate-task time so the audit trail shows why
+                # feedback_to did or didn't fire later. Only
+                # present when the operator explicitly changed it.
+                "max_iterations_set": (
+                    int(body.max_iterations)
+                    if body.max_iterations is not None else None
+                ),
             },
         )
     except Exception:
@@ -1648,6 +1691,12 @@ async def plan_visual_page(project_id: str, request: Request) -> HTMLResponse:
         "id": proj["id"],
         "name": proj["name"],
         "plan": plan_obj,
+        # v3.10.10 (2026-08-02): pass the current max_iterations to
+        # the template so the Generate Tasks modal can pre-fill the
+        # loop-back-cap input with the project's existing value
+        # instead of resetting to 3 every time. Operator can still
+        # type a new value in the modal before submitting.
+        "max_iterations": int(proj["max_iterations"] or 0),
     }
     # Per user feedback 2026-07-28: the side-panel Agent role field
     # was a free-text <input>; operators want a dropdown of registered

@@ -50,6 +50,7 @@
         steps: [],
     };
     let _projectId = null;
+    let _projectMaxIterations = 3;  // v3.10.10: cached at init, used by the Generate Tasks modal
     let _selectedNodeName = null;   // which step's details are shown in the side panel
     let _jsonMode = false;          // toggle between visual and JSON textarea
     // Map from step name -> drawflow's INTERNAL node id (the
@@ -326,6 +327,15 @@
                         e.preventDefault();
                         return;
                     }
+                    const gtOv = document.getElementById('vp-generate-tasks-overlay');
+                    if (gtOv && !gtOv.classList.contains('hidden')) {
+                        // v3.10.10: Generate Tasks modal also closes
+                        // on Esc, same pattern as JSON + Save as
+                        // workflow modals.
+                        closeGenerateTasksModal();
+                        e.preventDefault();
+                        return;
+                    }
                     const sawOv = document.getElementById('vp-save-as-workflow-overlay');
                     if (sawOv && !sawOv.classList.contains('hidden')) {
                         closeSaveAsWorkflowModal();
@@ -444,6 +454,13 @@
         const wrap = $('vp-wrap');
         if (!wrap) return;
         _projectId = wrap.getAttribute('data-project-id');
+        // v3.10.10: read the project's current max_iterations so
+        // the Generate Tasks modal can pre-fill the loop-back cap
+        // input. Default 3 if the attribute is missing (matches
+        // WorkflowRunBody default). 0 is a legitimate "disable"
+        // value; the modal handles it.
+        const maxIterAttr = parseInt(wrap.getAttribute('data-project-max-iterations') || '3', 10);
+        _projectMaxIterations = isNaN(maxIterAttr) ? 3 : maxIterAttr;
         const rawJson = wrap.getAttribute('data-plan-json') || '';
         if (rawJson && rawJson !== '') {
             try { _plan = JSON.parse(rawJson); }
@@ -1348,31 +1365,138 @@
             showBanner('Plan has no steps. Add some first.', 'error');
             return;
         }
-        // Save first
+        // Save first so the operator's latest plan is on the server
+        // before we open the confirm modal. If save fails, we don't
+        // show the modal (the user needs to fix the save error first).
         await savePlan();
-        // v3.10.4 (2026-08-02): confirm dialog text changed to
-        // reflect the new "no auto-dispatch" behavior. Project
-        // stays in 'planned' state after Generate tasks so the
-        // user can review the auto-seeded SOUL presets on the
-        // project page before clicking the green [▶ Run] button.
-        // Old behavior flipped state to 'ready' here and the
-        // supervisor's next tick auto-dispatched — too aggressive
-        // for LLM-generated plans where the user often wants to
-        // tweak the auto-generated SOUL first.
-        if (!confirm(
-            'Generate tasks from plan?\n\n' +
-            'This will:\n' +
-            '  • Archive the project\'s existing non-running tasks\n' +
-            '  • Create ' + _plan.steps.length + ' new pending task(s) from the plan\n' +
-            '  • Auto-seed project_soul_presets from each step\'s default_soul\n' +
-            '  • Leave project state at "planned" — you click [▶ Run] on the project page to dispatch\n\n' +
-            'Continue?'
-        )) return;
+        // v3.10.10 (2026-08-02): open the Generate Tasks modal
+        // instead of the bare `confirm()` dialog. The modal lets
+        // the operator set the loop-back cap (max_iterations) so
+        // any step.feedback_to on the plan actually fires. Mirrors
+        // the workflow Run modal's "Loop-back cap" field. See
+        // _doGenerateTasks() below for the actual fetch.
+        openGenerateTasksModal();
+    }
+
+    // ===== v3.10.10 (2026-08-02): Generate Tasks modal =====
+    // Replaces the v2.2 `confirm()` dialog. Lets the operator
+    // set the loop-back cap at Generate-task time so any
+    // step.feedback_to on the plan actually fires. Without
+    // this UI, projects default to max_iterations=0 and the
+    // supervisor's _maybe_loop_back returns False fast — the
+    // red dashed wires in the visual builder would silently
+    // no-op.
+    function openGenerateTasksModal() {
+        const ov = $('vp-generate-tasks-overlay');
+        if (!ov) return;
+        // Update the "what this does" copy to reflect the current
+        // step count. The modal template uses a span with id
+        // vp-generate-tasks-step-count.
+        const cnt = $('vp-generate-tasks-step-count');
+        if (cnt) cnt.textContent = String(_plan.steps.length);
+        // Pre-fill the loop-back cap with the project's current
+        // value. The operator can override; we send whatever they
+        // type to the server. Default 3 (matches WorkflowRunBody
+        // default and the workflow Run modal's placeholder).
+        const input = $('vp-generate-tasks-max-iter');
+        if (input) {
+            // Pre-fill with the project's value. If it's 0, the
+            // operator sees the warning text; they can type 3+
+            // to enable.
+            input.value = String(_projectMaxIterations || 0);
+        }
+        // Show a small note if the current value is 0 (warning)
+        // so the operator knows the implications.
+        const cur = $('vp-generate-tasks-current');
+        if (cur) {
+            if (!_projectMaxIterations) {
+                cur.textContent =
+                    '⚠ Currently 0 — feedback_to wires will be no-ops unless you raise this to 3+ before submitting.';
+                cur.classList.remove('hidden');
+                cur.classList.add('text-amber-700');
+            } else {
+                cur.textContent = 'Currently ' + _projectMaxIterations + ' for this project.';
+                cur.classList.remove('hidden');
+                cur.classList.remove('text-amber-700');
+            }
+        }
+        // Clear any previous error
+        const err = $('vp-generate-tasks-error');
+        if (err) { err.classList.add('hidden'); err.textContent = ''; }
+        // Show submit button, hide spinner
+        const sub = $('vp-generate-tasks-submit');
+        if (sub) sub.disabled = false;
+        const sp = $('vp-generate-tasks-spinner');
+        if (sp) sp.classList.add('hidden');
+        ov.classList.remove('hidden');
+    }
+    function closeGenerateTasksModal() {
+        const ov = $('vp-generate-tasks-overlay');
+        if (ov) ov.classList.add('hidden');
+    }
+    async function submitGenerateTasks() {
+        const input = $('vp-generate-tasks-max-iter');
+        if (!input) return;
+        // Validate. Empty / NaN / negative → 0 (explicit disable,
+        // same as the workflow Run modal allows).
+        let maxIter = parseInt(input.value, 10);
+        if (isNaN(maxIter) || maxIter < 0) maxIter = 0;
+        if (maxIter > 99) maxIter = 99;  // defensive cap; the server
+                                        // doesn't enforce this but a
+                                        // sane UI shouldn't accept
+                                        // 99999.
+        // Show the spinner, disable the submit button
+        const sub = $('vp-generate-tasks-submit');
+        if (sub) sub.disabled = true;
+        const sp = $('vp-generate-tasks-spinner');
+        if (sp) sp.classList.remove('hidden');
+        try {
+            await _doGenerateTasks({max_iterations: maxIter});
+            // _doGenerateTasks handles success (banner + redirect)
+            // and most failures inline. If it didn't redirect, the
+            // modal is still open — close it on success.
+            // (Failure path keeps the modal open so the operator
+            // can retry with a different cap.)
+            const ov = $('vp-generate-tasks-overlay');
+            // _doGenerateTasks redirects on success via setTimeout
+            // (1500ms). Detect by checking the banner class —
+            // simpler: just close after the await returns and let
+            // the success banner speak. If _doGenerateTasks throws
+            // / returns early without redirecting, the operator
+            // sees the banner and we re-enable the modal.
+            if (ov && !ov.classList.contains('hidden')) {
+                // Give the banner a beat, then re-enable on failure
+                setTimeout(() => {
+                    if (ov && !ov.classList.contains('hidden')) {
+                        // still open → failure path
+                        if (sub) sub.disabled = false;
+                        if (sp) sp.classList.add('hidden');
+                    }
+                }, 800);
+            }
+        } catch (e) {
+            const err = $('vp-generate-tasks-error');
+            if (err) { err.classList.remove('hidden'); err.textContent = 'Network error: ' + e.message; }
+            if (sub) sub.disabled = false;
+            if (sp) sp.classList.add('hidden');
+        }
+    }
+
+    // _doGenerateTasks: the actual /plan/run call. Extracted so
+    // both the modal submit AND the (legacy) reset-retry path can
+    // call it. Passes max_iterations in the body so the operator's
+    // chosen cap is applied to the project before tasks are
+    // dispatched.
+    async function _doGenerateTasks({max_iterations}) {
         try {
             const r = await fetch('/api/projects/' + _projectId + '/plan/run', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({archive_existing: true, name_suffix: ''}),
+                body: JSON.stringify({
+                    archive_existing: true,
+                    name_suffix: '',
+                    max_iterations: max_iterations,
+                }),
             });
             if (!r.ok) {
                 const d = await r.json().catch(() => ({}));
@@ -1401,14 +1525,15 @@
                                 return;
                             }
                             showBanner('Reset to planned. Retrying...', 'success');
-                            // Retry the run. We bypass the
-                            // confirm() this time (the user
-                            // already confirmed) and skip
-                            // re-saving (the plan is unchanged).
+                            // Retry the run with the same max_iterations.
                             const r2 = await fetch('/api/projects/' + _projectId + '/plan/run', {
                                 method: 'POST',
                                 headers: {'Content-Type': 'application/json'},
-                                body: JSON.stringify({archive_existing: true, name_suffix: ''}),
+                                body: JSON.stringify({
+                                    archive_existing: true,
+                                    name_suffix: '',
+                                    max_iterations: max_iterations,
+                                }),
                             });
                             if (!r2.ok) {
                                 const d2 = await r2.json().catch(() => ({}));
@@ -1423,6 +1548,7 @@
                             // project...") which was misleading
                             // after the no-auto-dispatch change.
                             showBanner('Generated ' + d2.tasks_created + ' task(s). Click [▶ Run] on the project page to dispatch.', 'success');
+                            closeGenerateTasksModal();
                             setTimeout(() => { location.href = '/projects/' + _projectId; }, 1500);
                             return;
                         } catch (e2) {
@@ -1439,9 +1565,11 @@
             // banner implied auto-dispatch which was misleading
             // after the no-auto-dispatch change.
             showBanner('Generated ' + d.tasks_created + ' task(s). Click [▶ Run] on the project page to dispatch.', 'success');
+            closeGenerateTasksModal();
             setTimeout(() => { location.href = '/projects/' + _projectId; }, 1500);
         } catch (e) {
             showBanner('Network error: ' + e.message, 'error');
+            throw e;  // let the modal handler re-enable the form
         }
     }
 
@@ -1906,6 +2034,13 @@
         openGeneratePlanModal: openGeneratePlanModal,
         closeGeneratePlanModal: closeGeneratePlanModal,
         generatePlanFromLlm: generatePlanFromLlm,
+        // v3.10.10 (2026-08-02): Generate Tasks modal — replaces the
+        // bare `confirm()` dialog with a proper modal that lets
+        // the operator set the loop-back cap (max_iterations).
+        // Mirrors the workflow Run modal's "Loop-back cap" field.
+        openGenerateTasksModal: openGenerateTasksModal,
+        closeGenerateTasksModal: closeGenerateTasksModal,
+        submitGenerateTasks: submitGenerateTasks,
         // v3.9.0 (Phase 2 UX): expose preset-cache hooks so e2e
         // tests can wait for the cache to fill and re-render. The
         // cache is module-private otherwise (no need for app code

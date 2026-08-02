@@ -41,7 +41,7 @@
         border-radius: 0.5rem;
         position: relative;
     }
-    .vp-canvas-wrap > div:not(.vp-side-panel):not(.vp-minimap):not(#vp-json-modal-overlay):not(#vp-save-as-workflow-overlay) {
+    .vp-canvas-wrap > div:not(.vp-side-panel):not(.vp-minimap):not(#vp-json-modal-overlay):not(#vp-save-as-workflow-overlay):not(#vp-generate-tasks-overlay) {
         width: 100% !important;
         height: 100% !important;
     }
@@ -356,6 +356,15 @@
         background: #1e293b;
         color: #e2e8f0;
     }
+    /* v3.10.10: Generate Tasks modal — same dark treatment */
+    body.dark #vp-generate-tasks-overlay > div {
+        background: #1e293b;
+        color: #e2e8f0;
+    }
+    body.dark #vp-generate-tasks-overlay .bg-gray-50 {
+        background: #0f172a;
+        border-color: #334155;
+    }
     body.dark #vp-save-as-workflow-name,
     body.dark #vp-save-as-workflow-description {
         background: #0f172a;
@@ -382,6 +391,12 @@
     data-project-id="{{ project.id }}"
     data-project-name="{{ project.name }}"
     data-plan-json='{{ project.plan | tojson if project.plan else "" }}'
+    {# v3.10.10: pre-fill the Generate Tasks modal's loop-back cap
+       input with the project's current max_iterations so the
+       operator doesn't have to remember the previous value. 0 means
+       "loop-back disabled"; the modal's helper text reminds the
+       operator to set 3+ to make any step.feedback_to actually fire. #}
+    data-project-max-iterations="{{ project.max_iterations or 0 }}"
     class="flex items-center justify-between mb-3 px-1">
     <div>
         <h1 class="text-lg font-bold text-gray-800">
@@ -740,6 +755,69 @@
                     </button>
                     <span id="vp-save-as-workflow-spinner" class="hidden text-sm text-gray-500 ml-2">
                         <span class="inline-block animate-pulse">LLM is generalizing…</span>
+                    </span>
+                </div>
+            </form>
+        </div>
+    </div>
+    {# v3.10.10 (2026-08-02): "Generate Tasks" modal. Replaces the
+       bare `confirm()` dialog. Lets the operator set the loop-back
+       cap (max_iterations) at Generate-task time — without this,
+       any step.feedback_to on the plan silently no-ops because
+       the project's max_iterations defaults to 0. Mirrors the
+       workflow Run modal's "Loop-back cap" field
+       (templates/workflow_detail.html). Backdrop click closes.
+       Esc key closes (handled in visual_plan.js keydown handler). #}
+    <div id="vp-generate-tasks-overlay"
+        class="hidden fixed inset-0 z-50 flex items-center justify-center"
+        style="background-color: rgba(0,0,0,0.5);"
+        onclick="if (event.target === this) window.vp.closeGenerateTasksModal()">
+        <div class="bg-white rounded-lg shadow-xl max-w-lg w-full mx-4">
+            <form onsubmit="event.preventDefault(); window.vp.submitGenerateTasks();" class="p-5">
+                <h2 class="text-lg font-semibold text-gray-800 mb-1">Generate tasks</h2>
+                <p class="text-sm text-gray-500 mb-4">
+                    Materialize the current plan into pending task rows. The
+                    project stays in <code>planned</code> state so you can
+                    review the auto-seeded SOUL presets before clicking Run.
+                </p>
+                <div class="bg-gray-50 border border-gray-200 rounded px-3 py-2 mb-4 text-xs text-gray-700">
+                    <p class="mb-1"><strong>What this does:</strong></p>
+                    <ul class="list-disc list-inside space-y-0.5">
+                        <li>Archives the project's existing non-running tasks</li>
+                        <li>Creates <span id="vp-generate-tasks-step-count" class="font-semibold">N</span> new pending task(s) from the plan</li>
+                        <li>Calls the LLM to generate project-specific SOUL personas (auto-overwrites generic placeholders)</li>
+                        <li>Project stays in <code>planned</code> state until you click Run</li>
+                    </ul>
+                </div>
+                <label class="block text-sm font-medium text-gray-700 mb-1">
+                    Loop-back cap
+                    <span class="text-xs text-gray-400 font-normal"
+                        title="How many times the supervisor should re-dispatch upstream steps when a step's feedback_to fires. 0 disables loop-back entirely (any step.feedback_to becomes a no-op). Default 3 — enough to recover from 1-2 transient failures, low enough to prevent infinite loops.">
+                        (?)
+                    </span>
+                </label>
+                <input id="vp-generate-tasks-max-iter" type="number" min="0" max="99"
+                    value="3"
+                    class="w-24 border rounded px-2 py-1 text-sm font-mono">
+                <p class="text-xs text-gray-500 mt-1">
+                    Set this to <strong>3+</strong> to make any step's
+                    <code>feedback_to</code> actually fire. Default of 0
+                    (used by older runs) silently disables loop-back even
+                    if you've drawn red dashed wires in the visual builder.
+                </p>
+                <p id="vp-generate-tasks-current" class="hidden text-xs text-gray-500 mt-1"></p>
+                <p id="vp-generate-tasks-error" class="hidden text-xs text-red-600 mt-2"></p>
+                <div class="mt-4 flex items-center gap-2">
+                    <button id="vp-generate-tasks-submit" type="submit"
+                        class="px-4 py-2 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700">
+                        Generate tasks
+                    </button>
+                    <button type="button" onclick="window.vp.closeGenerateTasksModal()"
+                        class="px-4 py-2 bg-gray-100 text-gray-700 rounded text-sm hover:bg-gray-200">
+                        Cancel
+                    </button>
+                    <span id="vp-generate-tasks-spinner" class="hidden text-sm text-gray-500 ml-2">
+                        <span class="inline-block animate-pulse">Materializing…</span>
                     </span>
                 </div>
             </form>
