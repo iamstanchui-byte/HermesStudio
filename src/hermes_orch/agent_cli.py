@@ -776,6 +776,80 @@ def _clean_hermes_output(stdout: str) -> str:
     return s.strip()
 
 
+# v3.11.0 (2026-08-03): TASK_FAILED marker convention.
+#
+# The hermes-agent subprocess returns exit code 0 even when the
+# agent's reasoning decides the task should fail (e.g. "threshold
+# not met, abort"). The orchestrator's task model assumes exit 0 =
+# success, so the agent has no clean way to mark a task as failed.
+# Without this, feedback_to (which depends on `status='failed'`)
+# never fires for LLM-decided failures — the loop-back path only
+# triggers for server-side failures (dispatch.mismatch, stuck
+# wrapper, missing profile).
+#
+# The convention: the agent writes a line containing
+# `TASK_FAILED: <reason>` to stdout (typically via its last shell
+# call, e.g. `echo "TASK_FAILED: total=\$45 < threshold=\$100"`).
+# Even with exit code 0, the wrapper detects the marker and
+# converts the result to status=failed, with the marker text as
+# the `error` field on the task row. The supervisor's loop-back
+# then fires (per the existing feedback_to path) and the upstream
+# steps are re-dispatched.
+#
+# Marker rules:
+#   - The marker is a literal string `TASK_FAILED:` (case-sensitive,
+#     with the colon). Anywhere in stdout.
+#   - Only the FIRST occurrence is honored. Multiple markers are
+#     ignored; the first is treated as the agent's primary signal.
+#   - The reason text is the substring after the first `TASK_FAILED:`
+#     on the matched line, trimmed. Multi-line reasons can be put
+#     on the same line OR on subsequent lines (we only take the
+#     substring after the marker, single line).
+#   - Cleanup: `_clean_hermes_output` strips box-drawing / ANSI
+#     before this check, so the marker survives the clean step.
+#   - If no marker → status=completed (unchanged behavior).
+_TASK_FAILED_MARKER = "TASK_FAILED:"
+
+
+def _apply_task_failed_marker(summary: str) -> dict:
+    """Convert a hermes-cleaned summary to a result dict, applying
+    the TASK_FAILED convention.
+
+    v3.11.0: extracted from `_run_task`'s exit-code-0 branch so the
+    marker-detection logic is unit-testable in isolation.
+
+    Args:
+        summary: the cleaned hermes stdout (post _clean_hermes_output).
+
+    Returns:
+        The result dict to POST to /api/tasks/{id}/result. Either:
+          - {"status": "completed", "summary": ..., "skipped_artifacts": []}
+            (no marker)
+          - {"status": "failed", "error": "TASK_FAILED: <reason>",
+             "summary": <full stdout>, "skipped_artifacts": []}
+            (marker present, first occurrence wins)
+    """
+    if _TASK_FAILED_MARKER in summary:
+        # Find the first line containing the marker and extract
+        # the reason (substring after the marker, trimmed). If
+        # somehow the marker appears without a line separator
+        # (single-line stdout), we still pick the substring after
+        # the first marker.
+        for line in summary.splitlines():
+            if _TASK_FAILED_MARKER in line:
+                reason = line.split(_TASK_FAILED_MARKER, 1)[1].strip()
+                return {
+                    "status": "failed",
+                    "error": f"TASK_FAILED: {reason}",
+                    "summary": summary,
+                    "skipped_artifacts": [],
+                }
+        # Marker present in summary but no line matched (defensive —
+        # could happen if the marker is in a line that was stripped
+        # by cleanup). Fall through to completed.
+    return {"status": "completed", "summary": summary, "skipped_artifacts": []}
+
+
 def _strip_prompt_echo(s: str) -> str:
     """Strip the prompt template echo that hermes prepends to its output.
 
@@ -2598,7 +2672,27 @@ def start(
 
             if rc == 0:
                 summary = _clean_hermes_output(stdout) if stdout else "(no output)"
-                result = {"status": "completed", "summary": summary, "skipped_artifacts": []}
+                # v3.11.0 (2026-08-03): TASK_FAILED convention. The
+                # agent can signal task-level failure by printing
+                # `TASK_FAILED: <reason>` anywhere in stdout, even
+                # with exit code 0. The wrapper detects this marker
+                # and converts the result to status=failed so the
+                # orchestrator's supervisor can run feedback_to
+                # loop-back, propagation, etc. Without this, an
+                # agent has no clean way to mark a task as failed
+                # (exit 0 = implicit success, hermes subprocess
+                # itself rarely errors out by exit code). Use case
+                # (savings demo on 2026-08-03): agent's check step
+                # reads a savings file, decides threshold not met,
+                # and needs to signal failure so the orchestrator
+                # re-runs the upstream `add_savings` step. The
+                # agent's last shell action does:
+                #   echo "TASK_FAILED: total=\$45 < threshold=\$100"
+                # and exits 0 — the wrapper catches the marker.
+                # Only the FIRST occurrence is honored (a
+                # defensive default; if multiple are present the
+                # first one is the agent's primary signal).
+                result = _apply_task_failed_marker(summary)
                 # If task declared an output_path: check local cache, upload
                 # to orchestrator via PUT file API, then attach artifact meta.
                 if cache_dir and output_path:
