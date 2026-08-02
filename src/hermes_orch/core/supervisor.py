@@ -1487,9 +1487,19 @@ class Supervisor:
         satisfiable (any dep is failed/cancelled/interrupted) — those
         tasks would never become ready, so leaving them pending just
         blocks the project from being marked complete.
+
+        v3.10.7 (2026-08-02): filter `archived = 0`. Archived tasks
+        are historical rows the user explicitly archived (typically
+        because the plan was changed). Without this filter, the
+        supervisor would re-pick up the archived batch and dispatch
+        duplicate work — repro on proj-e8106311 (2026-08-02) where
+        4 archived pending tasks at 18:04:29 got re-dispatched
+        alongside the new 18:18:00 batch, producing duplicate UUID
+        task rows for the same step names.
         """
         rows = await self.db.fetchall(
             "SELECT * FROM tasks WHERE project_id = ? AND status = 'pending' "
+            "AND archived = 0 "
             "ORDER BY created_at ASC",
             (project_id,),
         )
@@ -2043,9 +2053,14 @@ class Supervisor:
 
         MVP: do it immediately. Later, this is where the wrapper will actually
         receive the task via heartbeat or push.
+
+        v3.10.7 (2026-08-02): filter `archived = 0` for consistency
+        with `_find_ready_tasks` — archived tasks are historical and
+        should never be promoted.
         """
         rows = await self.db.fetchall(
-            "SELECT id, project_id FROM tasks WHERE project_id = ? AND status = 'assigned'",
+            "SELECT id, project_id FROM tasks WHERE project_id = ? "
+            "AND status = 'assigned' AND archived = 0",
             (project_id,),
         )
         n = 0
