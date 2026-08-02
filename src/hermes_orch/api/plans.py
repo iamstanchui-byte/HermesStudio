@@ -331,6 +331,12 @@ async def _seed_soul_presets_from_plan(
         "presets_skipped_existing": 0,
         "roles_skipped_no_default_soul": 0,
         "roles_skipped_no_profile": 0,
+        # v3.10.4 follow-up: count of roles that fell back to the
+        # generic role template (because the plan had no
+        # `default_soul` for them). The UI mentions this so the
+        # user knows to customize the generic text on the project
+        # page rather than treating it as a final answer.
+        "roles_used_generic_fallback": 0,
         "errors": [],
     }
     try:
@@ -340,10 +346,22 @@ async def _seed_soul_presets_from_plan(
         # Collect unique (role, default_soul) pairs. The LLM may
         # produce the same soul for the same role across multiple
         # steps; we only need one preset per (project, profile).
-        # Two places to look for the soul:
-        #   1. step.default_soul (top-level — v3.10.4 Pydantic field)
+        # Three places to look for the soul, in order of preference:
+        #   1. step.default_soul (top-level — v3.10.4 Pydantic field,
+        #      what the planner prompt asks the LLM to produce)
         #   2. step.params_template.get("default_soul") (legacy
         #      chatbox form, see orchestrator.soul_dispatch._step_default_soul)
+        #   3. _generic_role_template(role) — v3.10.4 follow-up
+        #      fallback for plans created before the planner prompt
+        #      was updated to require `default_soul`. Without this
+        #      fallback, the "Generate SOUL" button on a pre-v3.10.4
+        #      plan would skip every role and the user would have to
+        #      either re-plan or hand-write every SOUL. With the
+        #      fallback, they get a generic-but-usable starting point
+        #      that they can edit on the project page.
+        from hermes_orch.orchestrator.soul_dispatch import (
+            _generic_role_template,
+        )
         seen_roles: dict[str, str] = {}  # role -> default_soul
         for step in plan.steps:
             role = (step.agent_role or "").strip()
@@ -357,8 +375,19 @@ async def _seed_soul_presets_from_plan(
                     str(step.params_template.get("default_soul") or "").strip()
                 )
             if not default_soul:
-                stats["roles_skipped_no_default_soul"] += 1
-                continue
+                # v3.10.4 follow-up: fall back to the same generic
+                # template the dispatch path uses (see
+                # orchestrator.soul_dispatch._ensure_soul_preset).
+                # The plan was probably generated before the planner
+                # prompt required `default_soul`, OR the LLM
+                # skipped it. Either way, the user gets a usable
+                # starting point they can edit. Track as a separate
+                # stat so the UI can mention "N roles used generic
+                # fallback" so the user knows to customize.
+                default_soul = _generic_role_template(role)
+                stats["roles_used_generic_fallback"] = (
+                    stats.get("roles_used_generic_fallback", 0) + 1
+                )
             # If the same role has different default_souls in
             # different steps, we keep the FIRST one (deterministic
             # by step order). The user can manually edit the
@@ -603,6 +632,11 @@ class GenerateSoulFromPlanResponse(BaseModel):
     roles_seen: int
     roles_skipped_no_default_soul: int
     roles_skipped_no_profile: int
+    # v3.10.4 follow-up: count of roles that used the generic
+    # fallback (because the plan had no `default_soul` for them).
+    # The UI surfaces this so the user knows which presets need
+    # custom editing.
+    roles_used_generic_fallback: int
     errors: list[dict[str, str]]
 
 
@@ -653,6 +687,7 @@ async def generate_soul_from_plan(
         roles_seen=stats["roles_seen"],
         roles_skipped_no_default_soul=stats["roles_skipped_no_default_soul"],
         roles_skipped_no_profile=stats["roles_skipped_no_profile"],
+        roles_used_generic_fallback=stats.get("roles_used_generic_fallback", 0),
         errors=stats["errors"],
     )
 

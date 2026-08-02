@@ -41,7 +41,8 @@ Output format (STRICT — output ONLY this JSON object, no prose, no markdown):
       "depends_on": ["<name of an earlier task>", ...],
       "action": "<verb or function name the agent will run>",
       "params": { "<key>": "<value>", ... },
-      "required_capability": "<capability key the role MUST have, or null>"
+      "required_capability": "<capability key the role MUST have, or null>",
+      "default_soul": "<REQUIRED 2-4 sentence persona text: who the agent is, what expertise they bring to this step, what tone/approach to use. Be specific to the role AND the step's purpose.>"
     },
     ...
   ]
@@ -72,9 +73,32 @@ Rules:
     pick the role with the most general storage and let the operator
     route the file manually.
 11. TERSENESS: keep `name` and `action` to ≤ 5 words each. No prose in any
-    field. params should be a small flat object (≤ 4 keys) with concrete
-    values, not long strings. The model's output token budget is tight;
-    verbose tasks get truncated and the plan fails. Stay terse.
+    field except `default_soul` (which is always 2-4 sentences). params
+    should be a small flat object (≤ 4 keys) with concrete values, not
+    long strings. The model's output token budget is tight; verbose
+    tasks get truncated and the plan fails. Stay terse.
+12. DEFAULT_SOUL: every task MUST include a `default_soul` string
+    (2-4 sentences). This is the SOUL persona text that gets applied
+    to the agent when this step is dispatched. The user can see +
+    edit it on the project page BEFORE clicking [▶ Run]. Without
+    `default_soul`, the user has to write one themselves or the
+    agent gets a generic fallback. Concrete examples:
+    - step "fetch macro data" with role "data-analyst":
+        "You are a data analyst specializing in macroeconomic
+        indicators. For this step, fetch the requested time series
+        from the configured source, verify the data is clean and
+        covers the requested period, and return a structured summary."
+    - step "summarize report" with role "writer":
+        "You are a technical writer. Read the upstream outputs,
+        synthesize them into a single coherent report for the
+        operator. Use clear language, cite the key data points,
+        and keep the executive summary under 200 words."
+    - step "code review" with role "reviewer":
+        "You are a senior engineer doing a code review. Focus on
+        correctness, security, and clarity. Be specific: cite
+        file:line for every issue, and propose a concrete fix."
+    Same role in two different steps can have different `default_soul`
+    if the steps' purposes differ — make it specific to the step.
 """
 
 

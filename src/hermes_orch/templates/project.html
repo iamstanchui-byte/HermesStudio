@@ -1206,8 +1206,9 @@ async function generateSoulFromPlan(projectId) {
         const parts = [];
         if (data.presets_created > 0) parts.push('Created ' + data.presets_created + ' new preset(s)');
         if (data.presets_skipped_existing > 0) parts.push('skipped ' + data.presets_skipped_existing + ' already-existing (your edits are preserved)');
-        if (data.roles_skipped_no_default_soul > 0) parts.push(data.roles_skipped_no_default_soul + ' role(s) had no default_soul in the plan');
+        if (data.roles_skipped_no_default_soul > 0) parts.push(data.roles_skipped_no_default_soul + ' role(s) had no default_soul in the plan — even the generic fallback was skipped');
         if (data.roles_skipped_no_profile > 0) parts.push(data.roles_skipped_no_profile + ' role(s) had no idle profile to route to');
+        if (data.roles_used_generic_fallback > 0) parts.push(data.roles_used_generic_fallback + ' role(s) used the generic template (your plan was generated before v3.10.4, OR the LLM skipped default_soul — edit these in the SOUL editor to customize)');
         if (data.errors && data.errors.length > 0) parts.push(data.errors.length + ' error(s)');
         if (parts.length === 0) parts.push('No roles found in the plan to seed');
         alert(parts.join('.\n') + '.\n\nThe "Show SOUL editor" toggle (top of the page) now lets you review and edit them before dispatching.');

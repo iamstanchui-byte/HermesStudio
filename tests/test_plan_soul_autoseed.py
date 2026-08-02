@@ -419,6 +419,94 @@ async def test_plan_save_skips_roles_with_no_routable_profile(client):
 
 
 @pytest.mark.asyncio
+async def test_plan_save_falls_back_to_generic_template(client):
+    """v3.10.4 follow-up: when a plan step has no `default_soul`
+    (because the plan was generated before the planner prompt
+    required it, OR because the LLM skipped it), the auto-seed
+    should fall back to `_generic_role_template(role)` so the
+    user gets a usable starting point. Previously these roles
+    were silently skipped and the user had no presets to edit
+    — they had to either re-plan or hand-write every SOUL.
+
+    The fallback is the same generic template the dispatch
+    path uses (see orchestrator.soul_dispatch._ensure_soul_preset).
+    The user can edit it on the project page once it appears.
+    """
+    ac, app = client
+    await _login_admin(ac)
+    await _create_project_with_profile(app, profile_name="analyst")
+    pid = f"proj-soul-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO projects (id, name, goal, state, coordinator_role, "
+        "accept_criteria, deliverable_path, max_iterations, "
+        "current_iteration, last_iteration_summary) "
+        "VALUES (?, 'soul test', 'x', 'planned', '', '', '', 0, 0, '')",
+        (pid,),
+    )
+    r = await ac.put(
+        f"/api/projects/{pid}/plan",
+        json=_make_plan_json([
+            # Step with NO default_soul — should use generic fallback
+            {"name": "s1", "action": "do_task", "agent_role": "analyst"},
+        ]),
+    )
+    assert r.status_code == 200, r.text
+    presets = await _get_presets(app, pid)
+    assert len(presets) == 1, (
+        f"expected 1 preset (with generic fallback), got {len(presets)}: {presets}"
+    )
+    # The content is the generic template (not empty, not the LLM's output)
+    assert "analyst" in presets[0]["content"].lower()
+    # The default_soul field is also set (same as content, so a
+    # future "reset to default" can find it)
+    assert presets[0]["default_soul"] == presets[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_generate_soul_endpoint_uses_generic_fallback(client):
+    """v3.10.4 follow-up: the fallback endpoint also uses the
+    generic template when the plan has no default_soul. The
+    response includes `roles_used_generic_fallback` so the UI
+    can mention which presets need custom editing."""
+    ac, app = client
+    await _login_admin(ac)
+    await _create_project_with_profile(app, profile_name="analyst")
+    pid = f"proj-fallback-gen-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO projects (id, name, goal, state, coordinator_role, "
+        "accept_criteria, deliverable_path, max_iterations, "
+        "current_iteration, last_iteration_summary) "
+        "VALUES (?, 'fallback test', 'x', 'planned', '', '', '', 0, 0, '')",
+        (pid,),
+    )
+    r = await ac.put(
+        f"/api/projects/{pid}/plan",
+        json=_make_plan_json([
+            {"name": "s1", "action": "do_task", "agent_role": "analyst"},
+        ]),
+    )
+    assert r.status_code == 200
+    # Clear the auto-seeded preset
+    await app.state.db.execute(
+        "DELETE FROM project_soul_presets WHERE project_id = ?", (pid,)
+    )
+    # Call the fallback endpoint
+    r = await ac.post(f"/api/projects/{pid}/plan/generate-soul")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # The endpoint reports the generic fallback count
+    assert data["roles_used_generic_fallback"] == 1, (
+        f"expected 1 role using generic fallback, got "
+        f"{data['roles_used_generic_fallback']}: {data}"
+    )
+    assert data["presets_created"] == 1
+    # Preset content is the generic template
+    presets = await _get_presets(app, pid)
+    assert len(presets) == 1
+    assert "analyst" in presets[0]["content"].lower()
+
+
+@pytest.mark.asyncio
 async def test_plan_save_supports_legacy_params_template_default_soul(client):
     """Pre-v3.10.4 plans stored the SOUL in
     `params_template["default_soul"]`. Backwards compat: the
