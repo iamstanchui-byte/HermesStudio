@@ -411,13 +411,21 @@ async def test_chat_retry_also_think_only_raises_502_with_actionable_hint(client
 
 
 @pytest.mark.asyncio
-async def test_chat_max_tokens_is_at_least_4000(client, monkeypatch):
+async def test_chat_max_tokens_is_at_least_2000(client, monkeypatch):
     """v3.10.4 follow-up: max_tokens was bumped from 1500 to 4000.
     The 1500 budget was consumed by the LLM's internal reasoning
-    (~360 tokens) leaving ~1140 for the actual reply — not enough
-    for a multi-paragraph answer. 4000 gives the LLM ~3500 tokens
-    of headroom after reasoning. This test pins the value so a
-    future refactor that lowers it again is caught immediately."""
+    (~360 tokens) leaving ~1140 for the actual reply -- not enough
+    for a multi-paragraph answer.
+
+    v3.10.5 (2026-08-02) update: the chat LLM is now asked to keep
+    responses brief (1-3 paragraphs, < 500 words) via the slim
+    system prompt, so 4000 is overkill. Lowered to 2000 to save
+    ~50% on chat cost and signal brevity. This test now pins
+    the new floor at 2000. The system prompt at 2,513 chars
+    (~630 tokens) + chat snapshot (~1-2K tokens) + reasoning
+    (~360 tokens) + reply (~500 tokens) = ~2500-3000 tokens
+    total, which is well under the 2000 completion budget.
+    """
     ac, app = client
     await _login_admin(ac)
     pid = await _create_project(app)
@@ -448,9 +456,12 @@ async def test_chat_max_tokens_is_at_least_4000(client, monkeypatch):
     )
     # 200 because the LLM returned a real answer
     assert r.status_code == 200
-    # Critical: max_tokens must be at least 4000
-    assert captured_max_tokens["v"] >= 4000, (
-        f"max_tokens was {captured_max_tokens['v']}, expected >= 4000. "
+    # Critical: max_tokens must be at least 2000 (v3.10.5 lower
+    # bound) -- lower than 2000 and MiniMax M3's internal
+    # reasoning (~360 tokens) eats too much of the budget and the
+    # model produces no final answer.
+    assert captured_max_tokens["v"] >= 2000, (
+        f"max_tokens was {captured_max_tokens['v']}, expected >= 2000. "
         f"With less, MiniMax M3's internal reasoning (~360 tokens) "
         f"eats too much of the budget and the model produces no final "
         f"answer (proj-cef60586 repro on 2026-08-02)."

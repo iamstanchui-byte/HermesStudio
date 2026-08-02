@@ -1,14 +1,14 @@
-# coding: utf-8
-"""Project endpoints + file API (per REVIEW.md §3.6, §4).
+﻿# coding: utf-8
+"""Project endpoints + file API (per REVIEW.md Â§3.6, Â§4).
 
-All file access goes through HTTP (no SMB/NFS) per §3.6.
-Project folder structure (per §3.2):
+All file access goes through HTTP (no SMB/NFS) per Â§3.6.
+Project folder structure (per Â§3.2):
     ./projects/<project_id>/
-    ├── plan.md       (YAML frontmatter + body)
-    ├── status.md     (YAML frontmatter + body)
-    ├── decisions.md
-    ├── agents/<id>/notes.md
-    └── ...
+    â”œâ”€â”€ plan.md       (YAML frontmatter + body)
+    â”œâ”€â”€ status.md     (YAML frontmatter + body)
+    â”œâ”€â”€ decisions.md
+    â”œâ”€â”€ agents/<id>/notes.md
+    â””â”€â”€ ...
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import re
 import uuid
 
 # v1.4 (2026-07-29): strip common ANSI escape codes (CSI sequences
-# ending in a letter — covers SGR color/style codes, cursor moves,
+# ending in a letter â€” covers SGR color/style codes, cursor moves,
 # erase, etc.). We strip on the way OUT (GET /output) rather than
 # on the way IN (POST /output-chunk) so the audit_log keeps the
 # raw chunk for any future debugging needs.
@@ -28,7 +28,7 @@ def _strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from a string.
 
     Hermes writes colored output to its stdout (e.g.
-    ``[1;38;2;255;215;0m╺─━━━━ Hermes ━━━━╸[0m``). The terminal
+    ``[1;38;2;255;215;0mâ•ºâ”€â”â”â”â” Hermes â”â”â”â”â•¸[0m``). The terminal
     renders those as colors, but in the dashboard's <pre> block
     they show up as raw bytes and make the text hard to read.
     Stripping them server-side is cheaper + simpler than running
@@ -70,7 +70,7 @@ class ProjectCreate(BaseModel):
     # Phase 4+ repositioning (2026-07-25): create is now SIMPLE. Just a
     # name is required. Goal/iter-loop/etc. are setup INSIDE the
     # project page, not at create time. New projects always start at
-    # state='planned' (blank, awaiting tasks or Run click) — there is
+    # state='planned' (blank, awaiting tasks or Run click) â€” there is
     # no "auto-plan on create" anymore. The user adds tasks manually
     # via the project page, or clicks "Generate plan" to have the
     # LLM planner create them. Either way, the project stays at
@@ -130,7 +130,7 @@ def _project_id() -> str:
     """Generate a new project ID like 'proj-1a2b3c4d' (8 hex chars).
 
     Used by create_project. Kept here (rather than in utils) because
-    it's project-API-specific — the wrapper uses a different ID
+    it's project-API-specific â€” the wrapper uses a different ID
     scheme for agents, and tasks use 't-' + uuid4().hex.
     """
     return "proj-" + secrets.token_hex(4)
@@ -199,7 +199,7 @@ def _append_chat_jsonl(
 
 
 def _validate_relpath(path: str) -> str:
-    """Validate relative path — reject absolute, .., etc."""
+    """Validate relative path â€” reject absolute, .., etc."""
     if not path:
         raise HTTPException(400, "Path required")
     if path.startswith("/") or path.startswith("\\"):
@@ -222,7 +222,7 @@ def _resolve_inside(base: Path, rel: str) -> Path:
 
 
 def _parse_plan_md(content: str) -> tuple[dict[str, Any], str]:
-    """Parse plan.md → (frontmatter_dict, body_str)."""
+    """Parse plan.md â†’ (frontmatter_dict, body_str)."""
     if not content.startswith("---"):
         return {}, content
     m = re.match(r"^---\n(.*?)\n---\n?(.*)", content, re.DOTALL)
@@ -237,7 +237,7 @@ def _parse_plan_md(content: str) -> tuple[dict[str, Any], str]:
 
 
 def _serialize_plan_md(fm: dict[str, Any], body: str) -> str:
-    """Serialize (frontmatter, body) → plan.md text."""
+    """Serialize (frontmatter, body) â†’ plan.md text."""
     fm_str = yaml.safe_dump(fm, allow_unicode=True, sort_keys=False).strip()
     # Body should start with newline if non-empty
     if body and not body.startswith("\n"):
@@ -258,7 +258,7 @@ async def create_project(body: ProjectCreate, request: Request) -> Project:
     The user then:
       1. Adds tasks manually via the project page, OR
       2. Clicks "Generate plan" (LLM creates tasks from goal), OR
-      3. Both — some manual, some planned.
+      3. Both â€” some manual, some planned.
     ...and stays at state='planned' until they explicitly click Run.
     This is the orch-as-coordinator principle: LLM is a planner, not
     a control flow. Tasks don't auto-dispatch.
@@ -291,13 +291,13 @@ async def create_project(body: ProjectCreate, request: Request) -> Project:
 
     # Initial plan.md
     plan_fm = {"project_id": project_id, "state": initial_state, "created_at": now, "tasks": []}
-    goal_section = f"## Goal\n\n{initial_goal}\n" if initial_goal else "## Goal\n\n_(no goal set — add one via Edit, or click Generate plan)_\n"
+    goal_section = f"## Goal\n\n{initial_goal}\n" if initial_goal else "## Goal\n\n_(no goal set â€” add one via Edit, or click Generate plan)_\n"
     plan_body = f"\n# Project: {body.name or project_id}\n\n{goal_section}"
     (pdir / "plan.md").write_text(_serialize_plan_md(plan_fm, plan_body), encoding="utf-8")
 
     # Initial status.md
     status_fm = {"state": initial_state, "last_updated": now}
-    status_body = "\n# Status\n\nJust created (blank project — add tasks or click Generate plan, then click Run).\n"
+    status_body = "\n# Status\n\nJust created (blank project â€” add tasks or click Generate plan, then click Run).\n"
     (pdir / "status.md").write_text(
         _serialize_plan_md(status_fm, status_body), encoding="utf-8"
     )
@@ -310,7 +310,7 @@ async def create_project(body: ProjectCreate, request: Request) -> Project:
 
     # Phase 1 of 3-tier memory (docs/design/3-tier-memory.md): bootstrap
     # facts.md for L2 (curated facts). The L1 (trace.jsonl) bootstrap
-    # happens automatically when audit_log() runs below — it mirrors
+    # happens automatically when audit_log() runs below â€” it mirrors
     # every event to the per-project trace file.
     try:
         from hermes_orch.core.memory import get_memory_writer
@@ -382,7 +382,7 @@ async def get_project(project_id: str, request: Request) -> Project:
     return Project(**row)
 
 
-# ===== File API (§3.6 — all access via HTTP) =====
+# ===== File API (Â§3.6 â€” all access via HTTP) =====
 
 
 @router.get("/{project_id}/files/{path:path}")
@@ -424,8 +424,8 @@ async def read_file(
 #   even though the file is on disk. Confirmed by user 2026-07-30.
 #
 # The right fix is to split the endpoint:
-#   - /api/projects/{id}/files/{path}              → wrapper (HMAC, sync upload)
-#   - /api/projects/{id}/files/{path}/preview      → dashboard (no auth, view)
+#   - /api/projects/{id}/files/{path}              â†’ wrapper (HMAC, sync upload)
+#   - /api/projects/{id}/files/{path}/preview      â†’ dashboard (no auth, view)
 #
 # Threat model: the dashboard already has NO auth (no session, no
 # cookie). The project_id in the URL is the only barrier. Local network
@@ -434,7 +434,7 @@ async def read_file(
 # productize, the productize auth (session cookie) is a separate task
 # and would gate ALL dashboard endpoints uniformly.
 #
-# This endpoint is GET-only (read). It does NOT support PUT/DELETE —
+# This endpoint is GET-only (read). It does NOT support PUT/DELETE â€”
 # those remain on the HMAC'd endpoint. That preserves the wrapper
 # contract: a leaked project_id alone can't be used to mutate files.
 @router.get("/{project_id}/file-preview/{path:path}")
@@ -493,7 +493,7 @@ async def write_file(
         raise HTTPException(
             413,
             f"File too large: {len(body)} bytes (max {MAX_FILE_BYTES // (1024*1024)}MB). "
-            f"Large outputs should go to share folder — see agent_profiles.storage_refs. "
+            f"Large outputs should go to share folder â€” see agent_profiles.storage_refs. "
             f"Store only metadata/reference in orch.",
         )
     full.parent.mkdir(parents=True, exist_ok=True)
@@ -554,7 +554,7 @@ can read BEFORE starting the workflow.
 # Output rules (strict)
 - Output ONLY the markdown. No preamble, no "Here is your procedure",
   no code fence wrappers.
-- Plain markdown — no JSON frontmatter, no HTML.
+- Plain markdown â€” no JSON frontmatter, no HTML.
 - Length: 30-80 lines, ~1-2 KB. Be concise; this is a reading primer,
   not a tutorial.
 - Use second-person imperative ("Fetch the data", "Compose the report")
@@ -563,12 +563,12 @@ can read BEFORE starting the workflow.
   action) so the agent can match it against the plan it's been given.
 
 # Required sections (in this order)
-1. # <project name> — Procedure
-2. ## Goal — one or two sentences, copy from project.goal
-3. ## Steps — numbered list, one step per task, in execution order
-4. ## Pitfalls — 1-3 things that went wrong or that the next agent
+1. # <project name> â€” Procedure
+2. ## Goal â€” one or two sentences, copy from project.goal
+3. ## Steps â€” numbered list, one step per task, in execution order
+4. ## Pitfalls â€” 1-3 things that went wrong or that the next agent
    should be careful about (derive from facts.md and decision.md)
-5. ## Definition of done — what "good output" looks like for this
+5. ## Definition of done â€” what "good output" looks like for this
    workflow (1-2 sentences)
 
 If facts.md or decision.md are empty, skip the Pitfalls section.
@@ -582,7 +582,7 @@ async def auto_generate_procedure(project_id: str, request: Request) -> dict:
     """Use the LLM to render procedure.md from this project's tasks + facts.
 
     Writes the generated markdown to <project>/procedure.md (overwriting
-    any existing hand-written version — the user can re-Edit it
+    any existing hand-written version â€” the user can re-Edit it
     afterwards). Returns the rendered text so the UI can show it.
 
     Failure modes:
@@ -615,7 +615,7 @@ async def auto_generate_procedure(project_id: str, request: Request) -> dict:
     if not tasks:
         raise HTTPException(
             400,
-            f"Project {project_id} has no tasks yet — add tasks first so "
+            f"Project {project_id} has no tasks yet â€” add tasks first so "
             "the LLM has something to render.",
         )
 
@@ -638,7 +638,7 @@ async def auto_generate_procedure(project_id: str, request: Request) -> dict:
     def _clean(s: str) -> str:
         if not s:
             return ""
-        # Try JSON first — many task results are {"summary": "..."}
+        # Try JSON first â€” many task results are {"summary": "..."}
         try:
             d = json.loads(s)
             if isinstance(d, dict):
@@ -706,7 +706,7 @@ async def auto_generate_procedure(project_id: str, request: Request) -> dict:
     if not api_key:
         raise HTTPException(
             503,
-            "LLM api_key not configured — set llm.api_key in config.yaml "
+            "LLM api_key not configured â€” set llm.api_key in config.yaml "
             "before auto-generating procedures.",
         )
 
@@ -723,7 +723,7 @@ async def auto_generate_procedure(project_id: str, request: Request) -> dict:
             },
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.2,  # low — we want deterministic structure
+        "temperature": 0.2,  # low â€” we want deterministic structure
         "max_tokens": 1500,
     }
     headers = {
@@ -755,7 +755,7 @@ async def auto_generate_procedure(project_id: str, request: Request) -> dict:
     # LLM sometimes adds despite the prompt. Most modern models comply;
     # this is defense for the ones that don't.
     text = text.strip()
-    # Strip reasoning traces — MiniMax M3 emits <think>...</think>
+    # Strip reasoning traces â€” MiniMax M3 emits <think>...</think>
     # blocks before the actual answer. These are useful to the model
     # but useless (and noisy) in the saved procedure.md. Match across
     # newlines; non-greedy so we don't eat multiple blocks at once if
@@ -787,7 +787,7 @@ async def auto_generate_procedure(project_id: str, request: Request) -> dict:
     }
 
 
-# ===== Plan API (§4.1 — plan.md frontmatter) =====
+# ===== Plan API (Â§4.1 â€” plan.md frontmatter) =====
 
 
 @router.get("/{project_id}/plan")
@@ -830,7 +830,7 @@ async def open_project_folder(project_id: str, request: Request) -> dict[str, An
 
     Browser can't open local paths directly, so we shell out from the
     server. The user's browser must be running on the same host as the
-    orchestrator (this won't work for remote browser → local server).
+    orchestrator (this won't work for remote browser â†’ local server).
 
     Cross-platform: dispatches via `hermes_orch.core.platform_compat`,
     so the same endpoint works on Windows (Explorer), macOS (Finder),
@@ -848,7 +848,7 @@ async def open_project_folder(project_id: str, request: Request) -> dict[str, An
          kind=smb that exists, for any profile this project has
          used (via ``tasks.assigned_profile_id`` or active
          ``project_sessions.profile_id``)
-      3. Project metadata dir (orchestrator's cache — what older
+      3. Project metadata dir (orchestrator's cache â€” what older
          versions of this endpoint always opened)
     """
     from hermes_orch.core.platform_compat import (
@@ -981,7 +981,7 @@ async def unarchive_project(project_id: str, request: Request) -> dict:
     Sets state to 'completed' (NOT 'planning') so the supervisor
     doesn't re-run the task pipeline. If you want to re-run,
     manually transition the project (e.g. via a "re-run" button
-    on the project page) — restoring from archive is meant to
+    on the project page) â€” restoring from archive is meant to
     bring the project back to a viewable, run-once-finished
     state, not to restart it.
     """
@@ -1030,7 +1030,7 @@ async def undelete_project(project_id: str, request: Request) -> dict:
     """Restore a soft-deleted project.
 
     Sets state to 'completed' (NOT 'planning') so the supervisor
-    doesn't re-run the task pipeline — see unarchive_project for
+    doesn't re-run the task pipeline â€” see unarchive_project for
     the same rationale.
     """
     db = request.app.state.db
@@ -1161,7 +1161,7 @@ async def set_project_session(
     # Wrapper previously sent only {session_id, role} in the body, which
     # left agent_id / profile_id NULL in the project_sessions row. The
     # cleanup-ack endpoint JOINS agent_profiles on profile_id, so NULL
-    # rows can never be acked — they sit in pending_cleanup forever.
+    # rows can never be acked â€” they sit in pending_cleanup forever.
     # Fall back to deriving both from the request's X-Agent-Id header
     # (HMAC-authenticated) + (agent_id, role) lookup. The wrapper
     # doesn't even need to send them in the body anymore.
@@ -1181,7 +1181,7 @@ async def set_project_session(
         )
     db = request.app.state.db
     # Resolve profile_id from (agent_id, role) if the wrapper didn't
-    # send it. This is the standard case — the wrapper knows the role
+    # send it. This is the standard case â€” the wrapper knows the role
     # but doesn't know the UUID of its own profile row.
     if not profile_id:
         prof_row = await db.fetchone(
@@ -1267,7 +1267,7 @@ async def get_project_session(
     With `?role=<name>` (recommended): returns the session for that
     specific role. The wrapper passes its own role so it never resumes
     a session that belongs to a different profile (cross-profile session
-    reuse is broken at the hermes level — session namespaces are
+    reuse is broken at the hermes level â€” session namespaces are
     per-profile).
 
     Without `?role`: returns the legacy `current_session_id` (latest
@@ -1369,7 +1369,7 @@ async def replan_project(
         cleared = cur.rowcount if hasattr(cur, "rowcount") else 0
     # Always delete old iteration_review tasks. Without this, the supervisor's
     # _maybe_iterate would see the previous cycle's completed review task
-    # (status=completed) and "consume" its decision.md — auto-completing the
+    # (status=completed) and "consume" its decision.md â€” auto-completing the
     # fresh project based on a stale verdict. The replan must leave the
     # project in a state where the supervisor can dispatch a NEW review.
     old_reviews = await db.execute(
@@ -1469,7 +1469,7 @@ async def run_project(project_id: str, request: Request) -> dict:
     if not project:
         raise HTTPException(404, f"Project not found: {project_id}")
     cur_state = project["state"]
-    # Terminal states — refuse
+    # Terminal states â€” refuse
     if cur_state in ("completed", "cancelled", "archived", "deleted"):
         raise HTTPException(
             400,
@@ -1482,7 +1482,7 @@ async def run_project(project_id: str, request: Request) -> dict:
             "project_id": project_id,
             "state": "ready",
             "noop": True,
-            "message": "Project already in 'ready' — supervisor will dispatch on next tick.",
+            "message": "Project already in 'ready' â€” supervisor will dispatch on next tick.",
         }
     if cur_state == "running":
         return {
@@ -1492,7 +1492,7 @@ async def run_project(project_id: str, request: Request) -> dict:
             "message": "Project is already running.",
         }
     if cur_state != "planned":
-        # 'planning' is in-flight (planner running) — refuse, user should
+        # 'planning' is in-flight (planner running) â€” refuse, user should
         # wait or retry the plan first. 'interrupted' is a supervisor
         # signal, also refuse.
         raise HTTPException(
@@ -1511,7 +1511,7 @@ async def run_project(project_id: str, request: Request) -> dict:
             f"Project {project_id} has no tasks yet. Add tasks manually "
             f"or click Generate plan before clicking Run.",
         )
-    # All checks pass — flip to ready
+    # All checks pass â€” flip to ready
     await db.execute(
         "UPDATE projects SET state = 'ready', updated_at = ? WHERE id = ?",
         (_now_iso(), project_id),
@@ -1540,17 +1540,17 @@ async def run_project(project_id: str, request: Request) -> dict:
 # (e.g. report_month=May2026) and the project's task list becomes
 # the workflow's steps with placeholders substituted.
 #
-# Semantics (additive import — import the workflow's OBJECT into
+# Semantics (additive import â€” import the workflow's OBJECT into
 # the project, do NOT replace its task list):
 #   - All current non-archived tasks are LEFT ALONE. The workflow's
 #     steps JOIN them. Both old and new tasks coexist in the live
 #     Tasks list. If you want a destructive replace, use Clone chain
-#     (POST /api/tasks/{id}/clone-and-cascade) — that one is surgical.
+#     (POST /api/tasks/{id}/clone-and-cascade) â€” that one is surgical.
 #   - New tasks are inserted as pending with depends_on wired from
 #     the workflow's step names (with 2-pass resolution: workflow-
 #     internal first, then existing project task names by name).
 #   - Project state is set to 'planned' regardless of prior state
-#     (so the supervisor does NOT auto-dispatch — user clicks Run).
+#     (so the supervisor does NOT auto-dispatch â€” user clicks Run).
 #
 # Why not just call /api/workflows/{id}/run? That endpoint creates
 # a NEW project. Apply-to-existing is the operator's edit-the-plan
@@ -1562,7 +1562,7 @@ class WorkflowApplyBody(BaseModel):
 
     `variables` is a dict mapping workflow variable names to values.
     Required variables (per the workflow's declared variables) MUST
-    be present. Type coercion (string → int/bool) is handled by
+    be present. Type coercion (string â†’ int/bool) is handled by
     the same _validate_run_variables helper that /api/workflows/{id}/run
     uses, so the client can send values in their natural form.
     """
@@ -1578,15 +1578,15 @@ async def apply_workflow_to_project(
 
     Mental model: "apply workflow" = import a workflow OBJECT into
     the project. The workflow's steps are added to the project's
-    existing task list. Existing tasks are NOT touched — they stay
+    existing task list. Existing tasks are NOT touched â€” they stay
     in the live Tasks list, and the workflow's steps join them.
     If you want to replace an existing task chain, use Clone chain
-    (POST /api/tasks/{id}/clone-and-cascade) — that one is surgical.
+    (POST /api/tasks/{id}/clone-and-cascade) â€” that one is surgical.
 
-    User feedback (2026-07-26): "我一直都說是import workflow 的
-    object 入project". The previous version archived all current
+    User feedback (2026-07-26): "æˆ‘ä¸€ç›´éƒ½èªªæ˜¯import workflow çš„
+    object å…¥project". The previous version archived all current
     tasks then inserted the workflow's steps (a destructive replace).
-    This version is additive — both old and new tasks coexist, and
+    This version is additive â€” both old and new tasks coexist, and
     the user can manually clean up duplicates via the Tasks section
     (e.g. with Delete on a row, or Clone chain to supersede).
 
@@ -1600,13 +1600,13 @@ async def apply_workflow_to_project(
       4. Count current non-archived tasks (so the response can tell
          the user "you had N, now you have N+M"). DON'T archive.
       5. Set the project to state='planned' (pause dispatch). User
-         feedback (2026-07-26): "apply workflow 後會自動run, 應該
-         要按run 才start". The supervisor's _drive_project only
+         feedback (2026-07-26): "apply workflow å¾Œæœƒè‡ªå‹•run, æ‡‰è©²
+         è¦æŒ‰run æ‰start". The supervisor's _drive_project only
          handles 'planning' + 'ready'/'running', so from 'planned'
          the new pending tasks wait. User reviews + clicks Run.
       6. Insert the substituted steps as new pending tasks. depends_on
          is resolved in two passes:
-         a. First try the step_name → step_name map (the workflow
+         a. First try the step_name â†’ step_name map (the workflow
             references its own steps).
          b. Then try matching against EXISTING tasks in the project
             (by name). This lets a workflow integrate with the
@@ -1667,14 +1667,14 @@ async def apply_workflow_to_project(
     if not substituted:
         raise HTTPException(
             400,
-            f"workflow {wf['name']!r} has no steps in step_template — "
+            f"workflow {wf['name']!r} has no steps in step_template â€” "
             "nothing to apply",
         )
 
     now = _now_iso()
 
     # 4. Count current non-archived tasks (so the response + UI can
-    # show "you had N, now you have N+M" — additive semantics). We
+    # show "you had N, now you have N+M" â€” additive semantics). We
     # don't archive, so the user's existing tasks stay live.
     pre_count_row = await db.fetchone(
         "SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND archived = 0",
@@ -1683,14 +1683,14 @@ async def apply_workflow_to_project(
     pre_count = pre_count_row["n"] if pre_count_row else 0
 
     # 5. Set state to 'planned' (NOT 'ready') regardless of prior state.
-    # User feedback (2026-07-26): "apply workflow 後會自動run, 應該要按
-    # run 才start". Same model as /replan (planning → planned, user
+    # User feedback (2026-07-26): "apply workflow å¾Œæœƒè‡ªå‹•run, æ‡‰è©²è¦æŒ‰
+    # run æ‰start". Same model as /replan (planning â†’ planned, user
     # clicks Run). For all prior states, we transition: terminal
     # states (completed/failed/cancelled/interrupted/archived) need
     # to flip because the supervisor was ignoring them; non-terminal
     # states (ready/running/planning) need to flip to PAUSE dispatch
     # so the new pending tasks don't auto-run. 'planned' state is
-    # the supervisor's "do nothing" state — user reviews + clicks Run.
+    # the supervisor's "do nothing" state â€” user reviews + clicks Run.
     PLANNED = "planned"
     woken = False
     new_state = proj["state"]
@@ -1717,10 +1717,10 @@ async def apply_workflow_to_project(
     #      dep and the step being inserted are in THIS apply)
     #   b. Project-external: name -> existing project task id
     #      (so a workflow step can depend on a project task with
-    #      the same name — e.g. "verify-and-summarize" depends on
+    #      the same name â€” e.g. "verify-and-summarize" depends on
     #      an existing "fetch-data" task)
     # Anything not in either map is logged as unresolved (loud,
-    # not silent — the audit log will show the gap).
+    # not silent â€” the audit log will show the gap).
     # Load existing project tasks once, by name.
     existing_task_rows = await db.fetchall(
         "SELECT id, name FROM tasks WHERE project_id = ? AND archived = 0",
@@ -1838,8 +1838,8 @@ async def apply_workflow_to_project(
         "tasks": [{"id": t["id"], "name": t["name"]} for t in task_rows],
         "message": (
             f"Applied workflow '{wf['name']}' ({len(task_rows)} new tasks added to {pre_count} existing). "
-            + (f"State: {proj['state']} → planned. " if woken else "State already planned. ")
-            + "Click ▶️ Run on the project page to dispatch."
+            + (f"State: {proj['state']} â†’ planned. " if woken else "State already planned. ")
+            + "Click â–¶ï¸ Run on the project page to dispatch."
         ),
     }
 
@@ -2124,7 +2124,7 @@ async def append_project_fact(
     return {"ok": True, "project_id": project_id, "section": section}
 
 
-# ===== SOUL presets (§ — per-project agent identity) =====
+# ===== SOUL presets (Â§ â€” per-project agent identity) =====
 #
 # A SOUL preset is a per-project snapshot of what SOUL.md should look like
 # for a given agent profile when this project is "active". The user designs
@@ -2135,7 +2135,7 @@ async def append_project_fact(
 # that the wrapper picks up and applies as a regular SOUL.md update.
 #
 # Multiple projects can run concurrently as long as they target DIFFERENT
-# agent profiles — adding more agents unlocks more parallel projects. There
+# agent profiles â€” adding more agents unlocks more parallel projects. There
 # is no "wait for all agents idle" requirement.
 
 
@@ -2145,14 +2145,14 @@ class SoulPresetUpsert(BaseModel):
     content: str
     # v3.9.0 (SOUL routing): workflow-supplied default. The orch server
     # uses this as the initial content when auto-populating a preset on
-    # first dispatch (see orchestrator/soul_dispatch.py). Optional —
+    # first dispatch (see orchestrator/soul_dispatch.py). Optional â€”
     # old callers (pre-v3.9.0) leave it None and routing falls back
     # to a generic role template.
     default_soul: str | None = None
 
 
 class SoulPresetApply(BaseModel):
-    """Body for /soul-presets/apply — apply one or all presets for this project."""
+    """Body for /soul-presets/apply â€” apply one or all presets for this project."""
     agent_id: str | None = None  # if set with profile_name, apply just that one
     profile_name: str | None = None
     confirm_overwrite: bool = False  # required true if preset != current SOUL
@@ -2231,7 +2231,7 @@ async def upsert_soul_preset(
 ) -> SoulPreset:
     """Save or update a SOUL preset for one (project, profile) pair.
 
-    Idempotent — re-PUTting replaces the existing preset for that pair.
+    Idempotent â€” re-PUTting replaces the existing preset for that pair.
     The preset is just a snapshot in the DB; applying it later writes the
     content to the profile's actual SOUL.md via the profile_configs flow.
 
@@ -2268,7 +2268,7 @@ async def upsert_soul_preset(
         # v3.9.0: also write default_soul on update when the caller
         # provided it. NULL = keep existing (only an explicit None
         # preserves the old value; body.default_soul is just str | None).
-        # We treat "caller did not send the field" as "no change" — Pydantic
+        # We treat "caller did not send the field" as "no change" â€” Pydantic
         # defaults default_soul to None on the request model, so we
         # distinguish "absent" via model_fields_set (Pydantic v2).
         sets = ["content = ?", "role_name = ?", "updated_at = ?"]
@@ -2299,7 +2299,7 @@ async def upsert_soul_preset(
         )
     # v3.9.0 (Phase 3): append a version row for this save. The
     # flow is split between insert and update:
-    #   - INSERT (new preset): no backfill needed — the row was
+    #   - INSERT (new preset): no backfill needed â€” the row was
     #     just created with `body.content`, so v1 IS the head.
     #     `_append_preset_version` writes the next version number,
     #     which is 1 (no rows yet).
@@ -2309,7 +2309,7 @@ async def upsert_soul_preset(
     #     history shows the original state. Then we write the
     #     new version (next sequential number) with the NEW
     #     content. The result for an UPDATE is "v1 = old head,
-    #     v2 = new edit" — matches the user's mental model.
+    #     v2 = new edit" â€” matches the user's mental model.
     operator = "orch_server"
     try:
         from hermes_orch.auth.cookie import current_user_id
@@ -2324,7 +2324,7 @@ async def upsert_soul_preset(
         pass
     if not existing:
         # Fresh insert: just append v1 (or whatever the next number
-        # is — but for a brand-new preset it's always 1).
+        # is â€” but for a brand-new preset it's always 1).
         new_version = await _append_preset_version(
             db, preset_id=preset_id,
             content=body.content,
@@ -2333,7 +2333,7 @@ async def upsert_soul_preset(
             write_default_soul=("default_soul" in body.model_fields_set),
         )
     else:
-        # Update: backfill v1 from the current head (idempotent —
+        # Update: backfill v1 from the current head (idempotent â€”
         # no-op if v1 already exists), then append the new version.
         await _backfill_preset_v1(db, preset_id, created_by=operator)
         new_version = await _append_preset_version(
@@ -2387,7 +2387,7 @@ async def upsert_soul_preset(
 async def delete_soul_preset(
     project_id: str, agent_id: str, profile_name: str, request: Request
 ) -> Response:
-    """Remove a SOUL preset (snapshot in DB only — does not touch the
+    """Remove a SOUL preset (snapshot in DB only â€” does not touch the
     live SOUL.md on the agent host)."""
     db = request.app.state.db
     profile = await db.fetchone(
@@ -2500,7 +2500,7 @@ async def apply_soul_presets(
 # any routers). The orchestrator modules will import these directly
 # from hermes_orch.api.projects.
 #
-# Both functions are pure DB reads/writes — no FastAPI Request, no
+# Both functions are pure DB reads/writes â€” no FastAPI Request, no
 # HTTP semantics. The async signature matches Database methods so
 # the orchestrator can call them with the same `db: Database`
 # reference it already has.
@@ -2523,7 +2523,7 @@ async def get_soul_preset_by_role(
     there can be at most one preset per (project, profile). This
     helper searches by role_name instead, which can in principle
     match multiple profiles if a project has several presets with
-    the same role_name (rare but possible — e.g. "researcher" bound
+    the same role_name (rare but possible â€” e.g. "researcher" bound
     to two different agents). In that case we return the
     most-recently-updated one (FIFO behavior, matching the existing
     "first apply wins" semantics in `apply_soul_presets`).
@@ -2552,7 +2552,7 @@ async def touch_soul_preset(
     Called by orchestrator/soul_dispatch.py after a successful
     apply + heartbeat confirm. The dispatch path polls the
     heartbeat's reported SOUL.md mtime against `last_applied_mtime`
-    to decide whether a re-apply is needed — so this function is
+    to decide whether a re-apply is needed â€” so this function is
     the source of truth for "what we last wrote, when, and where
     the host's mtime is now".
 
@@ -2576,7 +2576,7 @@ async def touch_soul_preset(
 # in `project_soul_preset_versions` so the user can see "preset v3
 # of 5" and roll back. The "head" columns on `project_soul_presets`
 # stay denormalized (fast read at dispatch time). See
-# docs/soul-routing-design.md §"Phased plan → Phase 3" for the
+# docs/soul-routing-design.md Â§"Phased plan â†’ Phase 3" for the
 # schema and behavior.
 #
 # Versioning contract:
@@ -2618,7 +2618,7 @@ async def _next_version_number(db: Database, preset_id: str) -> int:
     Computed as MAX(version_number) + 1 on the versions table;
     returns 1 if the preset has no version rows yet. The result
     is racy under concurrent writes (two parallel PUTs could each
-    pick the same n+1) — the UNIQUE (preset_id, version_number)
+    pick the same n+1) â€” the UNIQUE (preset_id, version_number)
     constraint will reject the loser with an IntegrityError, which
     the caller should handle by re-reading and retrying once.
     """
@@ -2648,7 +2648,7 @@ async def _append_preset_version(
     the version was created by the system.
 
     Caller is responsible for updating the head columns on
-    `project_soul_presets` (this function does not touch the head —
+    `project_soul_presets` (this function does not touch the head â€”
     the caller knows what content to write there).
     """
     import uuid as _uuid
@@ -2781,7 +2781,7 @@ async def rollback_soul_preset(
 ) -> SoulPresetVersion:
     """Restore an older version as the new head.
 
-    Behavior: does NOT delete the intervening versions — instead,
+    Behavior: does NOT delete the intervening versions â€” instead,
     creates a new version row (number = max+1) whose content and
     default_soul are copied from the target version. This is the
     standard "append-only history" pattern (like git commits or
@@ -2795,7 +2795,7 @@ async def rollback_soul_preset(
     404 if the project / profile / preset / target version is
     missing. 409 if the rolled-back content would be identical
     to the current head (we still write a new row, but it's a
-    no-op semantically — the operator probably meant to roll
+    no-op semantically â€” the operator probably meant to roll
     back to a different version).
     """
     db = request.app.state.db
@@ -2853,7 +2853,7 @@ async def rollback_soul_preset(
             if user and user.get("username"):
                 operator = user["username"]
     except Exception:
-        # Auth resolution failure must NOT block the rollback —
+        # Auth resolution failure must NOT block the rollback â€”
         # the operator is already past auth (the endpoint is
         # called from the UI). Fall back to "orch_server".
         pass
@@ -2941,246 +2941,69 @@ async def rollback_soul_preset(
 # confirms, and the action runs through the normal API.
 
 # System prompt for the chat assistant. Rewritten 2026-07-28 for
-# chatbox-as-plan-editor (docs/chatbox-plan-editor.md §7.3). The
+# chatbox-as-plan-editor (docs/chatbox-plan-editor.md Â§7.3). The
 # LLM's job is now narrow: edit the project's plan workflow
 # object, never create tasks or trigger dispatch.
 _CHAT_SYSTEM_PROMPT = """\
 You are the chatbox plan editor for a single project in
 hermes-orchestrator. The operator sees you as a panel in the
-project page. Your ONLY job is to help the user design the
-project's `plan` — the structured workflow object that gets
-materialized into tasks when they click Run on the dashboard.
+project page.
 
-# What you can do
-  - Read the current plan (snapshot below)
-  - Suggest edits to plan.steps (add / remove / modify / re-order)
-  - Explain what a plan does in plain language
-  - Suggest an initial plan from a goal description
+# Your job
+  - Read the project's current state from the snapshot below
+  - Discuss the plan in plain language with the user
+  - When the user wants a new/changed plan, DESCRIBE the plan
+    in 1-3 short paragraphs
+  - End your response with a question like
+    "Want me to create this plan?" (the user clicks Apply)
+
+# CRITICAL: keep your response BRIEF
+  - Total response: < 500 words
+  - 1-3 short paragraphs MAX
+  - DO NOT output JSON, DAG diagrams, or code blocks
+  - DO NOT list every step in detail — describe the SHAPE only
+    (e.g. "5 steps: 1) research HK SME AI agent landscape,
+    2) analyze debug-loop risks, 3) compare LLM / tool options,
+    4) cost analysis vs hiring a programmer, 5) write a
+    Traditional Chinese report saved to project_temp_folder")
+  - The Apply button does the actual work — the server reads
+    your last response + the user's last message and calls the
+    planner LLM to generate the structured plan. You just
+    describe the IDEA; the planner makes it concrete.
 
 # What you MUST NEVER do
+  - NEVER output JSON / code blocks / DAG diagrams
   - NEVER create tasks directly (no `create_task` suggestion)
   - NEVER trigger dispatch (no `run` / `replan` / `materialize`)
-  - NEVER invent agent_role / skill / tool names that aren't in
-    the `agents_info` block below — the Pydantic validator on
-    PUT /api/projects/{id}/plan rejects unknown names with 422
-  - NEVER call /api/tasks/ or /api/projects/{id}/run directly
-  - Run is human-only (user clicks the Run button on the dashboard)
+  - NEVER invent agent_role / skill / tool names that are not
+    in the `agents_info` block below
+  - Run is human-only (user clicks the Run button on dashboard)
 
 # Snapshot you receive (per turn, see below)
-  - `project`: id, name, state, plan_updated_at (echo this in
-    every `update_plan` suggestion's `if_match` field for the
-    optimistic lock; null if no plan yet)
-  - `plan`: current ProjectPlan or null. If null, you're starting
-    from scratch — build one
-  - `agents_info.agent_roles` / `.skills` / `.tools`: valid names
-    you can put in plan.steps[*]. Use ONLY these, otherwise
-    PUT /api/projects/{id}/plan will 422
-  - `audit_tail`: last 5 audit events for context
-  - `soul_presets`: project-scoped role bindings + personas
-    (v3.9.0 ROLE CONTEXT, see section below). Empty list if
-    the project has no presets
-  - `truncated`: bool, true if the role-context section was
-    truncated to fit the size budget (treat the persona as a
-    hint, not authoritative, in that case)
+  - `project`: id, name, state
+  - `plan`: current ProjectPlan or null. If null, you are
+    starting from scratch
+  - `agents_info`: valid agent_role / skill / tool names. The
+    planner LLM uses these at Apply time
+  - `soul_presets`: per-project role bindings + personas
+    (v3.9.0 ROLE CONTEXT). The planner LLM uses these at Apply
+    time too — you do NOT need to enumerate them in chat
 
-# ROLE CONTEXT (v3.9.0) — how to use `soul_presets`
-  `soul_presets` is a per-project list of role bindings sourced
-  from `project_soul_presets`. Each preset is a dict with:
-    - `role_name` (string): the role label (e.g. "cpi-analyst",
-      "researcher"). Use this as `step.agent_role`
-    - `profile_id` (string): which agent profile this role is
-      bound to (informational only; routing is the orch server's
-      job, not yours)
-    - `content` (string): the persona prose for this role. Use
-      it to write the step's `action` so it aligns with the
-      role's voice and constraints
-    - `default_soul` (string, optional): a workflow-supplied
-      default persona. If you design a step with this role and
-      want the orch server to use this default, copy it into
-      the step's `default_soul` field
-
-  Rules for designing plan steps when `soul_presets` is non-empty:
-    1. Prefer `agent_role` values that match an existing preset's
-       `role_name`. Do NOT invent a new role name when a preset
-       already covers it — the orch server routes by role name
-       and an unknown role would 422 at dispatch
-    2. If you design a step with a role that has a `default_soul`
-       in the preset, copy the `default_soul` into the step's
-       `default_soul` field. The orch server uses this if no
-       project-level preset override exists. This keeps the
-       dispatch path consistent with the persona you saw here
-    3. If `soul_presets` is empty, design freely (existing
-       behavior — no role constraints from this section)
-    4. Do NOT include preset creation, editing, or deletion in
-       your `update_plan` suggestion. Preset management is the
-       orch server's job (auto-populated on first dispatch via
-       `_ensure_soul_preset` in `dispatch_step`; advanced users
-       edit presets via the project settings page, not here)
-    5. The role-context section is size-capped (1 KB per
-       preset, 4 KB total). If `truncated: true`, treat the
-       persona as a hint — you've only seen a fragment of the
-       full SOUL the agent will receive at dispatch time
-    6. (v3.10.0 — both-preset-and-llm behavior) If you design a
-       step with a role that has NO preset in `soul_presets`,
-       draft a 3-5 sentence persona for the step's
-       `default_soul` field. Be specific: domain expertise,
-       tone, output style, citation habits. The orch server
-       auto-populates a preset at dispatch time using this
-       value (via `_ensure_soul_preset` in `dispatch_step`).
-       The persona is the "voice" the agent adopts — e.g.
-       for role `code-reviewer`:
-         "You are a senior code reviewer specializing in Python
-          and FastAPI. You focus on correctness, readability,
-          and test coverage. You cite specific line numbers
-          and explain the why, not just the what. Your output
-          is concise markdown with severity tags."
-       Only add `default_soul` for roles that have NO matching
-       preset; for roles that do, copy the preset's
-       `default_soul` (rule 2)
-
-# Step fields — what each one means (REQUIRED vs optional)
-  Per 2026-07-29: the previous chat version left `action` empty
-  and the user had no way to know what each step actually does.
-  Every step MUST have a non-empty `action`. Use the canonical
-  verb-phrase form, matching workflow_packages.step_template:
-    - `name` (REQUIRED, kebab-case, unique): identifier. e.g.
-      "fetch-bus-93k-info", "send-telegram-message"
-    - `action` (REQUIRED, 2-200 chars, non-whitespace): short
-      verb phrase describing what the agent does. Canonical
-      examples: "fetch_url", "fetch_data", "navigate_to_folder",
-      "summarize", "send_telegram_message", "create_file",
-      "read_file", "search_web", "generate_report",
-      "extract_data", "transform_json". Either kebab-case OR
-      snake_case verbs work. The agent uses this as the
-      primary instruction; without it, the step is unrunnable.
-    - `agent_role` (REQUIRED if your `agents_info.agent_roles`
-      is non-empty): pick one. Or "" to let supervisor pick.
-    - `depends_on` (optional, list of step names): upstream
-      steps. Empty list = no upstream.
-    - `feedback_to` (optional, list of step names): loop-back
-      signal. v2.0 semantic: this field is on the FAILING step
-      (matches the standard `on_failure` pattern in AWS Step
-      Functions, Airflow, Temporal). "step.feedback_to = [A, B]"
-      means "if THIS step fails, re-run A and B (and reset
-      their downstream via depends_on)". Only fires if the
-      spawned project has `max_iterations > 0`. Use for retry-
-      on-validation-failure patterns (e.g. an "audit" step that
-      re-runs the earlier "search" step when the audit fails).
-      Empty list = no loop-back. Self-references are silently
-      dropped at run time.
-    - `skill` (optional, "" if N/A): canonical skill name from
-      `agents_info.skills`. Leave "" if the step uses a generic
-      action, not a specific skill.
-    - `tool` (optional, "" if N/A): canonical tool name from
-      `agents_info.tools`. Leave "" if no specific tool.
-    - `required_capability` (optional, "" if N/A): e.g.
-      "summarize", "search_web". The supervisor dispatches
-      based on this.
-    - `params_template` (optional dict): variables the agent
-      should fill in. Use {{var}} placeholders for plan vars.
-    - `output_path` (optional, "" if N/A): where the agent
-      writes its result.
-
-  **CRITICAL**: do NOT leave `action` empty. Even a simple step
-  like "fetch bus 93K info and post to Slack" needs a
-  non-empty action like "fetch_bus_info_and_post". The action
-  is the agent's primary instruction.
-
-# Workflow per user turn
-  1. Read the snapshot (provided below)
-  2. Apply the user's edit to your in-memory draft of the plan
-  3. Validate your draft (see Validation rules below)
-  4. Render the CURRENT plan as a DAG (see DAG format below)
-  5. Respond in markdown, then end with EXACTLY ONE fenced JSON
-     block (the Apply chip) containing the full new plan:
-     ```json
-     {{"suggestions": [{{"type": "update_plan", "plan": <full ProjectPlan>, "if_match": "<plan_updated_at>"}}]}}
-     ```
-     - if_match is the plan_updated_at from the snapshot. If
-       plan was null, set if_match to null (server treats null
-       as "no prior state, just write").
-     - The plan field must be the FULL new plan, not a diff.
-       The apply endpoint replaces the whole plan.
-
-# Validation rules (your draft must pass)
-  - Every step has a non-empty `name` (kebab-case, lowercase
-    letters, digits, hyphens; no spaces, no underscores, no
-    uppercase)
-  - Every step has a non-empty `action` (≥2 chars, not
-    whitespace, ≤200 chars) — see "Step fields" above for
-    what to put there. Put a short verb phrase.
-  - Step names are unique within the plan
-  - `depends_on` is a list of OTHER STEP NAMES (never IDs)
-  - All `depends_on` names resolve to steps in the plan (no
-    dangling references)
-  - No cycles (A→B→A)
-  - `feedback_to` is a list of OTHER STEP NAMES (never IDs)
-  - v2.0 semantic: this field is on the FAILING step
-    (matches standard on_failure pattern). If step X has
-    `feedback_to: [Y]`, that means "if X fails, re-run Y".
-  - All `feedback_to` names resolve to steps in the plan (no
-    dangling references; self-references are silently dropped
-    at run time)
-  - `agent_role` is in `agents_info.agent_roles` (or empty string)
-  - `skill` is in `agents_info.skills` (or empty string)
-  - `tool` is in `agents_info.tools` (or empty string)
-  - The plan's overall `name` is kebab-case (or empty for "no
-    plan yet")
-  - `version` is the string "1.0"
-
-# DAG render format (plain text, box-drawing)
-  Always end your markdown response with the current plan as a
-  DAG so the user can see the shape at a glance. Use exactly
-  these box-drawing characters: └─, ├─, │.
-
-  Linear chain:
-      step-1
-      └─ step-2
-          └─ step-3
-
-  Branching (fan-out + fan-in via duplicate rendering):
-      step-1
-      ├─ step-2
-      │     └─ step-4
-      └─ step-3
-            └─ step-4
-
-  Multiple roots:
-      step-1
-      └─ step-2
-      step-3
-
-  If you include agent_role for clarity (optional, use only when
-  user asks "who runs each step?"):
-      step-1  (super)
-      └─ step-2  (win-agent01)
+# ROLE CONTEXT (v3.9.0) — what `soul_presets` means
+  Each preset is a binding between a role and a persona. The
+  planner LLM sees these when the user clicks Apply, so the
+  generated plan steps will use roles that match. You do not
+  need to mention specific presets in your chat response.
 
 # Drift detection (per turn)
-  Each turn you receive a fresh snapshot. The `plan_updated_at`
-  field tells you when the plan last changed. If the user has
-  been editing the visual editor or another chat, the snapshot
-  may differ from the plan in your in-memory draft. If your
-  draft's plan_updated_at is older than the snapshot's, your
-  draft is stale. Warn the user ("⚠ plan was edited externally,
-  reload?") and use the snapshot's plan_updated_at in your
-  if_match.
-
-# Conflict (409) on Apply
-  The server returns 409 if your if_match is stale. The chat
-  UI handles this automatically and offers a 3-way merge. You
-  don't need to do anything special — the UI re-fetches the
-  current plan and the user re-applies.
-
-# Response format
-  - Plain markdown, terse. 1-15 lines.
-  - If user asks a question (no edit), no JSON block.
-  - If user wants an edit, end with EXACTLY ONE fenced JSON
-    block. Never multiple blocks. Never inline JSON.
-  - Never include text after the JSON block.
+  If the user has been editing in the visual editor, the
+  snapshot may differ from your last message. Trust the
+  snapshot; describe based on the current state.
 
 # Available profiles for plan.steps[*].agent_role
 {available_profiles_inline}
 """
+
 
 
 class ChatRequest(BaseModel):
@@ -3211,7 +3034,7 @@ async def list_chat_messages(
     Limit defaults to 50; cap at 200 to prevent OOM on a project
     with thousands of turns. Returns the message list + a
     `next_offset` for pagination (we use offset-based not
-    cursor-based for simplicity — the chat is small).
+    cursor-based for simplicity â€” the chat is small).
     """
     if limit > 200:
         limit = 200
@@ -3259,7 +3082,7 @@ async def list_chat_messages(
 # tighter 1 KB cap (presets are summaries for the LLM, not the
 # full SOUL.md the agent sees at dispatch time). The 4 KB total
 # cap leaves room for ~4 typical presets before truncation kicks
-# in — enough for the 98% case (1-3 roles per project) with
+# in â€” enough for the 98% case (1-3 roles per project) with
 # headroom for the long tail.
 _MAX_PRESET_BYTES = 1024
 _MAX_TOTAL_PRESETS_BYTES = 4096
@@ -3269,7 +3092,7 @@ async def _build_chat_context(project_id: str, db) -> dict:
     """Build a JSON snapshot of the project for the LLM.
 
     Rewritten 2026-07-28 for chatbox-as-plan-editor
-    (docs/chatbox-plan-editor.md §7.3). The chat is now plan-focused:
+    (docs/chatbox-plan-editor.md Â§7.3). The chat is now plan-focused:
     it edits the project plan, not individual tasks. The snapshot
     includes the current plan (if any), the valid agent_role /
     skill / tool names (so the LLM doesn't invent any), the
@@ -3279,7 +3102,7 @@ async def _build_chat_context(project_id: str, db) -> dict:
     v3.9.0 (SOUL routing, Phase 2 UX): the snapshot also includes
     the project's SOUL presets as `soul_presets` (the "ROLE
     CONTEXT" block). The LLM uses these to design plan steps that
-    align with the project's role bindings — see _CHAT_SYSTEM_PROMPT
+    align with the project's role bindings â€” see _CHAT_SYSTEM_PROMPT
     for the rules. The section is size-capped so a project with
     many presets doesn't blow up the prompt.
 
@@ -3304,7 +3127,7 @@ async def _build_chat_context(project_id: str, db) -> dict:
             data = json.loads(raw_plan) if isinstance(raw_plan, str) else raw_plan
             plan_obj = ProjectPlan.model_validate(data).model_dump(mode="json")
         except Exception:
-            # Malformed plan — treat as null in the snapshot so the
+            # Malformed plan â€” treat as null in the snapshot so the
             # LLM can rewrite it from scratch.
             plan_obj = None
     # Get the valid agent_role / skill / tool names (shared helper).
@@ -3339,7 +3162,7 @@ async def _build_chat_context(project_id: str, db) -> dict:
         (project_id,),
     )
     # Apply the per-preset (1 KB) and total (4 KB) caps. The
-    # `truncated` flag is True if any preset was cut — the LLM
+    # `truncated` flag is True if any preset was cut â€” the LLM
     # should treat the persona as a hint, not authoritative, when
     # truncated (it has only a fragment of the original).
     role_context_truncated = False
@@ -3351,7 +3174,7 @@ async def _build_chat_context(project_id: str, db) -> dict:
         content = r["content"] or ""
         default_soul = r["default_soul"] or ""
         # Per-preset cap: truncate the persona body to 1 KB.
-        # UTF-8 safe — split on byte boundary, drop the tail.
+        # UTF-8 safe â€” split on byte boundary, drop the tail.
         content_bytes = content.encode("utf-8")
         if len(content_bytes) > _MAX_PRESET_BYTES:
             content = content_bytes[:_MAX_PRESET_BYTES].decode(
@@ -3369,7 +3192,7 @@ async def _build_chat_context(project_id: str, db) -> dict:
         )
         # Total cap: drop presets from the end if adding this one
         # would exceed the 4 KB role-context budget. We never
-        # partially truncate a single preset to fit — preserving
+        # partially truncate a single preset to fit â€” preserving
         # preset coherence (a partial persona is worse than no
         # persona; the LLM will just confuse itself).
         if total_bytes + preset_bytes > _MAX_TOTAL_PRESETS_BYTES:
@@ -3396,7 +3219,7 @@ async def _build_chat_context(project_id: str, db) -> dict:
         "audit_tail": audit_list,
         # v3.9.0 ROLE CONTEXT: per-project SOUL preset snapshot
         # (see _CHAT_SYSTEM_PROMPT for usage rules). Empty list
-        # means the project has no presets — the LLM designs
+        # means the project has no presets â€” the LLM designs
         # freely. `truncated` is True if any preset was cut to
         # fit the size budget; the LLM should treat the persona
         # as a hint, not authoritative, in that case.
@@ -3411,8 +3234,16 @@ _SUGGESTION_RE = re.compile(
 )
 
 
-def _extract_suggestions(llm_text: str) -> tuple[str, list[dict] | None]:
-    """Split LLM response into (display_text, suggestions).
+def _extract_suggestions(llm_text: str) -> tuple[str, list[dict] | None, bool]:
+    """Split LLM response into (display_text, suggestions, truncated_json).
+
+    v3.10.5 (2026-08-02): added `truncated_json` flag for the
+    case where the LLM started a fenced ```json``` block but the
+    response was cut off mid-JSON (the cap was hit before the
+    closing ```). In that case the partial JSON is unusable for
+    Apply, so we strip it from the display and let the caller
+    decide whether to surface a "regenerate" hint or fall back
+    to a synthetic `create_plan_from_chat` suggestion.
 
     Suggestions are extracted in this order:
       1. LAST fenced ```json``` block in the response
@@ -3421,14 +3252,21 @@ def _extract_suggestions(llm_text: str) -> tuple[str, list[dict] | None]:
          (LLM-fooling pattern #9: LLM sometimes writes inline
           JSON like '"type": "create_task", "name": "..."'
           without the fence)
-      3. NOTHING: return (text, None). The UI shows a friendly
-         "Reformat" button so the user can ask the LLM to
-         try again with proper formatting.
+      3. NOTHING: return (text, None, truncated). Caller can
+         create a synthetic `create_plan_from_chat` suggestion
+         if the LLM response looks like a plan proposal.
 
-    Returns (text_without_json_block, suggestions_list_or_None).
+    Returns:
+        (display_text, suggestions_or_None, truncated_json)
+        - display_text: text with the (truncated or complete)
+          JSON block stripped. If the LLM response was truncated
+          mid-JSON, the partial JSON is removed entirely.
+        - suggestions: parsed list, or None if extraction failed
+        - truncated_json: True if the LLM started a JSON block
+          but didn't finish it (response hit the token cap).
     """
     if not llm_text:
-        return llm_text, None
+        return llm_text, None, False
     # 1) Try fenced JSON block first
     matches = list(_SUGGESTION_RE.finditer(llm_text))
     if matches:
@@ -3445,14 +3283,8 @@ def _extract_suggestions(llm_text: str) -> tuple[str, list[dict] | None]:
                          if isinstance(s, dict) and isinstance(s.get("type"), str)]
                 if valid:
                     display = (llm_text[: last.start()] + llm_text[last.end():]).strip()
-                    return display, valid
+                    return display, valid, False
     # 2) Fallback: inline JSON object with "suggestions" key.
-    # Use a regex to find a {"suggestions": [...]} pattern.
-    # The LLM might write inline like:
-    #   type: "create_task", name: "foo", ...
-    # OR
-    #   {"type": "create_task", "name": "foo"}
-    # The regex looks for the brace-delimited object form.
     inline_re = re.compile(
         r'(\{\s*"suggestions"\s*:\s*\[.*?\]\s*\})',
         re.DOTALL,
@@ -3474,8 +3306,58 @@ def _extract_suggestions(llm_text: str) -> tuple[str, list[dict] | None]:
                     # Don't strip from display (the inline form is
                     # part of the prose; stripping it would leave
                     # an awkward gap). Just return the text as-is.
-                    return llm_text.strip(), valid
-    return llm_text.strip(), None
+                    return llm_text.strip(), valid, False
+    # 3) Truncated fenced JSON block (v3.10.5). The LLM started
+    # ```json but never closed it (hit the token cap). Strip the
+    # partial block from display so the user doesn't see broken
+    # JSON, and let the caller fall back to a synthetic
+    # create_plan_from_chat suggestion.
+    truncated_re = re.compile(r"```json\s*\n?(.*)$", re.DOTALL)
+    trunc_matches = list(truncated_re.finditer(llm_text))
+    if trunc_matches:
+        last = trunc_matches[-1]
+        display = llm_text[: last.start()].rstrip()
+        return display, None, True
+    return llm_text.strip(), None, False
+
+
+def _looks_like_plan_proposal(text: str) -> bool:
+    """Heuristic: does this assistant message look like it's proposing
+    a plan (so the synthetic create_plan_from_chat suggestion should
+    show) vs. just answering a question / making small talk?
+
+    v3.10.5 (2026-08-02): the chat LLM is now asked to keep responses
+    brief and describe the plan in prose. When it does propose a plan,
+    we want the Apply button to appear so the user can create the
+    structured plan via /plan/from-llm.
+
+    The check is intentionally loose -- false positives just show an
+    extra button the user can ignore; false negatives hide a useful
+    action. The user is still in control -- they only Apply if the
+    message actually represents a plan they want.
+    """
+    if not text or not text.strip():
+        return False
+    t = text.lower()
+    # Heuristic 1: mentions a planning verb (設計 / 計劃 / 步驟 /
+    # step / plan / design / 5 步 / 5-step / phase / stage / 階段).
+    # These are common words the LLM uses when describing a plan.
+    plan_keywords = [
+        "步驟", "步", "step", "plan", "計劃", "計畫", "設計", "design",
+        "phase", "stage", "階段", "step-by-step", "dag",
+        "5-step", "4-step", "3-step", "6-step",
+    ]
+    if any(kw in t for kw in plan_keywords):
+        return True
+    # Heuristic 2: has numbered list (1) 2) 3) or 1. 2. 3.) which
+    # usually means the LLM is describing steps.
+    if re.search(r"^\s*[1-9][.)]\s+\S", text, re.MULTILINE):
+        return True
+    # Heuristic 3: long response (>= 200 chars) -- LLM probably
+    # wrote a structured answer worth applying.
+    if len(text.strip()) >= 200:
+        return True
+    return False
 
 
 def _render_dag_section(suggestions: list | None) -> str:
@@ -3491,7 +3373,7 @@ def _render_dag_section(suggestions: list | None) -> str:
 
     The output is wrapped in a ```text fence so the frontend can
     render it in monospace <pre>. Box-drawing characters
-    (└─ ├─ │) are not interpreted as markdown.
+    (â””â”€ â”œâ”€ â”‚) are not interpreted as markdown.
 
     Defensive: any exception (e.g. import error) returns "" so
     the chat endpoint still works.
@@ -3581,13 +3463,13 @@ async def chat_with_project(
     # plan.steps[*].agent_role (the Pydantic validator on PUT
     # /plan 422s on unknown names, so the LLM MUST use a real one).
     # Snapshot uses 'agents_info' (2026-07-28). Note: agents_info
-    # has the same shape as the /plan/agents endpoint response —
+    # has the same shape as the /plan/agents endpoint response â€”
     # agent_roles is a flat list of strings, not a list of dicts.
     profile_names = list(ctx.get("agents_info", {}).get("agent_roles", []))
     if profile_names:
         inline = ", ".join(f"`{n}`" for n in profile_names)
     else:
-        inline = "(no profiles registered — leave agent_role empty)"
+        inline = "(no profiles registered â€” leave agent_role empty)"
     system_prompt = _CHAT_SYSTEM_PROMPT.replace(
         "{available_profiles_inline}", inline
     )
@@ -3608,22 +3490,24 @@ async def chat_with_project(
     timeout = float(llm_cfg.get("timeout_seconds") or 90)
     if not api_key:
         raise HTTPException(
-            503, "LLM api_key not configured — set llm.api_key in config.yaml"
+            503, "LLM api_key not configured â€” set llm.api_key in config.yaml"
         )
     payload = {
         "model": model,
         "messages": llm_messages,
         "temperature": 0.4,
-        # v3.10.4 (2026-08-02): was 1500, bumped to 4000. The system
-        # prompt itself is 11,218 chars (~2,800 tokens) and the
-        # chat snapshot can add another 2-3K tokens. MiniMax M3 uses
-        # ~360 reasoning tokens for a typical chat turn BEFORE
-        # producing any actual reply. With max_tokens=1500, the
-        # reasoning eats the entire budget and the model outputs
-        # NO final answer (proj-cef60586 repro on 2026-08-02).
-        # 4000 gives the model ~3,500 tokens of headroom for the
-        # actual reply after reasoning. Cost: 2.7× per call.
-        "max_tokens": 4000,
+        # v3.10.5 (2026-08-02): was 4000, dropped to 2000. The chat
+        # LLM is now asked to keep responses brief (1-3 paragraphs,
+        # < 500 words) so a smaller output budget is plenty. The
+        # v3.10.4 bump to 4000 was needed because the LLM was
+        # emitting verbose prose + DAG diagram + full plan JSON in
+        # chat -- that bloated the response to ~3K tokens and the
+        # LLM hit the cap mid-JSON (proj-c7ad42e6 repro: assistant
+        # response truncated mid-{"suggestions": [{"type":
+        # "update_plan", "plan": {"name": "ai-coding-agent-...".
+        # With the slim prompt + brevity rule, 2000 is plenty and
+        # saves ~50% on chat cost.
+        "max_tokens": 2000,
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -3678,7 +3562,7 @@ async def chat_with_project(
     text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
     if not text.strip():
         # v3.10.4 follow-up: AUTOMATIC RETRY with a directive
-        # follow-up. The LLM "thought itself into a corner" — it
+        # follow-up. The LLM "thought itself into a corner" â€” it
         # spent its budget on internal reasoning. A simpler
         # second pass with a strong directive ("be concise, no
         # lengthy reasoning, answer in 1-2 paragraphs") usually
@@ -3699,13 +3583,13 @@ async def chat_with_project(
                     "internal reasoning (<think>...</think>) and didn't "
                     "produce a final answer. Please answer the original "
                     "question now in 1-2 concise paragraphs. Do not use "
-                    "lengthy internal reasoning — just answer directly."
+                    "lengthy internal reasoning â€” just answer directly."
                 )},
             ]
             text2 = await _call_llm(retry_messages, max_tokens=2000)
             text2 = re.sub(r"<think>.*?</think>\s*", "", text2, flags=re.DOTALL)
             if text2.strip():
-                # Retry succeeded — use the new answer.
+                # Retry succeeded â€” use the new answer.
                 text = text2
         except HTTPException:
             # Retry itself failed (network/5xx). Fall through to
@@ -3723,14 +3607,14 @@ async def chat_with_project(
         # and a shorter context leaves more room for the answer.
         detail = (
             "The LLM returned only internal reasoning (<think>...</think>) "
-            "without a final answer — twice (including an auto-retry "
+            "without a final answer â€” twice (including an auto-retry "
             "with a 'be concise' directive). This usually means the "
             "chat context is too long (system prompt + project snapshot "
             "+ history) and the model's reasoning ate the entire output "
             "budget. Try one of:\n"
-            "  • Click the ✕ next to the chat to clear its history\n"
-            "  • Ask a shorter, more focused question\n"
-            "  • Or, for plan-related questions, you can also use the "
+            "  â€¢ Click the âœ• next to the chat to clear its history\n"
+            "  â€¢ Ask a shorter, more focused question\n"
+            "  â€¢ Or, for plan-related questions, you can also use the "
             "JSON editor at the top of the page (right of 'Validate plan')"
             if had_think_block else
             "The LLM returned an empty reply (no content at all). "
@@ -3738,8 +3622,46 @@ async def chat_with_project(
             "status page."
         )
         raise HTTPException(502, detail)
-    # Extract suggestions
-    display_text, suggestions = _extract_suggestions(text)
+    # Extract suggestions. v3.10.5 (2026-08-02): returns
+    # (display_text, suggestions, truncated_json). The 3rd element
+    # tells us if the LLM started a JSON block but was cut off
+    # mid-stream (token cap hit before closing ```). In that case
+    # the partial JSON is unusable for Apply, so we strip it and
+    # let the synthetic-suggestion path below take over.
+    display_text, suggestions, truncated_json = _extract_suggestions(text)
+    # v3.10.5: if the LLM response looks like a plan proposal but
+    # didn't produce a usable JSON suggestion (no JSON, OR truncated
+    # JSON), create a synthetic `create_plan_from_chat` suggestion
+    # so the Apply button still appears. The apply endpoint reads
+    # the chat history and calls /plan/from-llm with the conversation
+    # as the goal. This means the chat no longer needs to output a
+    # full plan JSON -- it can just describe the plan in prose.
+    if not suggestions and _looks_like_plan_proposal(display_text):
+        suggestions = [{
+            "type": "create_plan_from_chat",
+            # No plan field -- the apply endpoint regenerates it
+            # from the conversation via /plan/from-llm.
+            "description": "Generate a plan from this conversation",
+        }]
+        if truncated_json:
+            display_text = (
+                display_text
+                + "\n\n_(the LLM response was truncated mid-JSON; click "
+                  "Apply to generate a plan from this conversation)_"
+            )
+    elif truncated_json and suggestions:
+        # Truncated JSON block had partial suggestions that couldn't
+        # be parsed. Drop the partial suggestion and let the synthetic
+        # path take over.
+        suggestions = [{
+            "type": "create_plan_from_chat",
+            "description": "Generate a plan from this conversation",
+        }]
+        display_text = (
+            display_text
+            + "\n\n_(the LLM response was truncated; click Apply to "
+              "regenerate the plan from this conversation)_"
+        )
     # Render the DAG from any update_plan suggestions and append it
     # to the assistant message so the user can see the current shape
     # without expanding the JSON suggestion chip. (Added 2026-07-28
@@ -3824,7 +3746,7 @@ async def get_chat_jsonl(project_id: str, request: Request):
     if size > MAX_BYTES:
         # Return only the last 1MB; tell the client via header.
         # After seeking back 1MB from the end, the position is
-        # likely in the middle of a JSONL record — advance to the
+        # likely in the middle of a JSONL record â€” advance to the
         # next newline so the first returned line is complete.
         with open(path, "rb") as f:
             f.seek(-MAX_BYTES, 2)
@@ -3862,7 +3784,7 @@ async def reformat_chat_message(
     The result is persisted to project_chat_messages as a new
     assistant turn so the history stays complete.
 
-    Body: {message: str} — the last user message (or the action
+    Body: {message: str} â€” the last user message (or the action
     they want reformatted). We re-ask the LLM to format THIS
     request as a structured suggestion.
     """
@@ -3923,7 +3845,7 @@ characters before or after the JSON.
             {"role": "system", "content": reformat_system},
             {"role": "user", "content": body.message},
         ],
-        "temperature": 0.2,  # very low — we want deterministic JSON
+        "temperature": 0.2,  # very low â€” we want deterministic JSON
         "max_tokens": 800,
     }
     headers = {
@@ -4035,12 +3957,12 @@ async def apply_chat_suggestion(
     Removed (2026-07-28):
       - create_task: chatbox no longer creates tasks directly. The
         LLM edits the plan, and the user clicks Run on the dashboard
-        to materialize plan → tasks.
+        to materialize plan â†’ tasks.
       - run: dispatch is human-only (Run button on dashboard).
       - replan: superseded by update_plan (the LLM produces a fresh
         plan object, not just a new goal string).
 
-    Allowed types: ["update_plan"].
+    Allowed types: ["update_plan", "create_plan_from_chat"].
     """
     # Local import: avoid module-level cycle (projects.py is loaded
     # before plans.py in main.py's router mount order; keeping this
@@ -4054,10 +3976,18 @@ async def apply_chat_suggestion(
     if not isinstance(s, dict) or not isinstance(s.get("type"), str):
         raise HTTPException(400, "suggestion must be a dict with a 'type' field")
     stype = s["type"]
+    # v3.10.5 (2026-08-02): new `create_plan_from_chat` type. The
+    # suggestion has no plan object; we synthesize a goal from the
+    # chat history and call the planner to generate a real plan.
+    if stype == "create_plan_from_chat":
+        return await _apply_create_plan_from_chat(
+            project_id, body, request,
+        )
     if stype != "update_plan":
         raise HTTPException(
             400,
-            f"unknown suggestion type: {stype!r}. Allowed: update_plan.",
+            f"unknown suggestion type: {stype!r}. Allowed: update_plan, "
+            f"create_plan_from_chat.",
         )
     plan_data = s.get("plan")
     if not isinstance(plan_data, dict):
@@ -4096,16 +4026,122 @@ async def apply_chat_suggestion(
     }
 
 
+async def _apply_create_plan_from_chat(
+    project_id: str, body: "ChatApplyRequest", request: Request,
+) -> dict:
+    """Handle `create_plan_from_chat` apply: read chat history, call
+    the planner LLM with the conversation as the goal, save the
+    resulting plan.
+
+    v3.10.5 (2026-08-02): added so the chat can be prose-only and
+    the Apply button triggers real plan generation server-side.
+    This decouples the chat LLM (describes) from the planner LLM
+    (structures) -- they no longer share the same JSON output.
+
+    The goal string is built from the assistant's last response
+    and the user's last message. We prepend the user's message so
+    the planner sees the original ask, then the assistant's prose
+    proposal. The planner uses the same role-skill / storage /
+    capabilities context as the chat LLM does (via
+    `generate_plan_from_llm`).
+
+    The new plan overwrites any existing plan (consistent with the
+    previous `update_plan` behavior). The user explicitly clicked
+    Apply on this conversation, so the new plan wins.
+    """
+    from hermes_orch.api.plans import (
+        FromLlmBody,
+        ProjectPlanUpdate,
+        generate_plan_from_llm,
+        put_project_plan,
+    )
+    db = request.app.state.db
+    # 1. Find the chat message that this apply is for. If the
+    #    client didn't include message_id, fall back to the
+    #    most recent assistant message on the project.
+    message_id = body.message_id
+    if message_id is None:
+        last_msg_row = await db.fetchone(
+            "SELECT id FROM project_chat_messages "
+            "WHERE project_id = ? AND role = 'assistant' "
+            "ORDER BY id DESC LIMIT 1",
+            (project_id,),
+        )
+        if last_msg_row:
+            message_id = last_msg_row["id"]
+    # 2. Read the assistant's prose (from the chat message row)
+    #    and the user's last message before it. If we have no
+    #    chat history at all, return 400.
+    assistant_text = ""
+    user_text = ""
+    if message_id is not None:
+        arow = await db.fetchone(
+            "SELECT content FROM project_chat_messages "
+            "WHERE id = ? AND project_id = ? AND role = 'assistant'",
+            (message_id, project_id),
+        )
+        if arow:
+            assistant_text = (arow.get("content") or "").strip()
+        urow = await db.fetchone(
+            "SELECT content FROM project_chat_messages "
+            "WHERE project_id = ? AND role = 'user' "
+            "AND id < ? ORDER BY id DESC LIMIT 1",
+            (project_id, message_id),
+        )
+        if urow:
+            user_text = (urow.get("content") or "").strip()
+    if not user_text and not assistant_text:
+        raise HTTPException(
+            400,
+            "Cannot create plan from chat: no chat history for this "
+            "project. Start a conversation first.",
+        )
+    # 3. Build the goal string. Order: user ask first (the original
+    #    intent), then the assistant's prose (the proposed plan).
+    #    The planner LLM uses this to generate a structured plan.
+    goal_parts: list[str] = []
+    if user_text:
+        goal_parts.append(f"User's request:\n{user_text}")
+    if assistant_text:
+        goal_parts.append(f"Assistant's proposed approach:\n{assistant_text}")
+    goal = "\n\n".join(goal_parts)
+    # 4. Call the planner LLM (same code path as POST /plan/from-llm).
+    #    Errors propagate so the user sees a real error and can retry.
+    plan_response = await generate_plan_from_llm(
+        project_id=project_id,
+        body=FromLlmBody(goal=goal, name_suffix=""),
+        request=request,
+    )
+    # 5. Save the plan. The new plan overwrites any existing plan.
+    #    if_match=None to force overwrite -- the user explicitly
+    #    clicked Apply on this conversation, so the new plan wins.
+    result = await put_project_plan(
+        project_id=project_id,
+        body=ProjectPlanUpdate(plan=plan_response.plan),
+        request=request,
+        if_match=None,
+        audit_actor="operator:chat:create_from_chat",
+    )
+    return {
+        "applied": True,
+        "type": "create_plan_from_chat",
+        "project_id": result.project_id,
+        "updated_at": result.updated_at,
+        "step_count": len(result.plan.steps) if result.plan else 0,
+        "plan": result.plan.model_dump(mode="json") if result.plan else None,
+    }
+
+
 # ===== Task Progress Monitor (T2, 2026-07-29) =====
 #
 # Powers the dashboard's real-time status badges + side panel.
-# Polled by the frontend every 5s (per design doc §4).
+# Polled by the frontend every 5s (per design doc Â§4).
 #
 # Endpoints:
 #   GET /api/projects/{id}/tasks/{task_id}/status
-#     → single task's loop_status + liveness info
+#     â†’ single task's loop_status + liveness info
 #   GET /api/projects/{id}/tasks/running
-#     → all running tasks' loop_status (for initial load + polling)
+#     â†’ all running tasks' loop_status (for initial load + polling)
 #
 # `loop_status` is one of ok / slow / stuck / unknown (see
 # src/hermes_orch/core/loop_status.py for semantics). 404 is
@@ -4200,7 +4236,7 @@ async def cancel_project_task(
     `was_running` flag so the UI can show a clear "cancelled"
     confirmation without re-fetching.
 
-    Used by the Task Progress Monitor side panel (T4) — the
+    Used by the Task Progress Monitor side panel (T4) â€” the
     "Cancel" button calls this endpoint instead of the unscoped
     one so a misclick on the wrong project can never cancel
     someone else's task."""
@@ -4223,10 +4259,10 @@ async def cancel_project_task(
     row = await _do_cancel_task(
         db, task_id, actor="operator:ui"
     )
-    # v1.8: SSE notify — the dashboard's task_progress.js calls
+    # v1.8: SSE notify â€” the dashboard's task_progress.js calls
     # THIS endpoint (project-scoped), not the unscoped one in
     # tasks.py. Without this, the status pill wouldn't update
-    # instantly via SSE — the 30s reconcile poll would eventually
+    # instantly via SSE â€” the 30s reconcile poll would eventually
     # catch it, but real-time is the point of v1.8.
     await publish_event(
         project_id,
@@ -4287,7 +4323,7 @@ def _row_to_task_dict(row: dict) -> dict:
 #
 #   GET /api/projects/{id}/tasks/{task_id}/output?since=N
 #     Returns: list of chunks with id > N, ordered by id ASC
-#     Capped at 500 chunks per request (defensive — a misbehaving
+#     Capped at 500 chunks per request (defensive â€” a misbehaving
 #     wrapper could spam millions of rows; pagination via since=).
 
 
@@ -4301,7 +4337,7 @@ async def post_output_chunk(
     request: Request,
     agent_id: str = Depends(require_hmac_auth),
 ) -> dict:
-    """Wrapper → server: push a live output chunk for a running task.
+    """Wrapper â†’ server: push a live output chunk for a running task.
 
     The wrapper's tailing thread (in hermes-orch-agent) watches
     hermes's stdout/stderr file and POSTs each chunk here. We
@@ -4310,9 +4346,9 @@ async def post_output_chunk(
     writes on retry (e.g. if the POST times out, the wrapper
     can re-send with the same seq; the frontend de-dupes by seq).
 
-    Auth: minimal — the agent must be the one currently assigned
+    Auth: minimal â€” the agent must be the one currently assigned
     to the task. Real HMAC verification is TODO (matches the
-    /api/agents/{id}/heartbeat MVP per the auth design doc §6.1).
+    /api/agents/{id}/heartbeat MVP per the auth design doc Â§6.1).
     """
     db = request.app.state.db
     task = await db.fetchone(
@@ -4381,12 +4417,12 @@ async def get_task_output(
     request: Request,
     since: int = 0,
 ) -> dict:
-    """Frontend → server: pull live output chunks for a task.
+    """Frontend â†’ server: pull live output chunks for a task.
 
     Returns all audit_log rows of type agent.output_chunk for this
     task with id > `since` (caller passes the last id they saw;
     default 0 returns everything). Capped at 500 rows per request
-    — if there are more, the client should retry with the
+    â€” if there are more, the client should retry with the
     returned `next_since` until empty.
 
     No agent-auth: the dashboard is already inside the trusted
@@ -4442,14 +4478,14 @@ async def get_task_output(
 #
 # Powers the dashboard's 5s polling so the UI can update not just
 # the loop_status badge (v1) but ALSO the status pill text/class
-# (running → done / failed / cancelled). Without this, the row
+# (running â†’ done / failed / cancelled). Without this, the row
 # stays visually "running" forever after the task finishes,
 # because v1 only polled /tasks/running (which excludes non-
 # running tasks by definition).
 #
-# Returns a light shape — only the fields the UI needs to update
+# Returns a light shape â€” only the fields the UI needs to update
 # one row. Capped at the project_id-scoped visible tasks (no
-# archive=1, no pagination — projects in this orchestrator are
+# archive=1, no pagination â€” projects in this orchestrator are
 # typically tens to low-hundreds of tasks).
 
 
@@ -4491,7 +4527,7 @@ async def get_project_task_states(project_id: str, request: Request) -> dict:
 #   1. An initial "snapshot" event with the current task states
 #      (so the UI doesn't need a separate /tasks/state fetch).
 #   2. "task.state_changed" when a task transitions (running -> done,
-#      etc.) — fired by the /result, /start, /cancel endpoints.
+#      etc.) â€” fired by the /result, /start, /cancel endpoints.
 #   3. "task.loop_status_changed" when compute_loop_status sees a new
 #      state (ok -> slow / stuck / looping).
 #   4. "output.chunk" when a new agent.output_chunk is written.
@@ -4503,7 +4539,7 @@ async def get_project_task_states(project_id: str, request: Request) -> dict:
 # capability (you have to know the project_id). For productize, add
 # session-cookie auth before exposing this past local network.
 #
-# Why not /api/projects/{id}/tasks/{task_id}/events? — that would
+# Why not /api/projects/{id}/tasks/{task_id}/events? â€” that would
 # require a new connection per task. The dashboard usually watches
 # 1-10 tasks, so one per-project connection is enough; the
 # browser filters by task_id in the JS handler.
@@ -4559,7 +4595,7 @@ async def stream_project_events(
         raise HTTPException(404, f"project {project_id} not found")
 
     async def event_stream():
-        # 1. Initial snapshot — same shape as /tasks/state but in an
+        # 1. Initial snapshot â€” same shape as /tasks/state but in an
         #    event envelope so the JS handler can use one path.
         rows = await db.fetchall(
             "SELECT * FROM tasks WHERE project_id = ? AND archived = 0 "
@@ -4622,9 +4658,9 @@ async def stream_project_events(
 # ===== Tool-call events for looping detection (v1.2, 2026-07-29) =====
 #
 # The wrapper emits one event per tool call (e.g. each row of the
-# form `┊ 💻 $ <command>` that hermes writes). compute_loop_status
+# form `â”Š ðŸ’» $ <command>` that hermes writes). compute_loop_status
 # queries these to detect when the agent is making the same call
-# over and over — a real "loop" that v1 couldn't see (it only had
+# over and over â€” a real "loop" that v1 couldn't see (it only had
 # heartbeat liveness, not content-level repetition).
 
 
@@ -4635,7 +4671,7 @@ async def post_tool_call(
     request: Request,
     agent_id: str = Depends(require_hmac_auth),
 ) -> dict:
-    """Wrapper → server: emit one tool-call event for looping analysis.
+    """Wrapper â†’ server: emit one tool-call event for looping analysis.
 
     Body: {tool: str, signature: str}
       - tool:      short human-readable name (e.g. "shell", "read_file")
@@ -4645,7 +4681,7 @@ async def post_tool_call(
                    call with the same args produces the same signature.
 
     The server writes an audit_log row (event_type="agent.tool_call")
-    and returns the new row's id. No GET endpoint — compute_loop_status
+    and returns the new row's id. No GET endpoint â€” compute_loop_status
     queries audit_log directly when it runs.
     """
     db = request.app.state.db
@@ -4674,7 +4710,7 @@ async def post_tool_call(
         raise HTTPException(
             400, "signature is required and must be a non-empty string"
         )
-    # Defensive caps: tool name (256 chars), signature (64 chars — usually
+    # Defensive caps: tool name (256 chars), signature (64 chars â€” usually
     # 8-16 hex of a SHA256 prefix). Bigger means a misbehaving wrapper.
     tool = tool[:256]
     signature = signature[:64]
@@ -4701,4 +4737,5 @@ async def post_tool_call(
         },
     )
     return {"ok": True, "id": last["id"]}
+
 
