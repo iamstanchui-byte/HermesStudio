@@ -136,6 +136,16 @@
             div.className = 'bg-blue-50 border border-blue-200 rounded p-2 ml-8';
             div.innerHTML = `<div class="text-xs text-gray-500 mb-1">You</div>
                 <div class="whitespace-pre-wrap">${escapeHtml(m.content)}</div>`;
+        } else if (m.isError) {
+            // v3.10.4 (2026-08-02): render actionable LLM errors as a
+            // distinct red card. Without this, the user just saw a
+            // tiny status-bar message that scrolled out of view; the
+            // error context (rephrase, shorter context, etc.) was
+            // hidden. Now it lives in the chat history alongside the
+            // user's question, so they can re-read it after scrolling.
+            div.className = 'bg-red-50 border border-red-300 rounded p-2 mr-8';
+            div.innerHTML = `<div class="text-xs text-red-700 mb-1">⚠️ Chat error</div>
+                <div class="whitespace-pre-wrap text-sm text-red-900">${escapeHtml(m.content)}</div>`;
         } else {
             div.className = 'bg-gray-50 border border-gray-200 rounded p-2 mr-8';
             let html = `<div class="text-xs text-gray-500 mb-1">Assistant</div>
@@ -143,7 +153,7 @@
             if (m.suggestions && m.suggestions.length) {
                 html += `<div class="mt-2 space-y-1">${m.suggestions.map((s, i) =>
                     renderSuggestion(s, i, m.id)).join('')}</div>`;
-            } else {
+            } else if (m.content && m.content.trim()) {
                 // LLM-fooling pattern #9: LLM sometimes describes the
                 // action in text without a JSON block. Show a Reformat
                 // button that asks the LLM to wrap the action in JSON
@@ -321,9 +331,25 @@
             );
             if (!r.ok) {
                 const err = await r.json().catch(() => ({}));
-                status.textContent = 'Error: ' + _errDetailToString(err.detail, r.status);
+                // v3.10.4 (2026-08-02): render the server's actionable
+                // error message as a persistent assistant bubble, so
+                // the user sees WHY the LLM didn't respond (think-only,
+                // timeout, etc.) instead of the generic "(empty
+                // response)" they'd see if we just appended the 200
+                // path's `data.message || '(empty response)'`. The
+                // server returns a 502 with a multi-line hint; we
+                // render it as a quoted error card.
+                const errText = _errDetailToString(err.detail, r.status);
+                status.textContent = 'Error: ' + (errText.split('\n')[0] || 'see assistant message');
                 status.className = 'text-xs text-red-600 mt-1 h-4';
-                loadChatHistory();
+                wrap.appendChild(renderChatMessage({
+                    role: 'assistant',
+                    content: '⚠️ ' + errText,
+                    suggestions: [],
+                    id: null,
+                    isError: true,
+                }));
+                wrap.scrollTop = wrap.scrollHeight;
                 return;
             }
             const data = await r.json();

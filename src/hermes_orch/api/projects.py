@@ -3640,8 +3640,37 @@ async def chat_with_project(
     except httpx.HTTPError as e:
         log.warning(f"chat LLM call failed for {project_id}: {e}")
         raise HTTPException(502, f"LLM unreachable: {e}")
-    # Strip <think> traces (MiniMax M3 emits them before the answer)
+    # Strip <think> traces (MiniMax M3 emits them before the answer).
+    # v3.10.4 (2026-08-02) BUGFIX: MiniMax M3 sometimes returns ONLY
+    # a <think>...</think> block with NO final answer (the model's
+    # internal reasoning eats the entire 1500-token output budget
+    # before it can produce a real reply). The previous code stripped
+    # <think> then continued with the empty remainder, which made
+    # the chatbox render "(empty response)" and the assistant
+    # message persisted with content_len=0. The user had no idea
+    # whether the LLM was broken, the chat endpoint was broken,
+    # or their prompt was unclear. The fix: AFTER stripping, check
+    # if any text remains. If not, surface an actionable 502 with
+    # a hint (rephrase / shorter context / lower reasoning effort).
+    # The check is on the POST-strip text (not the raw LLM text) so
+    # we only raise when there's truly nothing to show the user.
+    had_think_block = bool(re.search(r"<think>.*?</think>", text, flags=re.DOTALL))
     text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+    if not text.strip():
+        # Differentiate the two empty-text causes so the UI can
+        # give a useful hint. The "think-only" case is the one we
+        # actually saw in the wild (proj-cef60586, 2026-08-02).
+        detail = (
+            "The LLM returned only internal reasoning (<think>...</think>) "
+            "without a final answer. The model's reasoning used the full "
+            "token budget before producing a reply. Try: rephrase the "
+            "question, use a shorter context (e.g. clear chat history), "
+            "or set a lower reasoning_effort if your LLM supports it."
+            if had_think_block else
+            "The LLM returned an empty reply. Try rephrasing the question "
+            "or check the LLM provider's status page."
+        )
+        raise HTTPException(502, detail)
     # Extract suggestions
     display_text, suggestions = _extract_suggestions(text)
     # Render the DAG from any update_plan suggestions and append it
