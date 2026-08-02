@@ -287,6 +287,9 @@ async def _seed_soul_presets_from_plan(
     db: Any,
     project_id: str,
     plan: "ProjectPlan",
+    *,
+    llm_souls: dict[str, str] | None = None,
+    fill_empty_only: bool = False,
 ) -> dict[str, Any]:
     """Auto-seed `project_soul_presets` rows from a plan's `default_soul`.
 
@@ -299,6 +302,14 @@ async def _seed_soul_presets_from_plan(
     auto-generated content. The user had no chance to edit the
     soul before the agent started.
 
+    v3.10.5 (2026-08-02) update: the planner's `default_soul` field
+    was replaced with a dedicated LLM call (`_generate_souls_via_llm`
+    in orchestrator.soul_dispatch) that runs at "Generate Task" time
+    with full project context. Callers pass the LLM output via
+    `llm_souls`; if the call failed or wasn't attempted, the helper
+    falls back to the step's `default_soul` field (legacy) or the
+    generic role template (last resort).
+
     This helper pre-creates presets at plan-save time so the user
     can see + edit them BEFORE clicking the green [▶ Run] button.
 
@@ -308,15 +319,31 @@ async def _seed_soul_presets_from_plan(
          same soul — we only need one preset per profile).
       2. For each unique role, resolve to a profile using the
          routing engine (same logic dispatch uses).
-      3. Upsert project_soul_presets row for (project, profile) IF
-         it doesn't already exist (preserves any manual edits).
-         content = step.default_soul, default_soul = same (so
-         a future "reset to default" can find it).
-      4. Skip steps without a `default_soul` (the dispatch path
-         will use the generic role template as a fallback).
-      5. Skip roles where routing returns no profile (the
+      3. Insert project_soul_presets row for (project, profile) IF
+         no preset exists (or, if `fill_empty_only=True`, only if
+         the existing preset's content is empty). This preserves
+         user edits.
+         content priority:
+           1. llm_souls[role] (v3.10.5 — dedicated LLM call)
+           2. step.default_soul (legacy v3.10.4 Pydantic field)
+           3. _generic_role_template(role) (last-resort fallback)
+      4. Skip roles where routing returns no profile (the
          dispatch path will resolve it later; preset creation
          happens lazily on first dispatch).
+
+    Args:
+        db: the orchestrator database.
+        project_id: the project being seeded.
+        plan: the ProjectPlan Pydantic model.
+        llm_souls: optional {role: persona_text} override from a
+            dedicated LLM SOUL-generation call. Takes priority over
+            `step.default_soul`. If a role is missing from this dict
+            but exists in the plan, the helper falls through to
+            `step.default_soul` then the generic template.
+        fill_empty_only: if True, only fill presets that have NO
+            content yet. Used by the "Generate SOUL" recovery button
+            so it doesn't clobber user edits. Default False (the
+            original behavior — never overwrite existing presets).
 
     Returns a stats dict so the caller can include it in the
     response or audit log. Best-effort: any error is caught and
@@ -337,35 +364,46 @@ async def _seed_soul_presets_from_plan(
         # user knows to customize the generic text on the project
         # page rather than treating it as a final answer.
         "roles_used_generic_fallback": 0,
+        # v3.10.5: count of roles that used content from a
+        # dedicated LLM call (the new `_generate_souls_via_llm`
+        # path). Distinct from `roles_used_generic_fallback` so the
+        # UI can show "X roles got LLM-generated personas, Y used
+        # generic" — gives the user a quick read on quality.
+        "roles_used_llm_generated": 0,
         "errors": [],
     }
     try:
         # Lazy import — heavy module, only load when actually used
         from hermes_orch.orchestrator.routing import resolve_role_to_profile
 
-        # Collect unique (role, default_soul) pairs. The LLM may
-        # produce the same soul for the same role across multiple
-        # steps; we only need one preset per (project, profile).
-        # Three places to look for the soul, in order of preference:
-        #   1. step.default_soul (top-level — v3.10.4 Pydantic field,
-        #      what the planner prompt asks the LLM to produce)
-        #   2. step.params_template.get("default_soul") (legacy
-        #      chatbox form, see orchestrator.soul_dispatch._step_default_soul)
-        #   3. _generic_role_template(role) — v3.10.4 follow-up
-        #      fallback for plans created before the planner prompt
-        #      was updated to require `default_soul`. Without this
-        #      fallback, the "Generate SOUL" button on a pre-v3.10.4
-        #      plan would skip every role and the user would have to
-        #      either re-plan or hand-write every SOUL. With the
-        #      fallback, they get a generic-but-usable starting point
-        #      that they can edit on the project page.
+        # v3.10.5: priority for persona text per role:
+        #   1. llm_souls[role] (dedicated LLM call — the new path)
+        #   2. step.default_soul (v3.10.4 Pydantic field, legacy)
+        #   3. _generic_role_template(role) (last-resort fallback)
         from hermes_orch.orchestrator.soul_dispatch import (
             _generic_role_template,
         )
-        seen_roles: dict[str, str] = {}  # role -> default_soul
+        seen_roles: dict[str, str] = {}  # role -> persona_text
         for step in plan.steps:
             role = (step.agent_role or "").strip()
             if not role:
+                continue
+            # If the caller passed llm_souls, prefer it for this role.
+            # The same role across multiple steps gets ONE LLM persona
+            # (the LLM call returns one entry per unique role), so the
+            # first step to land in seen_roles wins.
+            if (
+                llm_souls
+                and role in llm_souls
+                and role not in seen_roles
+            ):
+                seen_roles[role] = llm_souls[role].strip()
+                stats["roles_used_llm_generated"] += 1
+                continue
+            # Already have this role from a prior step — skip
+            # subsequent steps to keep persona deterministic (first
+            # wins). The user can hand-merge if needed.
+            if role in seen_roles:
                 continue
             default_soul = (step.default_soul or "").strip()
             if not default_soul and isinstance(step.params_template, dict):
@@ -385,15 +423,8 @@ async def _seed_soul_presets_from_plan(
                 # stat so the UI can mention "N roles used generic
                 # fallback" so the user knows to customize.
                 default_soul = _generic_role_template(role)
-                stats["roles_used_generic_fallback"] = (
-                    stats.get("roles_used_generic_fallback", 0) + 1
-                )
-            # If the same role has different default_souls in
-            # different steps, we keep the FIRST one (deterministic
-            # by step order). The user can manually edit the
-            # preset to merge them.
-            if role not in seen_roles:
-                seen_roles[role] = default_soul
+                stats["roles_used_generic_fallback"] += 1
+            seen_roles[role] = default_soul
         stats["roles_seen"] = len(seen_roles)
 
         for role, default_soul in seen_roles.items():
@@ -425,15 +456,55 @@ async def _seed_soul_presets_from_plan(
                     continue
                 profile_id = profile["id"]
                 # Check if a preset already exists for this
-                # (project, profile). If yes, leave it alone
-                # (the user may have edited the content).
+                # (project, profile). Behaviour depends on the
+                # caller's intent:
+                #   - fill_empty_only=False (default, e.g. plan-save):
+                #     skip if ANY preset exists (preserve user edits
+                #     and avoid clobbering content from a prior
+                #     Generate-SOUL run)
+                #   - fill_empty_only=True (e.g. "Generate SOUL"
+                #     button): skip only if the existing preset has
+                #     non-empty content. Empty presets (e.g. the
+                #     user deleted the content, or it was never
+                #     filled) get refilled with the LLM text.
                 existing = await db.fetchone(
-                    "SELECT id FROM project_soul_presets "
+                    "SELECT id, content, default_soul "
+                    "FROM project_soul_presets "
                     "WHERE project_id = ? AND profile_id = ?",
                     (project_id, profile_id),
                 )
                 if existing:
-                    stats["presets_skipped_existing"] += 1
+                    existing_content = (
+                        (existing.get("content") or "").strip()
+                        if isinstance(existing, dict)
+                        else ""
+                    )
+                    if not fill_empty_only or existing_content:
+                        # Either we're not in fill-empty-only mode
+                        # (preserve everything), or the existing
+                        # preset has real content (user edited it,
+                        # leave alone). Either way, skip.
+                        stats["presets_skipped_existing"] += 1
+                        continue
+                    # fill_empty_only=True AND existing content is
+                    # empty → UPDATE the existing row with the new
+                    # persona text. The id is preserved so any
+                    # pending profile_configs rows (e.g. an in-flight
+                    # dispatch) stay consistent.
+                    await db.execute(
+                        "UPDATE project_soul_presets SET "
+                        "content = ?, default_soul = ?, "
+                        "role_name = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (
+                            default_soul,
+                            default_soul,
+                            role,
+                            _now_iso(),
+                            existing["id"] if isinstance(existing, dict) else existing[0],
+                        ),
+                    )
+                    stats["presets_created"] += 1
                     continue
                 # Create the preset. Content = default_soul; we
                 # also store default_soul on the preset so a
@@ -637,6 +708,15 @@ class GenerateSoulFromPlanResponse(BaseModel):
     # The UI surfaces this so the user knows which presets need
     # custom editing.
     roles_used_generic_fallback: int
+    # v3.10.5: count of roles whose persona came from a dedicated
+    # LLM call (`_generate_souls_via_llm`). Distinct from the
+    # generic-fallback count so the UI can show "X roles got
+    # LLM-generated personas, Y used the generic template".
+    roles_used_llm_generated: int
+    # v3.10.5: status of the LLM call so the UI can show
+    # "Generated 3 personas via LLM" or "LLM call failed, fell back
+    # to generic". Values: "ok" | "failed" | "skipped_mock"
+    llm_call_status: str
     errors: list[dict[str, str]]
 
 
@@ -649,11 +729,21 @@ async def generate_soul_from_plan(
 ) -> GenerateSoulFromPlanResponse:
     """Seed project_soul_presets from the project's plan_json.
 
-    The "Generate SOUL" button on the project page calls this. It
-    reuses the same `_seed_soul_presets_from_plan` helper that
-    runs automatically at plan-save time, so the behavior is
-    identical: idempotent, preserves manual edits, skips roles
-    that can't be routed, never raises (best-effort).
+    v3.10.5 (2026-08-02): the recovery button now also calls the
+    LLM to produce role-specific personas. The "Generate SOUL"
+    button has two real use cases:
+      1. User deleted an auto-generated SOUL by mistake and wants
+         it back. `fill_empty_only=True` refills the empty preset
+         without clobbering user edits elsewhere.
+      2. The initial seed at plan-save / plan-run time fell back to
+         the generic template (e.g. agents were offline so routing
+         couldn't resolve profiles). With agents back, the user
+         clicks this to (re)generate proper personas.
+
+    In both cases, the LLM has full project context (name +
+    description + plan steps) so the personas are specific to the
+    project, not generic. If the LLM call fails, we fall through
+    to the seed helper's normal step.default_soul / generic path.
 
     Behavior:
       200 with the stats dict on success (even if 0 presets
@@ -662,12 +752,14 @@ async def generate_soul_from_plan(
       409 if the project has no plan_json (call /plan/from-llm
         first to create one)
 
-    Side effect: same as put_project_plan's auto-seed — creates
-    project_soul_presets rows. No new tasks are created.
+    Side effect: creates / updates project_soul_presets rows for
+    any role whose preset is missing OR whose existing content is
+    empty. NEVER clobbers non-empty content (user edits preserved).
+    No new tasks are created.
     """
     db = request.app.state.db
     proj = await db.fetchone(
-        "SELECT id, plan_json FROM projects WHERE id = ?",
+        "SELECT id, name, goal, plan_json FROM projects WHERE id = ?",
         (project_id,),
     )
     if not proj:
@@ -679,7 +771,36 @@ async def generate_soul_from_plan(
             "No plan to generate SOUL from. Call POST /api/projects/{id}/plan/from-llm "
             "first, or save a plan via PUT /api/projects/{id}/plan."
         )
-    stats = await _seed_soul_presets_from_plan(db, project_id, plan)
+    # v3.10.5: call LLM to produce role-specific personas. Failure
+    # is non-fatal — the seed helper falls through to step.default_soul
+    # then the generic template, so the user always gets something.
+    llm_souls: dict[str, str] | None = None
+    llm_call_status = "skipped_mock"
+    try:
+        cfg = getattr(request.app.state, "config", None) or {}
+        llm_cfg = (cfg.get("llm") or {}) if isinstance(cfg, dict) else {}
+        from hermes_orch.orchestrator.soul_dispatch import (
+            _generate_souls_via_llm,
+        )
+        llm_souls = await _generate_souls_via_llm(
+            plan,
+            project_name=proj.get("name") or "",
+            project_description=proj.get("goal") or "",
+            llm_cfg=llm_cfg,
+        )
+        llm_call_status = "ok" if llm_souls else "empty_response"
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "generate-soul: LLM call failed (%s); falling back to "
+            "step.default_soul / generic template", e,
+        )
+        llm_call_status = "failed"
+    stats = await _seed_soul_presets_from_plan(
+        db, project_id, plan,
+        llm_souls=llm_souls,
+        fill_empty_only=True,
+    )
     return GenerateSoulFromPlanResponse(
         project_id=project_id,
         presets_created=stats["presets_created"],
@@ -688,6 +809,8 @@ async def generate_soul_from_plan(
         roles_skipped_no_default_soul=stats["roles_skipped_no_default_soul"],
         roles_skipped_no_profile=stats["roles_skipped_no_profile"],
         roles_used_generic_fallback=stats.get("roles_used_generic_fallback", 0),
+        roles_used_llm_generated=stats.get("roles_used_llm_generated", 0),
+        llm_call_status=llm_call_status,
         errors=stats["errors"],
     )
 
@@ -1203,6 +1326,48 @@ async def run_project_plan(
             raise HTTPException(
                 500, f"failed to insert task {t['name']!r}: {e}"
             )
+    # 4b. v3.10.5 (2026-08-02): generate SOULs via LLM at "Generate
+    # Task" time. The planner's `default_soul` field was unreliable
+    # (often returned empty under token pressure) so we now make a
+    # dedicated LLM call focused on persona writing with the full
+    # project context. Failure is non-fatal — the seed helper falls
+    # through to step.default_soul then the generic template.
+    #
+    # fill_empty_only=True so user-edited presets survive this run.
+    # The seed also runs at plan-save (PUT /plan) with
+    # fill_empty_only=False; this run re-fills only the empty ones
+    # the prior seed couldn't populate (e.g. routing failed because
+    # agents were offline, OR the plan predates the LLM SOUL path).
+    llm_souls: dict[str, str] | None = None
+    try:
+        cfg = getattr(request.app.state, "config", None) or {}
+        llm_cfg = (cfg.get("llm") or {}) if isinstance(cfg, dict) else {}
+        from hermes_orch.orchestrator.soul_dispatch import (
+            _generate_souls_via_llm,
+        )
+        proj_for_llm = await db.fetchone(
+            "SELECT name, goal FROM projects WHERE id = ?",
+            (project_id,),
+        )
+        llm_souls = await _generate_souls_via_llm(
+            plan,
+            project_name=(proj_for_llm or {}).get("name") or "",
+            project_description=(proj_for_llm or {}).get("goal") or "",
+            llm_cfg=llm_cfg,
+        )
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "run_project_plan: LLM SOUL gen failed (%s); "
+            "falling back to step.default_soul / generic", e,
+        )
+        # llm_souls stays None → seed helper uses step.default_soul
+        # or generic. Tasks are already created, no rollback.
+    await _seed_soul_presets_from_plan(
+        db, project_id, plan,
+        llm_souls=llm_souls,
+        fill_empty_only=True,
+    )
     # 5. v3.10.4 (2026-08-02): do NOT auto-dispatch. The project
     # stays in 'planned' state so the user can review the new
     # tasks + their SOUL presets (auto-seeded from the plan's

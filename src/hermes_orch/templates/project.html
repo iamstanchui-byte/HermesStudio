@@ -149,22 +149,51 @@
                         ▶️ Run
                     </button>
                     {# v3.10.4 (2026-08-02): "Generate SOUL" button —
-                       explicit fallback for the auto-seed that runs
-                       at plan-save time. Use this if the plan was
-                       saved before v3.10.4 (no auto-seed happened),
-                       or if routing at save time had no idle
-                       profile (now succeeds). Idempotent: skips
-                       existing presets to preserve manual edits.
-                       Only shown when the project has a plan_json
-                       (no point seeding from no plan). #}
+                       explicit recovery path. As of v3.10.5, this
+                       button:
+                       1. Calls the LLM with project + plan context
+                          to draft role-specific SOULs (2-4 sentences
+                          per role, tailored to the project topic).
+                       2. Seeds project_soul_presets with the LLM
+                          output, ONLY filling empty presets
+                          (preserves user edits).
+                       Use cases:
+                         - User deleted a SOUL by mistake
+                         - Initial seed at plan-save / plan-run
+                           used the generic template (agents were
+                           offline at the time)
+                       Always available when the project has a
+                       plan_json. #}
                     {% if project.plan_json %}
                     <button onclick="generateSoulFromPlan('{{ project.id }}')"
                         class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
-                        title="Generate project_soul_presets from the plan's per-step default_soul. Idempotent — skips existing presets. Run this if the auto-seed at plan-save time couldn't run (e.g., no idle profile at save time, plan was created before v3.10.4).">
+                        title="Re-generate SOULs via LLM (project-aware). Fills empty presets only — your manual edits are preserved. Use if you deleted a SOUL or want to upgrade the generic placeholder to a project-specific persona.">
                         🧠 Generate SOUL
                     </button>
                     {% endif %}
                 </div>
+                {# v3.10.5 (2026-08-02): Auto-SOUL info card. Shown
+                   when the project has a plan but no SOUL presets
+                   yet (e.g. user just generated a plan and hasn't
+                   clicked Generate Task). Replaces the old "click
+                   here to seed" wording with an explanation of
+                   what happens automatically when they Generate
+                   Task. Helps the user understand the new flow
+                   without reading docs. #}
+                {% if project.plan_json and (soul_presets|length == 0) %}
+                <div class="mt-2 text-xs text-gray-600 bg-purple-50 border border-purple-200 rounded px-3 py-2 flex items-start gap-2"
+                     title="When you click 'Generate tasks' (Plan editor), the orchestrator will call the LLM to draft role-specific SOULs from your project description + plan. You'll see them in the 'Show SOUL editor' toggle before dispatching.">
+                    <span class="text-purple-500 font-bold">🧠</span>
+                    <span>
+                        <strong>Auto-SOUL:</strong> when you click
+                        <em>Generate tasks</em> in the plan editor, the
+                        orchestrator will call the LLM to write
+                        project-specific SOULs (one per role). They'll
+                        appear below in <em>Show SOUL editor</em> for
+                        review before dispatching.
+                    </span>
+                </div>
+                {% endif %}
                 <div class="flex gap-1.5 flex-wrap justify-end">
                     {% if project.state == 'archived' %}
                     <button onclick="unarchiveProject('{{ project.id }}')"
@@ -1169,25 +1198,25 @@ async function openProjectFolder(projectId) {
         alert('Network error: ' + err.message);
     }
 }
-// v3.10.4 (2026-08-02): explicit "Generate SOUL" button handler.
-// The primary path auto-seeds project_soul_presets at plan-save
-// time. This button is the fallback for the cases where the
-// auto-seed couldn't run (no idle profile at save time, plan
-// created before v3.10.4, etc.). Idempotent: skips existing
-// presets to preserve any manual edits the user has made on
-// the project page.
+// v3.10.5 (2026-08-02): "Generate SOUL" button handler. The
+// endpoint now calls the LLM (with project + plan context) to
+// draft role-specific personas, then seeds only the empty presets
+// (preserves user edits). Used as a recovery path: user deleted a
+// SOUL by mistake, OR wants to upgrade the generic placeholder
+// to a project-specific persona. The primary path is at
+// "Generate Task" time (the run_project_plan endpoint).
 async function generateSoulFromPlan(projectId) {
     if (!confirm(
-        'Generate SOUL presets from the plan?\n\n' +
+        'Re-generate SOUL presets via LLM?\n\n' +
         'This will:\n' +
-        '  • Resolve each role in the plan to a profile (using the routing engine)\n' +
-        '  • Create a project_soul_preset for any role that doesn\'t have one yet\n' +
-        '  • Skip existing presets (your manual edits are preserved)\n\n' +
+        '  • Call the LLM with your project + plan to draft role-specific personas\n' +
+        '  • Fill any empty preset (skips presets you\'ve already edited)\n\n' +
         'Continue?'
     )) return;
     try {
         const r = await fetch('/api/projects/' + projectId + '/plan/generate-soul', {
             method: 'POST',
+            headers: {'Content-Type': 'application/json'},
         });
         const data = await r.json().catch(() => ({}));
         if (r.status === 404) {
@@ -1202,13 +1231,25 @@ async function generateSoulFromPlan(projectId) {
             alert('Generate SOUL failed: ' + (data.detail || r.status));
             return;
         }
-        // Build a human-friendly summary
+        // Build a human-friendly summary. v3.10.5: surface the
+        // LLM call status so the user knows whether the personas
+        // came from the LLM (good) or fell back to generic
+        // (LLM failed, edit before dispatching).
         const parts = [];
-        if (data.presets_created > 0) parts.push('Created ' + data.presets_created + ' new preset(s)');
-        if (data.presets_skipped_existing > 0) parts.push('skipped ' + data.presets_skipped_existing + ' already-existing (your edits are preserved)');
-        if (data.roles_skipped_no_default_soul > 0) parts.push(data.roles_skipped_no_default_soul + ' role(s) had no default_soul in the plan — even the generic fallback was skipped');
+        // Lead with LLM status so the user knows the source
+        if (data.llm_call_status === 'ok') {
+            parts.push('LLM generated ' + (data.roles_used_llm_generated || 0) + ' project-specific persona(s)');
+        } else if (data.llm_call_status === 'failed') {
+            parts.push('LLM call failed — using step-level / generic fallback');
+        } else if (data.llm_call_status === 'empty_response') {
+            parts.push('LLM returned an empty response — using fallback');
+        } else if (data.llm_call_status === 'skipped_mock') {
+            parts.push('LLM in mock mode — using step-level / generic fallback');
+        }
+        if (data.presets_created > 0) parts.push('Filled ' + data.presets_created + ' preset(s)');
+        if (data.presets_skipped_existing > 0) parts.push('skipped ' + data.presets_skipped_existing + ' already-edited preset(s) (your work is preserved)');
         if (data.roles_skipped_no_profile > 0) parts.push(data.roles_skipped_no_profile + ' role(s) had no idle profile to route to');
-        if (data.roles_used_generic_fallback > 0) parts.push(data.roles_used_generic_fallback + ' role(s) used the generic template (your plan was generated before v3.10.4, OR the LLM skipped default_soul — edit these in the SOUL editor to customize)');
+        if (data.roles_used_generic_fallback > 0) parts.push(data.roles_used_generic_fallback + ' role(s) used the generic template — edit them in the SOUL editor to customize');
         if (data.errors && data.errors.length > 0) parts.push(data.errors.length + ' error(s)');
         if (parts.length === 0) parts.push('No roles found in the plan to seed');
         alert(parts.join('.\n') + '.\n\nThe "Show SOUL editor" toggle (top of the page) now lets you review and edit them before dispatching.');

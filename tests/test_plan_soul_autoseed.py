@@ -463,11 +463,18 @@ async def test_plan_save_falls_back_to_generic_template(client):
 
 
 @pytest.mark.asyncio
-async def test_generate_soul_endpoint_uses_generic_fallback(client):
+async def test_generate_soul_endpoint_uses_generic_fallback(client, monkeypatch):
     """v3.10.4 follow-up: the fallback endpoint also uses the
     generic template when the plan has no default_soul. The
     response includes `roles_used_generic_fallback` so the UI
-    can mention which presets need custom editing."""
+    can mention which presets need custom editing.
+
+    v3.10.5 update: as of v3.10.5 the endpoint also calls the LLM
+    first. To exercise the generic-fallback path we mock httpx
+    so the LLM call returns a response that doesn't include the
+    role (simulating an LLM that doesn't know the role). The seed
+    helper then falls through to the generic template.
+    """
     ac, app = client
     await _login_admin(ac)
     await _create_project_with_profile(app, profile_name="analyst")
@@ -490,11 +497,54 @@ async def test_generate_soul_endpoint_uses_generic_fallback(client):
     await app.state.db.execute(
         "DELETE FROM project_soul_presets WHERE project_id = ?", (pid,)
     )
+    # v3.10.5: mock the LLM to return a SOULs dict that doesn't
+    # include the "analyst" role, so the seed helper falls through
+    # to the generic template.
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, **kw):
+            return _FakeResp(200, {
+                "choices": [{
+                    "message": {"content": json.dumps({
+                        # No "analyst" key — seed helper falls through
+                        "souls": {"some_other_role": "unused"},
+                    })},
+                    "finish_reason": "stop",
+                }],
+            })
+
+    class _FakeResp:
+        def __init__(self, sc, data):
+            self.status_code = sc
+            self._data = data
+        def json(self):
+            return self._data
+        @property
+        def text(self):
+            return json.dumps(self._data)
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    app.state.config = {"llm": {
+        "base_url": "https://api.minimax.io/anthropic",
+        "api_key": "test-key",
+        "model": "MiniMax-M3",
+        "mock": False,
+    }}
     # Call the fallback endpoint
     r = await ac.post(f"/api/projects/{pid}/plan/generate-soul")
     assert r.status_code == 200, r.text
     data = r.json()
-    # The endpoint reports the generic fallback count
+    # v3.10.5: LLM call ran but the role wasn't in the response, so
+    # the seed helper used the generic template. The LLM did respond
+    # (200) but the role fell back to generic.
+    assert data["llm_call_status"] == "ok"
+    assert data["roles_used_llm_generated"] == 0
     assert data["roles_used_generic_fallback"] == 1, (
         f"expected 1 role using generic fallback, got "
         f"{data['roles_used_generic_fallback']}: {data}"
@@ -591,10 +641,17 @@ async def test_plan_run_does_not_set_state_to_ready(client):
 
 
 @pytest.mark.asyncio
-async def test_generate_soul_endpoint_seeds_from_existing_plan(client):
+async def test_generate_soul_endpoint_seeds_from_existing_plan(client, monkeypatch):
     """The fallback endpoint POST /plan/generate-soul re-seeds
     from the project's existing plan_json. Idempotent: skips
-    existing presets."""
+    existing presets.
+
+    v3.10.5 update: as of v3.10.5 the endpoint also calls the LLM
+    first. To verify the existing step-level default_soul is still
+    used when the LLM doesn't return a matching persona, we mock
+    httpx so the LLM call returns a SOULs dict that excludes the
+    "analyst" role (forcing fallback to step.default_soul).
+    """
     ac, app = client
     await _login_admin(ac)
     await _create_project_with_profile(app, profile_name="analyst")
@@ -625,6 +682,42 @@ async def test_generate_soul_endpoint_seeds_from_existing_plan(client):
         "DELETE FROM project_soul_presets WHERE project_id = ?", (pid,)
     )
     assert len(await _get_presets(app, pid)) == 0
+    # v3.10.5: mock httpx so the LLM call returns an empty SOULs
+    # dict (no match for "analyst") so the seed helper falls through
+    # to the step-level default_soul. This is what we want to test.
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, **kw):
+            return _FakeResp(200, {
+                "choices": [{
+                    "message": {"content": json.dumps({"souls": {}})},
+                    "finish_reason": "stop",
+                }],
+            })
+
+    class _FakeResp:
+        def __init__(self, sc, data):
+            self.status_code = sc
+            self._data = data
+        def json(self):
+            return self._data
+        @property
+        def text(self):
+            return json.dumps(self._data)
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    app.state.config = {"llm": {
+        "base_url": "https://api.minimax.io/anthropic",
+        "api_key": "test-key",
+        "model": "MiniMax-M3",
+        "mock": False,
+    }}
     # Call the fallback endpoint
     r = await ac.post(f"/api/projects/{pid}/plan/generate-soul")
     assert r.status_code == 200, r.text
@@ -660,3 +753,603 @@ async def test_generate_soul_endpoint_409_for_project_with_no_plan(client):
     r = await ac.post(f"/api/projects/{pid}/plan/generate-soul")
     assert r.status_code == 409
     assert "No plan" in r.json()["detail"]
+
+
+# ===================================================================
+# v3.10.5: LLM-driven SOUL generation + recovery-fill mode
+# ===================================================================
+#
+# These tests cover the new flow:
+#   1. _generate_souls_via_llm() with a mocked httpx response
+#   2. _seed_soul_presets_from_plan(llm_souls=...) override
+#   3. _seed_soul_presets_from_plan(fill_empty_only=True) recovery mode
+#   4. End-to-end: generate-soul endpoint calls LLM, surfaces status
+#
+# The LLM is mocked at the httpx layer (monkeypatch) so the tests
+# don't need a real API key. This matches the pattern other tests
+# use for the chat / planner LLM paths.
+
+
+def _make_llm_cfg() -> dict:
+    """Build a minimal LLM config for the LLM SOUL gen helper.
+    Tests monkeypatch httpx.AsyncClient to intercept the call,
+    so api_key just needs to be non-empty."""
+    return {
+        "base_url": "https://api.minimax.io/anthropic",
+        "api_key": "test-key",
+        "model": "MiniMax-M3",
+        "timeout_seconds": 30,
+        "mock": False,
+    }
+
+
+def _build_plan_with_steps(steps_spec):
+    """Helper: build a ProjectPlan from a list of step dicts."""
+    return ProjectPlan(
+        name="test-plan",
+        steps=[PlanStep(**s) for s in steps_spec],
+    )
+
+
+# ===== _generate_souls_via_llm unit tests (mocked httpx) =====
+
+
+@pytest.mark.asyncio
+async def test_generate_souls_via_llm_happy_path(monkeypatch):
+    """LLM returns valid JSON -> helper parses and returns dict."""
+    from hermes_orch.orchestrator.soul_dispatch import _generate_souls_via_llm
+
+    captured = {}
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, **kw):
+            captured["url"] = url
+            captured["body"] = kw.get("json")
+            return _FakeResponse(200, {
+                "choices": [{
+                    "message": {
+                        "content": json.dumps({
+                            "souls": {
+                                "analyst": "You are a senior analyst for HK SME AI research.",
+                                "writer": "You are a markdown report writer.",
+                            }
+                        })
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            })
+
+    class _FakeResponse:
+        def __init__(self, status_code, data):
+            self.status_code = status_code
+            self._data = data
+        def json(self):
+            return self._data
+        @property
+        def text(self):
+            return json.dumps(self._data)
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    plan = _build_plan_with_steps([
+        {"name": "s1", "action": "do_task", "agent_role": "analyst",
+         "default_soul": ""},
+        {"name": "s2", "action": "do_task", "agent_role": "writer",
+         "default_soul": ""},
+    ])
+    out = await _generate_souls_via_llm(
+        plan, "HK SME research", "Analyse HK SME AI adoption",
+        _make_llm_cfg(),
+    )
+    assert out == {
+        "analyst": "You are a senior analyst for HK SME AI research.",
+        "writer": "You are a markdown report writer.",
+    }
+    # Verify the prompt included project context + per-step info
+    body = captured["body"]
+    assert body["model"] == "MiniMax-M3"
+    assert body["response_format"] == {"type": "json_object"}
+    user_msg = body["messages"][1]["content"]
+    assert "HK SME research" in user_msg
+    assert "analyst" in user_msg
+    assert "writer" in user_msg
+    assert "Analyse HK SME AI adoption" in user_msg
+
+
+@pytest.mark.asyncio
+async def test_generate_souls_via_llm_strips_think_blocks(monkeypatch):
+    """MiniMax M3 emits <think> traces. Helper should strip them."""
+    from hermes_orch.orchestrator.soul_dispatch import _generate_souls_via_llm
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, **kw):
+            return _FakeResp(200, {
+                "choices": [{
+                    "message": {
+                        "content": (
+                            "<think>The user wants HK SME research, so "
+                            "I should write an analyst persona.</think>"
+                            '{"souls": {"analyst": "You research HK SMEs."}}'
+                        )
+                    },
+                    "finish_reason": "stop",
+                }],
+            })
+
+    class _FakeResp:
+        def __init__(self, sc, data):
+            self.status_code = sc
+            self._data = data
+        def json(self):
+            return self._data
+        @property
+        def text(self):
+            return json.dumps(self._data)
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    plan = _build_plan_with_steps([
+        {"name": "s1", "action": "do_task", "agent_role": "analyst"},
+    ])
+    out = await _generate_souls_via_llm(
+        plan, "x", "y", _make_llm_cfg(),
+    )
+    assert out == {"analyst": "You research HK SMEs."}
+
+
+@pytest.mark.asyncio
+async def test_generate_souls_via_llm_raises_on_only_think(monkeypatch):
+    """If the LLM returns ONLY <think> (think-only response),
+    helper must raise so the caller falls back to generic."""
+    from hermes_orch.orchestrator.soul_dispatch import _generate_souls_via_llm
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, **kw):
+            # Closed <think> block with no JSON after — stripped
+            # content is empty, so the helper raises.
+            return _FakeResp(200, {
+                "choices": [{
+                    "message": {
+                        "content": "<think>Internal reasoning, no answer.</think>"
+                    },
+                    "finish_reason": "stop",
+                }],
+            })
+
+    class _FakeResp:
+        def __init__(self, sc, data):
+            self.status_code = sc
+            self._data = data
+        def json(self):
+            return self._data
+        @property
+        def text(self):
+            return json.dumps(self._data)
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    plan = _build_plan_with_steps([
+        {"name": "s1", "action": "do_task", "agent_role": "analyst"},
+    ])
+    with pytest.raises(RuntimeError, match="only internal reasoning"):
+        await _generate_souls_via_llm(
+            plan, "x", "y", _make_llm_cfg(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_souls_via_llm_raises_on_truncated(monkeypatch):
+    """finish_reason=length means the LLM was cut off mid-stream.
+    Helper must raise so the caller falls back."""
+    from hermes_orch.orchestrator.soul_dispatch import _generate_souls_via_llm
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, **kw):
+            return _FakeResp(200, {
+                "choices": [{
+                    "message": {"content": '{"souls": {"an'},
+                    "finish_reason": "length",
+                }],
+            })
+
+    class _FakeResp:
+        def __init__(self, sc, data):
+            self.status_code = sc
+            self._data = data
+        def json(self):
+            return self._data
+        @property
+        def text(self):
+            return json.dumps(self._data)
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    plan = _build_plan_with_steps([
+        {"name": "s1", "action": "do_task", "agent_role": "analyst"},
+    ])
+    with pytest.raises(RuntimeError, match="truncated"):
+        await _generate_souls_via_llm(
+            plan, "x", "y", _make_llm_cfg(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_souls_via_llm_raises_on_mock_mode():
+    """Mock mode (no api_key) should raise, not call LLM."""
+    from hermes_orch.orchestrator.soul_dispatch import _generate_souls_via_llm
+
+    plan = _build_plan_with_steps([
+        {"name": "s1", "action": "do_task", "agent_role": "analyst"},
+    ])
+    cfg = {"base_url": "x", "api_key": "", "mock": True}
+    with pytest.raises(RuntimeError, match="mock mode"):
+        await _generate_souls_via_llm(plan, "x", "y", cfg)
+
+
+# ===== _seed_soul_presets_from_plan with llm_souls =====
+
+
+@pytest.mark.asyncio
+async def test_seed_helper_prefers_llm_souls_over_default_soul(client):
+    """llm_souls[role] should win over step.default_soul."""
+    from hermes_orch.api.plans import _seed_soul_presets_from_plan
+    ac, app = client
+    await _login_admin(ac)
+    await _create_project_with_profile(app, profile_name="analyst")
+    pid = f"proj-llm-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO projects (id, name, goal, state, coordinator_role, "
+        "accept_criteria, deliverable_path, max_iterations, "
+        "current_iteration, last_iteration_summary) "
+        "VALUES (?, 'llm test', 'x', 'planned', '', '', '', 0, 0, '')",
+        (pid,),
+    )
+    plan = _build_plan_with_steps([
+        {"name": "s1", "action": "do_task", "agent_role": "analyst",
+         "default_soul": "OLD persona from step"},
+    ])
+    stats = await _seed_soul_presets_from_plan(
+        app.state.db, pid, plan,
+        llm_souls={"analyst": "NEW LLM-generated persona for this project"},
+    )
+    assert stats["presets_created"] == 1
+    assert stats["roles_used_llm_generated"] == 1
+    assert stats["roles_used_generic_fallback"] == 0
+    presets = await _get_presets(app, pid)
+    assert len(presets) == 1
+    assert presets[0]["content"] == "NEW LLM-generated persona for this project"
+
+
+@pytest.mark.asyncio
+async def test_seed_helper_falls_through_for_missing_roles(client):
+    """Roles not in llm_souls fall through to step.default_soul."""
+    from hermes_orch.api.plans import _seed_soul_presets_from_plan
+    ac, app = client
+    await _login_admin(ac)
+    await _create_project_with_profile(app, profile_name="analyst")
+    await _create_project_with_profile(app, profile_name="writer")
+    pid = f"proj-mix-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO projects (id, name, goal, state, coordinator_role, "
+        "accept_criteria, deliverable_path, max_iterations, "
+        "current_iteration, last_iteration_summary) "
+        "VALUES (?, 'mix test', 'x', 'planned', '', '', '', 0, 0, '')",
+        (pid,),
+    )
+    plan = _build_plan_with_steps([
+        {"name": "s1", "action": "do_task", "agent_role": "analyst",
+         "default_soul": "step-level analyst persona"},
+        {"name": "s2", "action": "do_task", "agent_role": "writer",
+         "default_soul": "step-level writer persona"},
+    ])
+    stats = await _seed_soul_presets_from_plan(
+        app.state.db, pid, plan,
+        llm_souls={"analyst": "LLM persona for analyst"},
+    )
+    assert stats["presets_created"] == 2
+    assert stats["roles_used_llm_generated"] == 1
+    assert stats["roles_used_generic_fallback"] == 0
+    presets = await _get_presets(app, pid)
+    by_role = {p["role_name"]: p["content"] for p in presets}
+    assert by_role["analyst"] == "LLM persona for analyst"
+    assert by_role["writer"] == "step-level writer persona"
+
+
+# ===== _seed_soul_presets_from_plan with fill_empty_only =====
+
+
+@pytest.mark.asyncio
+async def test_fill_empty_only_preserves_existing_content(client):
+    """fill_empty_only=True: existing preset with non-empty content
+    is NOT overwritten. Only empty presets are filled."""
+    from hermes_orch.api.plans import _seed_soul_presets_from_plan
+    ac, app = client
+    await _login_admin(ac)
+    _, profile_id = await _create_project_with_profile(
+        app, profile_name="analyst",
+    )
+    pid = f"proj-preserve-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO projects (id, name, goal, state, coordinator_role, "
+        "accept_criteria, deliverable_path, max_iterations, "
+        "current_iteration, last_iteration_summary) "
+        "VALUES (?, 'preserve test', 'x', 'planned', '', '', '', 0, 0, '')",
+        (pid,),
+    )
+    # Manually insert a preset with USER content
+    user_preset_id = f"preset-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO project_soul_presets (id, project_id, profile_id, "
+        "role_name, content, default_soul, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'analyst', 'USER EDITED THIS', 'OLD', ?, ?)",
+        (user_preset_id, pid, profile_id, "2026-08-02 12:00:00+08:00", "2026-08-02 12:00:00+08:00"),
+    )
+    plan = _build_plan_with_steps([
+        {"name": "s1", "action": "do_task", "agent_role": "analyst",
+         "default_soul": "fresh from LLM"},
+    ])
+    stats = await _seed_soul_presets_from_plan(
+        app.state.db, pid, plan,
+        llm_souls={"analyst": "fresh from LLM"},
+        fill_empty_only=True,
+    )
+    # Existing non-empty content preserved -> skipped, not created
+    assert stats["presets_skipped_existing"] == 1
+    assert stats["presets_created"] == 0
+    presets = await _get_presets(app, pid)
+    assert len(presets) == 1
+    assert presets[0]["content"] == "USER EDITED THIS"
+    assert presets[0]["id"] == user_preset_id  # same row
+
+
+@pytest.mark.asyncio
+async def test_fill_empty_only_fills_empty_existing_presets(client):
+    """fill_empty_only=True: existing preset with EMPTY content IS
+    filled (the recovery use case: user deleted the content)."""
+    from hermes_orch.api.plans import _seed_soul_presets_from_plan
+    ac, app = client
+    await _login_admin(ac)
+    _, profile_id = await _create_project_with_profile(
+        app, profile_name="analyst",
+    )
+    pid = f"proj-recover-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO projects (id, name, goal, state, coordinator_role, "
+        "accept_criteria, deliverable_path, max_iterations, "
+        "current_iteration, last_iteration_summary) "
+        "VALUES (?, 'recover test', 'x', 'planned', '', '', '', 0, 0, '')",
+        (pid,),
+    )
+    # Insert an existing preset with EMPTY content (user deleted it)
+    empty_preset_id = f"preset-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO project_soul_presets (id, project_id, profile_id, "
+        "role_name, content, default_soul, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'analyst', '', '', ?, ?)",
+        (empty_preset_id, pid, profile_id, "2026-08-02 12:00:00+08:00", "2026-08-02 12:00:00+08:00"),
+    )
+    plan = _build_plan_with_steps([
+        {"name": "s1", "action": "do_task", "agent_role": "analyst",
+         "default_soul": ""},
+    ])
+    stats = await _seed_soul_presets_from_plan(
+        app.state.db, pid, plan,
+        llm_souls={"analyst": "refilled by LLM"},
+        fill_empty_only=True,
+    )
+    # Empty content -> filled (created=1), id preserved
+    assert stats["presets_created"] == 1
+    assert stats["presets_skipped_existing"] == 0
+    presets = await _get_presets(app, pid)
+    assert len(presets) == 1
+    assert presets[0]["content"] == "refilled by LLM"
+    assert presets[0]["id"] == empty_preset_id  # same row id
+
+
+@pytest.mark.asyncio
+async def test_fill_empty_only_false_does_not_overwrite(client):
+    """fill_empty_only=False (default, plan-save behavior): existing
+    presets are NEVER overwritten, even if content is empty. Same
+    as the v3.10.4 behavior â€” preserved across the v3.10.5 change."""
+    from hermes_orch.api.plans import _seed_soul_presets_from_plan
+    ac, app = client
+    await _login_admin(ac)
+    _, profile_id = await _create_project_with_profile(
+        app, profile_name="analyst",
+    )
+    pid = f"proj-nooverwrite-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO projects (id, name, goal, state, coordinator_role, "
+        "accept_criteria, deliverable_path, max_iterations, "
+        "current_iteration, last_iteration_summary) "
+        "VALUES (?, 'nooverwrite', 'x', 'planned', '', '', '', 0, 0, '')",
+        (pid,),
+    )
+    # Existing preset (could be empty or not)
+    existing_id = f"preset-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO project_soul_presets (id, project_id, profile_id, "
+        "role_name, content, default_soul, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'analyst', 'whatever', 'whatever', ?, ?)",
+        (existing_id, pid, profile_id, "2026-08-02 12:00:00+08:00", "2026-08-02 12:00:00+08:00"),
+    )
+    plan = _build_plan_with_steps([
+        {"name": "s1", "action": "do_task", "agent_role": "analyst",
+         "default_soul": "fresh from step"},
+    ])
+    stats = await _seed_soul_presets_from_plan(
+        app.state.db, pid, plan,
+        llm_souls={"analyst": "fresh from LLM"},
+        # fill_empty_only NOT passed -> defaults to False
+    )
+    assert stats["presets_skipped_existing"] == 1
+    assert stats["presets_created"] == 0
+
+
+# ===== End-to-end: generate-soul endpoint with mocked LLM =====
+
+
+@pytest.mark.asyncio
+async def test_generate_soul_endpoint_calls_llm_and_uses_response(client, monkeypatch):
+    """E2E: POST /plan/generate-soul calls LLM, uses response to
+    fill empty presets, returns llm_call_status='ok'."""
+    ac, app = client
+    await _login_admin(ac)
+    await _create_project_with_profile(app, profile_name="analyst")
+    pid = f"proj-e2e-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO projects (id, name, goal, state, coordinator_role, "
+        "accept_criteria, deliverable_path, max_iterations, "
+        "current_iteration, last_iteration_summary) "
+        "VALUES (?, 'e2e', 'HK SME', 'planned', '', '', '', 0, 0, '')",
+        (pid,),
+    )
+    # Save a plan with empty default_soul (so generic would kick in
+    # if LLM didn't help)
+    r = await ac.put(
+        f"/api/projects/{pid}/plan",
+        json=_make_plan_json([
+            {"name": "s1", "action": "do_task", "agent_role": "analyst",
+             "default_soul": ""},
+        ]),
+    )
+    assert r.status_code == 200, r.text
+    # Delete the preset that plan-save created (with generic content)
+    # so we can verify LLM fills it
+    await app.state.db.execute(
+        "DELETE FROM project_soul_presets WHERE project_id = ?", (pid,)
+    )
+    # Mock httpx so the endpoint's LLM call returns our persona
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, **kw):
+            return _FakeResp(200, {
+                "choices": [{
+                    "message": {"content": json.dumps({
+                        "souls": {"analyst": "E2E LLM persona for HK SME analyst."}
+                    })},
+                    "finish_reason": "stop",
+                }],
+            })
+
+    class _FakeResp:
+        def __init__(self, sc, data):
+            self.status_code = sc
+            self._data = data
+        def json(self):
+            return self._data
+        @property
+        def text(self):
+            return json.dumps(self._data)
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    # Also set the app config to have a valid LLM block
+    app.state.config = {"llm": _make_llm_cfg()}
+    # Hit the endpoint
+    r = await ac.post(f"/api/projects/{pid}/plan/generate-soul")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["llm_call_status"] == "ok"
+    assert data["roles_used_llm_generated"] == 1
+    assert data["presets_created"] == 1
+    assert data["presets_skipped_existing"] == 0
+    # Verify the LLM persona actually made it into the DB
+    presets = await _get_presets(app, pid)
+    assert len(presets) == 1
+    assert presets[0]["content"] == "E2E LLM persona for HK SME analyst."
+
+
+@pytest.mark.asyncio
+async def test_generate_soul_endpoint_handles_llm_failure(client, monkeypatch):
+    """E2E: LLM call fails (HTTP 500) -> endpoint returns ok 200 with
+    llm_call_status='failed', seed helper falls back to step-level
+    / generic. User can still proceed."""
+    ac, app = client
+    await _login_admin(ac)
+    await _create_project_with_profile(app, profile_name="analyst")
+    pid = f"proj-fail-{uuid.uuid4().hex[:8]}"
+    await app.state.db.execute(
+        "INSERT INTO projects (id, name, goal, state, coordinator_role, "
+        "accept_criteria, deliverable_path, max_iterations, "
+        "current_iteration, last_iteration_summary) "
+        "VALUES (?, 'fail', 'x', 'planned', '', '', '', 0, 0, '')",
+        (pid,),
+    )
+    r = await ac.put(
+        f"/api/projects/{pid}/plan",
+        json=_make_plan_json([
+            {"name": "s1", "action": "do_task", "agent_role": "analyst",
+             "default_soul": "step-level fallback text"},
+        ]),
+    )
+    assert r.status_code == 200
+    await app.state.db.execute(
+        "DELETE FROM project_soul_presets WHERE project_id = ?", (pid,)
+    )
+    # Mock httpx to return 500
+    class _FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def post(self, url, **kw):
+            return _FakeResp(500, {"error": "boom"})
+
+    class _FakeResp:
+        def __init__(self, sc, data):
+            self.status_code = sc
+            self._data = data
+        def json(self):
+            return self._data
+        @property
+        def text(self):
+            return json.dumps(self._data)
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    app.state.config = {"llm": _make_llm_cfg()}
+    r = await ac.post(f"/api/projects/{pid}/plan/generate-soul")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["llm_call_status"] == "failed"
+    assert data["roles_used_llm_generated"] == 0
+    # Seed helper fell back to step-level text
+    presets = await _get_presets(app, pid)
+    assert len(presets) == 1
+    assert presets[0]["content"] == "step-level fallback text"
+

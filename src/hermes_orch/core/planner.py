@@ -42,7 +42,7 @@ Output format (STRICT — output ONLY this JSON object, no prose, no markdown):
       "action": "<verb or function name the agent will run>",
       "params": { "<key>": "<value>", ... },
       "required_capability": "<capability key the role MUST have, or null>",
-      "default_soul": "<REQUIRED 2-4 sentence persona text: who the agent is, what expertise they bring to this step, what tone/approach to use. Be specific to the role AND the step's purpose.>"
+      "default_soul": "<OPTIONAL 2-4 sentence persona text. NOT required \u2014 a dedicated LLM call at 'Generate Task' time writes project-specific personas with full project context. Only set this if you have a strong opinion about the persona; otherwise leave empty or set to null.>"
     },
     ...
   ]
@@ -73,32 +73,25 @@ Rules:
     pick the role with the most general storage and let the operator
     route the file manually.
 11. TERSENESS: keep `name` and `action` to ≤ 5 words each. No prose in any
-    field except `default_soul` (which is always 2-4 sentences). params
-    should be a small flat object (≤ 4 keys) with concrete values, not
-    long strings. The model's output token budget is tight; verbose
-    tasks get truncated and the plan fails. Stay terse.
-12. DEFAULT_SOUL: every task MUST include a `default_soul` string
-    (2-4 sentences). This is the SOUL persona text that gets applied
-    to the agent when this step is dispatched. The user can see +
-    edit it on the project page BEFORE clicking [▶ Run]. Without
-    `default_soul`, the user has to write one themselves or the
-    agent gets a generic fallback. Concrete examples:
-    - step "fetch macro data" with role "data-analyst":
-        "You are a data analyst specializing in macroeconomic
-        indicators. For this step, fetch the requested time series
-        from the configured source, verify the data is clean and
-        covers the requested period, and return a structured summary."
-    - step "summarize report" with role "writer":
-        "You are a technical writer. Read the upstream outputs,
-        synthesize them into a single coherent report for the
-        operator. Use clear language, cite the key data points,
-        and keep the executive summary under 200 words."
-    - step "code review" with role "reviewer":
-        "You are a senior engineer doing a code review. Focus on
-        correctness, security, and clarity. Be specific: cite
-        file:line for every issue, and propose a concrete fix."
-    Same role in two different steps can have different `default_soul`
-    if the steps' purposes differ — make it specific to the step.
+    field except `default_soul` (which, if set, is 2-4 sentences).
+    params should be a small flat object (≤ 4 keys) with concrete
+    values, not long strings. The model's output token budget is tight;
+    verbose tasks get truncated and the plan fails. Stay terse.
+12. DEFAULT_SOUL: `default_soul` is OPTIONAL as of v3.10.5. A
+    dedicated LLM call (`_generate_souls_via_llm` in
+    orchestrator.soul_dispatch) writes role-specific personas at
+    "Generate Task" time with full project context. Setting
+    `default_soul` here means "skip the LLM, use my text verbatim"
+    — useful for steps where you have a very specific persona in
+    mind (e.g. "You are a senior Python reviewer; only flag
+    correctness issues, ignore style"). For most steps, leave it
+    unset (empty string or null) and let the LLM handle it. If you
+    DO set it, the rules are unchanged from v3.10.4: 2-4 sentences,
+    specific to the role AND the step's purpose. The previous
+    "MUST include default_soul" rule (v3.10.4) was dropped because
+    it burned planner-token budget on a field the dedicated LLM
+    call can produce more accurately given the same project
+    context.
 """
 
 
