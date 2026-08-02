@@ -403,6 +403,23 @@
     body.dark .drawflow .connection .main-path.selected {
         stroke: #86efac !important;            /* emerald-300 (selected) */
     }
+    /* v3.11.1 (2026-08-03): loop-back (feedback_to) wire in dark mode.
+       The catch-all above paints ALL .main-path blue, which silently
+       overrides the light-mode red-dashed style on output_2 connections.
+       Keep output_2 red dashed in dark mode — it's a "data signal"
+       (mirrors the v3.7.0 status-color rule and the light-mode rule
+       on line ~145). Without this, the feedback_to wire in dark mode
+       looks identical to a chain wire, defeating the legend at the top
+       of the visual editor. Repro: open wf-ab4cca76755c (saving-game-v1)
+       in dark mode — check-total's loop-back wire to add-savings shows
+       blue solid instead of red dashed. */
+    body.dark .drawflow svg.connection.output_2 .main-path {
+        stroke: #dc2626 !important;            /* red-600, matches light mode */
+        stroke-dasharray: 5 3 !important;
+    }
+    body.dark .drawflow svg.connection.output_2 .main-path:hover {
+        stroke: #f87171 !important;            /* red-400 (hover) */
+    }
     /* "Add step" wrapper card (white bg + border) */
     body.dark .vf-canvas-wrap + div.bg-white,
     body.dark > div > div.bg-white.border {
