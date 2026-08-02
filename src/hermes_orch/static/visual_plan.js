@@ -268,11 +268,23 @@
     //   Ctrl+C            = copy selected step (skipped in text fields)
     //   Ctrl+V            = paste step        (skipped in text fields)
     //   Escape            = close side panel
-    // Undo/redo work EVERYWHERE including in text fields (matches
-    // native editor conventions; users expect Cmd+Z to work
-    // inside a textarea). Copy/paste defer to native browser
-    // behavior when focus is in a text input so users can still
-    // copy-paste within the side panel form fields.
+    //
+    // v3.10.8 (2026-08-02): undo/redo now ALSO skip text fields
+    // (input / textarea / contenteditable). Previously they fired
+    // everywhere — which meant Cmd+Z inside the chatbox textarea
+    // (the project page has chatbox docked at the bottom) was
+    // swallowed by the plan editor's undo and the user could not
+    // undo their chat text. The chatbox is part of the same page
+    // so its keydown bubbles up to this document-level handler.
+    // Letting the native textarea undo work is the expected UX
+    // (Cmd+Z inside a text field should always be the field's own
+    // undo). The plan editor's undo still works on the canvas and
+    // in the side-panel read-only / non-text controls.
+    //
+    // Copy/paste were already text-field-aware in v2.2. Escape
+    // only fires when ctrl is NOT held, so it never collides with
+    // text-field Escape behavior (most text fields treat Esc as
+    // "blur" which is fine to coexist with closing the side panel).
     function _bindGlobalShortcuts() {
         if (window._vpShortcutsBound) return;
         window._vpShortcutsBound = true;
@@ -308,7 +320,13 @@
             const key = e.key.toLowerCase();
             const tag = (e.target && e.target.tagName || '').toLowerCase();
             const isTextField = tag === 'input' || tag === 'textarea' || (e.target && e.target.isContentEditable);
-            // Undo / Redo — work everywhere
+            // v3.10.8: Undo / Redo defer to the native text-field
+            // undo when focus is in a text field. Outside text
+            // fields, they act on the plan editor history.
+            if (isTextField) {
+                return;  // let the browser handle Ctrl+Z/Y/C/V
+            }
+            // Undo / Redo — work everywhere except text fields
             if (key === 'z' && !e.shiftKey) {
                 e.preventDefault();
                 _undo();

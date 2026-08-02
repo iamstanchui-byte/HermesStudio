@@ -146,11 +146,23 @@
     }
     // Keyboard shortcuts: Ctrl+Z = undo, Ctrl+Y or Ctrl+Shift+Z = redo.
     // We bind to the document and skip when focus is in a text
-    // input (so the user's typing isn't hijacked) UNLESS the editor
-    // is focused and the shortcut was an explicit Ctrl+ combo.
+    // input (so the user's typing isn't hijacked).
+    //
+    // v3.10.8 (2026-08-02): actually skip text fields (the original
+    // comment claimed this but the code never did). Without this,
+    // Ctrl+Z inside the chatbox textarea or any side-panel form
+    // field was swallowed by the editor undo and the user couldn't
+    // undo their typed text. Copy/paste was already text-field-aware
+    // (see _bindCopyPasteShortcuts below) — undo/redo was the
+    // missing piece. Mirrors the same fix in visual_plan.js.
     document.addEventListener('keydown', (e) => {
         const ctrl = e.ctrlKey || e.metaKey;
         if (!ctrl) return;
+        // Skip text fields so the native textarea/input undo works.
+        const tag = (e.target && e.target.tagName || '').toLowerCase();
+        const isTextField = tag === 'input' || tag === 'textarea'
+            || (e.target && e.target.isContentEditable);
+        if (isTextField) return;
         const key = e.key.toLowerCase();
         // Ctrl+Z (no shift) = undo; Ctrl+Shift+Z or Ctrl+Y = redo
         if (key === 'z' && !e.shiftKey) {

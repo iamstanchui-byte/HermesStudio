@@ -3331,31 +3331,67 @@ def _looks_like_plan_proposal(text: str) -> bool:
     we want the Apply button to appear so the user can create the
     structured plan via /plan/from-llm.
 
-    The check is intentionally loose -- false positives just show an
-    extra button the user can ignore; false negatives hide a useful
-    action. The user is still in control -- they only Apply if the
-    message actually represents a plan they want.
+    v3.10.8 (2026-08-02): tightened the heuristic. The old v3.10.5
+    version was too loose — it accepted ANY message that mentioned
+    the word "步" (step) or was just long (>= 200 chars). That fired
+    on clarifying questions, storage-option discussions, and any
+    other long reply that mentioned an existing step. User reported
+    "Create plan from this conversation" appearing on every reply
+    (screenshot 2026-08-02 19:51 on proj-c7ad42e6). The new rules:
+
+      1. EXCLUDE responses that end with a clarifying question
+         (e.g. "你傾向哪一個?") UNLESS the question is itself asking
+         to create a plan (e.g. "Want me to create this plan?")
+      2. REQUIRE either a numbered list with 2+ items OR an
+         "ask-to-create-plan" closing phrase
+      3. Drop the >= 200 char fallback entirely (length is not
+         a signal of plan-ness)
+
+    False positives hide a useful action. False negatives just show
+    an extra "Create plan" button the user can ignore — so we err
+    on the strict side and require a real plan structure marker.
     """
     if not text or not text.strip():
         return False
-    t = text.lower()
-    # Heuristic 1: mentions a planning verb (設計 / 計劃 / 步驟 /
-    # step / plan / design / 5 步 / 5-step / phase / stage / 階段).
-    # These are common words the LLM uses when describing a plan.
-    plan_keywords = [
-        "步驟", "步", "step", "plan", "計劃", "計畫", "設計", "design",
-        "phase", "stage", "階段", "step-by-step", "dag",
-        "5-step", "4-step", "3-step", "6-step",
+    t = text.strip()
+    # Negative gate 1: ends with a clarifying question that is NOT
+    # asking to create a plan. The chat LLM is told to end plan
+    # proposals with "Want me to create this plan?" (or zh-HK
+    # equivalent). Any other "?" at the end is a clarification.
+    if t.endswith(("?", "？")):
+        tail = t[-200:].lower()
+        create_intent = any(
+            p in tail for p in (
+                "create", "create this plan", "want me to create",
+                "要我建立", "要我生成", "幫我建立", "幫我生成",
+                "幫我整", "幫我寫", "是否要", "要不要",
+                "要唔要",
+            )
+        )
+        if not create_intent:
+            return False
+    # Positive 1: numbered list with 2+ items. Supports:
+    #   1) ...  2) ...  (ASCII paren)
+    #   1. ...  2. ...  (ASCII dot)
+    #   1、...  2、...  (Chinese ideographic comma)
+    list_count = max(
+        len(re.findall(r"^\s*\d+[.)]\s+\S", t, re.MULTILINE)),
+        len(re.findall(r"^\s*\d+、\s*\S", t, re.MULTILINE)),
+    )
+    if list_count >= 2:
+        return True
+    # Positive 2: explicit "ask to create plan" closing. The chat
+    # LLM is trained to use phrases like "Want me to create this
+    # plan?" or "要我建立呢個 plan?". Match loosely.
+    lower = t.lower()
+    create_phrases = [
+        "want me to create", "want you to create", "shall i create",
+        "should i create", "create this plan", "create the plan",
+        "create a plan", "create this project plan",
+        "要我建立", "要我生成", "幫我建立", "幫我生成",
+        "幫我整個 plan", "建立呢個 plan", "生成呢個 plan",
     ]
-    if any(kw in t for kw in plan_keywords):
-        return True
-    # Heuristic 2: has numbered list (1) 2) 3) or 1. 2. 3.) which
-    # usually means the LLM is describing steps.
-    if re.search(r"^\s*[1-9][.)]\s+\S", text, re.MULTILINE):
-        return True
-    # Heuristic 3: long response (>= 200 chars) -- LLM probably
-    # wrote a structured answer worth applying.
-    if len(text.strip()) >= 200:
+    if any(p in lower for p in create_phrases):
         return True
     return False
 

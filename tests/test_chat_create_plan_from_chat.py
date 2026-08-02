@@ -122,35 +122,109 @@ def test_extract_suggestions_keeps_unmatched_open_fence():
 
 
 # ===== Unit tests for _looks_like_plan_proposal =====
+#
+# v3.10.8 (2026-08-02): heuristic tightened. Mentions of "步" or
+# "plan" alone are no longer enough — the user complained that
+# "Create plan from this conversation" was appearing on EVERY chat
+# reply (screenshot 2026-08-02 19:51 on proj-c7ad42e6 showed it on
+# a clarifying question about storage options, not a plan proposal).
+# New rule: numbered list (2+ items) OR explicit "create this plan"
+# closing phrase. Long-response fallback removed.
 
 
-def test_looks_like_plan_proposal_with_keywords():
-    """Mentions '步驟' or 'plan' or 'step' -> True."""
+def test_looks_like_plan_proposal_with_numbered_list_zh():
+    """Chinese numbered list `1) ... 2) ...` on separate lines -> True."""
     from hermes_orch.api.projects import _looks_like_plan_proposal
-    assert _looks_like_plan_proposal("我會做 5 步: 1) research 2) analyze 3) write") is True
-    assert _looks_like_plan_proposal("I'll create a 3-step plan for you") is True
-    assert _looks_like_plan_proposal("Here is the proposed design") is True
+    text = (
+        "我會做 5 步:\n"
+        "1) research HK SME landscape\n"
+        "2) analyze debug-loop risks\n"
+        "3) compare LLM / tool options\n"
+        "4) cost analysis\n"
+        "5) write Traditional Chinese report"
+    )
+    assert _looks_like_plan_proposal(text) is True
 
 
-def test_looks_like_plan_proposal_with_numbered_list():
-    """Has numbered list (1) 2) 3)) -> True."""
+def test_looks_like_plan_proposal_with_numbered_list_en():
+    """English numbered list -> True."""
     from hermes_orch.api.projects import _looks_like_plan_proposal
     text = "Steps to take:\n1) gather data\n2) analyze\n3) write report"
     assert _looks_like_plan_proposal(text) is True
 
 
-def test_looks_like_plan_proposal_with_long_response():
-    """Long response (>= 200 chars) -> True."""
+def test_looks_like_plan_proposal_with_chinese_comma_list():
+    """Chinese `1、... 2、... 3、...` numbering -> True."""
+    from hermes_orch.api.projects import _looks_like_plan_proposal
+    text = "方案:\n1、搜集資料\n2、分析數據\n3、撰寫報告"
+    assert _looks_like_plan_proposal(text) is True
+
+
+def test_looks_like_plan_proposal_with_closing_question():
+    """Ends with 'Want me to create this plan?' -> True (the
+    canonical plan-proposal closing per the chat system prompt)."""
+    from hermes_orch.api.projects import _looks_like_plan_proposal
+    assert _looks_like_plan_proposal(
+        "Here's a 3-step approach: gather data, analyze, write. "
+        "Want me to create this plan?"
+    ) is True
+    assert _looks_like_plan_proposal(
+        "我建議分 3 步做: 1) 搜集 2) 分析 3) 寫報告。要我建立呢個 plan?"
+    ) is True
+
+
+def test_looks_like_plan_proposal_long_response_only():
+    """Long response (>= 200 chars) WITHOUT a list or create
+    closing -> False. v3.10.8 removed the 200-char fallback
+    because it fired on every long reply (user feedback)."""
     from hermes_orch.api.projects import _looks_like_plan_proposal
     long_text = "I will help you with this. " + ("a" * 200)
-    assert _looks_like_plan_proposal(long_text) is True
+    assert _looks_like_plan_proposal(long_text) is False
+
+
+def test_looks_like_plan_proposal_storage_question():
+    """The proj-c7ad42e6 repro (2026-08-02 19:51): the assistant
+    explained two storage options and asked which the user prefers.
+    The reply contains the word "步驟" (mentioned in passing) and
+    is well over 200 chars. v3.10.8 returns False — this is a
+    clarifying question, not a plan proposal."""
+    from hermes_orch.api.projects import _looks_like_plan_proposal
+    text = (
+        "你擔心得有道理。從目前的靈魂設定和依賴關係來看,**super** 的 "
+        "`finalize_summary` 應該是讀取前面步驟任務輸出 (project shared "
+        "cache / task outputs) 來做總結,而不是直接去 Google Drive 抓資料"
+        "── 因為 win-agent01 和 win-agent02 的 `verify_gdrive` 結果會"
+        "寫回各自的任務輸出,super 透過依賴獲取得到。\n\n"
+        "不過既然 super 沒裝 Google Drive API,如果它要附上報告檔案就"
+        "沒地方放。兩個解法:\n\n"
+        "**A** 維持現狀:super 只在共享快取產出純文字總結,不寫檔。"
+        "簡單但沒有最終檔案輸出。\n\n"
+        "**B** 把 summary 交給 win-agent01 或 win-agent02(在寫偏好檔"
+        "那個步驟之後),它可以直接用 Google Drive 存檔。比較保險。\n\n"
+        "你傾向哪一個?"
+    )
+    assert _looks_like_plan_proposal(text) is False
 
 
 def test_looks_like_plan_proposal_short_question():
     """Short question -> False."""
     from hermes_orch.api.projects import _looks_like_plan_proposal
     assert _looks_like_plan_proposal("What do you mean?") is False
+    assert _looks_like_plan_proposal("你傾向哪一個?") is False
     assert _looks_like_plan_proposal("Hi") is False
+
+
+def test_looks_like_plan_proposal_mentioning_step_word():
+    """Just mentioning 'step' or '步' is not enough (v3.10.8
+    tightened). A 1-line response that references an existing
+    step in passing should NOT trigger the suggestion."""
+    from hermes_orch.api.projects import _looks_like_plan_proposal
+    assert _looks_like_plan_proposal(
+        "那個步驟之後就會用到 cache,不用擔心。"
+    ) is False
+    assert _looks_like_plan_proposal(
+        "Sure, the next step will handle that. Let me know."
+    ) is False
 
 
 def test_looks_like_plan_proposal_empty():
