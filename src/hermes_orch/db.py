@@ -11,6 +11,7 @@ Per REVIEW.md §3-§6, the DB stores denormalized views of:
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -768,9 +769,68 @@ class Database:
         return self._conn
 
     async def execute(self, sql: str, params: tuple = ()) -> aiosqlite.Cursor:
+        # Inside a `transaction()` block, defer the commit to the
+        # outer context manager. Outside, commit immediately (the
+        # legacy per-call-commit behavior — too many call sites
+        # depend on it to change without a wrapper layer).
         async with self.conn.execute(sql, params) as cur:
-            await self.conn.commit()
+            if not getattr(self, "_in_tx", False):
+                await self.conn.commit()
             return cur
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Atomic block. Yields once; on normal exit COMMIT, on
+        exception ROLLBACK.
+
+        SQLite serializes writers; BEGIN IMMEDIATE acquires the
+        write lock upfront so two concurrent dispatchers can't
+        both pass the "no live duplicate" check before either
+        commits (the race that motivated this).
+
+        Usage:
+            async with db.transaction():
+                await db.execute("UPDATE ...")
+                await db.execute("INSERT INTO ...")
+                await db.execute("INSERT INTO audit_log ...")
+
+        All `db.execute()` calls inside the block are buffered
+        in the same transaction; a single COMMIT (or ROLLBACK
+        on exception) covers all of them.
+        """
+        # aiosqlite defaults `isolation_level=""` which implicitly
+        # opens a read transaction on the first SELECT. Without
+        # flushing it, `BEGIN IMMEDIATE` raises
+        # `cannot start a transaction within a transaction`. The
+        # explicit COMMIT is a no-op when no writes are pending
+        # (and `db.execute()` already commits each write on
+        # normal exit), so this is safe in both clean and dirty
+        # states.
+        try:
+            await self.conn.commit()
+        except Exception:
+            # Connection might not be open yet (e.g. unit tests
+            # that build a Database without calling connect()).
+            # Fall through; BEGIN will raise a clearer error.
+            pass
+        await self.conn.execute("BEGIN IMMEDIATE")
+        prev = getattr(self, "_in_tx", False)
+        self._in_tx = True
+        try:
+            yield
+        except BaseException:
+            try:
+                await self.conn.execute("ROLLBACK")
+            except Exception:
+                # Connection may already be in a bad state; let the
+                # outer `close()` handle it. The original exception
+                # is what the caller cares about.
+                pass
+            raise
+        else:
+            await self.conn.commit()
+        finally:
+            self._in_tx = prev
 
     async def fetchone(self, sql: str, params: tuple = ()) -> dict[str, Any] | None:
         async with self.conn.execute(sql, params) as cur:

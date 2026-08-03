@@ -44,9 +44,16 @@ import uuid
 from typing import Any, Mapping, Union
 
 from hermes_orch.api.projects import get_soul_preset_by_role, touch_soul_preset
+from hermes_orch.core.audit import audit_log
 from hermes_orch.db import Database
 from hermes_orch.orchestrator.routing import resolve_role_to_profile
 from hermes_orch.utils import now_iso as _now_iso
+# v3.12.1 hardening: use utils.now_iso (free function) instead of
+# importing `_now_iso` from supervisor. supervisor does a function-local
+# `from ... import soul_dispatch` (see supervisor._dispatch_via_soul_dispatch),
+# so any module-level import back to supervisor would create a circular
+# dep. utils is leaf-level, safe to alias at module scope.
+from hermes_orch.utils import now_iso as _now_inner
 
 
 # A "step" can come in two shapes:
@@ -700,6 +707,7 @@ async def _create_dispatched_task(
         The newly inserted tasks row (dict).
     """
     step_name = step_dict.get("name") or ""
+    task_id = str(uuid.uuid4())
     # v3.12.1: archive older same-name live tasks (skip 'running'
     # to avoid disrupting in-flight wrappers). The supervisor's
     # v3.12.1 dedupe (NOT EXISTS subquery in _find_ready_tasks) is
@@ -709,81 +717,97 @@ async def _create_dispatched_task(
     # check-total from apply-workflow) + 0407f925-... (new
     # check-total from SOUL dispatch) both got dispatched, ~2x
     # LLM cost per loopback iteration.
-    if step_name:
-        archived = await db.fetchall(
-            "SELECT id, status FROM tasks "
-            "WHERE project_id = ? AND name = ? AND archived = 0 "
-            "AND status IN ('pending', 'dispatched', 'assigned', 'failed', 'skipped')",
-            (project_id, step_name),
-        )
-        if archived:
-            from hermes_orch.core.audit import audit_log
-            from hermes_orch.core.supervisor import _now_iso as _now_inner
-            ids = [r["id"] for r in archived]
-            placeholders = ",".join("?" for _ in ids)
-            await db.execute(
-                "UPDATE tasks SET archived = 1, updated_at = ? "
-                f"WHERE id IN ({placeholders})",
-                [_now_inner(), *ids],
+    #
+    # v3.12.1 hardening: wrap archive + insert in a single
+    # `db.transaction()` (BEGIN IMMEDIATE … COMMIT) so two
+    # concurrent dispatchers for the same `(project_id, name)` pair
+    # can't both pass the "no live duplicate" check before either
+    # commits. Without the transaction, the archive and the insert
+    # are separate statements; with SQLite's default DEFERRED
+    # transactions, the read + write don't acquire the write lock
+    # upfront, and the second dispatcher can race through the same
+    # `fetchall` window. BEGIN IMMEDIATE acquires the write lock at
+    # block entry, so the second dispatcher blocks on `BEGIN` until
+    # the first commits (or rolls back). Net effect: even if the
+    # archive path had a bug, the second dispatcher can't sneak a
+    # duplicate row in.
+    async with db.transaction():
+        if step_name:
+            archived = await db.fetchall(
+                "SELECT id, status FROM tasks "
+                "WHERE project_id = ? AND name = ? AND archived = 0 "
+                "AND status IN ('pending', 'dispatched', 'assigned', 'failed', 'skipped')",
+                (project_id, step_name),
             )
-            for old in archived:
-                await audit_log(
-                    db, "task.archived_on_soul_dispatch",
-                    actor="supervisor",
-                    project_id=project_id,
-                    task_id=old["id"],
-                    payload={
-                        "name": step_name,
-                        "old_status": old["status"],
-                        "reason": "soul_dispatch_replaced",
-                    },
+            if archived:
+                ids = [r["id"] for r in archived]
+                placeholders = ",".join("?" for _ in ids)
+                await db.execute(
+                    "UPDATE tasks SET archived = 1, updated_at = ? "
+                    f"WHERE id IN ({placeholders})",
+                    [_now_inner(), *ids],
                 )
+                for old in archived:
+                    await audit_log(
+                        db, "task.archived_on_soul_dispatch",
+                        actor="supervisor",
+                        project_id=project_id,
+                        task_id=old["id"],
+                        payload={
+                            "name": step_name,
+                            "old_status": old["status"],
+                            "reason": "soul_dispatch_replaced",
+                        },
+                    )
 
-        task_id = str(uuid.uuid4())
-    # Pydantic v2 keeps `depends_on` / `feedback_to` as list[str];
-    # JSON-encode for the TEXT column to keep parity with
-    # `create_task`. `_jsonify` in db.insert handles dicts/lists,
-    # but we pre-encode here so the round-trip is exact.
-    depends_json = json.dumps(list(step_dict.get("depends_on") or []))
-    feedback_json = json.dumps(list(step_dict.get("feedback_to") or []))
-    # Map plural `required_capabilities` â†’ singular
-    # `required_capability`. Use the first entry (matching how the
-    # chatbox plan editor currently emits single-capability steps).
-    req_caps = step_dict.get("required_capabilities") or []
-    if isinstance(req_caps, list) and req_caps:
-        required_capability = req_caps[0]
-    else:
-        # Fall back to the legacy singular field if present.
-        required_capability = step_dict.get("required_capability") or None
-    await db.insert(
-        "tasks",
-        {
-            "id": task_id,
-            "project_id": project_id,
-            "name": step_dict.get("name") or "",
-            "agent_role": step_dict.get("agent_role") or "",
-            # v3.9.0: also set `assigned_agent_id` so the supervisor's
-            # per-agent cap check (`COUNT(*) WHERE assigned_agent_id = ?
-            # AND status IN ('assigned','running')`) sees this new task
-            # on the next tick. Without this, the cap count is off by
-            # one for Round-3 dispatched tasks and the agent can be
-            # over-committed. The `agent_id` column on the profile row
-            # is the parent agent (set by the routing engine's JOIN
-            # in `_list_online_profiles` / `_get_profile_row`).
-            "assigned_profile_id": profile["id"],
-            "assigned_agent_id": profile.get("agent_id"),
-            "depends_on": depends_json,
-            "feedback_to": feedback_json,
-            "status": "pending",
-            "action": step_dict.get("action") or "do_step",
-            "required_capability": required_capability,
-            "output_path": step_dict.get("output_path") or None,
-            # params_template is the v3.5.x way to carry per-step
-            # variables; serialise as JSON so the supervisor sees the
-            # same shape it would from a POST /tasks call.
-            "params": json.dumps(step_dict.get("params_template") or {}),
-        },
-    )
+        # Pydantic v2 keeps `depends_on` / `feedback_to` as list[str];
+        # JSON-encode for the TEXT column to keep parity with
+        # `create_task`. `_jsonify` in db.insert handles dicts/lists,
+        # but we pre-encode here so the round-trip is exact.
+        depends_json = json.dumps(list(step_dict.get("depends_on") or []))
+        feedback_json = json.dumps(list(step_dict.get("feedback_to") or []))
+        # Map plural `required_capabilities` â†’ singular
+        # `required_capability`. Use the first entry (matching how the
+        # chatbox plan editor currently emits single-capability steps).
+        req_caps = step_dict.get("required_capabilities") or []
+        if isinstance(req_caps, list) and req_caps:
+            required_capability = req_caps[0]
+        else:
+            # Fall back to the legacy singular field if present.
+            required_capability = step_dict.get("required_capability") or None
+        await db.insert(
+            "tasks",
+            {
+                "id": task_id,
+                "project_id": project_id,
+                "name": step_dict.get("name") or "",
+                "agent_role": step_dict.get("agent_role") or "",
+                # v3.9.0: also set `assigned_agent_id` so the supervisor's
+                # per-agent cap check (`COUNT(*) WHERE assigned_agent_id = ?
+                # AND status IN ('assigned','running')`) sees this new task
+                # on the next tick. Without this, the cap count is off by
+                # one for Round-3 dispatched tasks and the agent can be
+                # over-committed. The `agent_id` column on the profile row
+                # is the parent agent (set by the routing engine's JOIN
+                # in `_list_online_profiles` / `_get_profile_row`).
+                "assigned_profile_id": profile["id"],
+                "assigned_agent_id": profile.get("agent_id"),
+                "depends_on": depends_json,
+                "feedback_to": feedback_json,
+                "status": "pending",
+                "action": step_dict.get("action") or "do_step",
+                "required_capability": required_capability,
+                "output_path": step_dict.get("output_path") or None,
+                # params_template is the v3.5.x way to carry per-step
+                # variables; serialise as JSON so the supervisor sees the
+                # same shape it would from a POST /tasks call.
+                "params": json.dumps(step_dict.get("params_template") or {}),
+            },
+        )
+
+    # Read-back happens OUTSIDE the transaction — no longer need
+    # the write lock to fetch a single row, and we want other
+    # dispatchers to be able to proceed as soon as we COMMIT.
     row = await db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
     if not row:
         raise SoulApplyError(
