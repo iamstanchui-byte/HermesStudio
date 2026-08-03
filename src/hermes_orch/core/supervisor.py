@@ -191,18 +191,33 @@ class Supervisor:
         # so the planner has a fresh cross-project summary from the
         # first goal it sees. Non-blocking -- if it fails, the manual
         # POST /memory/recent/regenerate endpoint is the fallback.
+        # v3.12.2 hang-investigation: print() (not log.info) used here
+        # because root logger is at WARNING + has no handler, so
+        # log.info() never reaches the server's stderr/stdout. We need
+        # a checkpoint to confirm whether this fire-and-forget task is
+        # where the supervisor hangs. If we never see the second print,
+        # the spawn itself hangs (extremely unlikely). If we see the
+        # second print but supervisor still hangs on the next tick,
+        # regenerate_recent_async is the hang point.
+        print("SUPERVISOR_CHECKPOINT: start() about to spawn regenerate_recent_async", flush=True)
         try:
             from hermes_orch.core.memory import get_memory_writer
             from hermes_orch.core.synthesis import get_recent_generator
             recent_gen = get_recent_generator(db=self.db)
             memory = get_memory_writer()
-            asyncio.create_task(
+            recent_task = asyncio.create_task(
                 recent_gen.regenerate_recent_async(
                     memory_writer=memory, trigger="startup"
                 ),
                 name="hermes-recent-regen",
             )
+            print(
+                f"SUPERVISOR_CHECKPOINT: start() regenerate_recent_async task "
+                f"spawned, id={id(recent_task)}, name={recent_task.get_name()!r}",
+                flush=True,
+            )
         except Exception as e:
+            print(f"SUPERVISOR_CHECKPOINT: start() regen trigger failed: {e}", flush=True)
             log.warning(f"startup recent regen trigger failed: {e}")
         log.info(f"supervisor started; interval={self.interval}s")
 
@@ -2014,11 +2029,23 @@ class Supervisor:
         tid = task["id"]
         role = task["agent_role"]
         is_single = bool(task.get("is_single_task"))
+        # v3.12.2 hang-investigation: print() (not log.info) used here
+        # for the same reason as in start() -- root logger is at WARNING
+        # + has no handler. If we see the first print but not the
+        # second, the hang is in the aiosqlite fetchone call. If we see
+        # both but the supervisor still doesn't progress, the hang is
+        # downstream in the role/profile matching logic.
+        print(f"SUPERVISOR_CHECKPOINT: _assign_task about to fetchone for task={tid}", flush=True)
         # Re-read to avoid races
         cur = await self.db.fetchone(
             "SELECT id, status, project_id, agent_role, required_capability "
             "FROM tasks WHERE id = ?",
             (tid,),
+        )
+        print(
+            f"SUPERVISOR_CHECKPOINT: _assign_task fetchone returned for task={tid} "
+            f"(cur={'None' if cur is None else 'row'})",
+            flush=True,
         )
         if not cur or cur["status"] != "pending":
             return False
