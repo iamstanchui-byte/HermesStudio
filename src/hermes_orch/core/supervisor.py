@@ -157,6 +157,15 @@ class Supervisor:
         # loop); auto-rotation keeps the main DB small without the
         # operator having to remember to cron it.
         self._last_audit_sweep_at: "datetime | None" = None
+        # v3.12.1 follow-up #3: per-(project_id, name) duplicate running
+        # rows detector. Populated by `_check_duplicate_running` on every
+        # supervisor tick; read by the dashboard warning banner via
+        # `get_duplicate_running_projects()`. Format: {project_id: [name, ...]}.
+        # Empty dict = invariant holds. A non-empty entry means at least one
+        # step name in that project has >1 'running' task — the cheapest
+        # possible early-warning signal for a regression in either the
+        # archive path (ea26b40) or the dedupe query (000cce6).
+        self._duplicate_running_projects: dict[str, list[str]] = {}
         # CleanupJob reference (set by main.py after construction).
         # supervisor only invokes it; the same instance is also exposed
         # via app.state.cleanup for the API endpoints.
@@ -337,6 +346,15 @@ class Supervisor:
                 log.info(f"cleared {cur.rowcount} ghost current_task_id reference(s)")
         except Exception as e:
             log.debug(f"ghost-ref scan failed: {e}")
+
+        # v3.12.1 follow-up #3: duplicate-running invariant check.
+        # Runs every tick. Cheap (one GROUP BY). Feeds the dashboard
+        # warning banner so a regression in either dispatch-dedupe
+        # layer is visible without scanning audit logs.
+        try:
+            await self._check_duplicate_running()
+        except Exception as e:
+            log.debug(f"duplicate-running check crashed: {e}")
 
         # Stuck-task check: if a 'running' task's last_liveness_at is
         # stale (>3 min), the wrapper has either died, lost network,
@@ -1032,6 +1050,130 @@ class Supervisor:
                 f"will delete from local hermes backends on next heartbeat."
             )
         return report
+
+    # ===== v3.12.1 invariant: no duplicate running tasks per step name =====
+    #
+    # Rationale (per docs/v3.12.1-duplicate-dispatch-fix.md):
+    # The 2-layer defense (ea26b40 archive + 000cce6 dedupe) prevents
+    # the same step from being dispatched twice. If a regression ever
+    # re-introduces the proj-29b2990d bug, we want the dashboard to
+    # surface the affected projects BEFORE the duplicate-dispatch
+    # doubles the LLM cost. This check runs every tick (cheap: one
+    # GROUP BY query), and the cache feeds the dashboard banner.
+    #
+    # Cost: 1 SQL per ~5s tick. With idx_tasks_status covering `status`,
+    # the query stays fast even at 10k+ tasks.
+
+    async def _check_duplicate_running(self) -> None:
+        """Detect and warn on duplicate 'running' rows per (project_id, name).
+
+        Updates `self._duplicate_running_projects` in place. Emits
+        `project.duplicate_running_detected` audit events for newly
+        detected violations, and `project.duplicate_running_resolved`
+        when a previously-flagged project comes back to clean.
+        Cheap to run on every tick (one GROUP BY scan over the
+        active task set).
+        """
+        try:
+            rows = await self.db.fetchall(
+                "SELECT project_id, name, COUNT(*) AS n, "
+                "       GROUP_CONCAT(id, ',') AS task_ids "
+                "FROM tasks "
+                "WHERE status = 'running' AND archived = 0 "
+                "GROUP BY project_id, name "
+                "HAVING COUNT(*) > 1"
+            )
+        except Exception as e:
+            log.debug(f"duplicate-running scan failed: {e}")
+            return
+
+        # Build a fresh snapshot of currently-flagged (project, name) pairs.
+        current: dict[str, set[str]] = {}
+        for r in rows:
+            current.setdefault(r["project_id"], set()).add(r["name"])
+
+        # Compare against the previous cache. Newly detected -> audit + warn.
+        previous = self._duplicate_running_projects  # {pid: [name, ...]}
+        previous_set: dict[str, set[str]] = {
+            pid: set(names) for pid, names in previous.items()
+        }
+        for pid, names in current.items():
+            new_names = names - previous_set.get(pid, set())
+            for name in new_names:
+                # Find the task ids for the audit payload.
+                matching = [
+                    r for r in rows
+                    if r["project_id"] == pid and r["name"] == name
+                ]
+                task_ids = (
+                    matching[0]["task_ids"].split(",") if matching else []
+                )
+                try:
+                    await audit_log(
+                        self.db,
+                        "project.duplicate_running_detected",
+                        actor="supervisor",
+                        project_id=pid,
+                        payload={
+                            "name": name,
+                            "count": matching[0]["n"] if matching else 0,
+                            "task_ids": task_ids,
+                            "reason": "duplicate_running_invariant_violated",
+                        },
+                    )
+                except Exception as e:
+                    log.debug(f"audit_log duplicate_running_detected failed: {e}")
+                log.warning(
+                    f"duplicate-running invariant violated: "
+                    f"project={pid} name={name!r} count={matching[0]['n'] if matching else 0} "
+                    f"task_ids={task_ids}"
+                )
+
+        # Resolved -> audit so operators can see when the warning cleared.
+        for pid, names in previous_set.items():
+            resolved_names = names - current.get(pid, set())
+            for name in resolved_names:
+                try:
+                    await audit_log(
+                        self.db,
+                        "project.duplicate_running_resolved",
+                        actor="supervisor",
+                        project_id=pid,
+                        payload={
+                            "name": name,
+                            "reason": "duplicate_running_invariant_cleared",
+                        },
+                    )
+                except Exception as e:
+                    log.debug(f"audit_log duplicate_running_resolved failed: {e}")
+                log.info(
+                    f"duplicate-running invariant cleared: "
+                    f"project={pid} name={name!r}"
+                )
+
+        # Refresh the cache: {pid: sorted list of duplicate names}.
+        # Empty when invariant holds.
+        self._duplicate_running_projects = {
+            pid: sorted(names) for pid, names in current.items()
+        }
+
+    def get_duplicate_running_projects(self) -> dict[str, list[str]]:
+        """Read-only view of the duplicate-running cache.
+
+        Used by the dashboard warning banner via
+        GET /api/projects/{id}/diagnostics. Returns a fresh copy
+        so callers can't mutate the supervisor's internal state.
+        """
+        return {
+            pid: list(names)
+            for pid, names in self._duplicate_running_projects.items()
+        }
+
+    def get_duplicate_running_for_project(self, project_id: str) -> list[str]:
+        """Convenience: return the list of duplicate names for a
+        specific project. Empty list = invariant holds for that project.
+        """
+        return list(self._duplicate_running_projects.get(project_id, []))
 
     # ===== execution (ready / running) =====
 

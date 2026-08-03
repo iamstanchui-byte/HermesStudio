@@ -1954,6 +1954,89 @@ async def regenerate_recent(request: Request) -> dict:
     return {"ok": True, "regenerating": True}
 
 
+# ===== v3.12.1 follow-up #3: project diagnostics =====
+#
+# The supervisor's `_check_duplicate_running` runs every tick
+# (one GROUP BY query) and caches per-project duplicate-name
+# lists in `self._duplicate_running_projects`. This endpoint
+# exposes that cache so the dashboard can render a warning
+# banner if a regression in the dispatch-dedupe defense
+# (ea26b40 archive + 000cce6 NOT EXISTS) lets duplicate
+# 'running' rows through.
+#
+# Cost: O(1) in-memory lookup. Safe to call from every page
+# render. Returns 200 with `duplicate_running: false` for
+# clean projects (the common case); `duplicate_running: true`
+# + the list of duplicate names + a counts map for affected ones.
+
+
+@router.get("/{project_id}/diagnostics")
+async def get_project_diagnostics(
+    project_id: str,
+    request: Request,
+) -> dict:
+    """Return supervisor-level diagnostics for a project.
+
+    Currently: the duplicate-running invariant status. If any
+    step name in this project has more than one 'running' task,
+    `duplicate_running` is `true` and `duplicate_running_names`
+    lists the offending step names. `duplicate_running_counts`
+    maps each such name to the number of running rows.
+
+    The supervisor's cache is in-memory and refreshed on every
+    tick (~every 5s). If you see `duplicate_running: false`,
+    the invariant holds at the most recent tick.
+    """
+    db = request.app.state.db
+    project = await db.fetchone(
+        "SELECT id, name FROM projects WHERE id = ?", (project_id,)
+    )
+    if not project:
+        raise HTTPException(404, f"Project not found: {project_id}")
+
+    # Pull the supervisor's cache. If the supervisor isn't
+    # attached (e.g. in unit tests), default to "clean" so the
+    # endpoint is still useful for unrelated callers.
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is None:
+        duplicate_names: list[str] = []
+    else:
+        try:
+            duplicate_names = supervisor.get_duplicate_running_for_project(
+                project_id
+            )
+        except Exception:
+            duplicate_names = []
+
+    # For each duplicate name, also report the count of running rows
+    # (useful for "is this 2 or 20?" — operator triage signal).
+    counts: dict[str, int] = {}
+    if duplicate_names:
+        try:
+            placeholders = ",".join("?" for _ in duplicate_names)
+            rows = await db.fetchall(
+                "SELECT name, COUNT(*) AS n FROM tasks "
+                "WHERE project_id = ? AND status = 'running' "
+                "AND archived = 0 AND name IN (" + placeholders + ") "
+                "GROUP BY name",
+                (project_id, *duplicate_names),
+            )
+            counts = {r["name"]: r["n"] for r in rows}
+        except Exception:
+            counts = {n: -1 for n in duplicate_names}
+
+    return {
+        "project_id": project_id,
+        "duplicate_running": bool(duplicate_names),
+        "duplicate_running_names": duplicate_names,
+        "duplicate_running_counts": counts,
+        # Empty `last_detected_at` until #5 instrumentation lands;
+        # operators can find the exact event in the audit log
+        # (event_type=project.duplicate_running_detected) for now.
+        "last_detected_at": None,
+    }
+
+
 @router.get("/{project_id}/memory/state")
 async def get_project_state(
     project_id: str,

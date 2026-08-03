@@ -172,7 +172,16 @@ document.getElementById('filter-form').addEventListener('submit', (e) => {
                         {% endif %}
                         </div>
                     </div>
-                    <div class="font-semibold text-gray-800 truncate" title="{{ p.name or '(unnamed)' }}">{{ p.name or '(unnamed)' }}</div>
+                    <div class="font-semibold text-gray-800 truncate flex items-center gap-1" title="{{ p.name or '(unnamed)' }}">
+                        <span class="truncate">{{ p.name or '(unnamed)' }}</span>
+                        {% if p.id in duplicate_running_projects %}
+                        <span class="duplicate-running-icon inline-flex items-center px-1.5 py-0.5 text-xs font-semibold rounded bg-red-100 text-red-700 border border-red-300 shrink-0"
+                              data-testid="dup-running-icon-{{ p.id }}"
+                              title="Duplicate-running invariant violated: steps {{ duplicate_running_projects[p.id] | join(', ') }}. See the project page for details.">
+                            ⚠️ {{ duplicate_running_projects[p.id] | length }}
+                        </span>
+                        {% endif %}
+                    </div>
                     <div class="text-sm text-gray-600 mt-1 truncate" title="{{ p.goal or '-' }}">{{ p.goal or '-' }}</div>
                 </div>
                 {# RIGHT: state, tokens, created_at. shrink-0 so it never

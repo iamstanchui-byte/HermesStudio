@@ -972,6 +972,36 @@ async def tasks_page(
     )
 
 
+def _get_dup_names_for_project(request: Request, project_id: str) -> list[str]:
+    """v3.12.1 follow-up #3: per-project duplicate-running names
+    pulled from the supervisor's in-memory cache. Returns an
+    empty list when the supervisor isn't attached (e.g. in unit
+    tests) or when the invariant holds. Safe to call from any
+    page handler.
+    """
+    sup = getattr(request.app.state, "supervisor", None)
+    if sup is None:
+        return []
+    try:
+        return sup.get_duplicate_running_for_project(project_id)
+    except Exception:
+        return []
+
+
+def _get_dup_running_map(request: Request) -> dict[str, list[str]]:
+    """v3.12.1 follow-up #3: full duplicate-running map. Used by
+    the projects list page to render a ⚠️ next to each affected
+    project. Returns {} when the supervisor isn't attached.
+    """
+    sup = getattr(request.app.state, "supervisor", None)
+    if sup is None:
+        return {}
+    try:
+        return sup.get_duplicate_running_projects()
+    except Exception:
+        return {}
+
+
 @router.get("/projects", response_class=HTMLResponse)
 async def projects_list_page(
     request: Request,
@@ -1091,6 +1121,11 @@ async def projects_list_page(
             "projects": projects,
             "token_map": token_map,
             "schedule_map": schedule_map,
+            # v3.12.1 follow-up #3: per-project duplicate-running
+            # map. {project_id: [name, ...]}. Empty when invariant
+            # holds. Template renders a ⚠️ next to the project name
+            # if its id is in this map.
+            "duplicate_running_projects": _get_dup_running_map(request),
             "workflow_map": workflow_map,
             "template_ids": template_ids,
             "show_archived": show_archived,
@@ -1409,6 +1444,13 @@ async def project_page(
             # a `session` dict here rather than wiring a full Starlette
             # SessionMiddleware (overkill for one boolean).
             "session": ui_prefs,
+            # v3.12.1 follow-up #3: per-project duplicate-running
+            # warning (list of step names that have >1 'running'
+            # rows). Pulled from the supervisor's in-memory cache;
+            # the supervisor refreshes it every tick (~every 5s).
+            # Template renders a banner at the top of the project
+            # page when this list is non-empty.
+            "duplicate_running_names": _get_dup_names_for_project(request, project_id),
         },
     )
 
