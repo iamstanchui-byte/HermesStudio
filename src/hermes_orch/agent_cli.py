@@ -1,4 +1,4 @@
-﻿# coding: utf-8
+# coding: utf-8
 """Agent-side CLI (hermes-orch-agent command).
 
 Commands (per REVIEW.md Â§8.1):
@@ -40,6 +40,7 @@ import httpx
 from hermes_orch.agent_http import (  # noqa: E402  (import after httpx on purpose)
     delete as _httpx_delete,
     get as _httpx_get,
+    get_verify as _agent_http_verify,
     patch as _httpx_patch,
     post as _httpx_post,
     put as _httpx_put,
@@ -3308,7 +3309,7 @@ def start(
             return 0
         applied = 0
         try:
-            with httpx.Client(timeout=10) as client:
+            with httpx.Client(timeout=10, verify=_agent_http_verify) as client:
                 for pname, pcfg in profiles_cfg.items():
                     # Resolve the profile root (template like <profiles_dir>/<role>)
                     try:
@@ -3345,7 +3346,7 @@ def start(
                             # by the dashboard's "Sync from disk" button. We
                             # run the sync and ack as applied (no file written).
                             if cfg_row["file_path"] == "__sync_skills__":
-                                with httpx.Client(timeout=30) as sync_client:
+                                with httpx.Client(timeout=30, verify=_agent_http_verify) as sync_client:
                                     n = _sync_one_profile_skills(sync_client, pname, pcfg)
                                 click.echo(
                                     f"[daemon] sync-skills trigger for {pname}: "
@@ -3651,7 +3652,7 @@ def start(
             # this profile â€” the file scan is cheap but no point doing it
             # every 5s.
             now_ts = time_mod.time()
-            with httpx.Client(timeout=30) as sync_client:
+            with httpx.Client(timeout=30, verify=_agent_http_verify) as sync_client:
                 for pname, pcfg in profiles_cfg.items():
                     last = _last_skill_sync.get(pname, 0)
                     if (now_ts - last) < _SKILL_AUTO_SYNC_INTERVAL:
@@ -3936,7 +3937,7 @@ def apply_configs(config_path: str, profile_filter: str | None) -> None:
         return
 
     applied_count = 0
-    with httpx.Client(timeout=30) as client:
+    with httpx.Client(timeout=30, verify=_agent_http_verify) as client:
         for pname, pcfg in profiles.items():
             root = Path(pcfg["root"])
             click.echo(f"[{pname}] root = {root}")

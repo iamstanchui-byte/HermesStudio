@@ -177,6 +177,52 @@ def test_delete_wrapper_passes_verify_kwarg(restore_env):
     assert kwargs.get("verify") is True
 
 
+def test_get_verify_callable_works(restore_env, tmp_path):
+    """httpx.Client() calls in agent_cli.py use `verify=_agent_http_verify`
+    (a re-import of `get_verify`). Make sure the function returns the
+    right type so the kwarg passes cleanly. Regression guard for the
+    issue where 4 httpx.Client sites bypassed the wrapper and crashed
+    on self-signed certs."""
+    mod = _reload_agent_http({
+        "INSECURE_SKIP_TLS_VERIFY": "1",
+        "ORCHESTRATOR_CA_BUNDLE": None,
+    })
+    val = mod.get_verify()
+    assert val is False
+    # With a real CA bundle file, it should be the path string
+    real_bundle = tmp_path / "ca.pem"
+    real_bundle.write_text("--- placeholder ---\n", encoding="utf-8")
+    mod2 = _reload_agent_http({
+        "INSECURE_SKIP_TLS_VERIFY": None,
+        "ORCHESTRATOR_CA_BUNDLE": str(real_bundle),
+    })
+    val2 = mod2.get_verify()
+    assert val2 == str(real_bundle)
+
+
+def test_agent_cli_uses_agent_http_verify_for_httpx_client():
+    """Grep guard: every `httpx.Client(` call in agent_cli.py must
+    pass `verify=` (typically `verify=_agent_http_verify`). Otherwise
+    the Client instance defaults to verify=True and rejects
+    self-signed certs (the 4-site bug we hit on 2026-08-03)."""
+    p = Path(__file__).resolve().parent.parent / "src" / "hermes_orch" / "agent_cli.py"
+    text = p.read_text(encoding="utf-8-sig")
+    import re
+    # Find httpx.Client( ... ) blocks and check if 'verify' is in the args
+    # (handles multi-line, since the calls span one line in the file)
+    bad = []
+    for m in re.finditer(r"httpx\.Client\(([^)]*)\)", text, re.DOTALL):
+        args = m.group(1)
+        if "verify" not in args:
+            bad.append(m.group(0)[:80])
+    assert not bad, (
+        f"agent_cli.py has httpx.Client() calls without `verify=`: {bad}. "
+        f"Add `verify=_agent_http_verify` to honor ORCHESTRATOR_CA_BUNDLE / "
+        f"INSECURE_SKIP_TLS_VERIFY (otherwise self-signed certs fail at the "
+        f"Client layer even though the wrapper functions honor them)."
+    )
+
+
 # ----- 3) regression guard: agent_cli no longer has bare httpx call sites -----
 
 def test_agent_cli_uses_aliased_httpx_only():
