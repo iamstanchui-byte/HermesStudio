@@ -395,6 +395,11 @@ async def test_no_existing_no_transaction_overhead():
         if c[0] == "execute" and "UPDATE tasks SET archived = 1" in c[1]
     ]
     assert not archive_updates
-    # New task inserted.
-    insert_calls = [c for c in db.calls if c[0] == "insert"]
-    assert len(insert_calls) == 1
+    # New task inserted. v3.12.1 follow-up #5 added a second
+    # insert (into `task_dispatch` for the instrumentation
+    # record), so the count is now 2 instead of 1. We just
+    # check the tasks insert is present.
+    task_inserts = [
+        c for c in db.calls if c[0] == "insert" and c[1] == "tasks"
+    ]
+    assert len(task_inserts) == 1

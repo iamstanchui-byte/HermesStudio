@@ -373,6 +373,66 @@ CREATE TABLE IF NOT EXISTS workflow_packages (
 );
 CREATE INDEX IF NOT EXISTS idx_workflows_name ON workflow_packages(name);
 CREATE INDEX IF NOT EXISTS idx_workflows_source ON workflow_packages(source_project_id);
+
+-- ===== v3.12.1 follow-up #5: per-task-attempt dispatch instrumentation =====
+-- Records one row per task dispatch (every time a task row goes
+-- from non-pending → pending, or a feedback_to reset re-fires a
+-- task). The `dispatch_path` column distinguishes the 3 entry
+-- points so we can see the contribution of each:
+--   'apply_workflow'  — the run_workflow / run_project_plan path
+--                       (workflow packages + plan-from-LLM)
+--   'soul_dispatch'   — orchestrator/soul_dispatch.dispatch_step
+--                       (Round 3 SOUL routing path)
+--   'loopback_reset'  — supervisor._cascade_reset when a feedback_to
+--                       edge fires and a task gets re-dispatched
+--
+-- `history_turn_count` is reserved for the wrapper-side
+-- instrumentation (see docs/v3.12.1-duplicate-dispatch-fix.md §5).
+-- The column is created NULL-able so the server-only deploy can
+-- land first; the wrapper will populate it in a separate change.
+-- Nullable + no default = old rows stay valid; new rows that
+-- don't have a wrapper value get NULL (which means "not yet
+-- instrumented" — distinct from 0, which would mean "zero turns").
+--
+-- Records accumulate indefinitely (no TTL). Per
+-- docs/v3.12.1-duplicate-dispatch-fix.md §5 follow-up decision,
+-- a future cold-storage archive script can move old rows out
+-- without deleting them. Index supports the dashboard's
+-- "last N days" query (e.g. `?days=7`).
+CREATE TABLE IF NOT EXISTS task_dispatch (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    -- One of: 'apply_workflow' | 'soul_dispatch' | 'loopback_reset'.
+    -- CHECK constraint not added because ALTER TABLE ADD CHECK
+    -- isn't supported without rebuilding the table; the API +
+    -- orchestrator enforce the literal at the call site.
+    dispatch_path TEXT NOT NULL,
+    -- When the dispatch happened (server-side timestamp). Used by
+    -- the dashboard's "last N days" widget + by the per-day
+    -- GROUP BY that powers future per-source trend charts.
+    dispatched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- 'operator' (manual edit), 'chat' (chatbox apply), or
+    -- 'supervisor' (loopback). Mirrors the audit_log.actor
+    -- convention so a future cross-table view is straightforward.
+    actor TEXT NOT NULL DEFAULT 'supervisor',
+    -- v3.12.1 follow-up #5 (deferred to wrapper deploy). NULL
+    -- means "wrapper hasn't reported" — distinct from 0.
+    history_turn_count INTEGER,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+-- Covering index for the "last N days per project" dashboard
+-- query. Without this, dashboards scan the full table on every
+-- load. Same pattern as idx_token_usage_created.
+CREATE INDEX IF NOT EXISTS idx_task_dispatch_project_time
+    ON task_dispatch(project_id, dispatched_at DESC);
+-- Secondary index for the "how many dispatches per source
+-- globally" admin query (e.g. %soul_dispatch vs %apply_workflow
+-- over the last 24h) — keeps the supervisor's instrumentation
+-- surface cheap to inspect.
+CREATE INDEX IF NOT EXISTS idx_task_dispatch_path_time
+    ON task_dispatch(dispatch_path, dispatched_at DESC);
 CREATE TABLE IF NOT EXISTS project_schedules (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

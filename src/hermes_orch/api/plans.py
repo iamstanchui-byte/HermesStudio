@@ -607,7 +607,7 @@ async def _seed_soul_presets_from_plan(
                 stats["errors"].append({"role": role, "error": str(e)})
         # Audit the seeding summary (best-effort)
         try:
-            from hermes_orch.core.audit import audit_log
+            from hermes_orch.core.audit import audit_log, record_dispatch
             await audit_log(
                 db, "project.soul_presets.seeded", actor="operator",
                 project_id=project_id,
@@ -1532,6 +1532,21 @@ async def run_project_plan(
     for t in new_task_rows:
         try:
             await db.insert("tasks", t)
+            # v3.12.1 follow-up #5: record the dispatch event.
+            # Best-effort — instrumentation must not block the
+            # user's "Run plan" flow if the write fails. Wrapped
+            # in its own try/except so a single bad row doesn't
+            # skip the per-task audit/event for the whole batch.
+            try:
+                await record_dispatch(
+                    db,
+                    project_id=project_id,
+                    task_id=t["id"],
+                    dispatch_path="apply_workflow",
+                    actor="operator",
+                )
+            except Exception:
+                pass
         except Exception as e:
             raise HTTPException(
                 500, f"failed to insert task {t['name']!r}: {e}"

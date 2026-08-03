@@ -44,7 +44,7 @@ import uuid
 from typing import Any, Mapping, Union
 
 from hermes_orch.api.projects import get_soul_preset_by_role, touch_soul_preset
-from hermes_orch.core.audit import audit_log
+from hermes_orch.core.audit import audit_log, record_dispatch
 from hermes_orch.db import Database
 from hermes_orch.orchestrator.routing import resolve_role_to_profile
 from hermes_orch.utils import now_iso as _now_iso
@@ -803,6 +803,18 @@ async def _create_dispatched_task(
                 # same shape it would from a POST /tasks call.
                 "params": json.dumps(step_dict.get("params_template") or {}),
             },
+        )
+        # v3.12.1 follow-up #5: record the dispatch event inside the
+        # same transaction as the task insert, so the row in
+        # task_dispatch and the row in tasks either both commit or
+        # both roll back. Cheap insert (one row, no joins); doesn't
+        # widen the transaction's critical section meaningfully.
+        await record_dispatch(
+            db,
+            project_id=project_id,
+            task_id=task_id,
+            dispatch_path="soul_dispatch",
+            actor="supervisor",
         )
 
     # Read-back happens OUTSIDE the transaction — no longer need

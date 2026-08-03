@@ -31,7 +31,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from hermes_orch.core.audit import audit_log
+from hermes_orch.core.audit import audit_log, record_dispatch
 from hermes_orch.core.notifier import Notifier
 from hermes_orch.core.planner import Planner
 from hermes_orch.utils import now_iso as _now_iso, now_aware
@@ -2663,6 +2663,19 @@ class Supervisor:
                     project_id=project_id,
                     task_id=current,
                     payload={"root": root_task_id},
+                )
+                # v3.12.1 follow-up #5: record the dispatch event
+                # for every task the cascade reset puts back into
+                # the pending pool. Each row tells the dashboard
+                # "this task was re-dispatched by a loopback
+                # reset", so we can chart loopback volume over
+                # time and per-source mix.
+                await record_dispatch(
+                    self.db,
+                    project_id=project_id,
+                    task_id=current,
+                    dispatch_path="loopback_reset",
+                    actor="supervisor",
                 )
 
             # Enqueue dependents (BFS forward through depends_on).

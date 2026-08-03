@@ -2037,6 +2037,116 @@ async def get_project_diagnostics(
     }
 
 
+@router.get("/{project_id}/dispatches")
+async def list_project_dispatches(
+    project_id: str,
+    request: Request,
+    days: int = 7,
+    limit: int = 200,
+) -> dict:
+    """Return recent task-dispatch events for a project (v3.12.1 #5).
+
+    For each dispatch_path in {apply_workflow, soul_dispatch,
+    loopback_reset}, returns the count over the last `days` days
+    AND the most recent `limit` events. Used by the dashboard's
+    "last 7d dispatch mix" widget and by operators debugging
+    "why did this task re-run?" via curl.
+
+    Args:
+        project_id: FK to projects.id.
+        days: lookback window in days (default 7, max 90).
+        limit: max events to return (default 200, max 2000).
+
+    Returns:
+        {
+          "project_id": "...",
+          "days": 7,
+          "counts": {
+            "apply_workflow": 12,
+            "soul_dispatch": 4,
+            "loopback_reset": 1,
+            "total": 17,
+          },
+          "events": [
+            {
+              "id": "td-...",
+              "task_id": "t-...",
+              "dispatch_path": "soul_dispatch",
+              "actor": "supervisor",
+              "dispatched_at": "2026-08-03T...",
+              "history_turn_count": null,
+            },
+            ...
+          ],
+        }
+    """
+    db = request.app.state.db
+    project = await db.fetchone(
+        "SELECT id FROM projects WHERE id = ?", (project_id,),
+    )
+    if not project:
+        raise HTTPException(404, f"Project not found: {project_id}")
+
+    # Clamp inputs to reasonable ranges. days: 1-90 (one quarter
+    # is the most we'd ever want to look at for a "recent"
+    # widget; bigger windows risk scanning a lot of rows).
+    # limit: 1-2000 (the dashboard's "last 7d" widget uses 200;
+    # power users can crank it up to debug a loopback storm).
+    if days < 1:
+        days = 1
+    if days > 90:
+        days = 90
+    if limit < 1:
+        limit = 1
+    if limit > 2000:
+        limit = 2000
+
+    # Counts per dispatch_path. Single GROUP BY with a subquery
+    # for the cutoff. The (project_id, dispatched_at DESC) index
+    # covers the WHERE + ORDER BY. Cheaper than 3 separate
+    # COUNT(*) queries.
+    rows = await db.fetchall(
+        "SELECT dispatch_path, COUNT(*) AS n "
+        "FROM task_dispatch "
+        "WHERE project_id = ? "
+        "  AND dispatched_at >= datetime('now', ? || ' days') "
+        "GROUP BY dispatch_path",
+        (project_id, f"-{days}"),
+    )
+    counts: dict[str, int] = {
+        "apply_workflow": 0,
+        "soul_dispatch": 0,
+        "loopback_reset": 0,
+    }
+    total = 0
+    for r in rows:
+        path = r.get("dispatch_path")
+        n = int(r.get("n") or 0)
+        if path in counts:
+            counts[path] = n
+        total += n
+    counts["total"] = total
+
+    # Recent events. Newest first. Same index supports this.
+    events = await db.fetchall(
+        "SELECT id, task_id, dispatch_path, actor, dispatched_at, "
+        "       history_turn_count "
+        "FROM task_dispatch "
+        "WHERE project_id = ? "
+        "  AND dispatched_at >= datetime('now', ? || ' days') "
+        "ORDER BY dispatched_at DESC, id DESC "
+        "LIMIT ?",
+        (project_id, f"-{days}", limit),
+    )
+
+    return {
+        "project_id": project_id,
+        "days": days,
+        "counts": counts,
+        "events": [dict(e) for e in events],
+    }
+
+
 @router.get("/{project_id}/memory/state")
 async def get_project_state(
     project_id: str,
