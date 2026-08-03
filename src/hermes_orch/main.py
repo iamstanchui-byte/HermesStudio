@@ -27,6 +27,97 @@ from hermes_orch.db import Database
 logger = logging.getLogger(__name__)
 
 
+# v3.12.1 follow-up #7 (reflection test enabler): _HMAC_PATH_PATTERNS
+# was previously a local variable inside _create_app(). The systematic
+# allowlist test (tests/test_hmac_middleware_allowlist_systematic.py)
+# needs to introspect the list, so it's been hoisted to module level.
+# Runtime behavior is identical: the same patterns are evaluated by
+# the same dispatch() loop in _RequireUserMiddleware. We intentionally
+# do NOT (yet) auto-generate this list from the FastAPI route table —
+# that's the v3.12.2 router-driven rebuild tracked separately. For
+# now the explicit list + the systematic test is the safety net.
+_HMAC_PATH_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^/api/agents/[^/]+/heartbeat/?$"),
+    re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/configs/pending/?$"),
+    re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/cleanup-ack/?$"),
+    re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/terminal-ack/?$"),
+    re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/tool-ack/?$"),
+    re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/tool-output/?$"),
+    re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/(?:start|update|complete|fail|log|abort)/?$"),
+    # v3.10.3 (2026-08-02) BUGFIX: `/(?:skills|mcp|llm)/.*$` requires
+    # at least a `/` after the resource name. The wrapper calls
+    # `/api/agents/{id}/profiles/{name}/skills` (NO trailing slash,
+    # query string `?include_deleted=1` is stripped to the path
+    # before regex.match), which doesn't match this pattern, so
+    # the user-cookie middleware returns 401 "Not authenticated"
+    # BEFORE the route handler (or `require_hmac_auth`) ever runs.
+    # The endpoint itself is HMAC-authed via Depends — there's no
+    # reason the middleware should be blocking it. Add `/?` before
+    # `.*$` so the path is allowed with or without a trailing
+    # slash (and with arbitrary query string after, since the
+    # middleware strips the query before testing).
+    re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/(?:skills|mcp|llm)/?.*$"),
+    # v3.10.3 (2026-08-02) BUGFIX: bootstrap secret endpoint
+    # `/api/agents/{id}/secret` was missing from the allowlist
+    # (the endpoint itself is intentionally unauthenticated
+    # per the inline docstring in api/agents.py — it's the
+    # one-shot HMAC bootstrap that pushes the wrapper's shared
+    # secret into the DB on wrapper startup). Without this
+    # entry, the user-cookie middleware returned 401 BEFORE
+    # the route handler, so every wrapper restart printed
+    # `[hmac] WARNING: bootstrap returned 401` and the operator
+    # saw a noisy startup log. The endpoint is harmless to
+    # allowlist: it accepts a body, validates the agent exists,
+    # and only mutates `hmac_secret` if the supplied value
+    # matches (idempotent 200) or is NULL (one-shot 201); a
+    # mismatched value returns 409 with no DB change. So an
+    # allowlist entry here only blocks the middleware's
+    # cookie check, not the endpoint's own consistency logic.
+    re.compile(r"^/api/agents/[^/]+/secret/?$"),
+    # v3.12.1 follow-up #6: max_history_config — the wrapper polls
+    # this on every tick to learn the server-side
+    # `default_max_history_turns` and apply hermes 0.19.1
+    # `compression.protect_last_n: N` to `~/.hermes/config.yaml`.
+    # Without this entry, the user-cookie middleware returns 401
+    # BEFORE the route handler (or `require_hmac_auth`) ever runs,
+    # so the wrapper silently keeps its module-level default
+    # (`_max_history_turns_cache = 6`) and never observes a value
+    # change made via `config.yaml` or a workflow's
+    # `ProjectPlan.max_history_turns` override. Symptom: per-task
+    # `history_turn_count` instrumentation populates, but hermes
+    # compaction settings stay frozen at wrapper boot values.
+    re.compile(r"^/api/agents/[^/]+/max_history_config/?$"),
+    # v3.5.2 follow-up: GET single agent (HMAC-authed, used by
+    # the wrapper for self-lookup / config sync).
+    re.compile(r"^/api/agents/[^/]+/?$"),
+    # v3.5.2 follow-up: agent acks the config it just wrote.
+    # Without this, the wrapper's "ack" call returns 401 and the
+    # config row stays in `pending` forever.
+    re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/configs/[^/]+/ack/?$"),
+    # v3.5.2 follow-up: agent claim / liveness / result on
+    # /api/tasks/{id}/{start,poll,result}. Without these, tasks
+    # assigned to an agent sit in `assigned` forever — the
+    # wrapper can never flip them to `running`. This was the
+    # primary reason the user's proj-56c8e080 plan was stuck
+    # at "Run → all 3 research tasks assigned, none started".
+    re.compile(r"^/api/tasks/[^/]+/(?:start|poll|result)/?$"),
+    # v3.5.2 follow-up: live output streaming + tool-call events
+    # for the dashboard loop_status / output viewer.
+    re.compile(r"^/api/projects/[^/]+/tasks/[^/]+/(?:output-chunk|tool-call)/?$"),
+    # v3.5.2 follow-up: agent reads/writes project files
+    # (output of upstream step → input of downstream step).
+    re.compile(r"^/api/projects/[^/]+/files/"),
+    # v3.5.2 follow-up: agent session get/set (continuity
+    # across tasks in a project).
+    re.compile(r"^/api/projects/[^/]+/session/?$"),
+    # v3.5.2 follow-up: memory endpoints (L1 trace / L2 facts /
+    # L3 state / global recent). Two shapes:
+    #   - /api/projects/memory/recent          (global, no project_id)
+    #   - /api/projects/{id}/memory/{state,facts,trace}  (per-project)
+    re.compile(r"^/api/projects/(?:memory/recent/?$|[^/]+/memory/(?:state|facts|trace)/?$)"),
+]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """App lifespan: load config, connect DB, start supervisor on startup; stop on shutdown."""
@@ -155,86 +246,9 @@ def create_app() -> FastAPI:
     # forever because the agent couldn't claim them. See
     # tests/test_hmac_middleware_allowlist.py for the regression test
     # that keeps this list honest.
-    _HMAC_PATH_PATTERNS = [
-        re.compile(r"^/api/agents/[^/]+/heartbeat/?$"),
-        re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/configs/pending/?$"),
-        re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/cleanup-ack/?$"),
-        re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/terminal-ack/?$"),
-        re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/tool-ack/?$"),
-        re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/tool-output/?$"),
-        re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/(?:start|update|complete|fail|log|abort)/?$"),
-        # v3.10.3 (2026-08-02) BUGFIX: `/(?:skills|mcp|llm)/.*$` requires
-        # at least a `/` after the resource name. The wrapper calls
-        # `/api/agents/{id}/profiles/{name}/skills` (NO trailing slash,
-        # query string `?include_deleted=1` is stripped to the path
-        # before regex.match), which doesn't match this pattern, so
-        # the user-cookie middleware returns 401 "Not authenticated"
-        # BEFORE the route handler (or `require_hmac_auth`) ever runs.
-        # The endpoint itself is HMAC-authed via Depends — there's no
-        # reason the middleware should be blocking it. Add `/?` before
-        # `.*$` so the path is allowed with or without a trailing
-        # slash (and with arbitrary query string after, since the
-        # middleware strips the query before testing).
-        re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/(?:skills|mcp|llm)/?.*$"),
-        # v3.10.3 (2026-08-02) BUGFIX: bootstrap secret endpoint
-        # `/api/agents/{id}/secret` was missing from the allowlist
-        # (the endpoint itself is intentionally unauthenticated
-        # per the inline docstring in api/agents.py — it's the
-        # one-shot HMAC bootstrap that pushes the wrapper's shared
-        # secret into the DB on wrapper startup). Without this
-        # entry, the user-cookie middleware returned 401 BEFORE
-        # the route handler, so every wrapper restart printed
-        # `[hmac] WARNING: bootstrap returned 401` and the operator
-        # saw a noisy startup log. The endpoint is harmless to
-        # allowlist: it accepts a body, validates the agent exists,
-        # and only mutates `hmac_secret` if the supplied value
-        # matches (idempotent 200) or is NULL (one-shot 201); a
-        # mismatched value returns 409 with no DB change. So an
-        # allowlist entry here only blocks the middleware's
-        # cookie check, not the endpoint's own consistency logic.
-        re.compile(r"^/api/agents/[^/]+/secret/?$"),
-        # v3.12.1 follow-up #6: max_history_config — the wrapper polls
-        # this on every tick to learn the server-side
-        # `default_max_history_turns` and apply hermes 0.19.1
-        # `compression.protect_last_n: N` to `~/.hermes/config.yaml`.
-        # Without this entry, the user-cookie middleware returns 401
-        # BEFORE the route handler (or `require_hmac_auth`) ever runs,
-        # so the wrapper silently keeps its module-level default
-        # (`_max_history_turns_cache = 6`) and never observes a value
-        # change made via `config.yaml` or a workflow's
-        # `ProjectPlan.max_history_turns` override. Symptom: per-task
-        # `history_turn_count` instrumentation populates, but hermes
-        # compaction settings stay frozen at wrapper boot values.
-        re.compile(r"^/api/agents/[^/]+/max_history_config/?$"),
-        # v3.5.2 follow-up: GET single agent (HMAC-authed, used by
-        # the wrapper for self-lookup / config sync).
-        re.compile(r"^/api/agents/[^/]+/?$"),
-        # v3.5.2 follow-up: agent acks the config it just wrote.
-        # Without this, the wrapper's "ack" call returns 401 and the
-        # config row stays in `pending` forever.
-        re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/configs/[^/]+/ack/?$"),
-        # v3.5.2 follow-up: agent claim / liveness / result on
-        # /api/tasks/{id}/{start,poll,result}. Without these, tasks
-        # assigned to an agent sit in `assigned` forever — the
-        # wrapper can never flip them to `running`. This was the
-        # primary reason the user's proj-56c8e080 plan was stuck
-        # at "Run → all 3 research tasks assigned, none started".
-        re.compile(r"^/api/tasks/[^/]+/(?:start|poll|result)/?$"),
-        # v3.5.2 follow-up: live output streaming + tool-call events
-        # for the dashboard loop_status / output viewer.
-        re.compile(r"^/api/projects/[^/]+/tasks/[^/]+/(?:output-chunk|tool-call)/?$"),
-        # v3.5.2 follow-up: agent reads/writes project files
-        # (output of upstream step → input of downstream step).
-        re.compile(r"^/api/projects/[^/]+/files/"),
-        # v3.5.2 follow-up: agent session get/set (continuity
-        # across tasks in a project).
-        re.compile(r"^/api/projects/[^/]+/session/?$"),
-        # v3.5.2 follow-up: memory endpoints (L1 trace / L2 facts /
-        # L3 state / global recent). Two shapes:
-        #   - /api/projects/memory/recent          (global, no project_id)
-        #   - /api/projects/{id}/memory/{state,facts,trace}  (per-project)
-        re.compile(r"^/api/projects/(?:memory/recent/?$|[^/]+/memory/(?:state|facts|trace)/?$)"),
-    ]
+    # NOTE: the actual pattern list is defined at module scope above
+    # (_HMAC_PATH_PATTERNS) so the systematic reflection test can
+    # import it. We just reference the module-level list here.
     _ALLOWLIST_PREFIXES = (
         "/static/",
         "/login",
