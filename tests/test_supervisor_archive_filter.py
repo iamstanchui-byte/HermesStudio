@@ -1,38 +1,26 @@
-"""Tests for v3.10.7 supervisor archived-task filter.
+"""Tests for v3.10.7 + v3.12.1 supervisor task filter.
 
-Context (2026-08-02):
-  The supervisor's `_find_ready_tasks` query and
-  `_promote_assigned_to_running` query did not filter
-  `archived = 0`. Archived tasks are historical rows the user
-  explicitly archived (typically when the plan changed via
-  PUT /plan or via the API).
+v3.10.7 (2026-08-02): filter `archived = 0` so the supervisor
+doesn't re-dispatch archived tasks (re-pro on proj-e8106311).
 
-  Real-world repro on proj-e8106311 (2026-08-02):
-    - User saved a plan, then edited it, which archived the
-      first batch of 4 tasks at 18:04:29.
-    - User clicked Generate Task at 18:18:00, which created a
-      new batch of 4 t-XXX tasks (also pending, also with
-      names ram-ssd/step/it-si/step-2).
-    - BUT the supervisor's _find_ready_tasks picked up the
-      archived batch (status=pending, archived=1) and
-      dispatched them, producing duplicate UUID tasks with the
-      same step names running alongside the new batch.
-    - Visible in the UI as 8f5c96cf ram-ssd (running) +
-      8ad469de it-si (running) for step names that already
-      had a 18:18 t-XXX task in the new batch.
-
-  Fix: add `AND archived = 0` to the two supervisor queries
-  that pick up tasks to act on (`_find_ready_tasks` and
-  `_promote_assigned_to_running`). The other supervisor
-  queries (count, propagate-failures dependents) are left
-  as-is — they're observability queries or only act on
-  the unarchived row anyway.
+v3.12.1 (2026-08-03): also dedupe by `name` — when there are
+multiple pending tasks with the same step name, only return
+the latest. The v3.10.7 fix handled the archive case but
+missed the SOUL re-dispatch case (re-pro on proj-29b2990d:
+loopback reset both `t-8c7634e3` (old check-total from
+apply-workflow) AND `0407f925-...` (new check-total from
+SOUL dispatch), then both got dispatched in parallel,
+doubling the LLM cost per iteration).
 
 This test asserts:
-  1. _find_ready_tasks skips archived pending tasks
-  2. _promote_assigned_to_running skips archived assigned tasks
+  1. _find_ready_tasks skips archived pending tasks  (v3.10.7)
+  2. _promote_assigned_to_running skips archived assigned tasks (v3.10.7)
   3. Non-archived tasks of the same status are still picked up
-     (no regression in the unarchived path)
+     (no regression in the unarchived path)                  (v3.10.7)
+  4. When multiple pending tasks share a step name, only the
+     LATEST is returned                                       (v3.12.1)
+  5. Mixed: unique-name tasks are unaffected, only duplicate-
+     named ones get the latest-only filter                    (v3.12.1)
 """
 from __future__ import annotations
 
@@ -211,3 +199,158 @@ async def test_promote_assigned_skips_archived_assigned(client):
         f"should have been left at 'assigned'"
     )
     assert live_row["status"] == "running"
+
+
+# ===== v3.12.1 dedupe by `name` =====
+
+
+async def _seed_duplicate_name_project(app, *, names: list[str]) -> str:
+    """Create a project with N pending tasks per name (created in
+    the order given, so later items are the 'newest' instance).
+
+    Returns the project_id. Use `name[i]` as the step name, with
+    one task per call. The first call creates the oldest instance
+    for that name, the last creates the newest.
+    """
+    db = app.state.db
+    pid = f"proj-{uuid.uuid4().hex[:8]}"
+    await db.execute(
+        "INSERT INTO projects (id, name, goal, state, coordinator_role, "
+        "accept_criteria, deliverable_path, max_iterations, "
+        "current_iteration, last_iteration_summary) "
+        "VALUES (?, ?, '', 'planned', '', '', '', 0, 0, '')",
+        (pid, f"dedupe-{pid}"),
+    )
+    for step_name in names:
+        # Fresh timestamp per INSERT so created_at is strictly
+        # increasing (the dedupe query depends on this — see the
+        # NOT EXISTS subquery's `t2.created_at > t.created_at`).
+        now = _now_iso()
+        tid = f"t-{uuid.uuid4().hex[:8]}"
+        await db.execute(
+            "INSERT INTO tasks (id, project_id, name, agent_role, "
+            "depends_on, on_parent_failure, status, priority, action, "
+            "params, retry_count, max_retries, timeout_seconds, "
+            "output_path, required_capability, feedback_to, "
+            "is_single_task, archived, created_at) "
+            "VALUES (?, ?, ?, 'super', '', 'skip', 'pending', 'normal', "
+            "'do_task', '{}', 0, 2, 1800, '', NULL, '[]', 0, 0, ?)",
+            (tid, pid, step_name, now),
+        )
+        # Tiny async yield so SQLite's CURRENT_TIMESTAMP ticks over
+        # (1s precision). Belt-and-suspenders; the explicit `now`
+        # above should already differ between inserts.
+        import asyncio
+        await asyncio.sleep(0.01)
+    return pid
+
+
+@pytest.mark.asyncio
+async def test_find_ready_tasks_dedupes_duplicate_names(client):
+    """v3.12.1: when 2 pending tasks share a name, only the LATEST
+    is returned. Regression: proj-29b2990d (2026-08-03) where
+    loopback reset both old `t-8c7634e3` and new `0407f925-...`
+    check-total tasks, and the supervisor dispatched BOTH in
+    parallel, doubling the LLM cost per iteration."""
+    ac, app = client
+    sup = _make_supervisor(app)
+    # Two pending check-total tasks (same name) plus one add-savings
+    pid = await _seed_duplicate_name_project(
+        app, names=["check-total", "check-total", "add-savings"],
+    )
+    # Names in the order: check-total(1), check-total(2), add-savings(3)
+    # Expected: only check-total(2) + add-savings(3) returned
+    ready = await sup._find_ready_tasks(pid)
+    ready_names = [r["name"] for r in ready]
+    assert sorted(ready_names) == ["add-savings", "check-total"], (
+        f"expected 2 unique names back, got {ready_names}"
+    )
+    # Verify the check-total that came back is the LATEST instance
+    # (highest created_at). The 3 inserts in seed created tids in
+    # order; the latest one for check-total is the one we want.
+    check_total_rows = [r for r in ready if r["name"] == "check-total"]
+    assert len(check_total_rows) == 1
+    # And it's the LAST one we inserted (highest created_at among
+    # tasks with name='check-total')
+    cur = await app.state.db.fetchall(
+        "SELECT id, created_at FROM tasks WHERE project_id=? AND "
+        "name='check-total' ORDER BY created_at",
+        (pid,),
+    )
+    assert check_total_rows[0]["id"] == cur[-1]["id"], (
+        f"expected latest check-total ({cur[-1]['id']}) to be dispatched, "
+        f"got {check_total_rows[0]['id']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_ready_tasks_three_duplicates_returns_latest_only(client):
+    """3+ instances of the same name: only the LATEST is returned."""
+    ac, app = client
+    sup = _make_supervisor(app)
+    pid = await _seed_duplicate_name_project(
+        app, names=["step-x", "step-x", "step-x", "step-x"],
+    )
+    ready = await sup._find_ready_tasks(pid)
+    assert len(ready) == 1
+    assert ready[0]["name"] == "step-x"
+    # Verify it's the last-inserted one
+    cur = await app.state.db.fetchall(
+        "SELECT id FROM tasks WHERE project_id=? AND name='step-x' "
+        "ORDER BY created_at",
+        (pid,),
+    )
+    assert ready[0]["id"] == cur[-1]["id"]
+
+
+@pytest.mark.asyncio
+async def test_find_ready_tasks_mixed_unique_and_duplicate(client):
+    """Sanity: dedupe doesn't break unique-name dispatch."""
+    ac, app = client
+    sup = _make_supervisor(app)
+    pid = await _seed_duplicate_name_project(
+        app, names=["alpha", "beta", "beta", "gamma"],
+    )
+    # alpha + gamma are unique, beta has 2 instances (only latest)
+    ready = await sup._find_ready_tasks(pid)
+    ready_names = sorted(r["name"] for r in ready)
+    assert ready_names == ["alpha", "beta", "gamma"]
+    # And beta is the latest instance
+    beta_rows = [r for r in ready if r["name"] == "beta"]
+    cur = await app.state.db.fetchall(
+        "SELECT id FROM tasks WHERE project_id=? AND name='beta' "
+        "ORDER BY created_at",
+        (pid,),
+    )
+    assert beta_rows[0]["id"] == cur[-1]["id"]
+
+
+@pytest.mark.asyncio
+async def test_find_ready_tasks_archived_dedup_combined(client):
+    """Both filters apply: archived rows are skipped AND duplicate
+    names are deduped. Mix archived + duplicate + live."""
+    ac, app = client
+    sup = _make_supervisor(app)
+    db = app.state.db
+    pid = await _seed_duplicate_name_project(
+        app, names=["step-a", "step-a"],  # 2 live, both pending
+    )
+    # Add an archived step-a
+    archived_tid = f"t-{uuid.uuid4().hex[:8]}"
+    await db.execute(
+        "INSERT INTO tasks (id, project_id, name, agent_role, "
+        "depends_on, on_parent_failure, status, priority, action, "
+        "params, retry_count, max_retries, timeout_seconds, "
+        "output_path, required_capability, feedback_to, "
+        "is_single_task, archived, created_at) "
+        "VALUES (?, ?, 'step-a', 'super', '', 'skip', 'pending', 'normal', "
+        "'do_task', '{}', 0, 2, 1800, '', NULL, '[]', 0, 1, ?)",
+        (archived_tid, pid, _now_iso()),
+    )
+    ready = await sup._find_ready_tasks(pid)
+    # 2 live + 1 archived for step-a. After filter:
+    #   archived skipped (v3.10.7), dup deduped to latest (v3.12.1)
+    # → 1 row returned
+    assert len(ready) == 1
+    assert ready[0]["name"] == "step-a"
+    assert ready[0]["archived"] == 0

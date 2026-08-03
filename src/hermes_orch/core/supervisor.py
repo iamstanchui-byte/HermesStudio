@@ -1496,10 +1496,45 @@ class Supervisor:
         4 archived pending tasks at 18:04:29 got re-dispatched
         alongside the new 18:18:00 batch, producing duplicate UUID
         task rows for the same step names.
+
+        v3.12.1 (2026-08-03): also dedupe by step `name` — keep
+        only the LATEST pending task per step name. Why this is
+        needed: when the SOUL dispatcher creates a new task row for
+        the same step (e.g. on first run → `t-c16d54c3` short id
+        from apply-workflow, then on a later re-dispatch via the
+        v3.10+ SOUL flow → `4d9944b3-...` UUID id), the old row
+        may not be archived (the plan didn't change, just the
+        dispatch path). Both rows end up pending after a loopback
+        reset, and the supervisor dispatches BOTH in parallel —
+        2x LLM calls for the same logical step. Repro on
+        proj-29b2990d (2026-08-03) where loopback iter 1 had
+        BOTH `t-8c7634e3` (old check-total) AND
+        `0407f925-...` (new check-total) running side by side,
+        each burning a ~70K-token LLM call.
+
+        The dedupe subquery picks the latest instance by
+        `created_at`; older duplicates stay in `pending` but are
+        not dispatched. They show up in the dashboard as
+        "queued" with the same step name as the active run; once
+        the user manually inspects, they can be archived via
+        DELETE /api/projects/{id}/tasks/{task_id} (or the auto-archive
+        on next plan change picks them up).
         """
+        # v3.12.1: dedupe by `name`, keep the latest pending task
+        # per (project_id, name) pair. The NOT EXISTS subquery filters
+        # out rows that have a newer pending task with the same name.
         rows = await self.db.fetchall(
-            "SELECT * FROM tasks WHERE project_id = ? AND status = 'pending' "
+            "SELECT * FROM tasks t "
+            "WHERE project_id = ? AND status = 'pending' "
             "AND archived = 0 "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM tasks t2 "
+            "  WHERE t2.project_id = t.project_id "
+            "  AND t2.name = t.name "
+            "  AND t2.archived = 0 "
+            "  AND t2.status = 'pending' "
+            "  AND t2.created_at > t.created_at"
+            ") "
             "ORDER BY created_at ASC",
             (project_id,),
         )
