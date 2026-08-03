@@ -3439,16 +3439,27 @@ def start(
                 _skill_body = json.dumps(
                     {"name": name, "content": content_text}
                 ).encode("utf-8")
+                # v3.12.1 follow-up #7 (skills-sync Content-Type): when we
+                # pass `content=_skill_body` (bytes), httpx does NOT
+                # auto-set Content-Type to application/json. Without it,
+                # the server's SkillCreate Pydantic model receives the
+                # body as a string and FastAPI returns 422
+                # "Input should be a valid dictionary or object to
+                # extract fields from". Same root cause as the v1.9.3
+                # result-submit fix at line ~2044; that one set
+                # Content-Type explicitly, this one was missed.
+                _skill_headers = {
+                    **_auth_headers(
+                        "POST",
+                        f"/api/agents/{agent_id}/profiles/{pname}/skills",
+                        _skill_body,
+                    ),
+                    "Content-Type": "application/json",
+                    "X-Skill-Source": "self-taught",
+                }
                 r = client.post(
                     f"{orchestrator_url}/api/agents/{agent_id}/profiles/{pname}/skills",
-                    headers={
-                        **_auth_headers(
-                            "POST",
-                            f"/api/agents/{agent_id}/profiles/{pname}/skills",
-                            _skill_body,
-                        ),
-                        "X-Skill-Source": "self-taught",
-                    },
+                    headers=_skill_headers,
                     content=_skill_body,
                     timeout=15,
                 )
