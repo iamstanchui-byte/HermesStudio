@@ -104,7 +104,12 @@ LLM 純做 **design-time assistant**（草擬 plan / 建議 route / 評審 audit
 - uvicorn SSL 自動 pick up（cert + key 兩個 file readable 嗰陣），否則 fallback HTTP + warning
 - Session cookie 自動 set `Secure` flag 喺 HTTPS request 上面（HTTP 保持 backward-compat）
 - HMAC agent auth over TLS 照 work（HMAC 喺 application layer）
-- Wrapper 暫未 auto-pick HTTPS，需要 set `ORCHESTRATOR_URL=https://...`（self-signed 加 `INSECURE_SKIP_TLS_VERIFY=1`，follow-up）
+- **Wrapper HTTPS support**（v3.12.0）— `agent_http.py` 自動 apply `verify` 政策
+  - 默認 `verify=True`（trusted CA only）
+  - `ORCHESTRATOR_CA_BUNDLE=/path/cert.pem` → 用 cert pin（recommended for production / self-signed）
+  - `INSECURE_SKIP_TLS_VERIFY=1` → `verify=False`（dev / self-signed only，接受 MITM 風險）
+  - Precedence: `ORCHESTRATOR_CA_BUNDLE` > `INSECURE_SKIP_TLS_VERIFY` > default
+- 21 個 wrapper 內部 httpx call sites 全部 refactor 走 `agent_http.get/post/put/delete`，SSL policy 統一由 import-time env 決定
 
 ---
 
@@ -302,7 +307,8 @@ LLM 純做 **design-time assistant**（草擬 plan / 建議 route / 評審 audit
 |---|---|
 | `cf24d2d` | **v3.11.1** docs: add approval-based task runner design + super profile soul template |
 | `dd935c3` | docs: refresh README — full API catalog + feature list + recent v3.10.x/v3.11.x progress |
-| (pending) | **v3.12.0** HTTPS / TLS: settings toggle + self-signed cert gen + cookie Secure flag |
+| `bb99bbe` | **v3.12.0** HTTPS / TLS: settings toggle + self-signed cert gen + cookie Secure flag |
+| (pending) | **v3.12.0** HTTPS wrapper support: `agent_http.py` with `INSECURE_SKIP_TLS_VERIFY` + `ORCHESTRATOR_CA_BUNDLE` |
 | `d932c21` | **v3.11.1** test: cover v3.10.10 'no auto-dispatch on Generate tasks' + Run button flow |
 | `87f16fe` | **v3.11.1** fix feedback_to wire color in dark mode (visual_workflow editor) |
 | `2c6837f` | **v3.11.0** TASK_FAILED marker convention for agent-driven failure |

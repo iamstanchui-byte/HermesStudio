@@ -32,6 +32,18 @@ from pathlib import Path
 
 import click
 import httpx
+# v3.12.0: HTTPS support. httpx.get/post/etc are wrapped by agent_http
+# so the wrapper auto-applies the right `verify` policy (env-driven,
+# see agent_http.py for the env var contract). All call sites below
+# use `from hermes_orch.agent_http import get/post/...` so swapping
+# the import is enough — no per-call verify= plumbing.
+from hermes_orch.agent_http import (  # noqa: E402  (import after httpx on purpose)
+    delete as _httpx_delete,
+    get as _httpx_get,
+    patch as _httpx_patch,
+    post as _httpx_post,
+    put as _httpx_put,
+)
 
 import shutil
 
@@ -503,7 +515,7 @@ def _bootstrap_hmac_secret(orchestrator_url: str, agent_id: str, secret: str) ->
     # check HMAC on this endpoint — it just reads the body. So we
     # can omit the signature header (the server doesn't require it).
     try:
-        r = httpx.post(
+        r = _httpx_post(
             f"{orchestrator_url}{path}",
             content=body,
             headers={
@@ -620,7 +632,7 @@ def _fetch_project_state_http(
     2KB by the synthesis module).
     """
     try:
-        r = httpx.get(
+        r = _httpx_get(
             f"{orchestrator_url}/api/projects/{project_id}/memory/state",
             headers=_hmac_headers(
                 agent_id, secret,
@@ -656,7 +668,7 @@ def _fetch_user_recent_http(
     context: "what has the user been up to lately".
     """
     try:
-        r = httpx.get(
+        r = _httpx_get(
             f"{orchestrator_url}/api/projects/memory/recent",
             headers=_hmac_headers(
                 agent_id, secret,
@@ -692,7 +704,7 @@ def _fetch_project_facts_http(
     is prepended if the file is larger.
     """
     try:
-        r = httpx.get(
+        r = _httpx_get(
             f"{orchestrator_url}/api/projects/{project_id}/memory/facts",
             headers=_hmac_headers(
                 agent_id, secret,
@@ -1385,7 +1397,7 @@ def register(
 
     # POST
     try:
-        r = httpx.post(
+        r = _httpx_post(
             f"{orchestrator.rstrip('/')}/api/agents/",
             json=body,
             timeout=30,
@@ -1575,7 +1587,7 @@ def start(
         click.echo("[daemon] syncing config from orchestrator...")
         # Reuse the sync-config logic by calling it inline (it's small enough)
         try:
-            r = httpx.get(
+            r = _httpx_get(
                 f"{orchestrator_url}/api/agents/{agent_id}",
                 headers=_hmac_headers(
                     agent_id, secret,
@@ -1699,7 +1711,7 @@ def start(
                 "status": "idle",
                 "profiles": profile_meta,
             }).encode("utf-8")
-            r = httpx.post(
+            r = _httpx_post(
                 f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
                 headers=_auth_headers(
                     "POST",
@@ -1811,7 +1823,7 @@ def start(
                 # hmac_auth_failed events at full volume. Now the path
                 # matches the actual URL.
                 _ck_path = f"/api/agents/{agent_id}/sessions/{sid}/cleanup-ack"
-                httpx.post(
+                _httpx_post(
                     f"{orchestrator_url}{_ck_path}",
                     headers=_auth_headers('POST', _ck_path),
                     timeout=10,
@@ -1829,7 +1841,7 @@ def start(
             # request.url.path; if the wrapper signs a different
             # string, every call 401s.
             _start_path = f"/api/tasks/{task_id}/start"
-            r = httpx.post(
+            r = _httpx_post(
                 f"{orchestrator_url}{_start_path}",
                 headers=_auth_headers('POST', _start_path),
                 timeout=10,
@@ -1886,7 +1898,7 @@ def start(
             _result_body = json.dumps(result).encode("utf-8")
             _auth_h = _auth_headers('POST', _result_path, _result_body)
             _auth_h["Content-Type"] = "application/json"
-            r = httpx.post(
+            r = _httpx_post(
                 f"{orchestrator_url}{_result_path}",
                 headers=_auth_h,
                 content=_result_body,
@@ -1976,7 +1988,7 @@ def start(
             try:
                 rel = parent_output.lstrip("/").replace("\\", "/")
                 _file_path_p = f"/api/projects/{project_id}/files/{rel}"
-                r = httpx.get(
+                r = _httpx_get(
                     f"{orchestrator_url}{_file_path_p}",
                     headers=_hmac_headers(
                         agent_id, secret,
@@ -2051,7 +2063,7 @@ def start(
         if depends_on:
             for parent_id in depends_on:
                 try:
-                    r = httpx.get(
+                    r = _httpx_get(
                         f"{orchestrator_url}/api/tasks/{parent_id}",
                         headers=_hmac_headers(
                             agent_id, secret,
@@ -2236,7 +2248,7 @@ def start(
         # its own profile created.
         if project_id and role:
             try:
-                r = httpx.get(
+                r = _httpx_get(
                     f"{orchestrator_url}/api/projects/{project_id}/session",
                     params={"role": role},
                     headers=_hmac_headers(
@@ -2337,7 +2349,7 @@ def start(
         def _poll_liveness() -> None:
             while not stop_poll.is_set():
                 try:
-                    r = httpx.post(
+                    r = _httpx_post(
                         f"{orchestrator_url}/api/tasks/{tid}/poll",
                         headers=_hmac_headers(
                             agent_id, secret,
@@ -2400,7 +2412,7 @@ def start(
                     "text": text,
                     "stream": stream,
                 }).encode("utf-8")
-                httpx.post(
+                _httpx_post(
                     f"{orchestrator_url}/api/projects/{project_id}"
                     f"/tasks/{tid}/output-chunk",
                     headers=_auth_headers(
@@ -2475,7 +2487,7 @@ def start(
                 _tool_body = json.dumps(
                     {"tool": tool, "signature": signature}
                 ).encode("utf-8")
-                httpx.post(
+                _httpx_post(
                     f"{orchestrator_url}/api/projects/{project_id}"
                     f"/tasks/{tid}/tool-call",
                     headers=_auth_headers(
@@ -2655,7 +2667,7 @@ def start(
                             _session_body = json.dumps(
                                 {"session_id": new_sid, "role": role}
                             ).encode("utf-8")
-                            httpx.post(
+                            _httpx_post(
                                 f"{orchestrator_url}/api/projects/{project_id}/session",
                                 headers=_hmac_headers(
                                     agent_id, secret,
@@ -2728,7 +2740,7 @@ def start(
                             rel = output_path.lstrip("/").replace("\\", "/")
                             try:
                                 _file_path = f"/api/projects/{project_id}/files/{rel}"
-                                r = httpx.put(
+                                r = _httpx_put(
                                     f"{orchestrator_url}{_file_path}",
                                     content=file_bytes,
                                     headers=_hmac_headers(
@@ -2980,7 +2992,7 @@ def start(
                             file_sha = hashlib.sha256(file_bytes).hexdigest()
                             try:
                                 _file_path2 = f"/api/projects/{project_id}/files/{rel}"
-                                r2 = httpx.put(
+                                r2 = _httpx_put(
                                     f"{orchestrator_url}{_file_path2}",
                                     content=file_bytes,
                                     headers=_hmac_headers(
@@ -3758,7 +3770,7 @@ def sync_config(config_file: str) -> None:
 
     # Fetch agent's role list from orchestrator
     try:
-        r = httpx.get(
+        r = _httpx_get(
             f"{orchestrator_url}/api/agents/{agent_id}",
             headers=_hmac_headers(
                 agent_id, secret,
@@ -3864,7 +3876,7 @@ def status() -> None:
         secret = secret_path.read_text(encoding="utf-8").strip()
         try:
             _hb_body = json.dumps({"status": "idle"}).encode("utf-8")
-            r = httpx.post(
+            r = _httpx_post(
                 f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
                 headers=_hmac_headers(
                     agent_id, secret,
