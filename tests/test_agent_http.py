@@ -202,24 +202,37 @@ def test_get_verify_callable_works(restore_env, tmp_path):
 
 def test_agent_cli_uses_agent_http_verify_for_httpx_client():
     """Grep guard: every `httpx.Client(` call in agent_cli.py must
-    pass `verify=` (typically `verify=_agent_http_verify`). Otherwise
+    pass `verify=` (typically `verify=_agent_http_verify()`). Otherwise
     the Client instance defaults to verify=True and rejects
-    self-signed certs (the 4-site bug we hit on 2026-08-03)."""
+    self-signed certs (the 4-site bug we hit on 2026-08-03).
+
+    Note the trailing `()` — `_agent_http_verify` is a function reference
+    (re-imported `get_verify`), so it MUST be called to get the actual
+    value. Passing the function itself as `verify` makes httpx treat it
+    as an SSL context callable, which crashes with
+    "'function' object has no attribute 'set_alpn_protocols'".
+    """
     p = Path(__file__).resolve().parent.parent / "src" / "hermes_orch" / "agent_cli.py"
     text = p.read_text(encoding="utf-8-sig")
     import re
-    # Find httpx.Client( ... ) blocks and check if 'verify' is in the args
-    # (handles multi-line, since the calls span one line in the file)
-    bad = []
+    bad_no_verify = []
+    bad_uncalled = []
     for m in re.finditer(r"httpx\.Client\(([^)]*)\)", text, re.DOTALL):
         args = m.group(1)
         if "verify" not in args:
-            bad.append(m.group(0)[:80])
-    assert not bad, (
-        f"agent_cli.py has httpx.Client() calls without `verify=`: {bad}. "
-        f"Add `verify=_agent_http_verify` to honor ORCHESTRATOR_CA_BUNDLE / "
-        f"INSECURE_SKIP_TLS_VERIFY (otherwise self-signed certs fail at the "
-        f"Client layer even though the wrapper functions honor them)."
+            bad_no_verify.append(m.group(0)[:80])
+        # Catch the bug: `verify=_agent_http_verify` without ()
+        if re.search(r"verify=_agent_http_verify(?!\s*\()", args):
+            bad_uncalled.append(m.group(0)[:80])
+    assert not bad_no_verify, (
+        f"agent_cli.py has httpx.Client() calls without `verify=`: {bad_no_verify}. "
+        f"Add `verify=_agent_http_verify()` to honor ORCHESTRATOR_CA_BUNDLE / "
+        f"INSECURE_SKIP_TLS_VERIFY."
+    )
+    assert not bad_uncalled, (
+        f"agent_cli.py has httpx.Client() calls passing the function reference "
+        f"instead of the result: {bad_uncalled}. Use `verify=_agent_http_verify()` "
+        f"(with the parens) so httpx gets the resolved bool/string."
     )
 
 
