@@ -167,10 +167,19 @@ if ($existing) {
 # positional args to a SINGLE nssm set call. The v2 script previously
 # used three separate calls and the user hit "hermes CLI not found"
 # on every task because only HOME survived.
+#
+# v3.12.0: include ORCHESTRATOR_CA_BUNDLE so the wrapper trusts the
+# orchestrator's self-signed cert when HTTPS is enabled. The cert
+# lives at ~/.hermes-orchestrator/certs/server.crt (same path the
+# user generated via `hermes-orch gen-cert`). For HTTP-only setups
+# the var is harmless (httpx ignores verify for http:// URLs), so
+# leaving it set unconditionally is safe.
+$OrchCertPath = Join-Path $UserProfile ".hermes-orchestrator\certs\server.crt"
 & nssm set $ServiceName AppEnvironmentExtra `
     "LOCALAPPDATA=$UserLocalAppData" `
     "USERPROFILE=$UserProfile" `
-    "HOME=$UserHome"
+    "HOME=$UserHome" `
+    "ORCHESTRATOR_CA_BUNDLE=$OrchCertPath"
 
 # Log rotation (10 MB per file, keep history)
 & nssm set $ServiceName AppStdout $LogOut
