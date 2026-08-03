@@ -775,6 +775,52 @@ async def _create_dispatched_task(
         else:
             # Fall back to the legacy singular field if present.
             required_capability = step_dict.get("required_capability") or None
+        # v3.12.1 follow-up #6: resolve the per-task
+        # `max_history_turns` and write it into task.params.
+        # The wrapper reads `_max_history_turns` from task.params
+        # (underscore prefix = orchestrator-internal, not a user
+        # param) and uses it to truncate the session history to
+        # the last N turns. This caps the ~4x prompt growth we
+        # measured in commit 20fb097 (proj-cc43d7ed went
+        # 80K -> 320K across 8 calls).
+        #
+        # Resolution order (highest priority first):
+        #   1. step_dict["max_history_turns"] (per-step override;
+        #      future UI can let the operator tune per-step)
+        #   2. project's plan_json.max_history_turns
+        #      (per-workflow override; long-context workflows
+        #      bump this higher, monitoring workflows can drop
+        #      to 0)
+        #   3. server config default_max_history_turns
+        #      (defaults to 6; per-orchestrator config.yaml)
+        #   4. hard-coded fall-back of 6 (defensive: never run
+        #      uncapped if config is missing)
+        _max_history_turns = step_dict.get("max_history_turns")
+        if _max_history_turns is None:
+            try:
+                _proj_row = await db.fetchone(
+                    "SELECT plan_json FROM projects WHERE id = ?",
+                    (project_id,),
+                )
+                if _proj_row and _proj_row.get("plan_json"):
+                    _plan_obj = json.loads(_proj_row["plan_json"])
+                    _max_history_turns = _plan_obj.get("max_history_turns")
+            except (ValueError, TypeError):
+                _max_history_turns = None
+        if _max_history_turns is None:
+            # Defensive fall-back. The proper source is
+            # config.supervisor.default_max_history_turns; the
+            # dispatch path doesn't have direct access to the
+            # app config, so a future sprint should thread the
+            # value through the dispatch context. For now, 6
+            # is the documented default and matches
+            # DEFAULT_CONFIG.
+            _max_history_turns = 6
+        # Merge orchestrator-internal metadata into the user
+        # params. Underscore-prefixed keys are reserved for
+        # orchestrator control flow.
+        task_params = dict(step_dict.get("params_template") or {})
+        task_params["_max_history_turns"] = int(_max_history_turns)
         await db.insert(
             "tasks",
             {
@@ -801,7 +847,7 @@ async def _create_dispatched_task(
                 # params_template is the v3.5.x way to carry per-step
                 # variables; serialise as JSON so the supervisor sees the
                 # same shape it would from a POST /tasks call.
-                "params": json.dumps(step_dict.get("params_template") or {}),
+                "params": json.dumps(task_params),
             },
         )
         # v3.12.1 follow-up #5: record the dispatch event inside the

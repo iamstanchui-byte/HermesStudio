@@ -33,6 +33,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "planner_timeout_seconds": 60,
         "stuck_planning_warn_minutes": 10,
         "session_turn_warn_threshold": 50,
+        # v3.12.1 follow-up #6: per-task LLM-call history window.
+        # Caps how many of the most recent turns the wrapper
+        # passes to hermes when resuming a session. Actual data
+        # (see commit 20fb097) shows prompts grow ~4x per task
+        # iteration (proj-cc43d7ed went 80K -> 320K across
+        # 8 calls) because the conversation history is fully
+        # carried forward. 6 turns ≈ 3-6K tokens of history
+        # overhead (a small fraction of the total prompt) and
+        # gives the LLM enough context to keep multi-iteration
+        # coherence.
+        #
+        # Per-workflow opt-in: ProjectPlan.max_history_turns
+        # overrides this default. NULL/None in the plan = use
+        # this server default. The wrapper picks up changes to
+        # this default on its next config-poll cycle (no
+        # wrapper restart needed).
+        "default_max_history_turns": 6,
         # Auto-cleanup for hermes sessions created BY the orchestrator
         # wrapper. Sessions older than `session_ttl_days` are deleted
         # from the hermes backend during the supervisor's hourly

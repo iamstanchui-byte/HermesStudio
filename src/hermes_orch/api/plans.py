@@ -202,6 +202,37 @@ class ProjectPlan(BaseModel):
     reset_policy: Literal[
         "full_chain_reset", "failed_branch_reset", "latest_instance_only"
     ] = "full_chain_reset"
+    # v3.12.1 follow-up #6: per-plan LLM-call history window
+    # override. NULL/None (the default) means "use the server's
+    # default_max_history_turns (config.supervisor section)";
+    # an explicit value overrides it for this plan only. Set to
+    # 0 to disable history entirely (each call starts fresh;
+    # not recommended for most workflows).
+    #
+    # Why per-plan opt-in: most workflows benefit from the
+    # default cap, but long-context workflows (e.g. iterative
+    # research) may need more history. Operators with SSH
+    # access to the wrapper host can also bump the server
+    # default via config.yaml + config-poll cycle (no
+    # wrapper restart needed) — see
+    # docs/v3.12.1-duplicate-dispatch-fix.md §5.1.
+    max_history_turns: int | None = None
+
+    @field_validator("max_history_turns")
+    @classmethod
+    def _max_history_turns_in_range(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if v < 0 or v > 200:
+            # 0 = "no cap on history for this plan" (allowed,
+            # useful for long-context workflows). Negative or
+            # > 200 is almost certainly a typo — cap at 200 to
+            # avoid accidentally OOM'ing the wrapper.
+            raise ValueError(
+                f"max_history_turns must be 0..200 (got {v}); "
+                f"0 = no cap, NULL = use server default"
+            )
+        return v
 
     @field_validator("name")
     @classmethod

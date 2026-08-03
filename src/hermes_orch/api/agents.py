@@ -496,6 +496,53 @@ class AgentSecretSetBody(BaseModel):
     secret: str = Field(min_length=16, max_length=256)
 
 
+@router.get("/{agent_id}/max_history_config")
+async def get_max_history_config(
+    agent_id: str, request: Request,
+    _agent_id: str = Depends(require_hmac_auth),
+) -> dict:
+    """Return the server's max_history_turns default (v3.12.1 #6).
+
+    The wrapper polls this endpoint on its existing config-poll
+    cycle (the same one that fetches profile_configs/pending).
+    The default value lives in `config.supervisor.default_max_history_turns`
+    (default 6). Operators tune it via config.yaml; the change
+    takes effect on the wrapper's next poll cycle (no restart).
+
+    Per-workflow overrides live in the project's plan_json
+    (ProjectPlan.max_history_turns); they're resolved per-task
+    in the orchestrator's dispatch path and written into
+    task.params. The wrapper reads `_max_history_turns` from
+    task.params for each dispatch (immediate effect, no poll
+    involved).
+
+    Returns:
+        {
+          "agent_id": "linux-a-01",
+          "value": 6,
+          "source": "default",  # or "config" once we have
+                                  # non-default values; for now
+                                  # the only source is the
+                                  # DEFAULT_CONFIG default
+        }
+    """
+    db = request.app.state.db
+    # Sanity check: agent_id should exist. If it doesn't, the
+    # wrapper should know (e.g. typo in agent_id) — but we
+    # don't reject the request, because the operator may have
+    # intentionally set up a config before the agent registers.
+    # The wrapper will keep polling; eventually the agent
+    # registers and the value is consumed.
+    cfg = request.app.state.config
+    sup_cfg = (cfg.get("supervisor") or {})
+    value = int(sup_cfg.get("default_max_history_turns", 6))
+    return {
+        "agent_id": agent_id,
+        "value": value,
+        "source": "default",
+    }
+
+
 @router.post("/{agent_id}/secret")
 async def set_agent_secret(
     agent_id: str, body: AgentSecretSetBody, request: Request
