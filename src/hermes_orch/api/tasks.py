@@ -217,6 +217,15 @@ class TaskResult(BaseModel):
     # synthesized step preserves every skill the source used
     # (Stage 1.5 multi-skill awareness, 2026-07-23).
     skills_used: list[str] | None = None
+    # v3.12.1 follow-up #6: hermes session turn count (number of
+    # messages in the session) at task completion. The wrapper
+    # reads this from `state.db` (sessions.message_count) after
+    # the hermes subprocess exits. Stored in
+    # `task_dispatch.history_turn_count` so the dashboard /
+    # operator can verify the conversation-history growth fix
+    # is working (e.g. 4x growth flattens to 1.3x with hermes
+    # 0.19.1's micro-compaction enabled).
+    history_turn_count: int | None = None
 
 
 class TaskAssign(BaseModel):
@@ -800,6 +809,37 @@ async def submit_result(
             import logging
             logging.getLogger(__name__).warning(
                 "token_usage record failed for task %s: %s", task_id, e
+            )
+
+    # v3.12.1 follow-up #6: persist the wrapper-reported
+    # `history_turn_count` (the hermes session's `message_count`
+    # at task completion) into the most-recent task_dispatch row
+    # for this task. Lets the dashboard / operator verify the
+    # conversation-history growth fix is working — the 4x
+    # growth curve we measured (commit 20fb097) should flatten
+    # to ~1.3x with hermes 0.19.1's micro-compaction enabled.
+    #
+    # Best-effort: a missing or None value is silently skipped
+    # (e.g. older wrappers that don't report it). We update by
+    # `MAX(dispatched_at)` because a task may have multiple
+    # task_dispatch rows (apply_workflow + loopback_reset paths
+    # can both create one for the same task id). The most recent
+    # row is the "final" dispatch for this task.
+    if body.history_turn_count is not None:
+        try:
+            await db.execute(
+                "UPDATE task_dispatch SET history_turn_count = ? "
+                "WHERE task_id = ? AND dispatched_at = ("
+                "  SELECT MAX(dispatched_at) FROM task_dispatch "
+                "  WHERE task_id = ?"
+                ")",
+                (int(body.history_turn_count), task_id, task_id),
+            )
+        except Exception as e:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning(
+                "history_turn_count record failed for task %s: %s",
+                task_id, e,
             )
 
     # v1.8: SSE notify. When a task transitions running → completed

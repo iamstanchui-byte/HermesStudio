@@ -161,6 +161,20 @@ _storage_refs_cache: dict[str, list[dict]] = {}
 _max_concurrent_tasks_cache: int = 1
 
 
+# v3.12.1 follow-up #6: server-side default for the per-task
+# conversation-history window (read from
+# /api/agents/{id}/max_history_config each tick). Cached in
+# a module-level var so the main loop's per-tick poll can write
+# it and `_run_task` can read it without passing through
+# function args. Default 6 matches the server's
+# config.supervisor.default_max_history_turns; the per-task
+# value in task.params["_max_history_turns"] still wins when
+# the wrapper is mid-dispatch (set by orchestrator at
+# dispatch time, server-resolved across the 4-tier priority
+# chain). The cache is only the FALLBACK default.
+_max_history_turns_cache: int = 6
+
+
 def _render_storage_block(role: str) -> str:
     """Render the [AVAILABLE STORAGE] block for the task prompt.
 
@@ -1193,6 +1207,111 @@ def _extract_skills_used_from_transcript(transcript_path: Path) -> list[str]:
     return out
 
 
+def _apply_hermes_compaction_config(profile_root: Path, max_history_turns: int) -> bool:
+    """Write `compression.protect_last_n` (and `threshold` 0.30) into
+    the per-profile hermes config.yaml.
+
+    v3.12.1 follow-up #6: hermes 0.19.1+ ships an opt-in
+    per-turn micro-compaction (config block `compression`).
+    The wrapper drives it by writing the per-task N value
+    into `compression.protect_last_n` so the next hermes
+    subprocess picks up the new cap on startup. We also drop
+    `compression.threshold` to 0.30 (down from the default
+    0.50) so compaction fires earlier — the measured 4x
+    prompt growth (commit 20fb097) is already a problem at
+    50% context usage, and a savings demo with 30+ iterations
+    will routinely exceed 30%.
+
+    Atomic write: write to a temp file in the same directory,
+    then rename. Avoids leaving a half-written config.yaml if
+    the wrapper is killed mid-write (hermes 0.19.1 reads
+    config.yaml at startup, so a torn write would either
+    reject hermes or — worse — silently use a partial
+    compression block).
+
+    Args:
+        profile_root: the profile's root directory
+            (e.g. `<profiles_dir>/super/`). The config lives
+            at `<profile_root>/config.yaml`.
+        max_history_turns: the per-task N value. 0 means "no
+            cap" (we write protect_last_n=0; hermes treats 0
+            as keep-everything-compressed-when-needed). > 200
+            is a typo and we silently fall back to 6.
+
+    Returns:
+        True if the write succeeded, False otherwise (file
+        didn't exist, YAML parse error, permission denied).
+        Failures are non-fatal: hermes will start with the
+        previous config, which is safer than a torn write.
+    """
+    if not profile_root:
+        return False
+    cfg_path = Path(profile_root) / "config.yaml"
+    if not cfg_path.exists():
+        return False
+    # Defensive clamp.
+    n = max(0, min(200, int(max_history_turns)))
+    try:
+        import yaml as _yaml
+        # Read existing config (preserve everything the operator
+        # might have set — model, mcp_servers, providers, etc.).
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = _yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            return False
+        # Set/merge the compression block. Hermes 0.19.1
+        # treats `compression` as a top-level dict with these
+        # sub-keys. We set:
+        #   enabled: True (turn it on, regardless of prior value)
+        #   threshold: 0.30 (compact earlier than default 0.50)
+        #   target_ratio: 0.20 (keep 20% as recent tail — same as
+        #     hermes default; explicit so future hermes defaults
+        #     don't override us)
+        #   protect_last_n: <N> (the cap — this is the value
+        #     that drives our "last N turns uncompressed" model)
+        #   in_place: True (use hermes's in-place compaction;
+        #     don't rotate session_id, see #38763)
+        #   protect_first_n: 3 (preserve head messages
+        #     verbatim — same as hermes default)
+        existing_comp = data.get("compression") or {}
+        if not isinstance(existing_comp, dict):
+            existing_comp = {}
+        existing_comp["enabled"] = True
+        existing_comp["threshold"] = 0.30
+        existing_comp["target_ratio"] = (
+            existing_comp.get("target_ratio") or 0.20
+        )
+        existing_comp["protect_last_n"] = n
+        existing_comp["protect_first_n"] = (
+            existing_comp.get("protect_first_n") or 3
+        )
+        existing_comp["in_place"] = True
+        data["compression"] = existing_comp
+        # Atomic write: write to a sibling temp file, then
+        # os.replace() — POSIX-atomic and Windows-atomic for
+        # the same directory.
+        tmp_path = cfg_path.with_suffix(".yaml.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            _yaml.safe_dump(
+                data, f, default_flow_style=False,
+                sort_keys=False, allow_unicode=True,
+            )
+        os.replace(tmp_path, cfg_path)
+        return True
+    except Exception as e:
+        click.echo(
+            f"  WARN: failed to apply hermes compaction config "
+            f"to {cfg_path}: {e}"
+        )
+        # Clean up the temp file if it's still there
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        return False
+
+
 def _capture_session_tokens(profile_root: Path) -> dict | None:
     """Read the most recent hermes session from ``<profile_root>/state.db``.
 
@@ -1235,6 +1354,16 @@ def _capture_session_tokens(profile_root: Path) -> dict | None:
                 # Either pre-v0.17 (no token columns) or some other schema
                 # we don't recognize. Skip silently.
                 return None
+            # v3.12.1 follow-up #6: also pull message_count (per-session
+            # turn count) so the wrapper can populate
+            # task_dispatch.history_turn_count for the operator.
+            # hermes 0.19.1+ has this column; the schema probe
+            # above already accounts for older versions (col
+            # list is built from `_HERMES_TOKEN_COLUMNS_V0_17`,
+            # which doesn't include it; we add it conditionally
+            # after probing).
+            if "message_count" in available:
+                cols.append("message_count")
             col_list = ", ".join(cols)
             # Don't filter by ended_at Ã¢â‚¬â€ most hermes sessions don't commit
             # an end timestamp even when they're functionally done (the
@@ -1272,6 +1401,20 @@ def _capture_session_tokens(profile_root: Path) -> dict | None:
         "started_at": session.get("started_at"),
         "ended_at": session.get("ended_at"),
         "message_count": session.get("message_count"),
+        # v3.12.1 follow-up #6: also expose as `history_turn_count`
+        # under a clearer alias. The orchestrator's
+        # /api/tasks/{id}/result handler reads this from the
+        # result dict and persists it into task_dispatch
+        # .history_turn_count (so the dashboard / operator can
+        # verify the conversation-history growth fix is
+        # working). hermes 0.19.1+ has the underlying
+        # `state.db.sessions.message_count` column; older
+        # versions return NULL.
+        "history_turn_count": (
+            int(session.get("message_count"))
+            if session.get("message_count") is not None
+            else None
+        ),
         "tool_call_count": session.get("tool_call_count"),
         # The orchestrator's token_usage schema only has 3 token columns
         # (prompt / completion / total). We map input -> prompt,
@@ -2235,6 +2378,29 @@ def start(
         # and --accept-hooks (auto-approve shell hooks). Both can be disabled
         # per-task via params.yolo=false / params.accept_hooks=false.
         hermes_args = [hermes_bin, "-p", role, "chat", "-q", prompt]
+        # v3.12.1 follow-up #6: apply the per-task conversation-history
+        # window to the hermes config BEFORE invoking hermes. We
+        # write `compression.protect_last_n` (and bump `threshold`
+        # down to 0.30 to trigger compaction earlier than the
+        # default 0.50) into the per-profile config.yaml. Hermes
+        # 0.19.1's micro-compaction then keeps the last N turns
+        # uncompressed, capping the ~4x prompt growth we measured
+        # in commit 20fb097. The per-task value comes from
+        # `task.params["_max_history_turns"]` (server-resolved
+        # across the 4-tier priority chain in
+        # `soul_dispatch._create_dispatched_task`); we fall back
+        # to `_max_history_turns_cache` (the server default
+        # polled each tick) for older wrappers / pre-Phase-A
+        # tasks that don't carry the per-task key.
+        _task_mht = None
+        if params.get("_max_history_turns") is not None:
+            try:
+                _task_mht = int(params["_max_history_turns"])
+            except (TypeError, ValueError):
+                _task_mht = None
+        if _task_mht is None:
+            _task_mht = _max_history_turns_cache
+        _apply_hermes_compaction_config(profile_root, _task_mht)
         if yolo:
             hermes_args.append("--yolo")
         if accept_hooks:
@@ -3038,6 +3204,19 @@ def start(
                 token_usage = _capture_session_tokens(profile_root)
                 if token_usage:
                     result["token_usage"] = token_usage
+                    # v3.12.1 follow-up #6: pop the history_turn_count
+                    # field out of token_usage (separate top-level
+                    # key) so the orchestrator's /api/tasks/{id}/result
+                    # handler can persist it into task_dispatch
+                    # .history_turn_count. The token_usage table
+                    # itself stays focused on token metrics.
+                    htc = token_usage.pop("history_turn_count", None)
+                    if htc is not None:
+                        result["history_turn_count"] = htc
+                        click.echo(
+                            f"  history_turn_count: {htc} "
+                            f"(hermes session message_count)"
+                        )
                     click.echo(
                         f"  tokens: in={token_usage.get('prompt_tokens', 0)} "
                         f"out={token_usage.get('completion_tokens', 0)} "
@@ -3065,6 +3244,13 @@ def start(
             token_usage = _capture_session_tokens(profile_root)
             if token_usage:
                 failed_result["token_usage"] = token_usage
+                # v3.12.1 follow-up #6: same top-level extraction as
+                # the success path above — even on a failed hermes
+                # run, the partial session's message_count is a
+                # useful observability signal.
+                htc = token_usage.pop("history_turn_count", None)
+                if htc is not None:
+                    failed_result["history_turn_count"] = htc
             # Same for skills_used Ã¢â‚¬â€ partial transcript may still show
             # what the agent loaded before failing.
             skills_used = _extract_skills_used_from_transcript(stdout_log)
@@ -3298,6 +3484,53 @@ def start(
         except Exception as e:
             click.echo(f"{log_prefix} ({pname}) scan error: {e}")
         return registered
+
+    def _poll_max_history_config() -> int:
+        """Fetch the server's default max_history_turns and cache it.
+
+        v3.12.1 follow-up #6: the orchestrator exposes
+        GET /api/agents/{id}/max_history_config so the wrapper
+        can pick up server-side config changes WITHOUT a
+        wrapper restart. Operators tune config.yaml (or
+        the future settings-page UI) and the new value is
+        picked up on the next tick's poll.
+
+        Per-task overrides in task.params["_max_history_turns"]
+        still win (server-resolved at dispatch time across the
+        4-tier priority chain); this cache is only the FALLBACK
+        default. The cache is read in `_run_task`'s
+        `compression.protect_last_n` write path.
+
+        Cost: one HMAC-signed GET per tick (~5s). The endpoint
+        is cheap (just reads from request.app.state.config),
+        so the wrapper-side overhead is bounded by the
+        HMAC computation + a small JSON parse.
+
+        Returns: 0 on success (cached value updated), 1 on
+        failure (cached value left at the previous setting).
+        """
+        global _max_history_turns_cache
+        try:
+            path = f"/api/agents/{agent_id}/max_history_config"
+            r = _httpx_get(
+                f"{orchestrator_url}{path}",
+                headers=_auth_headers("GET", path),
+                timeout=5,
+            )
+            if r.status_code != 200:
+                return 1
+            body = r.json() or {}
+            new_value = int(body.get("value", 6))
+            # Defensive clamp: 0..200 matches the Pydantic
+            # validator on ProjectPlan.max_history_turns.
+            # 0 = "no cap" (allowed). > 200 = typo, fall back.
+            if new_value < 0 or new_value > 200:
+                return 1
+            _max_history_turns_cache = new_value
+            return 0
+        except Exception as e:
+            click.echo(f"[daemon] max_history_config poll failed: {e}")
+            return 1
 
     def _apply_pending_configs_inline() -> int:
         """Drain pending profile_configs from the orchestrator and apply.
@@ -3550,6 +3783,11 @@ def start(
             # GET per profile that returns `None`, then breaks. So
             # adding this pre-tick cost is ~0ms in the common case.
             _apply_pending_configs_inline()
+            # v3.12.1 follow-up #6: poll the server's default
+            # max_history_turns. Cheap (one HMAC GET per tick);
+            # lets operators tune config.yaml and pick up the
+            # change on the next tick, no wrapper restart.
+            _poll_max_history_config()
             # v3.6.0: per-agent concurrent task cap. We rebuild the
             # ThreadPoolExecutor on every tick so cap changes (via
             # PUT /api/agents/{id}) take effect within `interval`
