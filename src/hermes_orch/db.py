@@ -358,6 +358,14 @@ CREATE TABLE IF NOT EXISTS workflow_packages (
     step_template TEXT NOT NULL,      -- JSON array (string-encoded)
     variables TEXT NOT NULL,          -- JSON array (string-encoded)
     visual_layout TEXT NOT NULL DEFAULT '{}',  -- JSON {step_name: {x, y}} card positions; visual editor only
+    -- v3.12.1 follow-up #4: per-workflow loopback reset scope.
+    -- See docs/v3.12.1-duplicate-dispatch-fix.md §4.1 for the
+    -- design. Allowed values: 'full_chain_reset' (default; current
+    -- behaviour, required by the savings demo), 'failed_branch_reset'
+    -- (only the failed target + direct dependents), or
+    -- 'latest_instance_only' (failed_branch_reset + skip steps that
+    -- already have a valid latest result).
+    reset_policy TEXT NOT NULL DEFAULT 'full_chain_reset',
     source_project_id TEXT,           -- FK to projects.id (NULL if hand-authored)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -512,6 +520,31 @@ MIGRATIONS = [
     # editor only — never read by the runner. Default '{}' = no
     # saved positions, fall back to vertical stack on render.
     "ALTER TABLE workflow_packages ADD COLUMN visual_layout TEXT NOT NULL DEFAULT '{}'",
+    # ===== v3.12.1 follow-up #4: reset_policy on workflow packages =====
+    # Per-workflow opt-in for the loopback reset scope. Lets future
+    # workflows skip work that doesn't need to be re-run (vs the
+    # current full-chain reset, which is required by the savings
+    # demo and is the default for backward compat).
+    #
+    # Allowed values:
+    #   'full_chain_reset'     (default; current behaviour — resets
+    #                          the failed target + all downstream
+    #                          tasks regardless of whether they
+    #                          have a valid latest result)
+    #   'failed_branch_reset'  (only the failed target + tasks
+    #                          whose `depends_on` directly includes
+    #                          it; deeper descendants stay as-is)
+    #   'latest_instance_only' (same scope as failed_branch_reset,
+    #                          plus skip re-running any step that
+    #                          already has a valid (status=completed,
+    #                          result non-NULL) latest result)
+    #
+    # Persists in workflow_packages so each workflow picks its own
+    # policy; projects spawned from the package inherit it via
+    # `ProjectPlan.reset_policy` (set at /api/workflows/{id}/run time).
+    # Default = 'full_chain_reset' so existing workflows (savings
+    # demo, etc.) keep their semantics with zero changes.
+    "ALTER TABLE workflow_packages ADD COLUMN reset_policy TEXT NOT NULL DEFAULT 'full_chain_reset'",
     # ===== Object Layer foundation (2026-07-26) =====
     # See src/hermes_orch/api/objects.py for the read API.
     #

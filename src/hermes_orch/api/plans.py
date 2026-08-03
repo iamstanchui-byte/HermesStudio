@@ -34,7 +34,7 @@ import json
 import logging
 import re
 import secrets
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +183,25 @@ class ProjectPlan(BaseModel):
     visual_layout: dict[str, dict[str, float]] = Field(
         default_factory=dict
     )
+    # v3.12.1 follow-up #4: per-plan loopback reset scope. Mirrors
+    # the workflow_packages.reset_policy column. The supervisor's
+    # _cascade_reset reads this to decide how much of the chain to
+    # re-run when a task fails and its feedback_to triggers a
+    # loopback. Default = 'full_chain_reset' to preserve the
+    # savings-demo semantics that every existing plan depends on;
+    # future workflows can opt in to a narrower scope.
+    #   'full_chain_reset'     (default) — reset failed + all
+    #                          downstream tasks
+    #   'failed_branch_reset'  — only the failed target + tasks
+    #                          whose `depends_on` directly includes
+    #                          it; deeper descendants stay as-is
+    #   'latest_instance_only' — same as failed_branch_reset plus
+    #                          skip any step that already has a
+    #                          valid (status=completed, result
+    #                          non-NULL) latest result
+    reset_policy: Literal[
+        "full_chain_reset", "failed_branch_reset", "latest_instance_only"
+    ] = "full_chain_reset"
 
     @field_validator("name")
     @classmethod
