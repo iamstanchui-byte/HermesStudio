@@ -193,6 +193,19 @@ def create_app() -> FastAPI:
         # allowlist entry here only blocks the middleware's
         # cookie check, not the endpoint's own consistency logic.
         re.compile(r"^/api/agents/[^/]+/secret/?$"),
+        # v3.12.1 follow-up #6: max_history_config — the wrapper polls
+        # this on every tick to learn the server-side
+        # `default_max_history_turns` and apply hermes 0.19.1
+        # `compression.protect_last_n: N` to `~/.hermes/config.yaml`.
+        # Without this entry, the user-cookie middleware returns 401
+        # BEFORE the route handler (or `require_hmac_auth`) ever runs,
+        # so the wrapper silently keeps its module-level default
+        # (`_max_history_turns_cache = 6`) and never observes a value
+        # change made via `config.yaml` or a workflow's
+        # `ProjectPlan.max_history_turns` override. Symptom: per-task
+        # `history_turn_count` instrumentation populates, but hermes
+        # compaction settings stay frozen at wrapper boot values.
+        re.compile(r"^/api/agents/[^/]+/max_history_config/?$"),
         # v3.5.2 follow-up: GET single agent (HMAC-authed, used by
         # the wrapper for self-lookup / config sync).
         re.compile(r"^/api/agents/[^/]+/?$"),

@@ -340,6 +340,36 @@ async def test_middleware_does_not_block_single_agent_get(client):
     )
 
 
+@pytest.mark.asyncio
+async def test_middleware_does_not_block_max_history_config(client):
+    """GET /api/agents/{id}/max_history_config (v3.12.1 #6 Phase A server-side
+    hook for the wrapper's per-tick `default_max_history_turns` poll).
+
+    Without the explicit allowlist entry in
+    `src/hermes_orch/main.py:_HMAC_PATH_PATTERNS`, the user-cookie
+    middleware returned 401 'Not authenticated' BEFORE
+    `require_hmac_auth` ever ran, so the wrapper kept its
+    module-level default (`_max_history_turns_cache = 6`) and never
+    observed value changes made via `config.yaml` or a workflow's
+    `ProjectPlan.max_history_turns` override. Symptom: per-task
+    `history_turn_count` instrumentation populated, but hermes
+    compaction settings stayed frozen at wrapper-boot values.
+    """
+    await _login_admin(client)
+    await _register_agent_with_hmac(client, "test-agent-1", "test-secret")
+    r = await client.get("/api/agents/test-agent-1/max_history_config")
+    assert r.status_code == 401
+    detail = r.json().get("detail", "")
+    assert "Not authenticated" not in detail, (
+        f"middleware blocked max_history_config; the wrapper's "
+        f"config-poll cycle silently kept its default N. detail={detail!r}"
+    )
+    assert "X-Agent-Id" in detail or "Missing" in detail, (
+        f"expected the require_hmac_auth message about missing "
+        f"HMAC headers; got detail={detail!r}"
+    )
+
+
 # ===== Negative tests: confirm the middleware still gates user-only paths =====
 
 
