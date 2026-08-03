@@ -1777,6 +1777,15 @@ async def create_or_update_skill(
         raise HTTPException(
             401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
         )
+    # v3.12.1 follow-up #7b: this function was missing the
+    # `db = request.app.state.db` line that every other route in
+    # this file has. The line 1780 `_find_profile(db, ...)` call
+    # therefore raised NameError, and EVERY skill POST 500'd with
+    # an unhandled exception -- even after the v3.12.1 #7
+    # Content-Type fix on the wrapper side. This blocks the
+    # 4x -> 1.3x e2e verification, which depends on
+    # skills-sync working end-to-end.
+    db = request.app.state.db
     profile = await _find_profile(db, agent_id, profile_name)
     name = _validate_skill_name(body.name)
     content = body.content or ""

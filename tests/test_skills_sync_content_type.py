@@ -144,11 +144,16 @@ async def client(tmp_path, monkeypatch):
             "VALUES (?, ?, ?, 'verified', CURRENT_TIMESTAMP)",
             (AGENT_ID, "test-hash", SECRET),
         )
-        # Profile row so _find_profile returns it
+        # Profile row so _find_profile returns it. agent_profiles.id
+        # is TEXT PRIMARY KEY (not INTEGER AUTOINCREMENT) so we must
+        # supply it explicitly. The same UUID convention the rest of
+        # the codebase uses.
+        import uuid as _uuid
+        profile_id = f"prof-{_uuid.uuid4().hex[:8]}"
         await db.execute(
-            "INSERT INTO agent_profiles (agent_id, name) "
-            "VALUES (?, ?)",
-            (AGENT_ID, PROFILE_NAME),
+            "INSERT INTO agent_profiles (id, agent_id, name) "
+            "VALUES (?, ?, ?)",
+            (profile_id, AGENT_ID, PROFILE_NAME),
         )
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
             yield ac
@@ -169,27 +174,14 @@ def _post_skill_headers(body: bytes, content_type: str | None) -> dict:
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    reason=(
-        "BLOCKED on a separate server-side bug: create_or_update_skill "
-        "in src/hermes_orch/api/agents.py:1780 calls "
-        "await _find_profile(db, agent_id, profile_name) but the "
-        "`db = request.app.state.db` line is missing from the function "
-        "body, so the endpoint 500s with NameError on every request "
-        "(independent of Content-Type). Tracked as v3.12.1 follow-up "
-        "#7b. Once the server-side missing-line bug is fixed, this "
-        "test will be enabled by removing the xfail marker."
-    ),
-    strict=True,
-)
 async def test_server_returns_201_with_content_type(client):
     """End-to-end: server returns 201 when Content-Type is application/json.
 
-    Currently xfail: the 201 path is blocked by a separate server-side
-    bug in create_or_update_skill (see xfail reason). The Content-Type
-    fix itself is verified by the structural test + the two 422 tests
-    (which confirm FastAPI's body parser behavior independent of the
-    server-side 500).
+    Was xfail'd before the v3.12.1 #7b server-side fix (the missing
+    `db = request.app.state.db` line in create_or_update_skill).
+    Now the 201 path works end-to-end. If this test fails with
+    another 500, the regression is in the server endpoint, not the
+    wrapper Content-Type fix.
     """
     body = json.dumps({"name": "test-skill", "content": "# Test\n\nbody\n"}).encode()
     headers, path = _post_skill_headers(body, "application/json")
