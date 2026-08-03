@@ -1,11 +1,11 @@
-"""SOUL apply lifecycle for v3.9.0 dispatch path.
+﻿"""SOUL apply lifecycle for v3.9.0 dispatch path.
 
 This module sits between routing (which picks an agent profile for a
 plan step) and the supervisor (which actually sends the task to the
 agent). Its job is to guarantee the **right** SOUL.md is on the
 target profile's disk *before* the task runs.
 
-Per `docs/soul-routing-design.md §"Lifecycle: SOUL apply before
+Per `docs/soul-routing-design.md Â§"Lifecycle: SOUL apply before
 dispatch"`, the original spec proposed:
   - per-profile `asyncio.Lock` to serialize applies
   - heartbeat poll for SOUL.md mtime confirmation
@@ -14,7 +14,7 @@ The Round 1 review (2026-08-01) realized the existing
 `profile_configs` flow already serializes + confirms via its
 atomic UPDATE pattern in `claim_pending_config`, so this module just
 writes a `profile_configs` row and polls the row's `status` field.
-No additional lock, no additional heartbeat check — the wrapper
+No additional lock, no additional heartbeat check â€” the wrapper
 poll loop + ack endpoint ARE the confirmation mechanism.
 
 Flow:
@@ -29,7 +29,7 @@ Flow:
      wrapper acks (`applied` / `failed`) or the 10s timeout
   6. `touch_soul_preset` records the apply timestamp + mtime
   7. A task row is created (pending) with `assigned_profile_id` set
-     — the supervisor picks it up and dispatches as usual
+     â€” the supervisor picks it up and dispatches as usual
 
 This module is imported by `api.projects.dispatch_step` (Round 3
 integration). The public surface is just `dispatch_step`; everything
@@ -50,9 +50,9 @@ from hermes_orch.utils import now_iso as _now_iso
 
 
 # A "step" can come in two shapes:
-#   - PlanStep (Pydantic v2 model from api.plans) — used by the
+#   - PlanStep (Pydantic v2 model from api.plans) â€” used by the
 #     chatbox / plan editor
-#   - dict (the shape the routing engine accepts) — used by tests
+#   - dict (the shape the routing engine accepts) â€” used by tests
 #     and anythin else that wants to avoid the Pydantic dep
 # We normalise to a dict at the boundary so the rest of the module
 # is uniform. Routing expects a dict too, so this is a no-op cost.
@@ -98,7 +98,7 @@ def _compose_soul_md(role_name: str, project_id: str, content: str) -> str:
     extract them without parsing free-form markdown.
 
     Args:
-        role_name: the role label (e.g. "cpi-analyst") — denormalized
+        role_name: the role label (e.g. "cpi-analyst") â€” denormalized
             from the project_soul_presets row.
         project_id: which project this preset belongs to.
         content: the actual SOUL prose (already stripped of trailing
@@ -121,7 +121,7 @@ def _generic_role_template(role_name: str) -> str:
 
     Used when neither the workflow step's `default_soul` nor the
     project preset has content. The wording is intentionally generic
-    so it works for any role — the workflow author is expected to
+    so it works for any role â€” the workflow author is expected to
     supply a real `default_soul` for production workflows.
 
     Args:
@@ -159,7 +159,7 @@ def _generic_role_template(role_name: str) -> str:
 # Triggered at "Generate Task" time (alongside task creation) and at
 # the manual "Generate SOUL" button (for the recovery use case where
 # the user accidentally deleted a preset). Falls back to the generic
-# template on any error — never blocks the user's flow.
+# template on any error â€” never blocks the user's flow.
 
 
 SOUL_GEN_SYSTEM_PROMPT = """\
@@ -184,14 +184,14 @@ Output format (STRICT JSON, no prose, no markdown, no <think>):
 
 Rules:
 1. One entry per unique role in the plan. Same role in different
-   steps gets ONE persona (not per-step) — the persona should be
+   steps gets ONE persona (not per-step) â€” the persona should be
    general enough to cover all the steps the role executes.
-2. Each persona MUST be specific to this project — name the project's
+2. Each persona MUST be specific to this project â€” name the project's
    topic/focus when the description provides it. Generic text like
    "you are a helpful assistant" is not acceptable.
 3. If a role's steps specify a language (e.g. `lang: zh-HK` in
    params), the persona should mention the language. Same for
-   output_path → mention the storage alias the agent will use.
+   output_path â†’ mention the storage alias the agent will use.
 4. Keep each persona 2-4 sentences (60-200 words). Concise wins.
 5. Output JSON only. No commentary, no markdown fences, no <think>.
 6. If the project description is too vague to write a specific
@@ -261,20 +261,20 @@ async def _generate_souls_via_llm(
     focused LLM call that has the full project context.
 
     Args:
-        plan: a ProjectPlan (Pydantic) — must have `.steps`.
+        plan: a ProjectPlan (Pydantic) â€” must have `.steps`.
         project_name: the project's display name.
         project_description: the project's goal/description (used to
             anchor the personas to the project topic).
         llm_cfg: the LLM config dict (the same `cfg["llm"]` block the
             planner uses). Must contain base_url, api_key, model.
             Optional: timeout_seconds (default 60), mock (if True, no
-            call is made — empty dict is returned).
+            call is made â€” empty dict is returned).
 
     Returns:
         A dict {role_name: persona_text}. The keys are the unique
         roles found in the plan; values are the LLM-generated 2-4
         sentence personas. The dict only contains roles the LLM
-        actually returned — caller is responsible for filling any
+        actually returned â€” caller is responsible for filling any
         missing roles with the generic template.
 
     Raises:
@@ -354,7 +354,7 @@ async def _generate_souls_via_llm(
             )
         data = r.json()
     except Exception as e:
-        # Network / parse / HTTP error — log + raise for caller to
+        # Network / parse / HTTP error â€” log + raise for caller to
         # fall back. Don't expose raw httpx errors to the user.
         log.warning("SOUL gen LLM call failed: %s", e)
         raise RuntimeError(f"SOUL gen LLM call failed: {e}") from e
@@ -368,7 +368,7 @@ async def _generate_souls_via_llm(
         raise RuntimeError(f"LLM response shape unexpected: {e}") from e
 
     if finish_reason == "length":
-        # Truncated — likely won't parse. Bail and let caller fallback.
+        # Truncated â€” likely won't parse. Bail and let caller fallback.
         raise RuntimeError(
             "LLM response truncated (finish_reason=length); "
             "max_tokens too small or output cap hit"
@@ -402,7 +402,7 @@ async def _generate_souls_via_llm(
             f"LLM JSON missing 'souls' dict; got keys: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed).__name__}"
         )
 
-    # Validate each value is a non-empty string. Anything weird → drop
+    # Validate each value is a non-empty string. Anything weird â†’ drop
     # the role (caller will fill with generic).
     out: dict[str, str] = {}
     for role, text in souls_raw.items():
@@ -476,7 +476,7 @@ def _step_default_soul(step_dict: dict[str, Any]) -> str:
     a `params_template["default_soul"]` fallback for forward-compat
     with the chatbox plan-editor's serialised form.
 
-    Returns an empty string if no default is available — callers
+    Returns an empty string if no default is available â€” callers
     must fall back to `_generic_role_template`.
     """
     direct = step_dict.get("default_soul")
@@ -501,7 +501,7 @@ async def _ensure_soul_preset(
 ) -> dict[str, Any]:
     """Return the project's SOUL preset for the step's role, creating one if missing.
 
-    The preset binds (project, profile) — workflow steps that name the
+    The preset binds (project, profile) â€” workflow steps that name the
     same role but run on different agents in the same project will get
     one preset each. The `project_soul_presets` table has
     `UNIQUE (project_id, profile_id)`, so a re-insert for the same
@@ -526,7 +526,7 @@ async def _ensure_soul_preset(
     if existing:
         return existing
 
-    # Auto-populate. Content priority: workflow default → generic.
+    # Auto-populate. Content priority: workflow default â†’ generic.
     default_soul = _step_default_soul(step_dict)
     content = default_soul or _generic_role_template(role)
     preset_id = str(uuid.uuid4())
@@ -547,7 +547,7 @@ async def _ensure_soul_preset(
         "SELECT * FROM project_soul_presets WHERE id = ?", (preset_id,)
     )
     if not row:
-        # Should be impossible — we just inserted. Treat as a soft
+        # Should be impossible â€” we just inserted. Treat as a soft
         # failure so the caller sees a meaningful error instead of
         # NoneType downstream.
         raise SoulApplyError(
@@ -568,7 +568,7 @@ async def _submit_soul_to_profile(
     Idempotent: if a row with the same `(profile_id, file_path,
     desired_sha256)` already exists in any status (pending, applying,
     applied, failed), we reuse it and skip the insert. This makes
-    repeated dispatches with the same SOUL a no-op — the wrapper
+    repeated dispatches with the same SOUL a no-op â€” the wrapper
     will re-claim the existing row, see the same content, and ack
     immediately. We do NOT force a re-apply; freshness is governed
     by `touch_soul_preset` and the project_soul_presets cache.
@@ -622,9 +622,9 @@ async def _wait_for_soul_applied(
 
     The wrapper's daemon loop calls
     `POST /api/agents/{id}/profiles/{name}/configs/pending` (atomic
-    claim → status='applying'), writes the file, then
+    claim â†’ status='applying'), writes the file, then
     `POST /configs/{id}/ack` (status='applied' or 'failed'). We poll
-    the row every 200ms — fast enough to feel snappy on a healthy
+    the row every 200ms â€” fast enough to feel snappy on a healthy
     host (typical 1-3s), slow enough to not hammer SQLite.
 
     We return `bool` rather than raising because the dispatch step
@@ -636,7 +636,7 @@ async def _wait_for_soul_applied(
         db: the orchestrator's Database connection.
         timeout_s: max seconds to wait before giving up. Default 30s
             (was 10s in v3.10.0; bumped 2026-08-02 after observing the
-            real-world ack latency of 8-12s on win-local-1 — the 10s
+            real-world ack latency of 8-12s on win-local-1 â€” the 10s
             ceiling left no headroom for slow host I/O or the
             skills-sync thread blocking the ack POST). The supervisor
             reaper still reaps anything stuck in 'applying' after 60s
@@ -699,14 +699,54 @@ async def _create_dispatched_task(
     Returns:
         The newly inserted tasks row (dict).
     """
-    task_id = str(uuid.uuid4())
+    step_name = step_dict.get("name") or ""
+    # v3.12.1: archive older same-name live tasks (skip 'running'
+    # to avoid disrupting in-flight wrappers). The supervisor's
+    # v3.12.1 dedupe (NOT EXISTS subquery in _find_ready_tasks) is
+    # a safety net; this archive is the primary fix so the DB
+    # stays clean and operators see the dedupe state directly.
+    # Repro on proj-29b2990d (2026-08-03): t-8c7634e3 (old
+    # check-total from apply-workflow) + 0407f925-... (new
+    # check-total from SOUL dispatch) both got dispatched, ~2x
+    # LLM cost per loopback iteration.
+    if step_name:
+        archived = await db.fetchall(
+            "SELECT id, status FROM tasks "
+            "WHERE project_id = ? AND name = ? AND archived = 0 "
+            "AND status IN ('pending', 'dispatched', 'assigned', 'failed', 'skipped')",
+            (project_id, step_name),
+        )
+        if archived:
+            from hermes_orch.core.audit import audit_log
+            from hermes_orch.core.supervisor import _now_iso as _now_inner
+            ids = [r["id"] for r in archived]
+            placeholders = ",".join("?" for _ in ids)
+            await db.execute(
+                "UPDATE tasks SET archived = 1, updated_at = ? "
+                f"WHERE id IN ({placeholders})",
+                [_now_inner(), *ids],
+            )
+            for old in archived:
+                await audit_log(
+                    db, "task.archived_on_soul_dispatch",
+                    actor="supervisor",
+                    project_id=project_id,
+                    task_id=old["id"],
+                    payload={
+                        "name": step_name,
+                        "old_status": old["status"],
+                        "reason": "soul_dispatch_replaced",
+                    },
+                )
+
+        task_id = str(uuid.uuid4())
     # Pydantic v2 keeps `depends_on` / `feedback_to` as list[str];
     # JSON-encode for the TEXT column to keep parity with
     # `create_task`. `_jsonify` in db.insert handles dicts/lists,
     # but we pre-encode here so the round-trip is exact.
     depends_json = json.dumps(list(step_dict.get("depends_on") or []))
     feedback_json = json.dumps(list(step_dict.get("feedback_to") or []))
-    # Map plural `required_capabilities` → singular
+    # Map plural `required_capabilities` â†’ singular
     # `required_capability`. Use the first entry (matching how the
     # chatbox plan editor currently emits single-capability steps).
     req_caps = step_dict.get("required_capabilities") or []
@@ -800,14 +840,14 @@ async def dispatch_step(
     step_dict = _step_to_dict(step)
     role = step_dict.get("agent_role") or ""
 
-    # 1. Routing — db is the last arg in the routing contract
+    # 1. Routing â€” db is the last arg in the routing contract
     profile = await resolve_role_to_profile(project_id, step_dict, db)
 
     # 2. Preset (auto-populates on first dispatch)
     preset = await _ensure_soul_preset(project_id, step_dict, profile, db)
 
-    # 3. Compose SOUL — content priority: preset.content → preset
-    #    .default_soul → step.default_soul → generic role template.
+    # 3. Compose SOUL â€” content priority: preset.content â†’ preset
+    #    .default_soul â†’ step.default_soul â†’ generic role template.
     raw_content = (
         (preset.get("content") or "").strip()
         or (preset.get("default_soul") or "").strip()
@@ -845,7 +885,7 @@ async def dispatch_step(
         )
 
     # 6. Record the apply. The mtime is the timestamp we composed
-    #    into the SOUL.md header — good enough as a coarse "this is
+    #    into the SOUL.md header â€” good enough as a coarse "this is
     #    what we wrote, when" marker. The wrapper doesn't currently
     #    report an authoritative SOUL.md mtime on the heartbeat, so
     #    using our own header timestamp is the only consistent value
@@ -853,5 +893,6 @@ async def dispatch_step(
     #    once that field is added to the heartbeat payload.)
     await touch_soul_preset(db, preset["id"], applied_mtime=_now_iso())
 
-    # 7. Create the task — supervisor picks it up from here
+    # 7. Create the task â€” supervisor picks it up from here
     return await _create_dispatched_task(project_id, step_dict, profile, db)
+
