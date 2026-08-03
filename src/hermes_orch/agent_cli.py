@@ -1,7 +1,7 @@
-# coding: utf-8
+﻿# coding: utf-8
 """Agent-side CLI (hermes-orch-agent command).
 
-Commands (per REVIEW.md §8.1):
+Commands (per REVIEW.md Â§8.1):
 - register            Register with orchestrator (get secret, write to .secret file)
 - start               Start the wrapper daemon (heartbeat + ready for tasks)
 - stop                Stop the daemon
@@ -36,7 +36,7 @@ import httpx
 # so the wrapper auto-applies the right `verify` policy (env-driven,
 # see agent_http.py for the env var contract). All call sites below
 # use `from hermes_orch.agent_http import get/post/...` so swapping
-# the import is enough — no per-call verify= plumbing.
+# the import is enough â€” no per-call verify= plumbing.
 from hermes_orch.agent_http import (  # noqa: E402  (import after httpx on purpose)
     delete as _httpx_delete,
     get as _httpx_get,
@@ -48,15 +48,15 @@ from hermes_orch.agent_http import (  # noqa: E402  (import after httpx on purpo
 import shutil
 
 # Force UTF-8 on stdout/stderr for service-manager log streams.
-# On Windows + NSSM, the log is a cp1252 pipe — any Unicode in
+# On Windows + NSSM, the log is a cp1252 pipe â€” any Unicode in
 # click.echo / prompt content (CJK, em-dash, smart quotes) blows up with
 # UnicodeEncodeError on that stream. That failure propagates OUT of
-# _run_task and the supervisor marks the task failed — even though the
+# _run_task and the supervisor marks the task failed â€” even though the
 # actual work (hermes subprocess) never even started.
 # On Linux + systemd, the journal captures bytes verbatim, but the
 # same reconfigure keeps click.echo safe under locale-odd environments
 # (e.g. LANG=C, no UTF-8 charmap). Cheap insurance either way.
-# Bug seen 2026-07-23 on proj-1a4a2962 ("Create a skill to get 香港天氣...").
+# Bug seen 2026-07-23 on proj-1a4a2962 ("Create a skill to get é¦™æ¸¯å¤©æ°£...").
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -74,7 +74,7 @@ def _resolve_hermes_bin() -> str | None:
 
     Order:
       1. HERMES_BIN env var (user override, takes absolute path)
-      2. shutil.which("hermes") — uses current PATH
+      2. shutil.which("hermes") â€” uses current PATH
       3. Common user-local locations (systemd/services don't load .bashrc
          and Windows services run as LocalSystem with a different %USERPROFILE%):
          - Windows: %LOCALAPPDATA%/hermes/hermes-agent/venv/Scripts/hermes.exe
@@ -134,7 +134,7 @@ def _read_secret(secret_path: Path) -> str:
             f"Secret file not found: {secret_path}\n"
             f"Run 'hermes-orch-agent register' first."
         )
-    return secret_path.read_text(encoding="utf-8").strip()
+    return secret_path.read_text(encoding="utf-8-sig").strip()
 
 
 # Cap on the cleaned task summary stored in the DB. 32KB is enough for
@@ -244,12 +244,12 @@ def _resolve_storage_hint(role: str, output_to: str) -> str:
             matched_via = "full ref"
             break
     if not matched:
-        # Not found — return a soft warning so the agent knows
+        # Not found â€” return a soft warning so the agent knows
         return (
             "--- STORAGE HINT (output_to unresolved) ---\n"
             f"output_to: {target}\n"
             f"WARNING: no entry in [AVAILABLE STORAGE] matches this value.\n"
-            "Falling back to [AVAILABLE STORAGE] context — pick the best\n"
+            "Falling back to [AVAILABLE STORAGE] context â€” pick the best\n"
             "entry by hand, or fix the task's output_to and re-dispatch.\n"
             "--- END STORAGE HINT ---"
         )
@@ -327,12 +327,12 @@ def _render_output_format_block() -> str:
     Convention (2026-07-22, user-stated):
     - .md  : for normal text output (human-readable deliverable)
     - .json: ONLY for parameter values (machine-readable structured data)
-    - DO NOT write `.results.json` to cache_dir as a status file —
+    - DO NOT write `.results.json` to cache_dir as a status file â€”
       task status is reported via the API (status/summary fields),
       not as a separate file. The wrapper auto-upload loop also
       skips any `*.results.json` it finds for this reason.
 
-    Always emitted (no opt-in flag) — this is the project's house
+    Always emitted (no opt-in flag) â€” this is the project's house
     style and shouldn't change per-profile.
     """
     return (
@@ -388,10 +388,10 @@ def _hmac_headers(
 
     Used by:
       - _fetch_project_state_http / _fetch_user_recent_http /
-        _fetch_project_facts_http (GET, no body) — these pass defaults
-      - heartbeat (POST with optional JSON body) — call site passes
+        _fetch_project_facts_http (GET, no body) â€” these pass defaults
+      - heartbeat (POST with optional JSON body) â€” call site passes
         method="POST" + path + body
-      - all other wrapper endpoints — call site passes method/path/body
+      - all other wrapper endpoints â€” call site passes method/path/body
 
     Args:
       agent_id: the agent id (goes into X-Agent-Id)
@@ -399,7 +399,7 @@ def _hmac_headers(
       method: HTTP method (default GET for backwards compat with
         the 3 fetch helpers that don't pass it)
       path: request path including query string (default "" for
-        helpers that don't need it — but the server's verify will
+        helpers that don't need it â€” but the server's verify will
         still pass because empty path matches empty path)
       body: raw request body bytes (default b"")
     """
@@ -425,7 +425,7 @@ def _hmac_headers(
 #      ignored it. A supervisor-set 1200s task would still get the
 #      full 1800s before being killed.
 #
-#   2. `proc.kill()` is SIGKILL/TerminateProcess — immediate, no
+#   2. `proc.kill()` is SIGKILL/TerminateProcess â€” immediate, no
 #      chance for hermes to flush its session, write a graceful
 #      shutdown, or release file locks. Better practice: SIGTERM
 #      first (grace_seconds), then SIGKILL only if it ignored
@@ -434,7 +434,7 @@ def _hmac_headers(
 # This helper centralizes both fixes. It returns (rc, timed_out)
 # so the caller can build the right failure result message. It
 # is module-level (not nested in start()) so it can be unit-tested
-# directly with a real subprocess — no daemon required.
+# directly with a real subprocess â€” no daemon required.
 DEFAULT_SUBPROCESS_GRACE_SEC = 5
 MAX_TASK_TIMEOUT_SEC = 1800  # 30 min hard cap (defense in depth)
 
@@ -512,7 +512,7 @@ def _bootstrap_hmac_secret(orchestrator_url: str, agent_id: str, secret: str) ->
     body = json.dumps({"secret": secret}).encode("utf-8")
     # The bootstrap endpoint isn't HMAC-authed (it IS the bootstrap),
     # so we sign it with a dummy value. But the server doesn't
-    # check HMAC on this endpoint — it just reads the body. So we
+    # check HMAC on this endpoint â€” it just reads the body. So we
     # can omit the signature header (the server doesn't require it).
     try:
         r = _httpx_post(
@@ -533,7 +533,7 @@ def _bootstrap_hmac_secret(orchestrator_url: str, agent_id: str, secret: str) ->
                 f"HMAC secret conflict: orchestrator has a different hmac_secret for "
                 f"agent {agent_id} than the local file. The local .secret-{agent_id} "
                 f"was likely rotated without telling the orchestrator. Fix with "
-                f"POST /api/agents/{agent_id}/rotate-key (v1.6.1+ — manual DB update "
+                f"POST /api/agents/{agent_id}/rotate-key (v1.6.1+ â€” manual DB update "
                 f"for now: DELETE from agents where id='{agent_id}' then re-register)."
             )
         else:
@@ -541,7 +541,7 @@ def _bootstrap_hmac_secret(orchestrator_url: str, agent_id: str, secret: str) ->
                 f"  [hmac] WARNING: bootstrap returned {r.status_code} {r.text[:200]}"
             )
     except httpx.HTTPError as e:
-        # Network errors are non-fatal — the wrapper will still try
+        # Network errors are non-fatal â€” the wrapper will still try
         # to heartbeat, and if HMAC is required the heartbeat will
         # 401 with a clearer error.
         click.echo(f"  [hmac] bootstrap network error (non-fatal): {e}")
@@ -655,7 +655,7 @@ def _fetch_project_state_http(
     # Cap at 2KB client-side
     if len(content.encode("utf-8")) > 2048:
         content = content.encode("utf-8")[:2048].decode("utf-8", errors="replace")
-        content += "\n[…truncated…]"
+        content += "\n[â€¦truncatedâ€¦]"
     return content
 
 
@@ -690,7 +690,7 @@ def _fetch_user_recent_http(
         return None
     if len(content.encode("utf-8")) > 2048:
         content = content.encode("utf-8")[:2048].decode("utf-8", errors="replace")
-        content += "\n[…recent truncated…]"
+        content += "\n[â€¦recent truncatedâ€¦]"
     return content
 
 
@@ -740,7 +740,7 @@ def _clean_hermes_output(stdout: str) -> str:
     we want the agent's actual conclusion to show, not hermes' session
     metadata.
 
-    We keep the first MAX_SUMMARY_CHARS chars (32KB by default — large
+    We keep the first MAX_SUMMARY_CHARS chars (32KB by default â€” large
     enough for research / backtest / multi-step tasks; small enough to
     keep the DB row light). The dashboard's "Show full" button + max-h-96
     scroll lets the user read the whole thing.
@@ -750,22 +750,22 @@ def _clean_hermes_output(stdout: str) -> str:
     # Strip ANSI escape codes (color, cursor moves, etc.)
     s = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s)
     # Strip the box-drawing borders that wrap "Hermes" tool headers.
-    # First: long runs of box-drawing chars (─━━╭╮╰╯│...).
-    s = re.sub(r"[─━╭╮╰╯│┌┐└┘├┤┬┴┼]{4,}", "[…]", s)
+    # First: long runs of box-drawing chars (â”€â”â”â•­â•®â•°â•¯â”‚...).
+    s = re.sub(r"[â”€â”â•­â•®â•°â•¯â”‚â”Œâ”â””â”˜â”œâ”¤â”¬â”´â”¼]{4,}", "[â€¦]", s)
     # Then: drop lines that are mostly box-drawing chrome
-    # (e.g. individual `╭─ ⚕ Hermes ─...╮` lines, or short `╰─...╯`).
-    s = re.sub(r"^\s*[╭╮╰╯│┌┐└┘├┤┬┴┼─━┃━╾╼]+\s*[^\n]*$", "", s, flags=re.MULTILINE)
-    # Drop the standalone "⚕ Hermes" brand mark on its own line.
-    s = re.sub(r"^\s*⚕\s*Hermes[^\n]*$", "", s, flags=re.MULTILINE)
-    # Strip hermes' "tool call" rows like "┊ 💻 preparing terminal…"
-    # and "┊ 💻 $         curl ... 1.2s". These dominate the output.
-    s = re.sub(r"^\s*┊\s*[^\n]*$", "", s, flags=re.MULTILINE)
+    # (e.g. individual `â•­â”€ âš• Hermes â”€...â•®` lines, or short `â•°â”€...â•¯`).
+    s = re.sub(r"^\s*[â•­â•®â•°â•¯â”‚â”Œâ”â””â”˜â”œâ”¤â”¬â”´â”¼â”€â”â”ƒâ”â•¾â•¼]+\s*[^\n]*$", "", s, flags=re.MULTILINE)
+    # Drop the standalone "âš• Hermes" brand mark on its own line.
+    s = re.sub(r"^\s*âš•\s*Hermes[^\n]*$", "", s, flags=re.MULTILINE)
+    # Strip hermes' "tool call" rows like "â”Š ðŸ’» preparing terminalâ€¦"
+    # and "â”Š ðŸ’» $         curl ... 1.2s". These dominate the output.
+    s = re.sub(r"^\s*â”Š\s*[^\n]*$", "", s, flags=re.MULTILINE)
     # Strip the trailing session metadata block that hermes prints on
     # exit. Everything from "Resume this session with:" to EOF is noise
     # for a human reading the task summary.
     s = re.sub(
         r"\n*Resume this session with:.*$",
-        "\n[…session metadata stripped…]",
+        "\n[â€¦session metadata strippedâ€¦]",
         s,
         flags=re.DOTALL,
     )
@@ -773,7 +773,7 @@ def _clean_hermes_output(stdout: str) -> str:
     # block that sometimes appears at the start of the output.
     s = re.sub(
         r"^Session:\s+\S+.*?Messages:\s+\d+.*$",
-        "[…session metadata stripped…]",
+        "[â€¦session metadata strippedâ€¦]",
         s,
         flags=re.MULTILINE | re.DOTALL,
     )
@@ -795,7 +795,7 @@ def _clean_hermes_output(stdout: str) -> str:
 # not met, abort"). The orchestrator's task model assumes exit 0 =
 # success, so the agent has no clean way to mark a task as failed.
 # Without this, feedback_to (which depends on `status='failed'`)
-# never fires for LLM-decided failures — the loop-back path only
+# never fires for LLM-decided failures â€” the loop-back path only
 # triggers for server-side failures (dispatch.mismatch, stuck
 # wrapper, missing profile).
 #
@@ -819,7 +819,7 @@ def _clean_hermes_output(stdout: str) -> str:
 #     substring after the marker, single line).
 #   - Cleanup: `_clean_hermes_output` strips box-drawing / ANSI
 #     before this check, so the marker survives the clean step.
-#   - If no marker → status=completed (unchanged behavior).
+#   - If no marker â†’ status=completed (unchanged behavior).
 _TASK_FAILED_MARKER = "TASK_FAILED:"
 
 
@@ -856,7 +856,7 @@ def _apply_task_failed_marker(summary: str) -> dict:
                     "summary": summary,
                     "skipped_artifacts": [],
                 }
-        # Marker present in summary but no line matched (defensive —
+        # Marker present in summary but no line matched (defensive â€”
         # could happen if the marker is in a line that was stripped
         # by cleanup). Fall through to completed.
     return {"status": "completed", "summary": summary, "skipped_artifacts": []}
@@ -899,9 +899,9 @@ def _strip_prompt_echo(s: str) -> str:
     # Find the LAST closing marker in the first 2500 chars. Each marker
     # is associated with a block that the agent shouldn't have echoed
     # in the first place. Strip everything up to and including the
-    # deepest closing marker. Order: OUTPUT FORMAT (always) → STORAGE
-    # HINT (only if params.output_to set) → AVAILABLE STORAGE (only if
-    # storage_refs configured) → PROJECT CONTEXT (only if context_block
+    # deepest closing marker. Order: OUTPUT FORMAT (always) â†’ STORAGE
+    # HINT (only if params.output_to set) â†’ AVAILABLE STORAGE (only if
+    # storage_refs configured) â†’ PROJECT CONTEXT (only if context_block
     # built). The deepest marker is the right one to strip up to.
     end_markers = [
         r"\s*--- END OUTPUT FORMAT ---\s*\n",
@@ -991,7 +991,7 @@ def _sweep_zombie_sessions_inline(
         sessions; those go through the supervisor cleanup-ack flow)
       - started_at < now - ttl_days (defensive: don't touch recent
         sessions in case a long-lived hermes subprocess is still using
-        them — e.g. a dashboard or gateway)
+        them â€” e.g. a dashboard or gateway)
 
     Returns the number of sessions deleted (0 if none found / dry-run).
 
@@ -1049,7 +1049,7 @@ def _sweep_zombie_sessions_inline(
 
     # Find the hermes CLI on PATH. We try a couple of common locations;
     # if neither works, we silently skip (the wrapper can't do much
-    # without hermes anyway — it'll have been failing earlier already).
+    # without hermes anyway â€” it'll have been failing earlier already).
     hermes_bin = None
     for cand in (Path(root).parent.parent / "hermes-agent" / "venv" / "bin" / "hermes",
                  Path(root).parent / "hermes-agent" / "venv" / "bin" / "hermes"):
@@ -1078,7 +1078,7 @@ def _sweep_zombie_sessions_inline(
             if proc.returncode == 0:
                 deleted += 1
             elif "not found" in (proc.stderr or "").lower() or "no such" in (proc.stderr or "").lower():
-                # Already gone — count as success (we wanted it gone)
+                # Already gone â€” count as success (we wanted it gone)
                 deleted += 1
             else:
                 click.echo(
@@ -1110,7 +1110,7 @@ def _read_profile_config(profile_root: Path) -> dict:
 
     All fields are optional. On missing file, parse error, or empty
     config, returns a dict with all-None / empty-list defaults. Never
-    raises — heartbeat must not break on a single bad config.yaml.
+    raises â€” heartbeat must not break on a single bad config.yaml.
 
     YAML schema (v0.17+):
         model:
@@ -1161,23 +1161,23 @@ def _read_profile_config(profile_root: Path) -> dict:
 
 
 def _extract_skills_used_from_transcript(transcript_path: Path) -> list[str]:
-    """Parse a hermes transcript for the `📚 skill <name>` markers that
+    """Parse a hermes transcript for the `ðŸ“š skill <name>` markers that
     indicate which skills the agent actually loaded during the task.
 
     The hermes CLI prints a line per skill it loads via the skill_view
     tool, formatted as:
-        ┊ 📚 skill     <name>  <duration>
-        ┊ 📚 skill     <name>  <duration>
+        â”Š ðŸ“š skill     <name>  <duration>
+        â”Š ðŸ“š skill     <name>  <duration>
     (Note: multiple spaces between "skill" and the name.)
 
     Stage 1.5 multi-skill awareness (2026-07-23): the wrapper reports
     this list in the /result POST so promote-to-workflow can preserve
     every skill the source used. The orchestrator-side helper does the
-    same parse — kept duplicated on purpose (the server can't read the
+    same parse â€” kept duplicated on purpose (the server can't read the
     agent-side transcript directly).
     """
     import re
-    pattern = re.compile(r"📚\s+skill\s+(\S+)\s+[\d.]+s")
+    pattern = re.compile(r"ðŸ“š\s+skill\s+(\S+)\s+[\d.]+s")
     out: list[str] = []
     seen: set[str] = set()
     try:
@@ -1235,7 +1235,7 @@ def _capture_session_tokens(profile_root: Path) -> dict | None:
                 # we don't recognize. Skip silently.
                 return None
             col_list = ", ".join(cols)
-            # Don't filter by ended_at — most hermes sessions don't commit
+            # Don't filter by ended_at â€” most hermes sessions don't commit
             # an end timestamp even when they're functionally done (the
             # process exits but the session row stays NULL on ended_at /
             # end_reason). The most recent session by started_at is what
@@ -1324,7 +1324,7 @@ def cli() -> None:
 @cli.command()
 @click.option("--orchestrator", required=True, help="Orchestrator URL (e.g. http://192.168.1.10:8765)")
 @click.option("--agent-id", required=True, help="Unique agent ID (e.g. linux-a-01)")
-@click.option("--roles", default=None, help="Comma-separated roles (e.g. data-analyst,backtest-runner). Optional — defaults to auto-detected hermes profile names if --profiles-dir is set or HERMES_PROFILES_DIR is set.")
+@click.option("--roles", default=None, help="Comma-separated roles (e.g. data-analyst,backtest-runner). Optional â€” defaults to auto-detected hermes profile names if --profiles-dir is set or HERMES_PROFILES_DIR is set.")
 @click.option("--ip", default=None, help="Agent IP (default: auto-detect)")
 @click.option("--os-type", default=None, type=click.Choice(["windows", "linux"]), help="OS (default: auto-detect)")
 @click.option("--secret-file", default=None, help="Where to write the secret (default: ~/.hermes-orchestrator/.secret-<agent_id>)")
@@ -1448,7 +1448,7 @@ def register(
         else:
             click.echo("  - WARN: couldn't auto-detect hermes profiles dir.")
             click.echo("    Set HERMES_PROFILES_DIR env var or use --profiles-dir.")
-            click.echo("    Skeleton will use '~' templates — edit later.")
+            click.echo("    Skeleton will use '~' templates â€” edit later.")
 
     # Write wrapper-config.json skeleton
     if not config_file:
@@ -1456,7 +1456,7 @@ def register(
     cfg_path = Path(config_file)
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     if cfg_path.exists():
-        # Don't clobber an existing config — just inform
+        # Don't clobber an existing config â€” just inform
         click.echo(f"  - wrapper-config.json already exists at {cfg_path} (left untouched)")
         click.echo(f"    (edit it manually to point to the right hermes profile roots)")
     else:
@@ -1471,7 +1471,7 @@ def register(
                 if candidate.exists():
                     profiles_section[r] = {"root": str(candidate)}
                 else:
-                    # Use template — daemon will warn if it can't find this role
+                    # Use template â€” daemon will warn if it can't find this role
                     profiles_section[r] = {"root": str(detected_dir / r)}
         else:
             for r in role_list:
@@ -1555,7 +1555,7 @@ def start(
     cfg_path = Path(config_file).expanduser()
     if not cfg_path.exists():
         raise click.ClickException(f"Config not found: {cfg_path}")
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     agent_id = cfg.get("agent_id")
     orchestrator_url = cfg.get("orchestrator_url", "").rstrip("/")
     secret_path = Path(cfg.get("secret_file", "")).expanduser()
@@ -1568,9 +1568,9 @@ def start(
     if not secret_path.exists():
         raise click.ClickException(f"Secret file not found: {secret_path}")
     if not profiles_cfg:
-        click.echo("WARN: no profiles in wrapper-config.json — wrapper will idle")
+        click.echo("WARN: no profiles in wrapper-config.json â€” wrapper will idle")
 
-    secret = secret_path.read_text(encoding="utf-8").strip()
+    secret = secret_path.read_text(encoding="utf-8-sig").strip()
     if not secret:
         raise click.ClickException(f"Secret file {secret_path} is empty")
 
@@ -1603,7 +1603,7 @@ def start(
                 added = [r for r in orch_roles if r not in existing]
                 if added:
                     # Re-read config in case another process wrote it
-                    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
                     existing = cfg.get("profiles") or {}
                     for r in orch_roles:
                         if r not in existing:
@@ -1756,7 +1756,7 @@ def start(
         """Run `hermes sessions delete <id> --yes` for each session ID,
         then POST /cleanup-ack to the orchestrator so the DB row flips
         from pending_cleanup to deleted. Best-effort: a hermes delete
-        failure (e.g. session already gone) is non-fatal — we still
+        failure (e.g. session already gone) is non-fatal â€” we still
         ack so the DB doesn't get stuck in pending_cleanup forever.
         """
         if not session_ids:
@@ -1800,7 +1800,7 @@ def start(
                 if proc.returncode == 0:
                     click.echo(f"[daemon] deleted hermes session: {sid}")
                 else:
-                    # "Session not found" / "no such session" is fine —
+                    # "Session not found" / "no such session" is fine â€”
                     # the session is already gone, which is what we wanted.
                     stderr_low = (proc.stderr or "").lower()
                     if "not found" in stderr_low or "no such" in stderr_low:
@@ -1878,8 +1878,8 @@ def start(
             #
             # Pre-fix symptoms: hermes ran fine, the wrapper did
             # all the post-processing (upload artifacts, capture
-            # tokens), then `_submit_result` got 401 (a) → task
-            # stayed in 'running' for 3 minutes → supervisor's
+            # tokens), then `_submit_result` got 401 (a) â†’ task
+            # stayed in 'running' for 3 minutes â†’ supervisor's
             # stuck_wrapper check finally marked it failed. With
             # the v1.9.1 path fix applied, the 401 went away but
             # the 422 surfaced (b). User saw "task timeout failed"
@@ -1924,7 +1924,7 @@ def start(
         # project). Without this filter, every task re-uploads every
         # file in the project cache, causing duplicate artifact rows
         # and audit_log events. (Bug fixed 2026-07-22: user reported
-        # N×duplicate artifact.registered events for the same file.)
+        # NÃ—duplicate artifact.registered events for the same file.)
         import time as _time_mod_for_start
         _task_start_ts = _time_mod_for_start.time()
         profile_cfg = profiles_cfg.get(role)
@@ -2024,7 +2024,7 @@ def start(
         # Path A (#22): if the supervisor denormalized the project's
         # procedure.md into this task's `procedure_md` column at assignment
         # time, include it in the prompt as the first thing the agent sees.
-        # This is the n8n-style "how to do this workflow" doc — the agent
+        # This is the n8n-style "how to do this workflow" doc â€” the agent
         # reads it BEFORE the LLM-driven action call so it follows the
         # project-specific procedure rather than improvising. The denormalized
         # copy lives in the tasks table (set by Supervisor._assign_task),
@@ -2138,13 +2138,13 @@ def start(
             click.echo(f"[daemon] failed to load project memory: {e}")
 
         # Build prompt for hermes. Prepend the [OUTPUT FORMAT] block
-        # (always — house style: .md for output, .json only for params,
+        # (always â€” house style: .md for output, .json only for params,
         # no .results.json) and the [AVAILABLE STORAGE] block (if any,
         # so the agent knows where to put large outputs BEFORE it
         # starts thinking about how to structure the work). Without
         # this, the LLM might default to "write to cache_dir" and hit
         # the 15MB upload cap, then try to chunk or base64 the data
-        # through the orch — neither is what we want.
+        # through the orch â€” neither is what we want.
         params_str = json.dumps(params, ensure_ascii=False) if params else "{}"
         output_format_block = _render_output_format_block()
         storage_block = _render_storage_block(role)
@@ -2278,7 +2278,7 @@ def start(
         #   task like a Google Drive query), the buffer fills and
         #   hermes's stdout write() BLOCKS. Meanwhile the wrapper
         #   is in `proc.communicate()` waiting for hermes to exit
-        #   before reading — classic deadlock. The 1800s timeout
+        #   before reading â€” classic deadlock. The 1800s timeout
         #   kills hermes and we get `error: hermes timeout after
         #   1800s` even though the agent was making real progress.
         #
@@ -2307,7 +2307,7 @@ def start(
                     # `input("Install now? [Y/n] ")` from hanging on a
                     # closed stdin. The wrapper is normally run as a
                     # service (NSSM on Windows, systemd on Linux) which
-                    # has no controlling terminal — input() would block
+                    # has no controlling terminal â€” input() would block
                     # forever. When isatty() returns False, hermes
                     # skips the prompt and proceeds to install attempt.
                     # The transcript log
@@ -2521,7 +2521,7 @@ def start(
                                     body = _strip_duration(raw)
                                     if not body:
                                         # Matched a tool but args is empty
-                                        # (e.g. `┊ 💻 $  done`). Skip.
+                                        # (e.g. `â”Š ðŸ’» $  done`). Skip.
                                         break
                                     sig = _hashlib.sha1(
                                         body.encode("utf-8")
@@ -2591,7 +2591,7 @@ def start(
                 # Live output streaming (v1.1): stop the tail threads
                 # BEFORE closing the file handles so they can do a
                 # final flush of any buffered output. join() with a
-                # small timeout — if a thread is stuck, the main loop
+                # small timeout â€” if a thread is stuck, the main loop
                 # still proceeds (the tail is best-effort).
                 stop_stream.set()
                 for t in stream_threads:
@@ -2609,7 +2609,7 @@ def start(
             stop_stream.set()
             for t in stream_threads:
                 t.join(timeout=3)
-            # Close file handles — Python flushes its userspace buffer
+            # Close file handles â€” Python flushes its userspace buffer
             # on close, so we get the complete transcript on disk.
             stdout_fh.close()
             stderr_fh.close()
@@ -2623,7 +2623,7 @@ def start(
             try:
                 raw = stdout_log.read_bytes()
                 if len(raw) > MAX_INPROC_READ_BYTES:
-                    # Take TAIL — that's where the agent's actual conclusion
+                    # Take TAIL â€” that's where the agent's actual conclusion
                     # is. The start is typically the prompt echo (handled by
                     # _strip_prompt_echo) and progress logs. Cleaner keeps
                     # the agent's last messages.
@@ -2700,7 +2700,7 @@ def start(
                 # re-runs the upstream `add_savings` step. The
                 # agent's last shell action does:
                 #   echo "TASK_FAILED: total=\$45 < threshold=\$100"
-                # and exits 0 — the wrapper catches the marker.
+                # and exits 0 â€” the wrapper catches the marker.
                 # Only the FIRST occurrence is honored (a
                 # defensive default; if multiple are present the
                 # first one is the agent's primary signal).
@@ -2783,7 +2783,7 @@ def start(
                 # Per orch-as-coordinator principle: 15MB per-file cap. Files
                 # larger than the cap are recorded in `skipped_artifacts`
                 # (returned in TaskResult) so the dashboard can show
-                # "N files too large — use share folder". The full path
+                # "N files too large â€” use share folder". The full path
                 # and size are preserved so the operator can locate the file
                 # on the agent's local cache.
                 if cache_dir and project_id:
@@ -2802,7 +2802,7 @@ def start(
                     # `artifact.registered` audit event + DB row) in
                     # ~1s, polluting the artifacts list. The wrapper
                     # should only upload deliverables the user cares
-                    # about — actual code from `cache_root` is rarely
+                    # about â€” actual code from `cache_root` is rarely
                     # a deliverable, and a `node_modules/` upload
                     # definitely isn't. Skip if ANY path component
                     # matches one of these names (case-insensitive,
@@ -2818,18 +2818,18 @@ def start(
                     # v3.10.4 follow-up (2026-08-02): added glob pattern
                     # support. v3.10.3's exact-name list missed
                     # `.pdfvenv/` (an agent-created venv for PDF build
-                    # tools) — 1403 files / 36MB got uploaded as
+                    # tools) â€” 1403 files / 36MB got uploaded as
                     # "artifacts" for proj-e05e89e9's
                     # finalize-hk-view-report step. Whack-a-mole
                     # (adding `.pdfvenv` to the explicit list) is the
-                    # wrong fix — agents will create more custom-named
+                    # wrong fix â€” agents will create more custom-named
                     # venvs (`.myvenv`, `proj-venv`, `tool_venv`,
                     # `.sandbox-venv`, etc.) forever. The right fix is
                     # to match any dir whose name contains "venv"
                     # (case-insensitive). Added as a glob pattern.
                     # Also added `*.egg-info` and `*.dist-info` for
                     # Python package metadata (pip install creates
-                    # these next to every installed package — easy to
+                    # these next to every installed package â€” easy to
                     # miss without the pattern).
                     _SKIP_DIR_PATTERNS = (
                         # Exact names (most common cases)
@@ -2900,7 +2900,7 @@ def start(
                             # the PARENT components only (not the leaf
                             # filename), so a file literally named
                             # `build.py` at the cache root is NOT
-                            # skipped — only files inside a `build/`
+                            # skipped â€” only files inside a `build/`
                             # subdirectory are. Example matches:
                             # `node_modules/foo.js`,
                             # `web/node_modules/foo.js`,
@@ -2960,7 +2960,7 @@ def start(
                             # clutter the artifacts list.
                             if f.name.endswith(".results.json") or f.name.endswith("_results.json"):
                                 continue
-                            # Size check BEFORE read_bytes() — avoid OOM on
+                            # Size check BEFORE read_bytes() â€” avoid OOM on
                             # huge files (an LLM could write a 10GB log if
                             # it loops). If too large, record in skipped
                             # and continue.
@@ -3022,7 +3022,7 @@ def start(
                         click.echo(f"  WARN: auto-upload scan error: {e}")
                     # Merge auto-uploaded artifacts into the result so the
                     # server can register them in the artifacts table. Merge
-                    # each list EXACTLY ONCE — extending twice causes duplicate
+                    # each list EXACTLY ONCE â€” extending twice causes duplicate
                     # artifact rows in the DB (caught 2026-07-22: 6 files
                     # produced 12 artifact.registered audit events, server
                     # registered 12 artifact rows for the 6 unique files).
@@ -3044,7 +3044,7 @@ def start(
                         f"cache_w={token_usage.get('cache_write_tokens', 0)}"
                     )
                 # Stage 1.5 multi-skill (2026-07-23): parse the hermes
-                # transcript for the `📚 skill <name>` markers and report
+                # transcript for the `ðŸ“š skill <name>` markers and report
                 # the unique list to the orchestrator. promote-to-workflow
                 # uses this to preserve every skill the source used.
                 skills_used = _extract_skills_used_from_transcript(stdout_log)
@@ -3064,7 +3064,7 @@ def start(
             token_usage = _capture_session_tokens(profile_root)
             if token_usage:
                 failed_result["token_usage"] = token_usage
-            # Same for skills_used — partial transcript may still show
+            # Same for skills_used â€” partial transcript may still show
             # what the agent loaded before failing.
             skills_used = _extract_skills_used_from_transcript(stdout_log)
             if skills_used:
@@ -3104,11 +3104,11 @@ def start(
     # Subfolder layout `skills/<category>/<name>/SKILL.md` is ALSO supported
     # (added 2026-07-24, Option B). The wrapper recursively scans up to
     # 2 levels deep; deeper nesting is unsupported. Names are derived
-    # from the full sub-path: `skills/productivity/xlsx/SKILL.md` →
+    # from the full sub-path: `skills/productivity/xlsx/SKILL.md` â†’
     # `name="productivity/xlsx"`. Hermes itself still uses the leaf
     # directory name to identify a skill, so two skills with the
     # same leaf name in different subfolders (e.g. `data/xlsx` and
-    # `productivity/xlsx`) will COLLIDE at the hermes layer — the
+    # `productivity/xlsx`) will COLLIDE at the hermes layer â€” the
     # operator should avoid this. Our DB happily stores both as
     # distinct records (different file_path, different name).
     _SKILL_FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
@@ -3132,7 +3132,7 @@ def start(
         """Scan <root>/skills/*.md and push missing/changed ones to the
         orchestrator. Returns the number of skills registered.
 
-        The wrapper is the source of truth for what's on disk — if a skill
+        The wrapper is the source of truth for what's on disk â€” if a skill
         file is on disk but missing from the orchestrator, we POST a
         profile_configs row for it (status=applied, source=self-taught).
         Files that match what's already in the orchestrator (same name,
@@ -3151,7 +3151,7 @@ def start(
         if not skills_dir.exists() or not skills_dir.is_dir():
             return 0
         # Fetch current DB view (include_deleted so we know about deletes too,
-        # but we'll only ever push new/upsert here — deletes are dashboard-driven)
+        # but we'll only ever push new/upsert here â€” deletes are dashboard-driven)
         try:
             r = client.get(
                 f"{orchestrator_url}/api/agents/{agent_id}/profiles/{pname}/skills?include_deleted=1",
@@ -3169,15 +3169,15 @@ def start(
         registered = 0
         try:
             # Two layouts are supported (2026-07-24: added subfolder):
-            #   1. Flat:  skills/<name>/SKILL.md        → name = "<name>"
-            #   2. Nested: skills/<category>/<name>/SKILL.md  → name = "<category>/<name>"
+            #   1. Flat:  skills/<name>/SKILL.md        â†’ name = "<name>"
+            #   2. Nested: skills/<category>/<name>/SKILL.md  â†’ name = "<category>/<name>"
             #      (recursive up to 2 levels; deeper nesting is unsupported
             #       to keep the API simple)
             #
             # The DB stores file_path as the full relative path
             # ("skills/<category>/<name>/SKILL.md") and the `name` is
             # derived from that. The server's _row_to_skill already
-            # handles this — see agents.py:1253-1254.
+            # handles this â€” see agents.py:1253-1254.
             #
             # Hermes 0.17+ uses the LEAF directory name to identify a
             # skill, so `data/xlsx` and `productivity/xlsx` would COLLIDE
@@ -3212,7 +3212,7 @@ def start(
                         click.echo(f"{log_prefix} ({pname}) skip '{rel}': bad subfolder name")
                         continue
                 else:
-                    # Deeper nesting (3+ levels) — unsupported
+                    # Deeper nesting (3+ levels) â€” unsupported
                     click.echo(
                         f"{log_prefix} ({pname}) skip '{rel}': depth > 2 not supported"
                     )
@@ -3228,7 +3228,7 @@ def start(
                 # Change detection: prefer SHA over byte-length. The API
                 # returns `sha256` (hex of desired_content bytes). If the
                 # file's SHA matches what the DB already has, the file is
-                # unchanged — don't re-post. This is content-addressed so
+                # unchanged â€” don't re-post. This is content-addressed so
                 # it's immune to encoding round-trip bugs (the previous
                 # byte-length compare was sensitive to em-dash = 3 bytes
                 # and caused an infinite re-apply loop on files with
@@ -3241,7 +3241,7 @@ def start(
                     and db_skill.get("sha256") == sha
                 ):
                     continue
-                # New or changed file — push to orchestrator. The orchestrator
+                # New or changed file â€” push to orchestrator. The orchestrator
                 # creates a pending row, we immediately ack as applied (file
                 # is already on disk), so the apply-pending loop won't try
                 # to write the file again.
@@ -3372,7 +3372,7 @@ def start(
                                 applied += 1
                                 continue
                             # Safety check: file_path must resolve inside `root`
-                            # (defense-in-depth — the API also validates skill
+                            # (defense-in-depth â€” the API also validates skill
                             # names, but a buggy config shouldn't be able to
                             # escape the profile dir on the agent host).
                             target_resolved = target.resolve()
@@ -3389,7 +3389,7 @@ def start(
                                 # the file on the agent host (used by the
                                 # dashboard's "delete skill" flow).
                                 #
-                                # Folder layout: skills/<name>/SKILL.md →
+                                # Folder layout: skills/<name>/SKILL.md â†’
                                 # rmtree the whole <name> folder
                                 # (we only register SKILL.md; aux files
                                 # in the folder are owned by the user)
@@ -3524,14 +3524,14 @@ def start(
             # 30s dispatch timeout would fire before the wrapper got a
             # chance to claim the pending config, and the new task would
             # fail with `dispatch.soul_apply_failed: SOUL apply timed
-            # out (status=pending)` — even though the wrapper was
+            # out (status=pending)` â€” even though the wrapper was
             # healthy and would have applied the config in 1-7s if it
             # had been polled.
             #
             # Real-world repro: proj-e05e89e9 (analyst 2) on 2026-08-02.
             # Task 365463c4 (research-hk-market-context, super profile)
             # started at 02:23:39 and was running. The super-b config
-            # 89449e75 was queued at 02:23:35 — the wrapper was busy
+            # 89449e75 was queued at 02:23:35 â€” the wrapper was busy
             # with 365463c4, never polled super-b, the 30s dispatch
             # timeout fired at 02:24:05, compare-features failed,
             # finalize-hk-view-report was skipped as a downstream
@@ -3541,11 +3541,11 @@ def start(
             # <profile.root>/<file_path> (typically soul.md), and the
             # task reads its profile's soul.md at start time (cached for
             # the task's lifetime). No shared lock needed; concurrent
-            # apply + read is benign — the task will see either the
+            # apply + read is benign â€” the task will see either the
             # old or the new soul.md, and either is a valid working
             # state.
             #
-            # Cheap when nothing pending — the inner loop is one HTTP
+            # Cheap when nothing pending â€” the inner loop is one HTTP
             # GET per profile that returns `None`, then breaks. So
             # adding this pre-tick cost is ~0ms in the common case.
             _apply_pending_configs_inline()
@@ -3605,7 +3605,7 @@ def start(
                 ) as pool:
                     futures = [pool.submit(_process_one, t) for t in assigned]
                     # Wait for all workers. We DON'T short-circuit on
-                    # stop_flag here — we want in-flight hermes
+                    # stop_flag here â€” we want in-flight hermes
                     # subprocesses to complete so we don't leak
                     # processes (each worker holds a subprocess.Popen).
                     # A kill signal via the outer while-loop's stop
@@ -3621,13 +3621,13 @@ def start(
                 click.echo("[daemon] --once: exiting after one tick")
                 return
             # (v3.10.4: `_apply_pending_configs_inline()` moved ABOVE
-            # the task pool — see the comment in the pre-tick block.
+            # the task pool â€” see the comment in the pre-tick block.
             # The old call here is gone; configs are now applied every
             # tick, BEFORE the workers start, so a long-running task
             # can never starve a new profile's SOUL apply.)
             # Periodic zombie-session sweep (Plan B for the long-standing
             # "49 active sessions in super/state.db" issue). Throttled to
-            # once per day per profile — the SQL scan is cheap but the
+            # once per day per profile â€” the SQL scan is cheap but the
             # hermes sessions delete subprocess calls aren't, and a fresh
             # sweep every 5s would be wasteful. Each profile is swept
             # independently so a slow hermes on one profile doesn't block
@@ -3648,7 +3648,7 @@ def start(
             # Catches self-taught skills the agent wrote into skills/ without
             # going through the dashboard. We use a single short-lived client
             # and only run if enough time has passed since the last sync for
-            # this profile — the file scan is cheap but no point doing it
+            # this profile â€” the file scan is cheap but no point doing it
             # every 5s.
             now_ts = time_mod.time()
             with httpx.Client(timeout=30) as sync_client:
@@ -3676,7 +3676,7 @@ def start(
             # cleanly so the service manager (NSSM on Windows, systemd
             # on Linux) respawns us with the new code. Without this,
             # editing `agent_cli.py` has no effect on the running
-            # wrapper — the user would have to manually bounce the
+            # wrapper â€” the user would have to manually bounce the
             # service, which on Windows 11 requires admin and a slow
             # stop/start cycle. Detected within `interval` seconds of
             # the save.
@@ -3706,7 +3706,7 @@ def start(
                         if os.path.getmtime(_wp) > _self_start_ts:
                             click.echo(
                                 f"[daemon] source changed ({os.path.basename(_wp)} "
-                                f"mtime > start time) — exiting for self-restart"
+                                f"mtime > start time) â€” exiting for self-restart"
                             )
                             return
                 except Exception as _e:
@@ -3720,7 +3720,7 @@ def start(
 def stop() -> None:
     """Stop the wrapper daemon.
 
-    Note: this is a placeholder — the daemon is single-process, so to stop
+    Note: this is a placeholder â€” the daemon is single-process, so to stop
     it just send Ctrl-C / SIGINT to the running process. For multi-process
     service (NSSM on Windows, systemd on Linux), use the OS service manager.
     """
@@ -3747,7 +3747,7 @@ def sync_config(config_file: str) -> None:
     `<detected_dir>/<role>`. Existing custom roots are kept (only adds
     missing roles; doesn't overwrite).
 
-    Idempotent — safe to run anytime (e.g., after adding a new profile in
+    Idempotent â€” safe to run anytime (e.g., after adding a new profile in
     the dashboard).
     """
     import time as time_mod
@@ -3758,7 +3758,7 @@ def sync_config(config_file: str) -> None:
         raise click.ClickException(
             f"Config not found: {cfg_path}. Run 'hermes-orch-agent register' first."
         )
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     agent_id = cfg.get("agent_id")
     orchestrator_url = cfg.get("orchestrator_url", "").rstrip("/")
     secret_path = Path(cfg.get("secret_file", "")).expanduser()
@@ -3766,7 +3766,7 @@ def sync_config(config_file: str) -> None:
         raise click.ClickException("Config missing agent_id or orchestrator_url")
     if not secret_path.exists():
         raise click.ClickException(f"Secret file not found: {secret_path}")
-    secret = secret_path.read_text(encoding="utf-8").strip()
+    secret = secret_path.read_text(encoding="utf-8-sig").strip()
 
     # Fetch agent's role list from orchestrator
     try:
@@ -3849,7 +3849,7 @@ def status() -> None:
         click.echo(f"Config not found: {cfg_path}")
         click.echo("Run 'hermes-orch-agent register' first.")
         return
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     agent_id = cfg.get("agent_id")
     orchestrator_url = cfg.get("orchestrator_url", "").rstrip("/")
     secret_path = Path(cfg.get("secret_file", "")).expanduser()
@@ -3873,7 +3873,7 @@ def status() -> None:
 
     # Try a heartbeat to see if we can reach the orchestrator
     if secret_path.exists() and orchestrator_url:
-        secret = secret_path.read_text(encoding="utf-8").strip()
+        secret = secret_path.read_text(encoding="utf-8-sig").strip()
         try:
             _hb_body = json.dumps({"status": "idle"}).encode("utf-8")
             r = _httpx_post(
@@ -3964,8 +3964,8 @@ def apply_configs(config_path: str, profile_filter: str | None) -> None:
                     content = cfg_row["desired_content"] or ""
                     if content == "" and cfg_row["file_path"].startswith("skills/"):
                         # Empty content for a skills/ path = delete on host.
-                        # Folder layout (skills/<name>/SKILL.md) → rmtree the
-                        # whole folder. Flat layout (skills/<name>.md) →
+                        # Folder layout (skills/<name>/SKILL.md) â†’ rmtree the
+                        # whole folder. Flat layout (skills/<name>.md) â†’
                         # rmtree the whole skill folder
                         skill_folder = target_resolved.parent
                         if skill_folder.exists() and skill_folder.is_dir():
@@ -4058,3 +4058,4 @@ def _ack(
 
 if __name__ == "__main__":
     cli()
+
