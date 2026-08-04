@@ -1265,12 +1265,56 @@ class Supervisor:
         """
         return list(self._duplicate_running_projects.get(project_id, []))
 
+    def _checkpoint_sync(self, name: str, project_id: str = None) -> None:
+        """v3.12.2 #1 hang-investigation: sync sqlite3 INSERT into
+        audit_log. Used at before/after checkpoints around the
+        suspect await calls in `_handle_execution`, since:
+          (1) root logger is at WARNING + has no handler, so
+              `log.info()` never reaches the server's
+              stdout/stderr (verified: server-new.log +
+              server.stdout.log + server.stderr.log all 0 bytes
+              after a fresh restart)
+          (2) `print(..., flush=True)` from commit adae1d7 was
+              also silently dropped by the Start-Process +
+              uvicorn chain (same reason)
+          (3) sync sqlite3 + WAL mode + 5s busy_timeout works
+              alongside the async aiosqlite connection
+              (verified earlier: external quick test on this same
+              DB took 0.00s for BEGIN IMMEDIATE + COMMIT)
+        The checkpoint is bounded by busy_timeout=5s, so even
+        if the DB is locked the write fails fast and we still
+        get the earlier checkpoint rows.
+        """
+        try:
+            import sqlite3 as _sync_sqlite_cp
+            import json as _json_cp
+            _sync_con = _sync_sqlite_cp.connect(self.db.db_path, timeout=5)
+            _sync_con.execute(
+                "INSERT INTO audit_log (event_type, actor, payload, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    "supervisor.checkpoint",
+                    "supervisor",
+                    _json_cp.dumps({
+                        "checkpoint": name,
+                        "project_id": project_id,
+                    }),
+                    _now_iso(),
+                ),
+            )
+            _sync_con.commit()
+            _sync_con.close()
+        except Exception:
+            pass
+
     # ===== execution (ready / running) =====
 
     async def _handle_execution(self, proj: dict[str, Any]) -> None:
         pid = proj["id"]
+        self._checkpoint_sync("handle_execution.before_propagate_failures", pid)
         # 1. Propagate failures: any failed task marks downstream pending/assigned as skipped
         await self._propagate_failures(pid)
+        self._checkpoint_sync("handle_execution.after_propagate_failures", pid)
         # 1.5. Loop-back check (Phase 0 of visual workflow builder, 2026-07-24):
         # if any failed task is referenced by another task's feedback_to,
         # cascade-reset the target + its dependents so the whole chain
@@ -1278,9 +1322,13 @@ class Supervisor:
         # visible) and BEFORE _find_ready_tasks (cascade-reset tasks are
         # picked up in the same tick). Idempotent and safe to skip if
         # the project has no feedback_to anywhere (returns False fast).
+        self._checkpoint_sync("handle_execution.before_maybe_loop_back", pid)
         await self._maybe_loop_back(pid)
+        self._checkpoint_sync("handle_execution.after_maybe_loop_back", pid)
         # 2. Find pending tasks ready to be assigned (all deps completed)
+        self._checkpoint_sync("handle_execution.before_find_ready_tasks", pid)
         ready = await self._find_ready_tasks(pid)
+        self._checkpoint_sync("handle_execution.after_find_ready_tasks", pid)
         no_progress = True  # assume no progress until we actually do something
         for t in ready:
             # v3.9.0: the project dispatch path goes through
@@ -1306,16 +1354,32 @@ class Supervisor:
             # cap check + status transition). Not pre-resolved →
             # run the full Round-3 dispatch.
             if t.get("assigned_profile_id"):
+                _tid_short = t.get("id", "?")[:14]
+                self._checkpoint_sync(
+                    f"handle_execution.before_assign_task:{_tid_short}", pid,
+                )
                 ok = await self._assign_task(t)
+                self._checkpoint_sync(
+                    f"handle_execution.after_assign_task:{_tid_short}", pid,
+                )
             else:
+                _tid_short = t.get("id", "?")[:14]
+                self._checkpoint_sync(
+                    f"handle_execution.before_dispatch_via_soul:{_tid_short}", pid,
+                )
                 ok = await self._dispatch_via_soul_dispatch(t)
+                self._checkpoint_sync(
+                    f"handle_execution.after_dispatch_via_soul:{_tid_short}", pid,
+                )
             if ok:
                 no_progress = False
         # 3. (skip) Assigned tasks stay 'assigned' until wrapper claims them via
         #    POST /api/tasks/{id}/start. Supervisor used to auto-promote to
         #    'running', but that was a stub — real work needs the wrapper.
         # 4. Project state transitions
+        self._checkpoint_sync("handle_execution.before_advance_state", pid)
         await self._maybe_advance_project_state(proj, no_progress)
+        self._checkpoint_sync("handle_execution.after_advance_state", pid)
         # 5. Q2 iteration loop: if the project has a coordinator_role and
         #    max_iterations, AND all current tasks are terminal, advance
         #    current_iteration and dispatch a "review" task to the
@@ -1323,7 +1387,9 @@ class Supervisor:
         #    "DECISION: PASS" (or max iterations hit), the project moves
         #    to completed. Coordinator tasks that create new sub-tasks
         #    will be picked up in the next tick (no manual trigger).
+        self._checkpoint_sync("handle_execution.before_maybe_iterate", pid)
         await self._maybe_iterate(proj)
+        self._checkpoint_sync("handle_execution.after_maybe_iterate", pid)
 
     # ===== Q2: project iteration loop =====
 
