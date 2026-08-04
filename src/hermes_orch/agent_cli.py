@@ -3975,7 +3975,17 @@ def start(
                                 f"[daemon] source changed ({os.path.basename(_wp)} "
                                 f"mtime > start time) Ã¢â‚¬â€ exiting for self-restart"
                             )
-                            return
+                            # v3.12.5: exit code 1 (not 0) so Task Scheduler
+                            # RecoveryConfig.RestartOnFailure can trigger a
+                            # respawn. Previously the wrapper used `return`
+                            # (clean exit 0), which leaves the service in a
+                            # "Success" state -- Task Scheduler treats that
+                            # as "nothing to do" and the wrapper stays down
+                            # until the next reboot. NSSM (production target)
+                            # does not care about exit code, so this only
+                            # affects Task Scheduler deployments.
+                            # HERMES_WRAPPER_NO_SELF_RESTART=1 still opts out.
+                            sys.exit(1)
                 except Exception as _e:
                     # Never let the watchdog crash the daemon
                     click.echo(f"[daemon] self-restart check error: {_e}")
