@@ -545,51 +545,6 @@ function fallbackCopy(text, taskId) {
     }
 }
 
-document.getElementById('new-task-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const form = e.target;
-    const status = document.getElementById('form-status');
-    status.textContent = 'Creating...';
-    status.className = 'text-sm text-gray-500';
-
-    const body = {
-        project_id: form.project_id.value,
-        agent_role: form.agent_role.value,
-        action: form.action.value,
-    };
-    if (form.params.value.trim()) {
-        try {
-            body.params = JSON.parse(form.params.value);
-        } catch (err) {
-            status.textContent = 'Invalid JSON in params: ' + err.message;
-            status.className = 'text-sm text-red-600';
-            return;
-        }
-    }
-
-    try {
-        const r = await fetch('/api/tasks/', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(body),
-        });
-        if (r.ok) {
-            const data = await r.json();
-            status.textContent = 'Created ' + data.id + '! Reloading...';
-            status.className = 'text-sm text-green-600';
-            if (document.activeElement) document.activeElement.blur();
-            setTimeout(() => location.reload(), 500);
-        } else {
-            const err = await r.json().catch(() => ({}));
-            status.textContent = 'Error: ' + (err.detail || r.status);
-            status.className = 'text-sm text-red-600';
-        }
-    } catch (err) {
-        status.textContent = 'Network error: ' + err.message;
-        status.className = 'text-sm text-red-600';
-    }
-});
-
 async function cancelTask(taskId) {
     if (!confirm('Cancel task ' + taskId + '?')) return;
     try {
