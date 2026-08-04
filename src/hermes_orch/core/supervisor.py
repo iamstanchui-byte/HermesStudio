@@ -571,10 +571,11 @@ class Supervisor:
 
         Single tasks live in the virtual __single_tasks__ project,
         which is in state='completed' (so the project loop skips it).
-        We scan for pending single tasks here, assign them to any
+        We scan for pending single tasks here and assign them to any
         available agent (since the user typically doesn't pin a role
-        for a one-off task), and promote them to running so the
-        wrapper can pick them up.
+        for a one-off task). The wrapper claims them via /start in
+        the same way it claims project tasks — see the comment in
+        _assign_task for the claim handshake.
 
         Unlike project tasks, single tasks:
           - have no depends_on (always 0 dependencies)
@@ -595,7 +596,6 @@ class Supervisor:
         if not pending:
             return
         n_assigned = 0
-        n_running = 0
         for t in pending:
             try:
                 ok = await self._assign_task(t)
@@ -603,38 +603,26 @@ class Supervisor:
                     n_assigned += 1
             except Exception as e:
                 log.exception(f"single-task assign {t['id']} failed: {e}")
-        # Promote just-assigned tasks to running (the wrapper polls
-        # for status='running' to claim work). For project tasks this
-        # is normally deferred (the wrapper claims via /start), but
-        # single tasks have no project lifecycle so we just kick
-        # them off.
-        rows = await self.db.fetchall(
-            "SELECT id FROM tasks WHERE project_id = ? "
-            "AND is_single_task = 1 AND status = 'assigned'",
-            (SINGLE_TASKS_PROJECT_ID,),
-        )
-        now = _now_iso()
-        for r in rows:
-            try:
-                await self.db.execute(
-                    "UPDATE tasks SET status = 'running', last_liveness_at = ?, "
-                    "started_at = COALESCE(started_at, ?), updated_at = ? "
-                    "WHERE id = ? AND status = 'assigned'",
-                    (now, now, now, r["id"]),
-                )
-                await audit_log(
-                    self.db, "task.started",
-                    actor="supervisor",
-                    project_id=SINGLE_TASKS_PROJECT_ID,
-                    task_id=r["id"],
-                )
-                n_running += 1
-            except Exception as e:
-                log.exception(f"single-task promote {r['id']} failed: {e}")
-        if n_assigned or n_running:
+        # Don't auto-promote assigned single-tasks to running. Same as
+        # the project-task flow: supervisor flips pending -> assigned,
+        # the wrapper sees status='assigned' in the heartbeat and calls
+        # /api/agents/{id}/profiles/{name}/tasks/{task_id}/start which
+        # atomically transitions to running (and seeds last_liveness_at).
+        #
+        # Auto-promoting here (the prior behavior) raced the wrapper:
+        # by the time the wrapper polled, the task was already running
+        # and its main-loop filter `if t.get("status") == "assigned"`
+        # skipped it. The task then sat in running with no liveness
+        # updates and the supervisor's 3-min stuck-wrapper cutoff
+        # marked it failed (audit: task.stuck_wrapper).
+        #
+        # Removing the auto-promote lets the wrapper claim via /start
+        # like project tasks do — single symmetric code path.
+        if n_assigned:
             log.info(
-                "single tasks: assigned %d, promoted %d (out of %d pending)",
-                n_assigned, n_running, len(pending),
+                "single tasks: assigned %d (out of %d pending); "
+                "wrapper will claim via /start",
+                n_assigned, len(pending),
             )
 
     # ===== planning -> ready =====
