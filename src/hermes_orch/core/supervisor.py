@@ -186,20 +186,61 @@ class Supervisor:
         if self._task and not self._task.done():
             return
         self._stop.clear()
+        # v3.12.2 #1 hang-investigation: write a sync checkpoint to
+        # audit_log BEFORE spawning the background task. The
+        # checkpoint uses sync `sqlite3` (not aiosqlite) because:
+        #   (1) the audit_log write path is independently verified
+        #       working (18:34 wrote 5 task.stuck_wrapper rows)
+        #   (2) the supervisor `start()` is a SYNC method, so we can't
+        #       call `await self.db.execute(...)` here
+        #   (3) print() to stdout/stderr was tried in commit adae1d7
+        #       but the Start-Process + uvicorn chain silently drops
+        #       the redirect (server-new.log + server.stdout.log +
+        #       server.stderr.log all 0 bytes after restart)
+        # Sync sqlite3 with WAL mode + 5s busy_timeout, talking to
+        # the same .db file the aiosqlite connection uses -- WAL
+        # mode allows concurrent reader/writer, so this sync write
+        # doesn't conflict with the aiosqlite reader. Verified
+        # earlier (external quick test took 0.00s for BEGIN
+        # IMMEDIATE + COMMIT).
+        try:
+            import sqlite3 as _sync_sqlite
+            import json as _json
+            _db_path = self.db.db_path  # aiosqlite Database exposes db_path
+            _sync_con = _sync_sqlite.connect(_db_path, timeout=5)
+            _sync_con.execute(
+                "INSERT INTO audit_log (event_type, actor, payload, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    "supervisor.checkpoint",
+                    "supervisor",
+                    _json.dumps({"checkpoint": "start_begin", "interval": self.interval}),
+                    _now_iso(),
+                ),
+            )
+            _sync_con.commit()
+            _sync_con.close()
+        except Exception as _e:
+            # If even this sync checkpoint fails, the DB is in such
+            # a bad state that the supervisor itself is broken at
+            # the I/O layer. Log the failure and continue -- the
+            # next attempt to write will surface the real error.
+            print(f"SUPERVISOR_CHECKPOINT: start_begin audit_log write failed: {_e}", flush=True)
         self._task = asyncio.create_task(self._run(), name="hermes-supervisor")
         # Phase 3: fire-and-forget user-level recent.md regen at startup
         # so the planner has a fresh cross-project summary from the
         # first goal it sees. Non-blocking -- if it fails, the manual
         # POST /memory/recent/regenerate endpoint is the fallback.
-        # v3.12.2 hang-investigation: print() (not log.info) used here
-        # because root logger is at WARNING + has no handler, so
-        # log.info() never reaches the server's stderr/stdout. We need
-        # a checkpoint to confirm whether this fire-and-forget task is
-        # where the supervisor hangs. If we never see the second print,
-        # the spawn itself hangs (extremely unlikely). If we see the
-        # second print but supervisor still hangs on the next tick,
-        # regenerate_recent_async is the hang point.
-        print("SUPERVISOR_CHECKPOINT: start() about to spawn regenerate_recent_async", flush=True)
+        # v3.12.2 #1 hang-investigation: also write the
+        # "start_after_regen_spawn" checkpoint via sync sqlite3,
+        # AFTER asyncio.create_task returns. If the audit_log has
+        # BOTH start_begin AND start_after_regen_spawn, the spawn
+        # is fine and the hang is in regenerate_recent_async's
+        # body (or in the next tick's await chain). If only
+        # start_begin is present, the create_task call itself or
+        # the import of get_recent_generator / get_memory_writer is
+        # blocking (very unlikely; would point to a circular
+        # import or a sync .__init__ that hangs).
         try:
             from hermes_orch.core.memory import get_memory_writer
             from hermes_orch.core.synthesis import get_recent_generator
@@ -211,13 +252,47 @@ class Supervisor:
                 ),
                 name="hermes-recent-regen",
             )
-            print(
-                f"SUPERVISOR_CHECKPOINT: start() regenerate_recent_async task "
-                f"spawned, id={id(recent_task)}, name={recent_task.get_name()!r}",
-                flush=True,
-            )
+            try:
+                import sqlite3 as _sync_sqlite2
+                import json as _json2
+                _sync_con2 = _sync_sqlite2.connect(self.db.db_path, timeout=5)
+                _sync_con2.execute(
+                    "INSERT INTO audit_log (event_type, actor, payload, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        "supervisor.checkpoint",
+                        "supervisor",
+                        _json2.dumps({
+                            "checkpoint": "start_after_regen_spawn",
+                            "task_id": id(recent_task),
+                            "task_name": recent_task.get_name(),
+                        }),
+                        _now_iso(),
+                    ),
+                )
+                _sync_con2.commit()
+                _sync_con2.close()
+            except Exception as _e2:
+                print(f"SUPERVISOR_CHECKPOINT: start_after_regen_spawn audit_log write failed: {_e2}", flush=True)
         except Exception as e:
-            print(f"SUPERVISOR_CHECKPOINT: start() regen trigger failed: {e}", flush=True)
+            try:
+                import sqlite3 as _sync_sqlite3
+                import json as _json3
+                _sync_con3 = _sync_sqlite3.connect(self.db.db_path, timeout=5)
+                _sync_con3.execute(
+                    "INSERT INTO audit_log (event_type, actor, payload, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        "supervisor.checkpoint",
+                        "supervisor",
+                        _json3.dumps({"checkpoint": "start_regen_failed", "error": str(e)[:200]}),
+                        _now_iso(),
+                    ),
+                )
+                _sync_con3.commit()
+                _sync_con3.close()
+            except Exception:
+                pass
             log.warning(f"startup recent regen trigger failed: {e}")
         log.info(f"supervisor started; interval={self.interval}s")
 
@@ -2029,24 +2104,61 @@ class Supervisor:
         tid = task["id"]
         role = task["agent_role"]
         is_single = bool(task.get("is_single_task"))
-        # v3.12.2 hang-investigation: print() (not log.info) used here
-        # for the same reason as in start() -- root logger is at WARNING
-        # + has no handler. If we see the first print but not the
-        # second, the hang is in the aiosqlite fetchone call. If we see
-        # both but the supervisor still doesn't progress, the hang is
-        # downstream in the role/profile matching logic.
-        print(f"SUPERVISOR_CHECKPOINT: _assign_task about to fetchone for task={tid}", flush=True)
+        # v3.12.2 #1 hang-investigation: write sync checkpoint BEFORE
+        # the aiosqlite fetchone. The hang is suspected to be in the
+        # aiosqlite fetchone (or downstream awaits that depend on it).
+        # The checkpoint uses sync sqlite3 for the same reasons as
+        # in start() (start() is sync, can't await; print() to
+        # stdout is silently dropped by the Start-Process redirect).
+        # If we see "assign_about_to_fetchone" but NOT
+        # "assign_fetchone_returned", the aiosqlite fetchone (or
+        # some sub-await it depends on) is the hang point.
+        try:
+            import sqlite3 as _sync_sqlite_assign
+            import json as _json_assign
+            _sync_con_a = _sync_sqlite_assign.connect(self.db.db_path, timeout=5)
+            _sync_con_a.execute(
+                "INSERT INTO audit_log (event_type, actor, payload, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    "supervisor.checkpoint",
+                    "supervisor",
+                    _json_assign.dumps({"checkpoint": "assign_about_to_fetchone", "task_id": tid}),
+                    _now_iso(),
+                ),
+            )
+            _sync_con_a.commit()
+            _sync_con_a.close()
+        except Exception:
+            pass
         # Re-read to avoid races
         cur = await self.db.fetchone(
             "SELECT id, status, project_id, agent_role, required_capability "
             "FROM tasks WHERE id = ?",
             (tid,),
         )
-        print(
-            f"SUPERVISOR_CHECKPOINT: _assign_task fetchone returned for task={tid} "
-            f"(cur={'None' if cur is None else 'row'})",
-            flush=True,
-        )
+        try:
+            import sqlite3 as _sync_sqlite_assign2
+            import json as _json_assign2
+            _sync_con_a2 = _sync_sqlite_assign2.connect(self.db.db_path, timeout=5)
+            _sync_con_a2.execute(
+                "INSERT INTO audit_log (event_type, actor, payload, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    "supervisor.checkpoint",
+                    "supervisor",
+                    _json_assign2.dumps({
+                        "checkpoint": "assign_fetchone_returned",
+                        "task_id": tid,
+                        "cur_is_none": cur is None,
+                    }),
+                    _now_iso(),
+                ),
+            )
+            _sync_con_a2.commit()
+            _sync_con_a2.close()
+        except Exception:
+            pass
         if not cur or cur["status"] != "pending":
             return False
         # Path A (#22): inject the project's procedure.md into the task row
