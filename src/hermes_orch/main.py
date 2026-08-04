@@ -128,6 +128,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     db = Database(db_path)
     await db.connect()
     app.state.db = db
+    # v3.12.2 #3: supervisor uses its own aiosqlite connection so its
+    # tick-loop writes don't compete with the API on the same
+    # in-process connection. The 2026-08-04 incident showed that
+    # `busy_timeout=5000` (v3.12.2 #2) only fixes SQLITE_BUSY (across
+    # connections); aiosqlite's worker-thread state can still hit
+    # SQLITE_LOCKED (in-transaction read lock in the SAME connection)
+    # when the supervisor's read+write loop holds the connection
+    # while the API tries to UPDATE (e.g. heartbeat). Two separate
+    # aiosqlite connections = two separate worker threads = no
+    # in-process lock contention. WAL mode + cross-connection
+    # busy_timeout still handle the cross-process / cross-thread
+    # cases.
+    supervisor_db = Database(db_path)
+    await supervisor_db.connect()
+    app.state.supervisor_db = supervisor_db
 
     # Shared Jinja2 templates. dashboard.py's page routes already
     # import a module-level instance; expose the same one on
@@ -145,7 +160,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Start the brain: notifier + planner + supervisor (background task)
     notifier = Notifier(cfg)
     planner = Planner(cfg, db=db)  # db needed for token-usage recording
-    supervisor = Supervisor(db, cfg, notifier, planner)
+    # v3.12.2 #3: supervisor gets its own aiosqlite connection (see
+    # `supervisor_db` block above). Decouples the supervisor's tick-
+    # loop writes from the API's request-path writes so SQLITE_LOCKED
+    # can't fire when the supervisor is busy and the API tries to
+    # commit a heartbeat / project-run.
+    supervisor = Supervisor(supervisor_db, cfg, notifier, planner)
     # CleanupJob shared by supervisor (daily sweep) + API (manual run).
     # Create BEFORE supervisor.start() so the supervisor can fire its
     # first daily-sweep check on the next tick.
@@ -181,10 +201,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         # Stop in reverse order: scheduler first (it queries the DB
-        # the supervisor writes to), then supervisor, then close DB.
+        # the supervisor writes to), then supervisor, then close DBs
+        # (v3.12.2 #3: supervisor has its own aiosqlite connection,
+        # so we close both).
         await scheduler.stop()
         await supervisor.stop()
         await db.close()
+        await supervisor_db.close()
         logger.info("Hermes orchestrator stopped")
 
 

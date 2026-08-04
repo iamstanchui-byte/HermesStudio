@@ -186,113 +186,23 @@ class Supervisor:
         if self._task and not self._task.done():
             return
         self._stop.clear()
-        # v3.12.2 #1 hang-investigation: write a sync checkpoint to
-        # audit_log BEFORE spawning the background task. The
-        # checkpoint uses sync `sqlite3` (not aiosqlite) because:
-        #   (1) the audit_log write path is independently verified
-        #       working (18:34 wrote 5 task.stuck_wrapper rows)
-        #   (2) the supervisor `start()` is a SYNC method, so we can't
-        #       call `await self.db.execute(...)` here
-        #   (3) print() to stdout/stderr was tried in commit adae1d7
-        #       but the Start-Process + uvicorn chain silently drops
-        #       the redirect (server-new.log + server.stdout.log +
-        #       server.stderr.log all 0 bytes after restart)
-        # Sync sqlite3 with WAL mode + 5s busy_timeout, talking to
-        # the same .db file the aiosqlite connection uses -- WAL
-        # mode allows concurrent reader/writer, so this sync write
-        # doesn't conflict with the aiosqlite reader. Verified
-        # earlier (external quick test took 0.00s for BEGIN
-        # IMMEDIATE + COMMIT).
-        try:
-            import sqlite3 as _sync_sqlite
-            import json as _json
-            _db_path = self.db.db_path  # aiosqlite Database exposes db_path
-            _sync_con = _sync_sqlite.connect(_db_path, timeout=5)
-            _sync_con.execute(
-                "INSERT INTO audit_log (event_type, actor, payload, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    "supervisor.checkpoint",
-                    "supervisor",
-                    _json.dumps({"checkpoint": "start_begin", "interval": self.interval}),
-                    _now_iso(),
-                ),
-            )
-            _sync_con.commit()
-            _sync_con.close()
-        except Exception as _e:
-            # If even this sync checkpoint fails, the DB is in such
-            # a bad state that the supervisor itself is broken at
-            # the I/O layer. Log the failure and continue -- the
-            # next attempt to write will surface the real error.
-            print(f"SUPERVISOR_CHECKPOINT: start_begin audit_log write failed: {_e}", flush=True)
         self._task = asyncio.create_task(self._run(), name="hermes-supervisor")
         # Phase 3: fire-and-forget user-level recent.md regen at startup
         # so the planner has a fresh cross-project summary from the
         # first goal it sees. Non-blocking -- if it fails, the manual
         # POST /memory/recent/regenerate endpoint is the fallback.
-        # v3.12.2 #1 hang-investigation: also write the
-        # "start_after_regen_spawn" checkpoint via sync sqlite3,
-        # AFTER asyncio.create_task returns. If the audit_log has
-        # BOTH start_begin AND start_after_regen_spawn, the spawn
-        # is fine and the hang is in regenerate_recent_async's
-        # body (or in the next tick's await chain). If only
-        # start_begin is present, the create_task call itself or
-        # the import of get_recent_generator / get_memory_writer is
-        # blocking (very unlikely; would point to a circular
-        # import or a sync .__init__ that hangs).
         try:
             from hermes_orch.core.memory import get_memory_writer
             from hermes_orch.core.synthesis import get_recent_generator
             recent_gen = get_recent_generator(db=self.db)
             memory = get_memory_writer()
-            recent_task = asyncio.create_task(
+            asyncio.create_task(
                 recent_gen.regenerate_recent_async(
                     memory_writer=memory, trigger="startup"
                 ),
                 name="hermes-recent-regen",
             )
-            try:
-                import sqlite3 as _sync_sqlite2
-                import json as _json2
-                _sync_con2 = _sync_sqlite2.connect(self.db.db_path, timeout=5)
-                _sync_con2.execute(
-                    "INSERT INTO audit_log (event_type, actor, payload, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (
-                        "supervisor.checkpoint",
-                        "supervisor",
-                        _json2.dumps({
-                            "checkpoint": "start_after_regen_spawn",
-                            "task_id": id(recent_task),
-                            "task_name": recent_task.get_name(),
-                        }),
-                        _now_iso(),
-                    ),
-                )
-                _sync_con2.commit()
-                _sync_con2.close()
-            except Exception as _e2:
-                print(f"SUPERVISOR_CHECKPOINT: start_after_regen_spawn audit_log write failed: {_e2}", flush=True)
         except Exception as e:
-            try:
-                import sqlite3 as _sync_sqlite3
-                import json as _json3
-                _sync_con3 = _sync_sqlite3.connect(self.db.db_path, timeout=5)
-                _sync_con3.execute(
-                    "INSERT INTO audit_log (event_type, actor, payload, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (
-                        "supervisor.checkpoint",
-                        "supervisor",
-                        _json3.dumps({"checkpoint": "start_regen_failed", "error": str(e)[:200]}),
-                        _now_iso(),
-                    ),
-                )
-                _sync_con3.commit()
-                _sync_con3.close()
-            except Exception:
-                pass
             log.warning(f"startup recent regen trigger failed: {e}")
         log.info(f"supervisor started; interval={self.interval}s")
 
@@ -619,21 +529,13 @@ class Supervisor:
         except Exception as e:
             log.exception(f"stuck-config scan failed: {e}")
 
-        self._checkpoint_sync("tick.before_projects_query")
         projects = await self.db.fetchall(
             "SELECT * FROM projects WHERE state IN ('planning','ready','running')"
         )
-        # Note: can't pass len(projects) through _checkpoint_sync (it
-        # only takes name + project_id). The checkpoint will fire
-        # regardless; the "0 vs 1" diagnostic is the next query.
-        self._checkpoint_sync("tick.after_projects_query")
         for proj in projects:
-            self._checkpoint_sync("tick.before_drive_project", proj.get("id"))
             try:
                 await self._drive_project(proj)
-                self._checkpoint_sync("tick.after_drive_project", proj.get("id"))
             except Exception as e:
-                self._checkpoint_sync("tick.drive_project_exception", proj.get("id"))
                 log.exception(f"drive_project {proj['id']} failed: {e}")
                 await self.notifier.send(
                     f"Project {proj['id']} tick error",
@@ -1273,56 +1175,12 @@ class Supervisor:
         """
         return list(self._duplicate_running_projects.get(project_id, []))
 
-    def _checkpoint_sync(self, name: str, project_id: str = None) -> None:
-        """v3.12.2 #1 hang-investigation: sync sqlite3 INSERT into
-        audit_log. Used at before/after checkpoints around the
-        suspect await calls in `_handle_execution`, since:
-          (1) root logger is at WARNING + has no handler, so
-              `log.info()` never reaches the server's
-              stdout/stderr (verified: server-new.log +
-              server.stdout.log + server.stderr.log all 0 bytes
-              after a fresh restart)
-          (2) `print(..., flush=True)` from commit adae1d7 was
-              also silently dropped by the Start-Process +
-              uvicorn chain (same reason)
-          (3) sync sqlite3 + WAL mode + 5s busy_timeout works
-              alongside the async aiosqlite connection
-              (verified earlier: external quick test on this same
-              DB took 0.00s for BEGIN IMMEDIATE + COMMIT)
-        The checkpoint is bounded by busy_timeout=5s, so even
-        if the DB is locked the write fails fast and we still
-        get the earlier checkpoint rows.
-        """
-        try:
-            import sqlite3 as _sync_sqlite_cp
-            import json as _json_cp
-            _sync_con = _sync_sqlite_cp.connect(self.db.db_path, timeout=5)
-            _sync_con.execute(
-                "INSERT INTO audit_log (event_type, actor, payload, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    "supervisor.checkpoint",
-                    "supervisor",
-                    _json_cp.dumps({
-                        "checkpoint": name,
-                        "project_id": project_id,
-                    }),
-                    _now_iso(),
-                ),
-            )
-            _sync_con.commit()
-            _sync_con.close()
-        except Exception:
-            pass
-
     # ===== execution (ready / running) =====
 
     async def _handle_execution(self, proj: dict[str, Any]) -> None:
         pid = proj["id"]
-        self._checkpoint_sync("handle_execution.before_propagate_failures", pid)
         # 1. Propagate failures: any failed task marks downstream pending/assigned as skipped
         await self._propagate_failures(pid)
-        self._checkpoint_sync("handle_execution.after_propagate_failures", pid)
         # 1.5. Loop-back check (Phase 0 of visual workflow builder, 2026-07-24):
         # if any failed task is referenced by another task's feedback_to,
         # cascade-reset the target + its dependents so the whole chain
@@ -1330,13 +1188,9 @@ class Supervisor:
         # visible) and BEFORE _find_ready_tasks (cascade-reset tasks are
         # picked up in the same tick). Idempotent and safe to skip if
         # the project has no feedback_to anywhere (returns False fast).
-        self._checkpoint_sync("handle_execution.before_maybe_loop_back", pid)
         await self._maybe_loop_back(pid)
-        self._checkpoint_sync("handle_execution.after_maybe_loop_back", pid)
         # 2. Find pending tasks ready to be assigned (all deps completed)
-        self._checkpoint_sync("handle_execution.before_find_ready_tasks", pid)
         ready = await self._find_ready_tasks(pid)
-        self._checkpoint_sync("handle_execution.after_find_ready_tasks", pid)
         no_progress = True  # assume no progress until we actually do something
         for t in ready:
             # v3.9.0: the project dispatch path goes through
@@ -1362,32 +1216,16 @@ class Supervisor:
             # cap check + status transition). Not pre-resolved →
             # run the full Round-3 dispatch.
             if t.get("assigned_profile_id"):
-                _tid_short = t.get("id", "?")[:14]
-                self._checkpoint_sync(
-                    f"handle_execution.before_assign_task:{_tid_short}", pid,
-                )
                 ok = await self._assign_task(t)
-                self._checkpoint_sync(
-                    f"handle_execution.after_assign_task:{_tid_short}", pid,
-                )
             else:
-                _tid_short = t.get("id", "?")[:14]
-                self._checkpoint_sync(
-                    f"handle_execution.before_dispatch_via_soul:{_tid_short}", pid,
-                )
                 ok = await self._dispatch_via_soul_dispatch(t)
-                self._checkpoint_sync(
-                    f"handle_execution.after_dispatch_via_soul:{_tid_short}", pid,
-                )
             if ok:
                 no_progress = False
         # 3. (skip) Assigned tasks stay 'assigned' until wrapper claims them via
         #    POST /api/tasks/{id}/start. Supervisor used to auto-promote to
         #    'running', but that was a stub — real work needs the wrapper.
         # 4. Project state transitions
-        self._checkpoint_sync("handle_execution.before_advance_state", pid)
         await self._maybe_advance_project_state(proj, no_progress)
-        self._checkpoint_sync("handle_execution.after_advance_state", pid)
         # 5. Q2 iteration loop: if the project has a coordinator_role and
         #    max_iterations, AND all current tasks are terminal, advance
         #    current_iteration and dispatch a "review" task to the
@@ -1395,9 +1233,7 @@ class Supervisor:
         #    "DECISION: PASS" (or max iterations hit), the project moves
         #    to completed. Coordinator tasks that create new sub-tasks
         #    will be picked up in the next tick (no manual trigger).
-        self._checkpoint_sync("handle_execution.before_maybe_iterate", pid)
         await self._maybe_iterate(proj)
-        self._checkpoint_sync("handle_execution.after_maybe_iterate", pid)
 
     # ===== Q2: project iteration loop =====
 
@@ -2178,61 +2014,12 @@ class Supervisor:
         tid = task["id"]
         role = task["agent_role"]
         is_single = bool(task.get("is_single_task"))
-        # v3.12.2 #1 hang-investigation: write sync checkpoint BEFORE
-        # the aiosqlite fetchone. The hang is suspected to be in the
-        # aiosqlite fetchone (or downstream awaits that depend on it).
-        # The checkpoint uses sync sqlite3 for the same reasons as
-        # in start() (start() is sync, can't await; print() to
-        # stdout is silently dropped by the Start-Process redirect).
-        # If we see "assign_about_to_fetchone" but NOT
-        # "assign_fetchone_returned", the aiosqlite fetchone (or
-        # some sub-await it depends on) is the hang point.
-        try:
-            import sqlite3 as _sync_sqlite_assign
-            import json as _json_assign
-            _sync_con_a = _sync_sqlite_assign.connect(self.db.db_path, timeout=5)
-            _sync_con_a.execute(
-                "INSERT INTO audit_log (event_type, actor, payload, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    "supervisor.checkpoint",
-                    "supervisor",
-                    _json_assign.dumps({"checkpoint": "assign_about_to_fetchone", "task_id": tid}),
-                    _now_iso(),
-                ),
-            )
-            _sync_con_a.commit()
-            _sync_con_a.close()
-        except Exception:
-            pass
         # Re-read to avoid races
         cur = await self.db.fetchone(
             "SELECT id, status, project_id, agent_role, required_capability "
             "FROM tasks WHERE id = ?",
             (tid,),
         )
-        try:
-            import sqlite3 as _sync_sqlite_assign2
-            import json as _json_assign2
-            _sync_con_a2 = _sync_sqlite_assign2.connect(self.db.db_path, timeout=5)
-            _sync_con_a2.execute(
-                "INSERT INTO audit_log (event_type, actor, payload, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (
-                    "supervisor.checkpoint",
-                    "supervisor",
-                    _json_assign2.dumps({
-                        "checkpoint": "assign_fetchone_returned",
-                        "task_id": tid,
-                        "cur_is_none": cur is None,
-                    }),
-                    _now_iso(),
-                ),
-            )
-            _sync_con_a2.commit()
-            _sync_con_a2.close()
-        except Exception:
-            pass
         if not cur or cur["status"] != "pending":
             return False
         # Path A (#22): inject the project's procedure.md into the task row
