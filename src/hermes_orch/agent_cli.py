@@ -1297,6 +1297,9 @@ def _apply_hermes_compaction_config(profile_root: Path, max_history_turns: int) 
                 sort_keys=False, allow_unicode=True,
             )
         os.replace(tmp_path, cfg_path)
+        # v3.12.4 instrument: race vs c3e998d atomic-write (diag only).
+        import time as _race_t
+        click.echo(f"[race-diag-internal {cfg_path}] t={_race_t.time():.6f} os.replace DONE")
         return True
     except Exception as e:
         click.echo(
@@ -2400,7 +2403,15 @@ def start(
                 _task_mht = None
         if _task_mht is None:
             _task_mht = _max_history_turns_cache
-        _apply_hermes_compaction_config(profile_root, _task_mht)
+        # v3.12.4 instrument: race vs c3e998d atomic-write (diag only).
+        # Logs the exact microsecond of config-write start/end + hermes
+        # start/exit. Off after diagnosis — see v3.12.4 chat.
+        import time as _race_t
+        _race_t0 = _race_t.time()
+        click.echo(f"[race-diag {tid}] t={_race_t0:.6f} _apply_hermes_compaction_config START (role={role}, profile_root={profile_root})")
+        _compaction_rc = _apply_hermes_compaction_config(profile_root, _task_mht)
+        _race_t1 = _race_t.time()
+        click.echo(f"[race-diag {tid}] t={_race_t1:.6f} _apply_hermes_compaction_config DONE (rc={_compaction_rc}, dur={(_race_t1-_race_t0)*1000:.1f}ms)")
         if yolo:
             hermes_args.append("--yolo")
         if accept_hooks:
@@ -2487,6 +2498,9 @@ def start(
                     # env=...: force UTF-8 output from hermes even on Windows
                     env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
                 )
+                # v3.12.4 instrument: race vs c3e998d atomic-write (diag only).
+                import time as _race_t
+                click.echo(f"[race-diag {tid}] t={_race_t.time():.6f} Popen DONE (pid={proc.pid}, role={role}, cwd={hermes_cwd})")
             except BaseException:
                 # If Popen fails, close the file handles we opened
                 stdout_fh.close()
@@ -2741,6 +2755,9 @@ def start(
                 rc, timed_out = _run_subprocess_with_timeout(
                     proc, timeout=task_timeout,
                 )
+                # v3.12.4 instrument: race vs c3e998d atomic-write (diag only).
+                import time as _race_t
+                click.echo(f"[race-diag {tid}] t={_race_t.time():.6f} hermes EXIT (rc={rc}, timed_out={timed_out})")
             except Exception as e:
                 # proc.wait() can throw on Windows if the child closes
                 # handles abruptly. Bail out via the catch-all below
