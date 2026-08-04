@@ -232,3 +232,114 @@ def test_looks_like_plan_proposal_empty():
     from hermes_orch.api.projects import _looks_like_plan_proposal
     assert _looks_like_plan_proposal("") is False
     assert _looks_like_plan_proposal("   ") is False
+
+
+# ===== v3.12.3 (2026-08-04): broadened phrase list + inline list support =====
+#
+# Repro: proj-da1aedda (analyst 13, 2026-08-04 17:23) — the chat
+# assistant proposed a 4-step plan in inline form ("建議嘅計劃大約
+# 3-4 步：1) ... 2) ... 3) ... 4) ...") and closed with "要我幫你建立
+# 呢個計劃嗎?". v3.10.8's heuristic returned False because:
+#   1. The numbered regex required ^\s* (start-of-line), but the
+#      list was inline (1) 2) 3) 4) on the same line). 0 matches.
+#   2. The negative-gate create_intent list had only "要我建立" /
+#      "幫我建立" / etc., but the LLM wrote "要我幫你建立" — none
+#      of those are substrings. No match.
+#   3. The Positive-2 create_phrases had the same gap. No match.
+# Net: synthetic create_plan_from_chat suggestion was never created,
+# so the Apply button never appeared, so the user couldn't
+# one-click convert the chat to a structured plan.
+#
+# v3.12.3 fix:
+#   - Inline lists now count (regex no longer requires ^).
+#   - Added "要我幫你建立", "幫你建立", "幫你整", "幫你搞",
+#     "要我幫你整", "要我搞", "要我寫", "要唔要", "是否要",
+#     "想唔想" etc. to both the negative-gate and positive-2 lists.
+
+def test_looks_like_plan_proposal_inline_list_zh():
+    """v3.12.3: inline numbered list on a single line counts.
+
+    The LLM often writes compact responses like "建議嘅計劃大約
+    3-4 步:1) ... 2) ... 3) ... 4) ..." in a single paragraph to
+    keep tokens low. v3.10.8's regex required ^\\s* (start-of-line)
+    + MULTILINE, so this was 0 matches. v3.12.3 drops the ^ and
+    just counts \\d+[.)]\\s+\\S anywhere.
+    """
+    from hermes_orch.api.projects import _looks_like_plan_proposal
+    text = (
+        "建議嘅計劃大約 3-4 步：1) 用 hk-weather-forecast 技能擷取數據, "
+        "2) 整理數據並用淺白中文生成摘要, 3) 用 docx 技能做 Word 報告, "
+        "4) 用 gdrive-write 技能儲存到 Google Drive。 要我幫你建立呢個計劃嗎?"
+    )
+    assert _looks_like_plan_proposal(text) is True
+
+
+def test_looks_like_plan_proposal_zh_natural_variants():
+    """v3.12.3: CJK natural variations the LLM actually uses.
+
+    The v3.10.8 list had only literal "要我建立" / "幫我建立" /
+    "要我生成" / etc. — the LLM uses longer forms like:
+      - "要我幫你建立呢個計劃嗎?" (literal repro from proj-da1aedda)
+      - "幫你建立呢個 plan"
+      - "要我幫你整嗎?"
+      - "要唔要我幫你搞掂?"
+    None of those contain "要我建立" or "幫我建立" as substrings,
+    so the heuristic returned False and the Apply button never
+    appeared. v3.12.3 broadens the list.
+    """
+    from hermes_orch.api.projects import _looks_like_plan_proposal
+    # Literal repro from the user-reported bug (analyst 13 chat)
+    assert _looks_like_plan_proposal(
+        "建議嘅計劃大約 3-4 步：1) 用 hk-weather-forecast 技能擷取香港天文台未來 7 日嘅天氣預報數據，"
+        "2) 整理數據並用淺白中文生成逐日摘要，3) 用 docx 技能製作成正式 Word 報告，"
+        "4) 用 gdrive-write 技能儲存到 Google Drive 嘅指定資料夾。 要我幫你建立呢個計劃嗎？"
+    ) is True
+    assert _looks_like_plan_proposal(
+        "我會整個 plan 俾你。幫你建立呢個 plan?"
+    ) is True
+    assert _looks_like_plan_proposal(
+        "資料齊全,可以開始做。要唔要我幫你搞掂?"
+    ) is True
+    assert _looks_like_plan_proposal(
+        "已經 plan 好喇。幫你整個 report 啦?"
+    ) is True
+
+
+def test_looks_like_plan_proposal_clarifying_questions_still_false():
+    """v3.12.3: broadening the phrase list must NOT cause
+    clarifying questions to misfire as plan proposals.
+
+    The original v3.10.8 list was tightened (per user feedback
+    2026-08-02 19:51 on proj-c7ad42e6) because "Create plan"
+    was appearing on every reply. v3.12.3 only adds NATURAL
+    EXTENSIONS of the create-intent phrases — generic
+    clarifying questions should still return False.
+    """
+    from hermes_orch.api.projects import _looks_like_plan_proposal
+    assert _looks_like_plan_proposal("What do you mean?") is False
+    assert _looks_like_plan_proposal("你傾向哪一個?") is False
+    assert _looks_like_plan_proposal("Hi") is False
+    # Even with broader phrases, a true clarifying question
+    # without create intent should not match.
+    assert _looks_like_plan_proposal("你覺得邊個比較好?") is False
+    assert _looks_like_plan_proposal("你想用 A 定 B?") is False
+
+
+def test_looks_like_plan_proposal_proj_da1aedda_exact_repro():
+    """v3.12.3 regression guard: the EXACT text from the
+    user-reported bug (proj-da1aedda / analyst 13 chat, 2026-08-04
+    17:23) must return True. Before the fix, _looks_like_plan_proposal
+    returned False for this exact input, and the Apply button
+    never appeared."""
+    from hermes_orch.api.projects import _looks_like_plan_proposal
+    text = (
+        "睇到項目 `analyst 13` 而家係空白狀態，我可以用 `hk-weather-forecast` 技能幫你做一個香港未來一周天氣報告。\n\n"
+        "建議嘅計劃大約 3-4 步：1) 用 `hk-weather-forecast` 技能擷取香港天文台未來 7 日嘅天氣預報數據"
+        "（包括溫度、濕度、風速、降雨概率等），2) 整理數據並用淺白中文生成逐日摘要"
+        "（例如「週三多雲有驟雨，最高 32°C」），3) 用 `docx` 技能製作成正式 Word 報告，"
+        "4) 用 `gdrive-write` 技能儲存到 Google Drive 嘅指定資料夾，方便日後翻閱或分享。\n\n"
+        "報告內容會包含標題、未來 7 日逐日天氣概況、最高／最低溫度、特別天氣提示"
+        "（例如雷暴或熱帶氣旋警告），以及週末出行小貼士。\n\n"
+        "要我幫你建立呢個計劃嗎？"
+    )
+    assert _looks_like_plan_proposal(text) is True

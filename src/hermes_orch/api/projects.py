@@ -3551,25 +3551,54 @@ def _looks_like_plan_proposal(text: str) -> bool:
     # asking to create a plan. The chat LLM is told to end plan
     # proposals with "Want me to create this plan?" (or zh-HK
     # equivalent). Any other "?" at the end is a clarification.
+    #
+    # v3.12.3 fix (2026-08-04): broadened the phrase list to cover
+    # natural variations the LLM actually uses. The v3.10.8 list only
+    # had literal substrings like "要我建立" and "幫我建立", but
+    # the LLM emits longer forms like "要我幫你建立呢個計劃嗎"
+    # and "幫你建立呢個 plan" — none of the original phrases are
+    # substrings of those, so the heuristic returned False and the
+    # Apply button never appeared. Repro on proj-da1aedda (analyst 13,
+    # 2026-08-04 17:23).
     if t.endswith(("?", "？")):
         tail = t[-200:].lower()
-        create_intent = any(
-            p in tail for p in (
-                "create", "create this plan", "want me to create",
-                "要我建立", "要我生成", "幫我建立", "幫我生成",
-                "幫我整", "幫我寫", "是否要", "要不要",
-                "要唔要",
-            )
+        create_intent_phrases = (
+            # English
+            "create", "create this plan", "create the plan",
+            "create a plan", "create this project plan",
+            "want me to create", "want you to create",
+            "shall i create", "should i create",
+            "help you create", "help me create", "i create",
+            # Cantonese / HK direct object = "我/你" comes AFTER the verb
+            # e.g. "要我建立", "要我幫你建立", "幫你建立", "幫你整"
+            "要我建立", "要我生成", "要我幫你建立", "要我幫你生成",
+            "要我整", "要我搞", "要我寫",
+            "幫我建立", "幫我生成", "幫我整", "幫我寫",
+            "幫你建立", "幫你生成", "幫你整", "幫你搞", "幫你寫",
+            "幫你整個", "幫你搞掂",
+            # Confirmation / clarification phrases
+            "是否要", "要不要", "要唔要",
+            "想唔想", "想不想",
         )
+        create_intent = any(p in tail for p in create_intent_phrases)
         if not create_intent:
             return False
     # Positive 1: numbered list with 2+ items. Supports:
-    #   1) ...  2) ...  (ASCII paren)
-    #   1. ...  2. ...  (ASCII dot)
-    #   1、...  2、...  (Chinese ideographic comma)
+    #   1) ...  2) ...  (ASCII paren, on its own line OR inline)
+    #   1. ...  2. ...  (ASCII dot, on its own line OR inline)
+    #   1、...  2、...  (Chinese ideographic comma, on its own line OR inline)
+    # v3.12.3 fix (2026-08-04): don't require start-of-line (^).
+    # The LLM often writes inline lists like "1) fetch 2) summarize
+    # 3) format 4) save" in a single paragraph to keep responses
+    # compact. The original v3.10.8 regex needed ^ + newline, so
+    # those inline lists weren't detected and the Apply button
+    # didn't appear (proj-da1aedda repro 2026-08-04 17:23).
+    # We just count \d+[.)]\s+\S anywhere in the text; the pattern
+    # is unique enough (digit + paren/dot + space + non-space) that
+    # false positives in CJK prose are negligible.
     list_count = max(
-        len(re.findall(r"^\s*\d+[.)]\s+\S", t, re.MULTILINE)),
-        len(re.findall(r"^\s*\d+、\s*\S", t, re.MULTILINE)),
+        len(re.findall(r"\d+[.)]\s+\S", t)),
+        len(re.findall(r"\d+、\s*\S", t)),
     )
     if list_count >= 2:
         return True
@@ -3578,11 +3607,18 @@ def _looks_like_plan_proposal(text: str) -> bool:
     # plan?" or "要我建立呢個 plan?". Match loosely.
     lower = t.lower()
     create_phrases = [
+        # English
         "want me to create", "want you to create", "shall i create",
         "should i create", "create this plan", "create the plan",
         "create a plan", "create this project plan",
-        "要我建立", "要我生成", "幫我建立", "幫我生成",
+        "help you create", "help me create",
+        # Cantonese / HK
+        "要我建立", "要我生成", "要我幫你建立", "要我幫你生成",
+        "要我整", "要我搞", "要我寫",
+        "幫我建立", "幫我生成", "幫我整", "幫我寫",
+        "幫你建立", "幫你生成", "幫你整", "幫你搞", "幫你寫",
         "幫我整個 plan", "建立呢個 plan", "生成呢個 plan",
+        "幫你整個 plan", "幫你建立呢個 plan",
     ]
     if any(p in lower for p in create_phrases):
         return True
