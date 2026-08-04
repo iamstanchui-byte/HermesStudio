@@ -786,6 +786,25 @@ class Database:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
+        # v3.12.2 #2: aiosqlite defaults to busy_timeout=0, which makes
+        # concurrent writers (e.g. the supervisor's tick loop and an
+        # API request) immediately fail with "database is locked"
+        # instead of waiting briefly. This was the cause of the
+        # "Run failed: 500" errors when the supervisor was busy
+        # processing single-tasks (each tick = ~40 writes via
+        # _assign_task). 5s is the same value the sync checkpoint
+        # helper uses; large enough to ride out a 1-2s supervisor
+        # write burst without spurious 500s, small enough that a
+        # genuinely stuck writer still surfaces quickly.
+        await self._conn.execute("PRAGMA busy_timeout = 5000")
+        # Auto-checkpoint the WAL every 1000 pages so a long-running
+        # server doesn't accumulate a 500MB+ WAL that slows every
+        # write (default SQLite auto-checkpoint is 1000, but
+        # aiosqlite can sometimes miss it; explicit setting
+        # guarantees behavior). Without this, the WAL grew to
+        # 580MB on the 2026-08-04 incident before any API write
+        # would even attempt to acquire the lock.
+        await self._conn.execute("PRAGMA wal_autocheckpoint = 1000")
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA)
         # Idempotent migrations for existing DBs (catch "duplicate column" errors)
