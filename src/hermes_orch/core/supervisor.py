@@ -619,13 +619,21 @@ class Supervisor:
         except Exception as e:
             log.exception(f"stuck-config scan failed: {e}")
 
+        self._checkpoint_sync("tick.before_projects_query")
         projects = await self.db.fetchall(
             "SELECT * FROM projects WHERE state IN ('planning','ready','running')"
         )
+        # Note: can't pass len(projects) through _checkpoint_sync (it
+        # only takes name + project_id). The checkpoint will fire
+        # regardless; the "0 vs 1" diagnostic is the next query.
+        self._checkpoint_sync("tick.after_projects_query")
         for proj in projects:
+            self._checkpoint_sync("tick.before_drive_project", proj.get("id"))
             try:
                 await self._drive_project(proj)
+                self._checkpoint_sync("tick.after_drive_project", proj.get("id"))
             except Exception as e:
+                self._checkpoint_sync("tick.drive_project_exception", proj.get("id"))
                 log.exception(f"drive_project {proj['id']} failed: {e}")
                 await self.notifier.send(
                     f"Project {proj['id']} tick error",
