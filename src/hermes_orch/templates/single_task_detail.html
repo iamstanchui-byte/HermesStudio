@@ -93,10 +93,11 @@
     <a href="/single-tasks" class="px-3 py-1.5 bg-gray-200 text-gray-700 rounded text-sm hover:bg-gray-300">
         ← Back
     </a>
-    {% if task.status == 'pending' %}
+    {% if task.status in ('failed', 'interrupted', 'cancelled', 'skipped') %}
     <button onclick="runTask('{{ task.id }}')"
-        class="px-3 py-1.5 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700 font-medium">
-        ▶ Run
+        class="px-3 py-1.5 bg-emerald-600 text-white rounded text-sm hover:bg-emerald-700 font-medium"
+        title="Re-queue this task. The supervisor will pick it up on the next tick and re-dispatch it.">
+        ▶ Retry
     </button>
     {% endif %}
     {# Per the 2026-07-27 unified-tasks decision: "ad-hoc task that
@@ -217,9 +218,9 @@ async function submitPromote() {
 }
 
 async function runTask(taskId) {
-    if (!confirm('Run this single task now? The supervisor will pick it up on the next tick.')) return;
+    if (!confirm('Re-queue this task? The supervisor will pick it up on the next tick and re-dispatch it.')) return;
     try {
-        const r = await _fetchWithTimeout('/api/tasks/' + taskId + '/start', {
+        const r = await _fetchWithTimeout('/api/tasks/' + taskId + '/retry', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
         }, 10000);
