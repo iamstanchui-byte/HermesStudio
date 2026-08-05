@@ -3150,6 +3150,83 @@ project page.
   - End your response with a question like
     "Want me to create this plan?" (the user clicks Apply)
 
+# CRITICAL: incremental edits MUST emit apply_plan_patch JSON
+  v3.12.6 (Phase 4.1, 2026-08-05): if the user asks to MODIFY the
+  EXISTING plan (add a step, remove a step, edit a step's action,
+  rename a step, insert a step before/after another), you MUST
+  end your prose with a fenced JSON code block containing an
+  `apply_plan_patch` suggestion. The block is what the Apply
+  button dispatches — without it, the synthetic fallback picks
+  `create_plan_from_chat` which OVERWRITES the plan and silently
+  drops the user's existing steps (this was a real incident on
+  proj-8d68823e).
+  
+  The two cases are easy to tell apart:
+    - User has NO plan (plan is null): create a new one.
+      Just describe the plan in prose + end with "Want me to
+      create this plan?" + apply_plan_patch is NOT needed
+      (use create_plan_from_chat by writing no JSON).
+    - User has an existing plan AND asks for any kind of
+      modification (add / remove / edit / reorder): ALWAYS
+      include the apply_plan_patch JSON. End the response
+      with prose summary + the JSON code block. NO need to
+      end with "Want me to create this plan?" — Apply is
+      the action.
+  
+  JSON shape:
+    ```json
+    {{
+      "suggestions": [
+        {{
+          "type": "apply_plan_patch",
+          "patch": {{
+            "add":    [{{"name": "...", "agent_role": "...", "action": "...", "depends_on": [...]}}],
+            "edit":   [{{"name": "<existing_step_name>", "patch": {{"field": "value"}}}}],
+            "remove": ["<existing_step_name>"],
+            "position": {{"after": "<name>", "before": "<name>"}}
+          }},
+          "reason": "short reason"
+        }}
+      ]
+    }}
+    ```
+  
+  Step names in the patch MUST exist in the current plan (for
+  edit/remove) or be NEW (for add). Use kebab-case. Reference
+  the actual step names from the snapshot.
+  
+  Example — user says "add a step before summarize-ip-results
+  to check the Windows OS version":
+    ```json
+    {{
+      "suggestions": [
+        {{
+          "type": "apply_plan_patch",
+          "patch": {{
+            "add": [{{
+              "name": "probe-win-agent02-os-version",
+              "agent_role": "win-agent02",
+              "action": "probe_os_version",
+              "depends_on": ["get-win-agent02-ip-info"]
+            }}],
+            "edit": [{{
+              "name": "summarize-ip-results",
+              "patch": {{"depends_on": [
+                "get-super-ip-info",
+                "get-win-agent02-ip-info",
+                "probe-win-agent02-os-version"
+              ]}}
+            }}],
+            "position": {{"before": "summarize-ip-results"}}
+          }},
+          "reason": "Insert OS-version probe before summary so the report includes Windows build"
+        }}
+      ]
+    }}
+    ```
+  (prose goes BEFORE this code block, explaining what you did
+  and why; the JSON block is the last thing in the response.)
+
 # CRITICAL: keep your response BRIEF
   - Total response: < 500 words
   - 1-3 short paragraphs MAX
@@ -3522,6 +3599,27 @@ def _extract_suggestions(llm_text: str) -> tuple[str, list[dict] | None, bool]:
     return llm_text.strip(), None, False
 
 
+def _project_has_steps(plan_json_raw) -> bool:
+    """v3.12.6 (Phase 4.1): does the project have a non-empty plan?
+
+    Used by the chat endpoint to decide between
+    `create_plan_from_chat` (no existing plan) and
+    `apply_plan_patch` (existing plan, user wants to modify).
+    """
+    if not plan_json_raw:
+        return False
+    try:
+        data = json.loads(plan_json_raw) if isinstance(plan_json_raw, str) else plan_json_raw
+    except Exception:
+        return False
+    if isinstance(data, dict):
+        steps = data.get("steps")
+        return isinstance(steps, list) and len(steps) > 0
+    if isinstance(data, list):
+        return len(data) > 0
+    return False
+
+
 def _looks_like_plan_proposal(text: str) -> bool:
     """Heuristic: does this assistant message look like it's proposing
     a plan (so the synthetic create_plan_from_chat suggestion should
@@ -3630,6 +3728,88 @@ def _looks_like_plan_proposal(text: str) -> bool:
     ]
     if any(p in lower for p in create_phrases):
         return True
+    return False
+
+
+def _looks_like_plan_modification(text: str) -> bool:
+    """v3.12.6 (Phase 4.1): heuristic for INCREMENTAL plan edits.
+
+    Returns True if the assistant's prose describes modifying an
+    EXISTING plan (add a step, remove a step, edit a step, reorder)
+    rather than proposing a brand-new plan.
+
+    Critical to dispatch correctly between `create_plan_from_chat`
+    (which OVERWRITES the plan — kills user's existing steps) and
+    `apply_plan_patch` (which modifies atomically — preserves
+    everything else). Without this distinction, the chat LLM says
+    "Updated plan shape (4 steps): 1. existing 2. existing 3. new
+    4. existing" and the synthetic path picks create_plan_from_chat,
+    which then drops steps 1, 2, 4 from the saved plan.
+
+    Strong signals of "modification" (English + CJK):
+      - "Updated plan shape" / "Updated plan" / "Modified plan"
+      - "Updated to add" / "modified to include"
+      - "更新計劃" / "更新 plan" / "修改計劃" / "改 plan"
+      - "加入" / "新增" / "添加" + step-name marker ("step", "步",
+        "個 step")
+      - "我幫你加" / "我加咗" / "我幫你更新"
+      - "加多個 step" / "加多一個 step" / "add a step" / "add one step"
+      - "前面加" / "後面加" / "前面加一個" / "後面加一個"
+        (insert-before / insert-after — the position parameter)
+
+    Returns False for "new plan" phrases like "Plan shape", "New
+    plan shape", "Plan: 1. ... 2. ...".
+
+    False positives are OK (we'll try the reformat LLM as a
+    fallback; the user's Apply may 422 if it really is a new plan).
+    False negatives are bad (the user loses their existing steps),
+    so we err on the side of returning True when ambiguous.
+    """
+    if not text or not text.strip():
+        return False
+    t = text.strip().lower()
+    # Negative gate: if it ends with a "new plan" or "create plan"
+    # phrase (not modification), it's NOT a modification.
+    new_plan_phrases = (
+        "new plan shape", "plan shape:", "plan shape (",
+        "new project plan", "proposed plan", "here is the plan",
+        "呢個 plan", "呢個計劃", "以下係 plan", "新 plan",
+        "新建 plan", "新計劃",
+    )
+    if any(p in t for p in new_plan_phrases):
+        # But "Updated plan shape" still overrides this — check
+        # modification first.
+        pass
+    # Strong positive signals
+    mod_phrases = (
+        # English
+        "updated plan", "modified plan", "updated to add",
+        "add a step", "add one step", "add the step",
+        "add a new step", "add a quality", "add a check",
+        "add an os-version", "add an os version",
+        "add a probe", "add a summary", "add a notify",
+        "add a tail", "add a send", "add a write",
+        "remove the old", "remove the", "remove step",
+        "delete step", "delete the", "rename step",
+        "change step", "edit step",
+        "insert before", "insert after", "add before",
+        "add after", "remove that", "remove this",
+        "前面加", "後面加", "前面加一個", "後面加一個",
+        # CJK modifications
+        "更新計劃", "更新 plan", "更新咗", "修改計劃", "改 plan",
+        "加咗", "幫你加", "幫你更新", "幫你加入",
+        "加多個 step", "加多一個 step", "加多個 step",
+        "刪除 step", "移除 step", "改名 step",
+    )
+    if any(p in t for p in mod_phrases):
+        return True
+    # Weaker signal: the response LISTS the existing step names.
+    # If the assistant says "Updated plan shape (4 steps): 1. X
+    # 2. Y 3. Z 4. W" and the project context has steps X/Y/Z/W,
+    # this is almost certainly incremental. We can't know the
+    # project context here (heuristic is sync), so we just
+    # return False in the ambiguous case — the reformat LLM
+    # would still get it right.
     return False
 
 
@@ -3925,18 +4105,53 @@ async def chat_with_project(
     display_text, suggestions, truncated_json = _extract_suggestions(text)
     # v3.10.5: if the LLM response looks like a plan proposal but
     # didn't produce a usable JSON suggestion (no JSON, OR truncated
-    # JSON), create a synthetic `create_plan_from_chat` suggestion
-    # so the Apply button still appears. The apply endpoint reads
-    # the chat history and calls /plan/from-llm with the conversation
-    # as the goal. This means the chat no longer needs to output a
-    # full plan JSON -- it can just describe the plan in prose.
+    # JSON), create a synthetic suggestion so the Apply button
+    # still appears. The apply endpoint reads the chat history and
+    # either:
+    #   - reformat LLM extracts a structured plan (create_plan_from_chat)
+    #   - reformat LLM extracts a patch payload (apply_plan_patch)
+    #
+    # v3.12.6 (Phase 4.1): critical distinction between "create a
+    # NEW plan" (create_plan_from_chat — overwrites) and "modify
+    # the EXISTING plan" (apply_plan_patch — atomic, preserves
+    # the rest). The LLM often says "Updated plan shape (4 steps):
+    # 1. get-super-ip-info 2. ..." to signal an incremental edit,
+    # but the synthetic path previously always picked
+    # create_plan_from_chat which OVERWROTE the existing plan and
+    # silently dropped user steps. The plan-modification heuristic
+    # catches the "Updated / 加一個 step / 前面加" intent and
+    # synthesizes apply_plan_patch instead.
+    proj_for_synth = await db.fetchone(
+        "SELECT id, plan_json FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    has_existing_plan = (
+        proj_for_synth is not None
+        and proj_for_synth.get("plan_json")
+        and _project_has_steps(proj_for_synth["plan_json"])
+    )
     if not suggestions and _looks_like_plan_proposal(display_text):
-        suggestions = [{
-            "type": "create_plan_from_chat",
-            # No plan field -- the apply endpoint regenerates it
-            # from the conversation via /plan/from-llm.
-            "description": "Generate a plan from this conversation",
-        }]
+        if has_existing_plan and _looks_like_plan_modification(display_text):
+            # v3.12.6 (Phase 4.1): the assistant is describing a
+            # modification to the existing plan (not a fresh
+            # rewrite). Synthesize apply_plan_patch with patch=null
+            # so the apply endpoint reads the chat history and
+            # calls the reformat LLM to extract the patch payload
+            # (preserves all the existing steps the user has built).
+            suggestions = [{
+                "type": "apply_plan_patch",
+                "description": (
+                    "Incremental edit (preserves existing steps)"
+                ),
+            }]
+        else:
+            # Original v3.10.5 behavior: fresh plan proposal.
+            suggestions = [{
+                "type": "create_plan_from_chat",
+                # No plan field -- the apply endpoint regenerates it
+                # from the conversation via /plan/from-llm.
+                "description": "Generate a plan from this conversation",
+            }]
         if truncated_json:
             display_text = (
                 display_text
@@ -4392,10 +4607,59 @@ async def _apply_plan_patch_from_chat(
     No workflow_id / project_id field — the project is the
     URL. To target a workflow package's step_template instead,
     emit `apply_workflow_patch` (which carries workflow_id).
+
+    v3.12.6 (Phase 4.1): if `patch` is null/missing/empty, the
+    chat LLM described the modification in prose but didn't
+    emit the structured patch. Read the chat history, call
+    the reformat LLM to extract a patch payload, then apply.
+    This is the path the synthetic suggestion from the chat
+    endpoint takes when it detects an incremental edit
+    ("Updated plan shape" + has existing plan) but doesn't
+    have a structured patch to dispatch.
     """
     from hermes_orch.api.plans import PlanPatchBody
     s = body.suggestion
     patch_data = s.get("patch")
+    # Detect empty/null patch — the synthetic-suggestion path
+    # from the chat endpoint falls through here when the LLM
+    # wrote prose ("Updated plan shape...") without a JSON block.
+    patch_is_empty = (
+        patch_data is None
+        or not isinstance(patch_data, dict)
+        or (
+            not patch_data.get("add")
+            and not patch_data.get("edit")
+            and not patch_data.get("remove")
+        )
+    )
+    if patch_is_empty:
+        # Read chat history + call reformat LLM to extract patch.
+        try:
+            patch_data = await _extract_plan_patch_from_chat_history(
+                project_id, body, request,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "apply_plan_patch: extraction LLM call failed for %s: %s",
+                project_id, e,
+            )
+            raise HTTPException(
+                502,
+                f"apply_plan_patch: failed to extract patch from chat "
+                f"history: {e!s}. Try clicking 'Reformat as actions' to "
+                f"re-emit a structured suggestion.",
+            )
+        if not patch_data:
+            raise HTTPException(
+                422,
+                "apply_plan_patch: could not extract a patch from the chat "
+                "history. The LLM may not have described a concrete "
+                "modification. Try clicking 'Reformat as actions' to "
+                "re-emit a structured suggestion.",
+            )
     if not isinstance(patch_data, dict):
         raise HTTPException(
             400, "apply_plan_patch suggestion missing 'patch' object",
@@ -4508,6 +4772,190 @@ async def _apply_workflow_patch_from_chat(
         "diff": result.get("diff", {}),
         "step_count": len(result.get("workflow", {}).get("step_template", [])),
     }
+
+
+async def _extract_plan_patch_from_chat_history(
+    project_id: str, body: "ChatApplyRequest", request: Request,
+) -> dict | None:
+    """v3.12.6 (Phase 4.1): when the chat LLM wrote prose for an
+    incremental plan edit (no structured patch payload), read the
+    chat history and call the reformat LLM to extract a patch.
+
+    Returns the patch dict ({add, edit, remove, position?}) on
+    success, or None if extraction failed (caller will return 422
+    so the user can click 'Reformat as actions' for a retry).
+    """
+    db = request.app.state.db
+    cfg = request.app.state.config
+    proj = await db.fetchone(
+        "SELECT id, plan_json FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    if not proj:
+        return None
+    # Read chat history. The ChatApplyRequest has `message_id`
+    # (the message that emitted the suggestion). We use the
+    # 2 most recent user+assistant turns around that message
+    # as the LLM context.
+    history = []
+    message_id = body.message_id
+    if message_id is not None:
+        # Read the message + the user message that prompted it
+        arow = await db.fetchone(
+            "SELECT role, content FROM project_chat_messages "
+            "WHERE id = ? AND project_id = ?",
+            (message_id, project_id),
+        )
+        if arow:
+            history.append({"role": arow["role"], "content": arow["content"]})
+        # Then the user message just before it
+        urow = await db.fetchone(
+            "SELECT role, content FROM project_chat_messages "
+            "WHERE project_id = ? AND role = 'user' "
+            "AND id < ? ORDER BY id DESC LIMIT 1",
+            (project_id, message_id),
+        )
+        if urow:
+            history.insert(0, {"role": urow["role"], "content": urow["content"]})
+    # Fall back to the most recent 4 messages if message_id is
+    # missing (defensive — normally the chatbox always sets it).
+    if not history:
+        rows = await db.fetchall(
+            "SELECT role, content FROM project_chat_messages "
+            "WHERE project_id = ? ORDER BY id DESC LIMIT 4",
+            (project_id,),
+        )
+        history = [{"role": r["role"], "content": r["content"]}
+                   for r in reversed(rows)]
+    # Build the LLM prompt. The reformat LLM is the same model
+    # as the chat LLM, so we use the same base_url/api_key/model.
+    # We give it the existing plan as context so it can reference
+    # step names, and explicitly ask for apply_plan_patch.
+    existing_plan_str = ""
+    if proj.get("plan_json"):
+        try:
+            existing_plan_str = json.dumps(
+                json.loads(proj["plan_json"]), ensure_ascii=False, indent=2
+            )[:8000]  # cap to keep prompt bounded
+        except Exception:
+            existing_plan_str = "(malformed plan)"
+    # Get valid agent_role names
+    profile_rows = await db.fetchall(
+        "SELECT name FROM agent_profiles ORDER BY name"
+    )
+    profile_names = [p["name"] for p in profile_rows]
+    inline = ", ".join(f"`{n}`" for n in profile_names) if profile_names else "(none)"
+    system = f"""\
+You are a JSON formatter for a workflow assistant. The user
+asked the assistant to MODIFY an existing project plan, and the
+assistant described the modification in prose. Your job is to
+extract the precise atomic patch.
+
+The current plan (JSON) is below. Only modify the steps that
+the user explicitly asked to change. PRESERVE every other step
+exactly as it is — do not delete, rename, or reorder steps
+unless the user explicitly asked.
+
+```json
+{existing_plan_str}
+```
+
+Return ONLY a JSON object (no markdown fence, no preamble):
+
+  {{
+    "suggestions": [
+      {{
+        "type": "apply_plan_patch",
+        "patch": {{
+          "add":    [{{"name": "...", "agent_role": "...", "action": "...", "depends_on": [...]}}],
+          "edit":   [{{"name": "<existing_step_name>", "patch": {{"field": "value"}}}}],
+          "remove": ["<existing_step_name>"],
+          "position": {{"after": "<name>", "before": "<name>"}}  // optional
+        }},
+        "reason": "brief reason"
+      }}
+    ]
+  }}
+
+If the user's request is not actually a modification (e.g. it's
+a question or a request to start from scratch), return
+{{"suggestions": []}}.
+
+Valid agent_role names: {inline}.
+
+Step names must be kebab-case (lowercase letters, digits, hyphens).
+"""
+    # Build the LLM messages (system + recent history)
+    llm_messages = [{"role": "system", "content": system}]
+    for h in history[-10:]:  # cap history
+        role = h.get("role")
+        content = h.get("content", "")
+        if role in ("user", "assistant") and content:
+            llm_messages.append({"role": role, "content": content})
+    llm_cfg = cfg.get("llm", {})
+    base_url = (llm_cfg.get("base_url") or "https://api.minimax.io/v1").rstrip("/")
+    api_key = llm_cfg.get("api_key") or ""
+    model = llm_cfg.get("model") or "MiniMax-M3"
+    timeout = float(llm_cfg.get("timeout_seconds") or 60)
+    if not api_key:
+        return None
+    import httpx
+    import re
+    payload = {
+        "model": model,
+        "messages": llm_messages,
+        "temperature": 0.1,
+        "max_tokens": 4000,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(
+                f"{base_url}/chat/completions",
+                json=payload, headers=headers,
+            )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        text = (data.get("choices", [{}])[0].get("message", {}).get("content")
+                or "").strip()
+        # Strip think blocks + markdown fences
+        text = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL)
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        # Parse JSON
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            # Try to find {"suggestions": [...]} in the text
+            m = re.search(r'(\{[\s\S]*"suggestions"[\s\S]*\})', text)
+            if m:
+                try:
+                    parsed = json.loads(m.group(1))
+                except Exception:
+                    return None
+            else:
+                return None
+        # Find the apply_plan_patch suggestion
+        suggestions = parsed.get("suggestions") if isinstance(parsed, dict) else None
+        if not isinstance(suggestions, list):
+            return None
+        for sg in suggestions:
+            if isinstance(sg, dict) and sg.get("type") == "apply_plan_patch":
+                p = sg.get("patch")
+                if isinstance(p, dict):
+                    return p
+        return None
+    except Exception:
+        return None
 
 
 async def _apply_create_plan_from_chat(
