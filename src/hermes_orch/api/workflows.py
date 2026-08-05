@@ -2372,3 +2372,127 @@ async def remove_step(
         "workflow": detail,
         "diff": diff_summary,
     }
+
+
+
+# v3.12.6 (Phase 2): atomic unified patch endpoint.
+# The chatbox LLM may emit a single `apply_workflow_patch`
+# suggestion that contains all three sub-operations (add + edit +
+# remove) in one body. Per spec §7.1 these must be atomic. Calling
+# POST/PATCH/DELETE individually would not be atomic — this
+# endpoint enforces all-or-nothing via _apply_step_patch()
+# (which validates incrementally and raises on the first
+# invalid sub-op, leaving the caller's new_steps list
+# untouched on raise).
+#
+# The single-op endpoints above (POST /steps, PATCH /steps/{name},
+# DELETE /steps/{name}) remain useful for direct API callers
+# (e.g. a future visual-editor "edit step" button that wants
+# to PATCH one step at a time). This endpoint is for the
+# chatbox's "Apply patch" button which always carries a
+# complete patch payload.
+class WorkflowStepsPatchBody(BaseModel):
+    """POST /api/workflows/{id}/patch body.
+
+    Each sub-list is optional and defaults to empty. Mixed ops
+    in one body are atomic. position only applies when add is
+    non-empty; ignored otherwise.
+    """
+    add: list[_AddStepItem] = Field(default_factory=list, max_length=20)
+    edit: list[dict] = Field(default_factory=list, max_length=20)
+    # ^ each edit: {"name": "<step_name>", "patch": {<fields>}}
+    remove: list[str] = Field(default_factory=list, max_length=20)
+    position: _Position | None = None
+    reason: str = Field("", max_length=1000)
+
+
+@router.post("/{workflow_id}/patch")
+async def apply_workflow_patch(
+    workflow_id: str, body: WorkflowStepsPatchBody, request: Request
+) -> dict:
+    """v3.12.6 (Phase 2): atomic mixed add/edit/remove patch.
+
+    This is the endpoint the chatbox apply button calls when
+    the LLM emits an `apply_workflow_patch` suggestion (one
+    body with all three sub-ops). It guarantees:
+
+      - Validation runs AFTER the helper builds new_steps, so
+        if any sub-op fails (collision, missing target, path
+        traversal, cycle, dangling ref) the entire patch is
+        rejected and the workflow's step_template is unchanged
+        on disk.
+      - The diff summary in the response covers all three
+        sub-op types so the chatbox preview can render
+        ADD / EDIT / REMOVE in one place.
+
+    Existing 3 single-op endpoints stay (for direct API
+    callers); this one is the chatbox-friendly path.
+    """
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+
+    existing = json.loads(row["step_template"] or "[]")
+    add_dicts = [s.model_dump(exclude_none=False) for s in body.add]
+    # Edit body shape: each item has a "name" + a "patch" dict.
+    # We accept whatever fields the LLM puts in the patch dict
+    # (the helper enforces _EDITABLE_STEP_FIELDS whitelist).
+    edit_dicts = body.edit
+    pos_dict = body.position.model_dump() if body.position else None
+    try:
+        new_steps, diff_summary = _apply_step_patch(
+            existing_steps=existing,
+            add_steps=add_dicts,
+            edit_steps=edit_dicts,
+            remove_step_names=body.remove,
+            position=pos_dict,
+        )
+    except ValueError as e:
+        # Re-use the same error-mapping discipline as the 3
+        # single-op endpoints: collision / ref / position / path
+        # all surface as 4xx with a clear detail message.
+        msg = str(e)
+        if "409" in msg or "already exists" in msg:
+            raise HTTPException(409, msg)
+        if "404" in msg or "not found" in msg:
+            raise HTTPException(404, msg)
+        if "still referenced" in msg:
+            raise HTTPException(409, msg)
+        if "not editable" in msg or "empty patch" in msg:
+            raise HTTPException(422, msg)
+        if "path" in msg.lower() or "traversal" in msg.lower():
+            raise HTTPException(422, msg)
+        if "cycle" in msg.lower() or "dangling" in msg.lower():
+            raise HTTPException(422, msg)
+        raise HTTPException(422, msg)
+
+    now = _now_iso()
+    await db.execute(
+        "UPDATE workflow_packages SET step_template=?, updated_at=? WHERE id=?",
+        (
+            json.dumps(new_steps, ensure_ascii=False),
+            now, workflow_id,
+        ),
+    )
+    await audit_log(
+        db, "workflow.patch", actor="operator",
+        payload={
+            "workflow_id": workflow_id,
+            "added": [s["name"] for s in diff_summary["added"]],
+            "edited": [e["name"] for e in diff_summary["edited"]],
+            "removed": [r["name"] for r in diff_summary["removed"]],
+            "reason": body.reason or "patched by LLM (no reason provided)",
+            "step_count": len(new_steps),
+        },
+    )
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    detail = _row_to_workflow_detail(row)
+    return {
+        "workflow": detail,
+        "diff": diff_summary,
+    }

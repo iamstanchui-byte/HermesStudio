@@ -3206,6 +3206,14 @@ class ChatRequest(BaseModel):
     # messages from DB. If provided, server appends to the DB
     # row + uses for the LLM call. Max 30 turns (defensive cap).
     history: list[dict] | None = None  # [{role, content}, ...]
+    # v3.12.6 (Phase 2) context-aware editing: which node (step)
+    # the user has currently selected in the visual editor. The
+    # LLM sees this in the system prompt as the "FOCUS" block
+    # and can target suggestions at that step. Cleared by the
+    # frontend on page navigation (sessionStorage lifetime).
+    # Shape: {kind: "plan_step"|"workflow_step", workflow_id?,
+    #         step_name, action?, agent_role?, depends_on?}.
+    selected_node: dict | None = None
 
 
 class ChatApplyRequest(BaseModel):
@@ -3738,6 +3746,27 @@ async def chat_with_project(
     system_prompt = _CHAT_SYSTEM_PROMPT.replace(
         "{available_profiles_inline}", inline
     )
+    # v3.12.6 (Phase 2) context-aware editing: if the user has a
+    # node selected in the visual editor, surface it as a FOCUS
+    # block in the system prompt. The LLM can use this to target
+    # suggestions at that step (e.g. "modify step X's action" →
+    # emit apply_workflow_patch with edit=[{name: X, patch: ...}]).
+    # Cap the FOCUS payload to 1 KB to keep the prompt bounded.
+    if body.selected_node and isinstance(body.selected_node, dict):
+        focus_dict = dict(body.selected_node)
+        focus_str = json.dumps(focus_dict, ensure_ascii=False, indent=2)
+        if len(focus_str) > 1024:
+            focus_str = focus_str[:1024] + "\n... (truncated)"
+        system_prompt = (
+            system_prompt
+            + "\n\n# FOCUS (v3.12.6 context-aware editing)\n"
+            + "The user has a node selected in the visual editor.\n"
+            + "When the user asks to modify THIS node (or 'this step'),\n"
+            + "target your suggestions at it. To modify an EXISTING\n"
+            + "workflow (not the project plan), emit an `apply_workflow_patch`\n"
+            + "suggestion with edit[] / remove[] pointing at this step.\n"
+            + f"Selected node:\n{focus_str}"
+        )
     llm_messages = [
         {"role": "system", "content": system_prompt + "\n\nProject snapshot:\n" + json.dumps(ctx, ensure_ascii=False, indent=2)},
     ]
@@ -4078,6 +4107,18 @@ Allowed suggestion types:
     (version, name, description, trigger, variables, steps[]).
     if_match is the updated_at value from the most recent
     GET /api/projects/{id}/plan (optimistic lock).
+  - apply_workflow_patch: v3.12.6 incremental editing of an
+    existing workflow package. {type, workflow_id, patch: {add,
+    edit, remove, position?}, reason?}. Use this when the user
+    asks to modify an existing workflow (not the project plan):
+    add a step, edit a step's action/depends_on, or remove a step.
+    The workflow_id must be the wf-... id of the workflow. The
+    patch is atomic — all sub-ops succeed or all fail together.
+    Pick this over update_plan when the user says "modify the
+    workflow", "add a step to the workflow", "change step X",
+    "remove step Y". Pick update_plan when the user says "change
+    the project's plan" (the project's plan_json, not the
+    underlying workflow package).
 
 If the user's request is just a question (no concrete action),
 return {"suggestions": []}.
@@ -4227,7 +4268,8 @@ async def apply_chat_suggestion(
       - replan: superseded by update_plan (the LLM produces a fresh
         plan object, not just a new goal string).
 
-    Allowed types: ["update_plan", "create_plan_from_chat"].
+    Allowed types: ["update_plan", "create_plan_from_chat",
+                  "apply_workflow_patch"] (v3.12.6).
     """
     # Local import: avoid module-level cycle (projects.py is loaded
     # before plans.py in main.py's router mount order; keeping this
@@ -4248,11 +4290,19 @@ async def apply_chat_suggestion(
         return await _apply_create_plan_from_chat(
             project_id, body, request,
         )
+    # v3.12.6 (Phase 2): workflow incremental-editing suggestion.
+    # The chatbox LLM emits one suggestion with all add/edit/remove
+    # sub-ops in a single body; the chatbox shows a field-level
+    # diff preview before the user clicks Apply.
+    if stype == "apply_workflow_patch":
+        return await _apply_workflow_patch_from_chat(
+            project_id, body, request,
+        )
     if stype != "update_plan":
         raise HTTPException(
             400,
             f"unknown suggestion type: {stype!r}. Allowed: update_plan, "
-            f"create_plan_from_chat.",
+            f"create_plan_from_chat, apply_workflow_patch.",
         )
     plan_data = s.get("plan")
     if not isinstance(plan_data, dict):
@@ -4288,6 +4338,81 @@ async def apply_chat_suggestion(
         "project_id": result.project_id,
         "updated_at": result.updated_at,
         "step_count": len(result.plan.steps) if result.plan else 0,
+    }
+
+
+async def _apply_workflow_patch_from_chat(
+    project_id: str, body: "ChatApplyRequest", request: Request,
+) -> dict:
+    """v3.12.6 (Phase 2): handle `apply_workflow_patch` suggestion.
+
+    The chatbox LLM may emit a single suggestion of type
+    `apply_workflow_patch` containing a mixed add/edit/remove patch
+    (one body, all sub-ops atomic). The chatbox then shows the
+    diff preview; on Apply we delegate to the workflow's atomic
+    patch endpoint.
+
+    Suggestion shape (per docs/v3.12.6-workflow-incremental-editing.md §7.1):
+      {
+        "type": "apply_workflow_patch",
+        "workflow_id": "wf-...",
+        "patch": {
+          "add":    [{name, agent_role, action, ...}, ...],  // optional
+          "edit":   [{name, patch: {<field>: <value>}}, ...], // optional
+          "remove": ["step_name", ...],                       // optional
+          "position": {after: "...", before: "..."} | null    // optional
+        },
+        "reason": "..."   // optional
+      }
+
+    The workflow_id is REQUIRED (the chat knows which project but
+    not which workflow — the LLM must emit it explicitly).
+    """
+    # Local import: avoid module-level cycle
+    from hermes_orch.api.workflows import (
+        WorkflowStepsPatchBody,
+        apply_workflow_patch,
+    )
+    s = body.suggestion
+    workflow_id = s.get("workflow_id")
+    if not isinstance(workflow_id, str) or not workflow_id:
+        raise HTTPException(
+            400,
+            "apply_workflow_patch suggestion missing required 'workflow_id'",
+        )
+    patch_data = s.get("patch")
+    if not isinstance(patch_data, dict):
+        raise HTTPException(
+            400, "apply_workflow_patch suggestion missing 'patch' object",
+        )
+    # Re-validate the patch body through Pydantic so the workflow
+    # endpoint gets a well-typed object. Empty sub-lists are fine —
+    # the LLM may have only one of add/edit/remove to apply.
+    try:
+        patch_body = WorkflowStepsPatchBody(
+            add=patch_data.get("add") or [],
+            edit=patch_data.get("edit") or [],
+            remove=patch_data.get("remove") or [],
+            position=patch_data.get("position"),
+            reason=s.get("reason") or "",
+        )
+    except Exception as e:
+        raise HTTPException(422, f"apply_workflow_patch: invalid patch: {e}")
+    # Delegate. The endpoint handles 404/409/422 internally;
+    # HTTPException propagates so the chatbox can show the error
+    # inline (not a 500 page).
+    result = await apply_workflow_patch(
+        workflow_id=workflow_id,
+        body=patch_body,
+        request=request,
+    )
+    return {
+        "applied": True,
+        "type": "apply_workflow_patch",
+        "project_id": project_id,
+        "workflow_id": workflow_id,
+        "diff": result.get("diff", {}),
+        "step_count": len(result.get("workflow", {}).get("step_template", [])),
     }
 
 

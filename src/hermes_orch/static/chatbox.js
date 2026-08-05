@@ -14,6 +14,10 @@
 //   - onPlanApplied: function(plan) — called after a successful
 //     update_plan apply. Use this to refresh the visual canvas
 //     or any other UI that reflects the plan.
+//   - onWorkflowPatchApplied: function(workflowId, diff) — called
+//     after a successful apply_workflow_patch apply. Use this to
+//     refresh the workflow editor (visual_workflow.js). The diff
+//     arg is the {added, edited, removed} summary from the server.
 
 (function () {
     'use strict';
@@ -235,6 +239,15 @@
             // "make this real" button.
             label = '✨ Create plan from this conversation';
             desc = s.description || 'Server will generate a plan from the chat history';
+        } else if (type === 'apply_workflow_patch') {
+            // v3.12.6 (Phase 2): incremental editing of an existing
+            // workflow. The chatbox LLM emits a single suggestion
+            // with all add/edit/remove sub-ops in one body. The
+            // chip shows a compact +/-/~ summary; clicking Apply
+            // shows a full diff modal before committing (so the
+            // user can verify the patch).
+            label = '🔧 Patch workflow';
+            desc = _renderWorkflowPatchSummary(s);
         } else {
             label = `? ${type}`;
             desc = JSON.stringify(s).slice(0, 80);
@@ -328,12 +341,30 @@
         wrap.appendChild(renderChatMessage({role: 'user', content: text}));
         wrap.scrollTop = wrap.scrollHeight;
         try {
+            // v3.12.6 (Phase 2) context-aware editing: read the
+            // currently-selected node from sessionStorage (set by
+            // visual_plan.js / visual_workflow.js) and send it to
+            // the server. The server injects it into the system
+            // prompt as the FOCUS block so the LLM can target
+            // suggestions at the selected step. Cleared on page
+            // navigation (sessionStorage lifetime = tab session).
+            const selectedNode = (() => {
+                try {
+                    const raw = sessionStorage.getItem(
+                        'hermes_chat_selected_node'
+                    );
+                    return raw ? JSON.parse(raw) : null;
+                } catch (e) { return null; }
+            })();
             const r = await _fetchWithTimeout(
                 `/api/projects/${PROJECT_ID}/chat`,
                 {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({message: text}),
+                    body: JSON.stringify({
+                        message: text,
+                        selected_node: selectedNode,
+                    }),
                 },
                 60000,
             );
@@ -394,19 +425,30 @@
             const suggestion = msg.suggestions[suggestionIdx];
             const isPlan = suggestion.type === 'update_plan';
             const isCreateFromChat = suggestion.type === 'create_plan_from_chat';
+            const isWorkflowPatch = suggestion.type === 'apply_workflow_patch';
             const stepCount = isPlan ? ((suggestion.plan && suggestion.plan.steps) || []).length : 0;
-            // v3.10.5 (2026-08-02): chat-driven plan creation. The
-            // confirm message is friendlier and warns that the
-            // server will generate the plan from the conversation.
-            const confirmMsg = isPlan
-                ? `Apply this plan (${stepCount} step${stepCount === 1 ? '' : 's'})?`
-                : isCreateFromChat
-                    ? `Create a plan from this conversation?\n\n` +
-                      `The server will call the planner LLM with the ` +
-                      `chat history as the goal and save the result as ` +
-                      `the project's plan. This may take 10-20s.`
-                    : `Apply this action?\n\n${JSON.stringify(suggestion, null, 2)}`;
-            if (!confirm(confirmMsg)) return;
+            // v3.12.6 (Phase 2): workflow patches get a dedicated
+            // diff modal instead of the plain confirm() dialog,
+            // because the patch is non-trivial (may add/edit/remove
+            // multiple steps) and we want the user to verify the
+            // exact changes before committing.
+            if (isWorkflowPatch) {
+                const confirmed = await _showWorkflowPatchDiffModal(suggestion);
+                if (!confirmed) return;
+            } else {
+                // v3.10.5 (2026-08-02): chat-driven plan creation. The
+                // confirm message is friendlier and warns that the
+                // server will generate the plan from the conversation.
+                const confirmMsg = isPlan
+                    ? `Apply this plan (${stepCount} step${stepCount === 1 ? '' : 's'})?`
+                    : isCreateFromChat
+                        ? `Create a plan from this conversation?\n\n` +
+                          `The server will call the planner LLM with the ` +
+                          `chat history as the goal and save the result as ` +
+                          `the project's plan. This may take 10-20s.`
+                        : `Apply this action?\n\n${JSON.stringify(suggestion, null, 2)}`;
+                if (!confirm(confirmMsg)) return;
+            }
             const status = document.getElementById('chat-status');
             status.textContent = isCreateFromChat
                 ? 'Generating plan from conversation...'
@@ -496,6 +538,17 @@
             if (isCreateFromChat) {
                 const sc = (adata && adata.step_count) || 0;
                 status.textContent = `✓ Plan created (${sc} step${sc === 1 ? '' : 's'})`;
+            } else if (isWorkflowPatch) {
+                // v3.12.6 (Phase 2): workflow patch summary
+                const diff = (adata && adata.diff) || {};
+                const na = (diff.added || []).length;
+                const ne = (diff.edited || []).length;
+                const nr = (diff.removed || []).length;
+                const parts = [];
+                if (na) parts.push(`+${na}`);
+                if (ne) parts.push(`~${ne}`);
+                if (nr) parts.push(`-${nr}`);
+                status.textContent = `✓ Workflow patched (${parts.join(', ') || 'no change'})`;
             } else {
                 status.textContent = 'Applied: ' + (adata.type || '?');
             }
@@ -518,6 +571,23 @@
                     }
                 } else {
                     // No hook registered — fall back to page reload
+                    setTimeout(() => location.reload(), 1500);
+                }
+            } else if (isWorkflowPatch) {
+                // v3.12.6 (Phase 2): workflow page hook so the
+                // visual_workflow editor can refresh its drawflow
+                // without a full page reload.
+                const hooks = _getHooks();
+                if (typeof hooks.onWorkflowPatchApplied === 'function') {
+                    try {
+                        hooks.onWorkflowPatchApplied(
+                            (adata && adata.workflow_id) || suggestion.workflow_id,
+                            (adata && adata.diff) || {},
+                        );
+                    } catch (e) {
+                        console.warn('onWorkflowPatchApplied hook failed:', e);
+                    }
+                } else {
                     setTimeout(() => location.reload(), 1500);
                 }
             } else {
@@ -573,6 +643,18 @@
         _summarizePlan,
         _resolveConflictUseServer,
         _resolveConflictForceApply,
+        // v3.12.6 (Phase 2): workflow patch diff modal. Exposed for
+        // tests and embedders that want to show the same modal
+        // from a non-chatbox entry point.
+        _renderWorkflowPatchSummary,
+        _showWorkflowPatchDiffModal,
+        // v3.12.6 (Phase 2): context-aware editing helpers. The
+        // visual editor calls setSelectedNode() on selection and
+        // clearSelectedNode() on deselect. The chatbox reads it
+        // automatically on sendChatMessage().
+        setSelectedNode,
+        getSelectedNode,
+        clearSelectedNode,
     };
 
     // ========== 3-way merge helpers (Phase 2, 2026-07-29) ==========
@@ -599,6 +681,182 @@
             html.push(`<ul class="list-disc list-inside pl-1 space-y-0.5">${preview}${more}</ul>`);
         }
         return html.join('');
+    }
+
+    // ========== v3.12.6 (Phase 2) workflow patch helpers ==========
+
+    // v3.12.6 (Phase 2) context-aware editing: set / clear the
+    // currently-selected node in sessionStorage. The chatbox reads
+    // this on the next sendChatMessage() and includes it in the
+    // request body. Call this from visual_plan.js / visual_workflow.js
+    // when a step is selected or deselected.
+    //
+    // Example:
+    //   chatbox.setSelectedNode({
+    //     kind: "workflow_step",     // or "plan_step"
+    //     workflow_id: "wf-abc...",
+    //     step_name: "alpha",
+    //     action: "fetch",
+    //     agent_role: "researcher",
+    //   });
+    function setSelectedNode(node) {
+        try {
+            if (node && typeof node === 'object') {
+                sessionStorage.setItem(
+                    'hermes_chat_selected_node',
+                    JSON.stringify(node)
+                );
+            } else {
+                sessionStorage.removeItem('hermes_chat_selected_node');
+            }
+        } catch (e) {
+            console.warn('setSelectedNode failed:', e);
+        }
+    }
+    function getSelectedNode() {
+        try {
+            const raw = sessionStorage.getItem('hermes_chat_selected_node');
+            return raw ? JSON.parse(raw) : null;
+        } catch (e) { return null; }
+    }
+    function clearSelectedNode() {
+        try {
+            sessionStorage.removeItem('hermes_chat_selected_node');
+        } catch (e) { /* noop */ }
+    }
+
+    // Compact summary for the suggestion chip. Returns an HTML
+    // string like "+2, ~1, -1 (workflow wf-...)". Used in the
+    // suggestion list (one-line description).
+    function _renderWorkflowPatchSummary(suggestion) {
+        const patch = suggestion.patch || {};
+        const add = Array.isArray(patch.add) ? patch.add.length : 0;
+        const edit = Array.isArray(patch.edit) ? patch.edit.length : 0;
+        const remove = Array.isArray(patch.remove) ? patch.remove.length : 0;
+        const parts = [];
+        if (add) parts.push(`<span class="text-green-700">+${add}</span>`);
+        if (edit) parts.push(`<span class="text-blue-700">~${edit}</span>`);
+        if (remove) parts.push(`<span class="text-red-700">-${remove}</span>`);
+        const summary = parts.length ? parts.join(', ') : '(empty patch)';
+        const wfId = suggestion.workflow_id || '?';
+        const wfShort = wfId.length > 16 ? wfId.slice(0, 13) + '…' : wfId;
+        return `${summary} on <span class="font-mono">${escapeHtml(wfShort)}</span>`;
+    }
+
+    // Full diff modal for an apply_workflow_patch suggestion.
+    // Shows each add/edit/remove in detail so the user can verify
+    // the patch before clicking Apply. Returns a Promise that
+    // resolves to true (Apply), false (Cancel), or null (closed).
+    function _showWorkflowPatchDiffModal(suggestion) {
+        return new Promise((resolve) => {
+            const patch = suggestion.patch || {};
+            const add = Array.isArray(patch.add) ? patch.add : [];
+            const edit = Array.isArray(patch.edit) ? patch.edit : [];
+            const remove = Array.isArray(patch.remove) ? patch.remove : [];
+            const reason = suggestion.reason || '';
+
+            // Render the 3 sub-sections
+            const addHtml = add.length
+                ? add.map(s => {
+                    const name = escapeHtml(s.name || '(unnamed)');
+                    const agent = escapeHtml(s.agent_role || '?');
+                    const action = escapeHtml(s.action || '?');
+                    const deps = (s.depends_on || []).map(d => escapeHtml(d));
+                    return `<li class="font-mono text-xs py-1">
+                        <span class="text-green-700">+</span>
+                        <span class="font-semibold">${name}</span>
+                        <span class="text-gray-500">[${agent}]</span>
+                        <span class="text-gray-700">${action}</span>
+                        ${deps.length ? `<span class="text-gray-400"> after=[${deps.join(', ')}]</span>` : ''}
+                    </li>`;
+                }).join('')
+                : '<li class="text-gray-400 italic text-xs">(none)</li>';
+
+            const editHtml = edit.length
+                ? edit.map(e => {
+                    const name = escapeHtml(e.name || '(unnamed)');
+                    const p = e.patch || {};
+                    const fields = Object.keys(p).map(k => {
+                        const v = typeof p[k] === 'object' ? JSON.stringify(p[k]) : String(p[k]);
+                        return `<div class="ml-3 text-xs">
+                            <span class="font-mono text-blue-700">${escapeHtml(k)}</span>
+                            <span class="text-gray-500">=</span>
+                            <span class="text-gray-800">${escapeHtml(v)}</span>
+                        </div>`;
+                    }).join('');
+                    return `<li class="py-1">
+                        <span class="text-blue-700">~</span>
+                        <span class="font-mono text-xs font-semibold">${name}</span>
+                        <div class="border-l-2 border-blue-200 ml-2 pl-1 mt-0.5">${fields}</div>
+                    </li>`;
+                }).join('')
+                : '<li class="text-gray-400 italic text-xs">(none)</li>';
+
+            const removeHtml = remove.length
+                ? remove.map(name =>
+                    `<li class="font-mono text-xs py-1">
+                        <span class="text-red-700">-</span>
+                        <span class="line-through text-gray-600">${escapeHtml(name)}</span>
+                    </li>`).join('')
+                : '<li class="text-gray-400 italic text-xs">(none)</li>';
+
+            // Build the modal
+            const modal = document.createElement('div');
+            modal.className = 'fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4';
+            modal.innerHTML = `
+                <div class="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[85vh] flex flex-col">
+                    <div class="px-4 py-3 border-b flex items-center justify-between">
+                        <div>
+                            <div class="text-sm font-semibold text-gray-800">
+                                🔧 Workflow patch preview
+                            </div>
+                            <div class="text-xs text-gray-500 font-mono">
+                                ${escapeHtml(suggestion.workflow_id || '?')}
+                            </div>
+                        </div>
+                        <button data-act="cancel" class="text-gray-400 hover:text-gray-600 text-xl leading-none"
+                            title="Close">&times;</button>
+                    </div>
+                    <div class="px-4 py-3 space-y-3 overflow-y-auto text-sm flex-1">
+                        <div>
+                            <div class="text-xs font-semibold text-green-700 mb-1">ADD (${add.length})</div>
+                            <ul class="bg-green-50 border border-green-200 rounded p-2 space-y-0.5">${addHtml}</ul>
+                        </div>
+                        <div>
+                            <div class="text-xs font-semibold text-blue-700 mb-1">EDIT (${edit.length})</div>
+                            <ul class="bg-blue-50 border border-blue-200 rounded p-2 space-y-0.5">${editHtml}</ul>
+                        </div>
+                        <div>
+                            <div class="text-xs font-semibold text-red-700 mb-1">REMOVE (${remove.length})</div>
+                            <ul class="bg-red-50 border border-red-200 rounded p-2 space-y-0.5">${removeHtml}</ul>
+                        </div>
+                        ${reason ? `<div class="text-xs text-gray-500 italic border-t pt-2">Reason: ${escapeHtml(reason)}</div>` : ''}
+                    </div>
+                    <div class="px-4 py-3 border-t flex gap-2 justify-end">
+                        <button data-act="cancel"
+                            class="px-3 py-1 text-sm bg-gray-200 text-gray-800 rounded hover:bg-gray-300">
+                            Cancel
+                        </button>
+                        <button data-act="apply"
+                            class="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700"
+                            ${(add.length + edit.length + remove.length) === 0 ? 'disabled' : ''}>
+                            Apply patch
+                        </button>
+                    </div>
+                </div>`;
+            document.body.appendChild(modal);
+
+            const cleanup = (result) => {
+                document.body.removeChild(modal);
+                resolve(result);
+            };
+            modal.addEventListener('click', (e) => {
+                const act = e.target && e.target.dataset && e.target.dataset.act;
+                if (act === 'apply') cleanup(true);
+                else if (act === 'cancel') cleanup(false);
+                else if (e.target === modal) cleanup(false); // backdrop
+            });
+        });
     }
 
     // Conflict resolution: "Use server's plan" — discard the user's
