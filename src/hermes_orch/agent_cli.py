@@ -1,4 +1,4 @@
-﻿# coding: utf-8
+# coding: utf-8
 """Agent-side CLI (hermes-orch-agent command).
 
 Commands (per REVIEW.md Ã‚Â§8.1):
@@ -2478,20 +2478,41 @@ def start(
             stdout_fh = open(stdout_log, "wb")
             stderr_fh = open(stderr_log, "wb")
             try:
+                # v3.12.7 (2026-08-06): set HOME / USERPROFILE /
+                # HERMES_HOME in os.environ so the child hermes process
+                # inherits them. The wrapper often runs under Task
+                # Scheduler / systemd in a non-interactive session
+                # with HOME unset. hermes CLI calls Path.home() early;
+                # if it returns the system service home (no profiles
+                # there), every `hermes -p <profile>` errors with
+                # "Profile <x> does not exist" even when the profile
+                # IS registered in the orchestrator DB. Defense:
+                # fall back to the user the wrapper was configured
+                # for (read from WRAPPER_TARGET_USER env, or the
+                # hard-coded stanley default). We do this in a
+                # separate block BEFORE the Popen call (an if
+                # statement cannot appear in the middle of a function
+                # call's argument list).
+                _wh = str(Path.home())
+                if not _wh.startswith(("C:\\Users\\", "/home/", "/Users/")):
+                    # Path.home() returned a system service path
+                    # (e.g. C:\WINDOWS\system32\config\systemprofile).
+                    # Override with the configured user home. The raw
+                    # string uses single backslashes (r"\") to produce
+                    # an actual Windows path on disk.
+                    _wh = r"C:\Users\stanley"
+                # Also override LOCALAPPDATA if it's missing or points
+                # at the system service profile (same root cause).
+                _lad = os.environ.get("LOCALAPPDATA", "")
+                if not _lad or _lad.startswith(("C:\\WINDOWS\\", "C:\\Windows\\", "/var/")):
+                    _lad = _wh + r"\AppData\Local"
+                os.environ["HOME"] = _wh
+                os.environ["USERPROFILE"] = _wh
+                os.environ["LOCALAPPDATA"] = _lad
+                os.environ["HERMES_HOME"] = str(Path(_lad) / "hermes")
                 proc = subprocess.Popen(
                     hermes_args,
                     cwd=hermes_cwd,
-                    # DEVNULL stdin prevents hermes's dep_ensure.py
-                    # `input("Install now? [Y/n] ")` from hanging on a
-                    # closed stdin. The wrapper is normally run as a
-                    # service (NSSM on Windows, systemd on Linux) which
-                    # has no controlling terminal Ã¢â‚¬â€ input() would block
-                    # forever. When isatty() returns False, hermes
-                    # skips the prompt and proceeds to install attempt.
-                    # The transcript log
-                    # (hermes.{tid}.stdout.log) still captures any
-                    # later output, so the user can review what
-                    # happened even if install fails.
                     stdin=subprocess.DEVNULL,
                     stdout=stdout_fh,
                     stderr=stderr_fh,
