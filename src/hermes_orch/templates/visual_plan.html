@@ -556,6 +556,21 @@
     </div>
 </div>
 
+{# v3.12.5: Add-step palette chips — same layout as visual_workflow.html
+   (above the canvas, not below). The chips pre-fill a new step's
+   `action` (search→fetch_url, analyze→summarize, audit→audit_check,
+   write→write_output) and chain-mode auto-wire depends_on to the last
+   step. The wrapper class is `bg-white border rounded-lg p-2 mb-2`
+   to visually match workflow's `Add step:` row. #}
+<div class="bg-white border rounded-lg p-2 mb-2 flex items-center gap-2">
+    <span class="text-xs font-semibold text-gray-700">Add step:</span>
+    <span class="vp-palette-chip" data-template="search">search</span>
+    <span class="vp-palette-chip" data-template="analyze">analyze</span>
+    <span class="vp-palette-chip" data-template="audit">audit</span>
+    <span class="vp-palette-chip" data-template="write">write</span>
+    <span class="text-xs text-gray-400 ml-2">click to add (chain-mode: auto-wires to last step)</span>
+</div>
+
 <div class="vp-canvas-wrap" id="vp-canvas-wrap">
     {# Generate plan modal (UI cleanup 2026-07-27). LLM takes a
        goal and returns a plan_json. Replaces the old project-page
@@ -867,21 +882,12 @@
             placeholder="What this plan does"
             class="w-full px-2 py-1 text-sm border rounded">
     </div>
-    <div class="flex items-end gap-2 flex-wrap">
-        {# v3.12.5: replace bare +Add step button with the same 4-template
-           palette that visual_workflow.html has (search / analyze / audit /
-           write). Each chip pre-fills a new step with a sensible action
-           + auto-wires depends_on to the last step (chain mode). User can
-           still edit every field afterward via the side panel. The
-           `vp-palette-chip` class (vs `vf-palette-chip` for workflow)
-           avoids the styles colliding if both editors ever share a page. #}
-        <span class="text-xs font-semibold text-gray-700 self-center">Add step:</span>
-        <span class="vp-palette-chip" data-template="search">search</span>
-        <span class="vp-palette-chip" data-template="analyze">analyze</span>
-        <span class="vp-palette-chip" data-template="audit">audit</span>
-        <span class="vp-palette-chip" data-template="write">write</span>
-        <span class="text-xs text-gray-400 ml-2 self-center">click to add (chain-mode: auto-wires to last step)</span>
-    </div>
+    {# v3.12.5: the +Add step chips were here in commit 3830b92, but
+       that put them at the page bottom (below the canvas), which
+       doesn't match the workflow editor's layout (chips above the
+       canvas). Moved up to the toolbar/canvas boundary in
+       commit <this>. The class `vp-palette-chip` is unchanged;
+       only the position moved. #}
 </div>
 
 {# Apply workflow + Promote to workflow modals (2026-07-28). The
