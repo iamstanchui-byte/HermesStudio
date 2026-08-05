@@ -571,6 +571,10 @@
         // and initialize the undo/redo button states (both disabled
         // at start because undo stack is empty).
         _bindGlobalShortcuts();
+        // v3.12.5: bind the 4-template palette chips in the toolbar
+        // (search / analyze / audit / write). Idempotent — guarded
+        // by window._vpChipsBound so re-init doesn't double-bind.
+        _bindPaletteChips();
         _updateHistoryButtons();
     }
 
@@ -1061,18 +1065,37 @@
     }
 
     // ===== Step CRUD =====
-    function addStep() {
-        _checkpoint('Add step');  // v2.2: undo support
-        // Generate a default name. We scan existing names and
-        // pick "step-N" with the smallest N that's not taken.
+    // v3.12.5: 4-template palette (search / analyze / audit / write),
+    // mirroring visual_workflow.js so the UX is consistent across
+    // both editors. The bare `+ Add step` button (which produced a
+    // step with all-empty fields) is gone — every new step now starts
+    // with a sensible `action` so the user can immediately tell what
+    // the step is supposed to do. Fields like `agent_role` stay
+    // empty because they depend on the user's runtime choices; the
+    // side panel is opened automatically so the user can fill them
+    // in without an extra click.
+    const _PALETTE_ACTIONS = {
+        search:  'fetch_url',
+        analyze: 'summarize',
+        audit:   'audit_check',
+        write:   'write_output',
+    };
+    function _newStepFromTemplate(tmpl) {
+        const action = _PALETTE_ACTIONS[tmpl] || '';
+        // Pick a unique name by appending a numeric suffix, so the
+        // user can click the same chip multiple times in a row and
+        // get `search-1`, `search-2`, ... without conflicts.
         const used = new Set(_plan.steps.map(s => s.name));
         let n = 1;
-        while (used.has('step-' + n)) n++;
-        const name = 'step-' + n;
-        const step = {
-            name: name,
+        let name = `${tmpl}-${n}`;
+        while (used.has(name)) {
+            n += 1;
+            name = `${tmpl}-${n}`;
+        }
+        return {
+            name,
             agent_role: '',
-            action: '',
+            action: action,
             skill: '',
             tool: '',
             required_capability: '',
@@ -1081,16 +1104,60 @@
             params_template: {},
             output_path: '',
         };
-        _plan.steps.push(step);
-        // Position: place below the lowest existing node
+    }
+    function _addStepFromChip(tmpl) {
+        const newStep = _newStepFromTemplate(tmpl);
+        // Chain mode: depends_on = [last step's name]. Skip if no
+        // prior step (first chip click on an empty plan). Same shape
+        // as visual_workflow.js:1559-1600.
+        const lastStep = _plan.steps.length > 0
+            ? _plan.steps[_plan.steps.length - 1]
+            : null;
+        if (lastStep) {
+            newStep.depends_on = [lastStep.name];
+        }
+        // v2.2: checkpoint BEFORE the push so undo restores the
+        // pre-add state.
+        _checkpoint('Add step "' + newStep.name + '"');
+        _plan.steps.push(newStep);
+        // Place below the lowest existing node, same logic as the
+        // old addStep() helper.
         const lastIdx = _plan.steps.length - 1;
-        addNodeToCanvas(step, 100 + (lastIdx % 3) * 280, 100 + Math.floor(lastIdx / 3) * 130);
+        addNodeToCanvas(newStep, 100 + (lastIdx % 3) * 280, 100 + Math.floor(lastIdx / 3) * 130);
+        // Chain mode: draw the wire from the last step to the new
+        // one. wireDepsForStep reads the internal-id map populated
+        // by addNodeToCanvas (for both the source and target), so
+        // it works whether the source step was added via chip or
+        // via the initial plan_json render. The old bare
+        // + Add step button didn't draw any wire (depends_on was
+        // always []), so chip flow is strictly better.
+        wireDepsForStep(newStep);
         // v2.2: auto-select the new step so the user can immediately
-        // Ctrl+C → Ctrl+V to clone, or dblclick to edit. Without
-        // this they'd have to dblclick first to "select".
-        _selectedNodeName = name;
+        // Ctrl+C → Ctrl+V to clone, or dblclick to edit. We also
+        // open the side panel so the user sees what fields still
+        // need filling (agent_role, params_template, etc.) without
+        // a second click.
+        _selectedNodeName = newStep.name;
+        openSidePanel(newStep.name);
         updateMinimap();
-        showBanner('Step "' + name + '" added. Double-click to edit, or Ctrl+C to clone.', 'success');
+        showBanner(
+            `Added step: ${newStep.name}` +
+            (lastStep ? ` (auto-wired from ${lastStep.name}).` : '.'),
+            'success'
+        );
+    }
+    function _bindPaletteChips() {
+        // v3.12.5: bind the 4-template palette chips in the toolbar.
+        // Idempotent — guarded by a window flag so a re-init (e.g. after
+        // SPA navigation) doesn't double-bind.
+        if (window._vpChipsBound) return;
+        window._vpChipsBound = true;
+        document.querySelectorAll('.vp-palette-chip').forEach((chip) => {
+            chip.addEventListener('click', () => {
+                const tmpl = chip.dataset.template;
+                _addStepFromChip(tmpl);
+            });
+        });
     }
 
     function deleteStepByName(name) {
@@ -2005,7 +2072,11 @@
 
     // ===== Public API (window.vp) =====
     window.vp = {
-        addStep: addStep,
+        // v3.12.5: addStep is removed — the 4-template palette chips
+        // in the toolbar (`_bindPaletteChips`) cover this use case
+        // with a sensible `action` pre-fill. The chips don't need a
+        // window.vp entry because they're bound on init and the
+        // handlers call internal helpers directly.
         savePlan: savePlan,
         generateTasks: generateTasks,
         validatePlan: validatePlan,

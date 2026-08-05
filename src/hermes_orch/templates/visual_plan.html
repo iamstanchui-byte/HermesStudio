@@ -381,6 +381,31 @@
         background: #450a0a;
         color: #fca5a5;
     }
+    /* v3.12.5: Add-step palette chips (mirror of .vf-palette-chip in
+       visual_workflow.html so the 4 templates look identical across
+       both editors). The class is `vp-palette-chip` (vs `vf-palette-chip`
+       for workflow) to keep the two editors style-isolated. */
+    .vp-palette-chip {
+        display: inline-block;
+        padding: 6px 10px;
+        margin: 2px 4px 2px 0;
+        background: #eff6ff;     /* blue-50 */
+        border: 1px solid #93c5fd; /* blue-300 */
+        border-radius: 4px;
+        color: #1e3a8a;          /* blue-900 */
+        font-size: 12px;
+        cursor: pointer;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .vp-palette-chip:hover { background: #dbeafe; }
+    body.dark .vp-palette-chip {
+        background: #1e3a8a;
+        border-color: #1d4ed8;
+        color: #bfdbfe;
+    }
+    body.dark .vp-palette-chip:hover {
+        background: #1d4ed8;
+    }
 </style>
 {% endblock %}
 
@@ -842,12 +867,20 @@
             placeholder="What this plan does"
             class="w-full px-2 py-1 text-sm border rounded">
     </div>
-    <div class="flex items-end gap-2">
-        <button onclick="window.vp.addStep()"
-            class="px-3 py-1.5 text-sm font-medium rounded border border-cyan-300 text-cyan-700 hover:bg-cyan-50"
-            title="Add a new step to the canvas (default name 'step-N')">
-            + Add step
-        </button>
+    <div class="flex items-end gap-2 flex-wrap">
+        {# v3.12.5: replace bare +Add step button with the same 4-template
+           palette that visual_workflow.html has (search / analyze / audit /
+           write). Each chip pre-fills a new step with a sensible action
+           + auto-wires depends_on to the last step (chain mode). User can
+           still edit every field afterward via the side panel. The
+           `vp-palette-chip` class (vs `vf-palette-chip` for workflow)
+           avoids the styles colliding if both editors ever share a page. #}
+        <span class="text-xs font-semibold text-gray-700 self-center">Add step:</span>
+        <span class="vp-palette-chip" data-template="search">search</span>
+        <span class="vp-palette-chip" data-template="analyze">analyze</span>
+        <span class="vp-palette-chip" data-template="audit">audit</span>
+        <span class="vp-palette-chip" data-template="write">write</span>
+        <span class="text-xs text-gray-400 ml-2 self-center">click to add (chain-mode: auto-wires to last step)</span>
     </div>
 </div>
 
