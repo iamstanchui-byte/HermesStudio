@@ -14,6 +14,7 @@ but the output is JSON, not markdown.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import sys
@@ -1794,4 +1795,580 @@ async def suggest_vars(workflow_id: str, request: Request) -> dict:
         "workflow_id": workflow_id,
         "suggestions": suggestions,
         "already_defined_count": sum(1 for s in suggestions if s["already_defined"]),
+    }
+
+
+
+# ===== v3.12.6: Workflow Incremental Editing =====
+#
+# Per docs/v3.12.6-workflow-incremental-editing.md. Three
+# domain-specific endpoints (POST /steps, PATCH /steps/{name},
+# DELETE /steps/{name}) that let the LLM chatbox assistant patch
+# the workflow step_template incrementally instead of replacing
+# the whole package. The apply_workflow_patch suggestion type
+# (used by the chatbox heuristic) routes through these three
+# endpoints and shows a field-level diff preview before
+# committing.
+#
+# Design-time only. The runtime task layer (workflow.run →
+# projects + tasks) is untouched. Reversing a patch requires
+# a fresh Apply of the inverse diff; there's no undo endpoint
+# in v1 (audit log + git history are the recovery path).
+#
+# DAG validation (cycle + dangling ref) and output_path
+# path-safety are enforced on every patch. Collision on
+# add_steps returns 409. Editing a non-existent step returns
+# 404. Deleting a step that is still referenced returns 409
+# (use a separate explicit edit_step to drop the references
+# first; spec §9.4 — automatic rewiring is v1.0 out of scope).
+# ---------------------------------------------------------------------
+
+
+# Fields the LLM is allowed to PATCH on a step (add_steps creates
+# new step; edit_step may only change fields in this tuple). We
+# explicitly exclude `name` to enforce "no silent rename" — see
+# the rename discussion in the spec §9.5. To rename, delete the
+# old step and add a new one (or do it manually in the visual
+# editor where the rename is intentional and reviewable).
+# `tool` and `required_capability` are task-level columns, not
+# workflow step fields; they're populated when a workflow is
+# materialized into a project, not in the template.
+_EDITABLE_STEP_FIELDS = (
+    "agent_role", "action", "depends_on", "feedback_to",
+    "params_template", "timeout_seconds", "retry",
+    "max_retries", "output_path",
+)
+
+
+# ---- Pydantic request models ----
+
+class _AddStepItem(BaseModel):
+    """A single step to add. Required: name. Optional: everything
+    else. The chatbox flow usually supplies name + agent_role +
+    action (with chain-mode depends_on pre-filled); the visual
+    editor's `+ Add step` chip pre-fills action only and leaves
+    agent_role blank for the user to choose in the side panel.
+
+    Field defaults mirror the workflow step's natural shape
+    (api/plans.py PlanStep) so the result is a valid step even
+    if the LLM only sets `name` + `action`.
+    """
+    name: str = Field(..., min_length=1, max_length=40,
+                      pattern=r"^[a-z0-9][a-z0-9-]*$")
+    agent_role: str = Field("", max_length=80)
+    action: str = Field("", max_length=200)
+    depends_on: list[str] = Field(default_factory=list)
+    feedback_to: list[str] = Field(default_factory=list)
+    params_template: dict = Field(default_factory=dict)
+    output_path: str = Field("", max_length=500)
+    skill: str = Field("", max_length=40)
+    timeout_seconds: int = Field(1800, ge=0, le=86400)
+    retry: int = Field(0, ge=0)
+    max_retries: int = Field(3, ge=0)
+
+
+class _Position(BaseModel):
+    """Where to insert the new step(s). Empty strings mean "not
+    specified" (caller picks default = append).
+
+    Per spec §6.2: exactly one of after / before should be
+    non-empty. If both are set, the request is rejected.
+    """
+    after: str = Field("", max_length=40)
+    before: str = Field("", max_length=40)
+
+
+class AddStepsBody(BaseModel):
+    """POST /api/workflows/{id}/steps body.
+
+    steps must be non-empty (1..20). position is optional. reason
+    is optional and recorded in the audit log; if empty the
+    server records "added by LLM (no reason provided)" so the
+    audit log entry is never blank.
+    """
+    steps: list[_AddStepItem] = Field(..., min_length=1, max_length=20)
+    position: _Position | None = None
+    reason: str = Field("", max_length=1000)
+
+
+class EditStepBody(BaseModel):
+    """PATCH /api/workflows/{id}/steps/{name} body.
+
+    `patch` is a free-form dict whose keys must be a subset of
+    _EDITABLE_STEP_FIELDS. We validate the key set inside the
+    handler (Pydantic can't enforce a subset-of-tuple without
+    a custom validator, and a TypedDict would force every
+    optional field to be present, which is the opposite of
+    what PATCH semantics want).
+
+    The empty patch (no fields to change) is a no-op and
+    returns 422 — silent no-op PATCHes are a common bug source
+    in REST APIs and we surface them as errors instead.
+    """
+    patch: dict = Field(..., min_length=1)
+    reason: str = Field("", max_length=1000)
+
+
+# ---- DAG / path-safety / diff helpers ----
+
+def _check_no_cycle(steps: list[dict]) -> tuple[bool, str]:
+    """Detect a cycle in `depends_on` edges. Linear-time DFS with
+    3-color marking (white/gray/black). Returns (ok, error).
+
+    Note: `feedback_to` is a TRIGGER semantic (on-failure re-run)
+    so cycles there are tolerable in principle, but for v1 we
+    forbid them too — keep the design-time graph acyclic, period.
+    """
+    name_to_idx = {s.get("name"): i for i, s in enumerate(steps) if s.get("name")}
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = [WHITE] * len(steps)
+    adj: dict[int, list[int]] = {i: [] for i in range(len(steps))}
+    for i, s in enumerate(steps):
+        n = s.get("name")
+        if not n:
+            continue
+        deps = s.get("depends_on") or []
+        adj[i] = [name_to_idx[d] for d in deps if d in name_to_idx]
+    def visit(u: int) -> bool:
+        color[u] = GRAY
+        for v in adj.get(u, []):
+            if color[v] == GRAY:
+                return False  # back-edge = cycle
+            if color[v] == WHITE and not visit(v):
+                return False
+        color[u] = BLACK
+        return True
+    for u in range(len(steps)):
+        if color[u] == WHITE and not visit(u):
+            cycle_step = steps[u].get("name", f"step[{u}]")
+            return False, f"depends_on cycle detected involving step {cycle_step!r}"
+    return True, ""
+
+
+def _check_dangling_refs(steps: list[dict]) -> tuple[bool, str]:
+    """Every depends_on / feedback_to target must be a known
+    step name. Returns (ok, error)."""
+    names = {s.get("name") for s in steps if s.get("name")}
+    for i, s in enumerate(steps):
+        n = s.get("name", f"step[{i}]")
+        for ref in s.get("depends_on") or []:
+            if ref not in names:
+                return False, (
+                    f"step {n!r} depends_on={ref!r} but {ref!r} is not a known step"
+                )
+        for ref in s.get("feedback_to") or []:
+            if ref not in names:
+                return False, (
+                    f"step {n!r} feedback_to={ref!r} but {ref!r} is not a known step"
+                )
+    return True, ""
+
+
+def _check_path_safety(path: str) -> tuple[bool, str]:
+    r"""Per spec §6.3 + §13.4: output_path must remain inside the
+    project temp folder boundary. Workflow packages themselves
+    are project-agnostic templates, so we enforce conservative
+    rules here:
+
+      - empty path is OK (workflows may run without an output)
+      - no '..' path-traversal segments
+      - no absolute paths (Unix `/...` or Windows `C:\...` / `\\server\share`)
+      - no Windows drive letters
+
+    The actual project-scoped path-safety check happens when a
+    workflow is materialized into a project (see api/projects.py
+    `apply_workflow` for the project_temp_folder resolution).
+    """
+    if not path:
+        return True, ""
+    # Normalize separators for the check (we don't actually
+    # resolve symlinks -- that's the runtime materialization's job).
+    norm = path.replace("\\", "/")
+    segments = norm.split("/")
+    if ".." in segments:
+        return False, f"output_path={path!r} contains '..' (path traversal)"
+    if os.path.isabs(path) or (len(path) >= 2 and path[1] == ":"):
+        return False, f"output_path={path!r} is absolute (must be relative)"
+    return True, ""
+
+
+def _compute_field_diff(before: dict, after: dict) -> dict:
+    """Field-level diff for the diff preview. Returns
+    {field: {"before": <old>, "after": <new>}} for every key
+    whose value differs between before and after. Keys present
+    in only one side appear with the other side as None.
+
+    JSON values that are dicts / lists are compared structurally
+    (Python ==, which for dicts is value equality). For very
+    large params_template the diff can be noisy; the chatbox
+    UI collapses unchanged subtrees in a future iteration.
+    """
+    diff: dict = {}
+    for k in sorted(set(before.keys()) | set(after.keys())):
+        if before.get(k) != after.get(k):
+            diff[k] = {"before": before.get(k), "after": after.get(k)}
+    return diff
+
+
+def _apply_step_patch(
+    existing_steps: list[dict],
+    add_steps: list[dict] | None = None,
+    edit_steps: list[dict] | None = None,
+    remove_step_names: list[str] | None = None,
+    position: dict | None = None,
+) -> tuple[list[dict], dict]:
+    """Apply add/edit/remove sub-operations to an existing step
+    list and return (new_steps, diff_summary).
+
+    Validates incrementally so failures point at the offending
+    sub-operation (not just "patch failed"):
+
+      1. add_steps names must not collide with existing step names
+      2. position.after / position.before must reference an
+         existing step (or be omitted for default append)
+      3. edit_steps names must exist; their `patch` dict may only
+         contain keys from _EDITABLE_STEP_FIELDS; if any value
+         is an `output_path`, the path-safety check runs
+      4. remove_steps names must exist; if any other step still
+         references the removed step (via depends_on or
+         feedback_to), the removal is refused with 409 (spec
+         §9.4 — no automatic rewiring in v1)
+      5. Final validation: no cycle, no dangling refs
+
+    Returns:
+      new_steps:    the new step list (caller writes to DB)
+      diff_summary: {
+        "added":   [{"name": ..., "fields": [...]}, ...],
+        "edited":  [{"name": ..., "field_diff": {...}}, ...],
+        "removed": [{"name": ..., "was_referenced_by": [...]}, ...],
+      }
+    """
+    add_steps = add_steps or []
+    edit_steps = edit_steps or []
+    remove_step_names = remove_step_names or []
+
+    new_steps = list(existing_steps)  # copy
+    diff_summary: dict = {"added": [], "edited": [], "removed": []}
+
+    # 1. Apply add_steps (with position)
+    if add_steps:
+        existing_names = {s.get("name") for s in new_steps}
+        for s in add_steps:
+            n = s.get("name")
+            if not n:
+                raise ValueError("add_step missing 'name' field")
+            if n in existing_names:
+                # 409 Conflict per spec §9.1
+                raise ValueError(
+                    f"step name {n!r} already exists in workflow (409 Conflict)"
+                )
+            # Path-safety on output_path (in case the LLM pre-filled one)
+            op = s.get("output_path") or ""
+            ok, err = _check_path_safety(op)
+            if not ok:
+                raise ValueError(f"add_step: {err}")
+            existing_names.add(n)
+
+        if position and (position.get("after") or position.get("before")):
+            after = position.get("after", "")
+            before = position.get("before", "")
+            if after and before:
+                raise ValueError("position: cannot specify both 'after' and 'before'")
+            if after:
+                idx = next(
+                    (i for i, s in enumerate(new_steps) if s.get("name") == after),
+                    -1,
+                )
+                if idx == -1:
+                    raise ValueError(f"position.after={after!r} not found in workflow")
+                # Insert in order, so insertion order = input order
+                for offset, s in enumerate(add_steps):
+                    new_steps.insert(idx + 1 + offset, s)
+            else:  # before
+                idx = next(
+                    (i for i, s in enumerate(new_steps) if s.get("name") == before),
+                    -1,
+                )
+                if idx == -1:
+                    raise ValueError(f"position.before={before!r} not found in workflow")
+                # Insert in reverse so input order preserved
+                for offset, s in enumerate(reversed(add_steps)):
+                    new_steps.insert(idx, s)
+        else:
+            # Default: append
+            new_steps.extend(add_steps)
+
+        for s in add_steps:
+            diff_summary["added"].append({
+                "name": s.get("name"),
+                "fields": sorted(s.keys()),
+            })
+
+    # 2. Apply edit_steps
+    for edit in edit_steps:
+        name = edit.get("name")
+        patch = edit.get("patch") or {}
+        if not name:
+            raise ValueError("edit_step missing 'name' field")
+        if not patch:
+            raise ValueError(f"edit_step {name!r}: empty patch (no-op PATCH rejected)")
+        target_idx = next(
+            (i for i, s in enumerate(new_steps) if s.get("name") == name),
+            -1,
+        )
+        if target_idx == -1:
+            raise ValueError(f"edit_step: step {name!r} not found (404)")
+        for k in patch.keys():
+            if k not in _EDITABLE_STEP_FIELDS:
+                raise ValueError(
+                    f"edit_step {name!r}: field {k!r} is not editable "
+                    f"(allowed: {_EDITABLE_STEP_FIELDS})"
+                )
+            if k == "output_path":
+                ok, err = _check_path_safety(patch[k])
+                if not ok:
+                    raise ValueError(f"edit_step {name!r}: {err}")
+        before_step = dict(new_steps[target_idx])
+        new_steps[target_idx] = {**new_steps[target_idx], **patch}
+        diff_summary["edited"].append({
+            "name": name,
+            "field_diff": _compute_field_diff(before_step, new_steps[target_idx]),
+        })
+
+    # 3. Apply remove_step_names
+    for name in remove_step_names:
+        target_idx = next(
+            (i for i, s in enumerate(new_steps) if s.get("name") == name),
+            -1,
+        )
+        if target_idx == -1:
+            raise ValueError(f"remove_step: step {name!r} not found (404)")
+        # 9.4: refuse if anyone still references it
+        referencing: list[str] = []
+        for s in new_steps:
+            if name in (s.get("depends_on") or []):
+                referencing.append(s.get("name"))
+            elif name in (s.get("feedback_to") or []):
+                referencing.append(s.get("name"))
+        if referencing:
+            raise ValueError(
+                f"remove_step: {name!r} is still referenced by: {referencing}. "
+                f"Send a separate edit_step on each referencing step "
+                f"to drop the reference first, then retry the remove."
+            )
+        new_steps.pop(target_idx)
+        diff_summary["removed"].append({
+            "name": name,
+            "was_referenced_by": [],
+        })
+
+    # 4. Final integrity check
+    ok, err = _check_no_cycle(new_steps)
+    if not ok:
+        raise ValueError(f"patch produced invalid DAG: {err}")
+    ok, err = _check_dangling_refs(new_steps)
+    if not ok:
+        raise ValueError(f"patch produced dangling refs: {err}")
+
+    return new_steps, diff_summary
+
+
+# ---- Endpoints ----
+
+@router.post("/{workflow_id}/steps", status_code=201)
+async def add_steps(
+    workflow_id: str, body: AddStepsBody, request: Request
+) -> dict:
+    """v3.12.6: append / insert 1..20 new steps into a workflow.
+
+    Per spec §6.2 / §8.1. Default position is `append`; specify
+    `position.after` or `position.before` to insert.
+
+    Returns the new step_template + a diff summary for the
+    chatbox preview. The DB row is updated atomically: the
+    entire step_template is re-written (no granular row-level
+    update since step_template is a single TEXT column holding
+    a JSON array).
+    """
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+
+    existing = json.loads(row["step_template"] or "[]")
+
+    # Convert Pydantic items to plain dicts for the helper
+    add_dicts = [s.model_dump(exclude_none=False) for s in body.steps]
+    pos_dict = body.position.model_dump() if body.position else None
+    try:
+        new_steps, diff_summary = _apply_step_patch(
+            existing_steps=existing,
+            add_steps=add_dicts,
+            position=pos_dict,
+        )
+    except ValueError as e:
+        msg = str(e)
+        if "409" in msg or "already exists" in msg:
+            raise HTTPException(409, msg)
+        if "404" in msg or "not found" in msg:
+            raise HTTPException(404, msg)
+        if "path" in msg.lower() or "traversal" in msg.lower():
+            raise HTTPException(422, msg)
+        raise HTTPException(422, msg)
+
+    now = _now_iso()
+    await db.execute(
+        "UPDATE workflow_packages SET step_template=?, updated_at=? WHERE id=?",
+        (
+            json.dumps(new_steps, ensure_ascii=False),
+            now, workflow_id,
+        ),
+    )
+    await audit_log(
+        db, "workflow.add_steps", actor="operator",
+        payload={
+            "workflow_id": workflow_id,
+            "added": [s["name"] for s in diff_summary["added"]],
+            "reason": body.reason or "added by LLM (no reason provided)",
+            "step_count": len(new_steps),
+        },
+    )
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    detail = _row_to_workflow_detail(row)
+    return {
+        "workflow": detail,
+        "diff": diff_summary,
+    }
+
+
+@router.patch("/{workflow_id}/steps/{step_name}")
+async def edit_step(
+    workflow_id: str, step_name: str, body: EditStepBody, request: Request
+) -> dict:
+    """v3.12.6: patch fields on an existing step. Only fields
+    in `_EDITABLE_STEP_FIELDS` are accepted. The `name` field
+    is intentionally excluded to enforce "no silent rename" —
+    use remove + add if you need to rename (spec §9.5).
+
+    Returns the new step_template + a field-level diff.
+    """
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+
+    existing = json.loads(row["step_template"] or "[]")
+    edit_dicts = [{"name": step_name, "patch": body.patch}]
+    try:
+        new_steps, diff_summary = _apply_step_patch(
+            existing_steps=existing,
+            edit_steps=edit_dicts,
+        )
+    except ValueError as e:
+        msg = str(e)
+        if "404" in msg or "not found" in msg:
+            raise HTTPException(404, msg)
+        if "not editable" in msg:
+            raise HTTPException(422, msg)
+        if "empty patch" in msg:
+            raise HTTPException(422, msg)
+        if "path" in msg.lower() or "traversal" in msg.lower():
+            raise HTTPException(422, msg)
+        raise HTTPException(422, msg)
+
+    now = _now_iso()
+    await db.execute(
+        "UPDATE workflow_packages SET step_template=?, updated_at=? WHERE id=?",
+        (
+            json.dumps(new_steps, ensure_ascii=False),
+            now, workflow_id,
+        ),
+    )
+    # The diff_summary has the field-level diff for the edited
+    # step (the only one). Pull it for the audit log.
+    edited = diff_summary["edited"][0] if diff_summary["edited"] else None
+    await audit_log(
+        db, "workflow.edit_step", actor="operator",
+        payload={
+            "workflow_id": workflow_id,
+            "step_name": step_name,
+            "field_diff": edited["field_diff"] if edited else {},
+            "reason": body.reason or "edited by LLM (no reason provided)",
+        },
+    )
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    detail = _row_to_workflow_detail(row)
+    return {
+        "workflow": detail,
+        "diff": diff_summary,
+    }
+
+
+@router.delete("/{workflow_id}/steps/{step_name}")
+async def remove_step(
+    workflow_id: str, step_name: str, request: Request
+) -> dict:
+    """v3.12.6: delete a step. Refuses (409) if any other step
+    still references it via depends_on or feedback_to — the
+    spec §9.4 forbids automatic rewiring in v1. To remove a
+    referenced step, the chatbox flow must first edit_step
+    each referencing step to drop the reference, then
+    remove_step the target.
+
+    DELETE has no body, so there's no `reason` field — the
+    audit log records a default placeholder so the entry is
+    never blank (spec §11).
+    """
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        raise HTTPException(404, f"workflow {workflow_id} not found")
+
+    existing = json.loads(row["step_template"] or "[]")
+    try:
+        new_steps, diff_summary = _apply_step_patch(
+            existing_steps=existing,
+            remove_step_names=[step_name],
+        )
+    except ValueError as e:
+        msg = str(e)
+        if "404" in msg or "not found" in msg:
+            raise HTTPException(404, msg)
+        if "still referenced" in msg:
+            raise HTTPException(409, msg)
+        raise HTTPException(422, msg)
+
+    now = _now_iso()
+    await db.execute(
+        "UPDATE workflow_packages SET step_template=?, updated_at=? WHERE id=?",
+        (
+            json.dumps(new_steps, ensure_ascii=False),
+            now, workflow_id,
+        ),
+    )
+    await audit_log(
+        db, "workflow.remove_step", actor="operator",
+        payload={
+            "workflow_id": workflow_id,
+            "step_name": step_name,
+            "reason": "removed by LLM (no user reason provided)",
+        },
+    )
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    detail = _row_to_workflow_detail(row)
+    return {
+        "workflow": detail,
+        "diff": diff_summary,
     }
