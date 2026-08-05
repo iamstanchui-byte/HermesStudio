@@ -4119,6 +4119,20 @@ Allowed suggestion types:
     "remove step Y". Pick update_plan when the user says "change
     the project's plan" (the project's plan_json, not the
     underlying workflow package).
+  - apply_plan_patch: v3.12.6 (Phase 4) incremental editing of
+    the project's plan_json. {type, patch: {add, edit, remove,
+    position?}, reason?}. Same shape as apply_workflow_patch
+    but NO workflow_id (the project is implicit from the URL).
+    Use this when the user says "add a step to the plan", "add
+    a step after X", "rename step Y", "change step Z's action",
+    "remove the old step". The patch is atomic — only the named
+    steps change; everything else stays exactly as it was.
+    THIS IS THE PREFERRED TYPE for any "add a step" request on
+    an existing plan because it preserves all the other steps
+    the user already designed (e.g. their IP-collection branches,
+    data-prep steps, parallel-fetch wires). Without this, the
+    LLM often falls back to create_plan_from_chat which OVERWRITES
+    the whole plan and silently drops steps the user wants to keep.
 
 If the user's request is just a question (no concrete action),
 return {"suggestions": []}.
@@ -4298,11 +4312,21 @@ async def apply_chat_suggestion(
         return await _apply_workflow_patch_from_chat(
             project_id, body, request,
         )
+    # v3.12.6 (Phase 4): plan incremental-editing suggestion.
+    # Same shape as apply_workflow_patch (no workflow_id — the
+    # project is implicit from the URL). Used for "add a step
+    # to the plan", "rename step X", "remove step Y" — these
+    # would previously fall through to create_plan_from_chat
+    # which over-trimmed the existing plan.
+    if stype == "apply_plan_patch":
+        return await _apply_plan_patch_from_chat(
+            project_id, body, request,
+        )
     if stype != "update_plan":
         raise HTTPException(
             400,
             f"unknown suggestion type: {stype!r}. Allowed: update_plan, "
-            f"create_plan_from_chat, apply_workflow_patch.",
+            f"create_plan_from_chat, apply_workflow_patch, apply_plan_patch.",
         )
     plan_data = s.get("plan")
     if not isinstance(plan_data, dict):
@@ -4338,6 +4362,76 @@ async def apply_chat_suggestion(
         "project_id": result.project_id,
         "updated_at": result.updated_at,
         "step_count": len(result.plan.steps) if result.plan else 0,
+    }
+
+
+async def _apply_plan_patch_from_chat(
+    project_id: str, body: "ChatApplyRequest", request: Request,
+) -> dict:
+    """v3.12.6 (Phase 4): handle `apply_plan_patch` suggestion.
+
+    The chatbox LLM emits a single suggestion of type
+    `apply_plan_patch` containing a mixed add/edit/remove patch
+    (one body, all sub-ops atomic) for the project's plan_json.
+    The chatbox then shows the diff preview; on Apply we
+    delegate to the plan's atomic patch endpoint.
+
+    Suggestion shape (per docs/v3.12.6-workflow-incremental-editing.md §7.1
+    + Phase 4 §13.5):
+      {
+        "type": "apply_plan_patch",
+        "patch": {
+          "add":    [{name, agent_role, action, ...}, ...],  // optional
+          "edit":   [{name, patch: {<field>: <value>}}, ...], // optional
+          "remove": ["step_name", ...],                       // optional
+          "position": {after: "...", before: "..."} | null    // optional
+        },
+        "reason": "..."   // optional
+      }
+
+    No workflow_id / project_id field — the project is the
+    URL. To target a workflow package's step_template instead,
+    emit `apply_workflow_patch` (which carries workflow_id).
+    """
+    from hermes_orch.api.plans import PlanPatchBody
+    s = body.suggestion
+    patch_data = s.get("patch")
+    if not isinstance(patch_data, dict):
+        raise HTTPException(
+            400, "apply_plan_patch suggestion missing 'patch' object",
+        )
+    # Re-validate the patch body through Pydantic so the plan
+    # endpoint gets a well-typed object.
+    try:
+        patch_body = PlanPatchBody(
+            add=patch_data.get("add") or [],
+            edit=patch_data.get("edit") or [],
+            remove=patch_data.get("remove") or [],
+            position=patch_data.get("position"),
+            reason=s.get("reason") or "",
+        )
+    except Exception as e:
+        raise HTTPException(422, f"apply_plan_patch: invalid patch: {e}")
+    # Delegate to the plan patch endpoint. We construct a
+    # synthetic ASGI call so the existing /api/projects/{id}/
+    # plan/patch endpoint handles the auth, validation, and
+    # audit logging. This is the same pattern as
+    # _apply_workflow_patch_from_chat, which calls
+    # apply_workflow_patch() directly (no HTTP roundtrip).
+    from hermes_orch.api.plans import apply_plan_patch
+    result = await apply_plan_patch(
+        project_id=project_id,
+        body=patch_body,
+        request=request,
+    )
+    return {
+        "applied": True,
+        "type": "apply_plan_patch",
+        "project_id": project_id,
+        "plan": result.get("plan"),
+        "diff": result.get("diff", {}),
+        "step_count": result.get("step_count", 0),
+        "updated_at": result.get("updated_at"),
     }
 
 

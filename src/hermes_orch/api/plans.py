@@ -1141,6 +1141,170 @@ async def put_project_plan(
     )
 
 
+# ===== v3.12.6 (Phase 4): plan incremental editing =====
+#
+# Per docs/v3.12.6-workflow-incremental-editing.md §4.1 + §13.5,
+# the v3.12.6 series covers BOTH projects.plan_json AND
+# workflow_packages.step_template. Phase 1-3 wired the workflow
+# package side (POST /api/workflows/{id}/patch). Phase 4 adds
+# the mirror for the project plan (POST /api/projects/{id}/plan/patch)
+# so the chatbox can incrementally edit the plan the same way it
+# edits a workflow package.
+#
+# Why this matters: the chatbox previously had to fall back to
+# `create_plan_from_chat` (which overwrites the entire plan) for
+# any user request that mentioned "add a step" or "modify a step".
+# The LLM would sometimes over-trim the existing steps, dropping
+# the IP-collection branches the user had carefully built. With
+# `apply_plan_patch`, the chatbox emits an add/edit/remove
+# suggestion that the server applies atomically without touching
+# the rest of the plan.
+
+class PlanPatchBody(BaseModel):
+    """POST /api/projects/{id}/plan/patch body.
+
+    Shape mirrors WorkflowStepsPatchBody (workflows.py):
+      add:    list of new step dicts (1..20)
+      edit:   list of {name, patch: {<field>: <value>}} (1..20)
+      remove: list of step names (1..20)
+      position: {after: <name> | before: <name>} | null
+      reason: free-form text for the audit log
+    """
+    add: list[dict] = Field(default_factory=list, max_length=20)
+    edit: list[dict] = Field(default_factory=list, max_length=20)
+    remove: list[str] = Field(default_factory=list, max_length=20)
+    position: dict | None = None  # {after: str | "", before: str | ""}
+    reason: str = Field("", max_length=1000)
+
+
+@router.post("/projects/{project_id}/plan/patch")
+async def apply_plan_patch(
+    project_id: str, body: PlanPatchBody, request: Request
+) -> dict:
+    """v3.12.6 (Phase 4): atomic mixed add/edit/remove patch on
+    the project's plan.
+
+    The chatbox emits `apply_plan_patch` suggestions when the
+    user asks to modify an existing plan ("add a step", "rename
+    step X", "remove step Y"). Without this endpoint, the only
+    options were full-replace `update_plan` (which loses the LLM's
+    context) or `create_plan_from_chat` (which often over-trims
+    existing steps because the LLM doesn't have a stable
+    representation of them).
+
+    This endpoint reuses `_apply_step_patch` from workflows.py —
+    the validation rules (cycle detection, dangling refs, path
+    safety, collision / 409, still-referenced / 409) are
+    identical because plan_json.steps uses the same step schema
+    as workflow_packages.step_template.
+
+    Returns the new plan + a diff summary covering all three
+    sub-op types so the chatbox can render a field-level diff
+    preview (the same modal used for apply_workflow_patch).
+    """
+    db = request.app.state.db
+    proj = await db.fetchone(
+        "SELECT id, plan_json, updated_at FROM projects WHERE id = ?",
+        (project_id,),
+    )
+    if not proj:
+        raise HTTPException(404, f"Project not found: {project_id}")
+    # Parse the current plan (may be null = empty project)
+    existing_steps: list[dict] = []
+    if proj.get("plan_json"):
+        try:
+            raw = proj["plan_json"]
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(data, dict) and isinstance(data.get("steps"), list):
+                existing_steps = data["steps"]
+            elif isinstance(data, list):
+                # Some legacy rows store steps as a top-level list
+                existing_steps = data
+        except Exception:
+            # Malformed plan: treat as empty (the patch will build
+            # a fresh plan). This is the same fallback
+            # put_project_plan uses.
+            existing_steps = []
+    # Reuse the workflow patch helper. The validation is
+    # identical (same step schema, same DAG rules, same
+    # path-safety checks).
+    from hermes_orch.api.workflows import _apply_step_patch
+    try:
+        new_steps, diff_summary = _apply_step_patch(
+            existing_steps=existing_steps,
+            add_steps=body.add,
+            edit_steps=body.edit,
+            remove_step_names=body.remove,
+            position=body.position,
+        )
+    except ValueError as e:
+        # Same 4xx mapping discipline as the workflow endpoint:
+        # 409 collision / still-referenced, 404 missing,
+        # 422 path / cycle / dangling / empty.
+        msg = str(e)
+        if "409" in msg or "already exists" in msg:
+            raise HTTPException(409, msg)
+        if "404" in msg or "not found" in msg:
+            raise HTTPException(404, msg)
+        if "still referenced" in msg:
+            raise HTTPException(409, msg)
+        if "not editable" in msg or "empty patch" in msg:
+            raise HTTPException(422, msg)
+        if "path" in msg.lower() or "traversal" in msg.lower():
+            raise HTTPException(422, msg)
+        if "cycle" in msg.lower() or "dangling" in msg.lower():
+            raise HTTPException(422, msg)
+        raise HTTPException(422, msg)
+    # Compose the new plan (preserve other fields: name,
+    # description, version, trigger, variables). We re-read the
+    # existing plan and only replace the `steps` array.
+    if proj.get("plan_json"):
+        try:
+            existing_plan = json.loads(proj["plan_json"])
+            if not isinstance(existing_plan, dict):
+                existing_plan = {}
+        except Exception:
+            existing_plan = {}
+    else:
+        existing_plan = {}
+    existing_plan["steps"] = new_steps
+    # Bump version to .patched (or keep version if missing)
+    if not existing_plan.get("version"):
+        existing_plan["version"] = "0.1.0"
+    now = _now_iso()
+    await db.execute(
+        "UPDATE projects SET plan_json=?, updated_at=? WHERE id=?",
+        (
+            json.dumps(existing_plan, ensure_ascii=False),
+            now, project_id,
+        ),
+    )
+    # Audit
+    try:
+        from hermes_orch.core.audit import audit_log
+        await audit_log(
+            db, "project.plan.patched", actor="operator:chat",
+            project_id=project_id,
+            payload={
+                "added": [s["name"] for s in diff_summary["added"]],
+                "edited": [e["name"] for e in diff_summary["edited"]],
+                "removed": [r["name"] for r in diff_summary["removed"]],
+                "reason": body.reason or "patched by LLM (no reason provided)",
+                "step_count": len(new_steps),
+            },
+        )
+    except Exception:
+        # Audit is best-effort
+        pass
+    return {
+        "project_id": project_id,
+        "plan": existing_plan,
+        "step_count": len(new_steps),
+        "diff": diff_summary,
+        "updated_at": now,
+    }
+
+
 @router.delete("/projects/{project_id}/plan", status_code=204)
 async def delete_project_plan(project_id: str, request: Request):
     """Clear a project's plan (back to legacy mode).

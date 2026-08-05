@@ -248,6 +248,16 @@
             // user can verify the patch).
             label = '🔧 Patch workflow';
             desc = _renderWorkflowPatchSummary(s);
+        } else if (type === 'apply_plan_patch') {
+            // v3.12.6 (Phase 4): incremental editing of the
+            // project's plan_json. Same shape as workflow patch
+            // (no workflow_id — the project is implicit). This is
+            // the PREFERRED type for "add a step to the plan" on
+            // an existing plan: it preserves all the other steps
+            // the user already designed, instead of overwriting
+            // the whole plan.
+            label = '🔧 Patch plan';
+            desc = _renderWorkflowPatchSummary(s);
         } else {
             label = `? ${type}`;
             desc = JSON.stringify(s).slice(0, 80);
@@ -426,13 +436,16 @@
             const isPlan = suggestion.type === 'update_plan';
             const isCreateFromChat = suggestion.type === 'create_plan_from_chat';
             const isWorkflowPatch = suggestion.type === 'apply_workflow_patch';
+            const isPlanPatch = suggestion.type === 'apply_plan_patch';
+            const isAnyPatch = isWorkflowPatch || isPlanPatch;
             const stepCount = isPlan ? ((suggestion.plan && suggestion.plan.steps) || []).length : 0;
-            // v3.12.6 (Phase 2): workflow patches get a dedicated
+            // v3.12.6 (Phase 2 + 4): patches get a dedicated
             // diff modal instead of the plain confirm() dialog,
             // because the patch is non-trivial (may add/edit/remove
             // multiple steps) and we want the user to verify the
-            // exact changes before committing.
-            if (isWorkflowPatch) {
+            // exact changes before committing. The same modal is
+            // reused for workflow + plan patches (same shape).
+            if (isAnyPatch) {
                 const confirmed = await _showWorkflowPatchDiffModal(suggestion);
                 if (!confirmed) return;
             } else {
@@ -538,8 +551,8 @@
             if (isCreateFromChat) {
                 const sc = (adata && adata.step_count) || 0;
                 status.textContent = `✓ Plan created (${sc} step${sc === 1 ? '' : 's'})`;
-            } else if (isWorkflowPatch) {
-                // v3.12.6 (Phase 2): workflow patch summary
+            } else if (isAnyPatch) {
+                // v3.12.6 (Phase 2 + 4): patch summary
                 const diff = (adata && adata.diff) || {};
                 const na = (diff.added || []).length;
                 const ne = (diff.edited || []).length;
@@ -548,7 +561,8 @@
                 if (na) parts.push(`+${na}`);
                 if (ne) parts.push(`~${ne}`);
                 if (nr) parts.push(`-${nr}`);
-                status.textContent = `✓ Workflow patched (${parts.join(', ') || 'no change'})`;
+                const subj = isPlanPatch ? 'Plan' : 'Workflow';
+                status.textContent = `✓ ${subj} patched (${parts.join(', ') || 'no change'})`;
             } else {
                 status.textContent = 'Applied: ' + (adata.type || '?');
             }
@@ -573,19 +587,28 @@
                     // No hook registered — fall back to page reload
                     setTimeout(() => location.reload(), 1500);
                 }
-            } else if (isWorkflowPatch) {
-                // v3.12.6 (Phase 2): workflow page hook so the
-                // visual_workflow editor can refresh its drawflow
-                // without a full page reload.
+            } else if (isAnyPatch) {
+                // v3.12.6 (Phase 2 + 4): page hook so the visual
+                // editor can refresh its drawflow without a full
+                // page reload. The hook name differs by type:
+                // onWorkflowPatchApplied for workflows (workflow
+                // page), onPlanApplied for plans (plan page). Both
+                // pages already register the appropriate hook
+                // in their HTML template.
                 const hooks = _getHooks();
-                if (typeof hooks.onWorkflowPatchApplied === 'function') {
+                const hookName = isPlanPatch ? 'onPlanApplied' : 'onWorkflowPatchApplied';
+                if (typeof hooks[hookName] === 'function') {
                     try {
-                        hooks.onWorkflowPatchApplied(
-                            (adata && adata.workflow_id) || suggestion.workflow_id,
-                            (adata && adata.diff) || {},
-                        );
+                        if (isPlanPatch) {
+                            hooks.onPlanApplied((adata && adata.plan) || {});
+                        } else {
+                            hooks.onWorkflowPatchApplied(
+                                (adata && adata.workflow_id) || suggestion.workflow_id,
+                                (adata && adata.diff) || {},
+                            );
+                        }
                     } catch (e) {
-                        console.warn('onWorkflowPatchApplied hook failed:', e);
+                        console.warn(hookName + ' hook failed:', e);
                     }
                 } else {
                     setTimeout(() => location.reload(), 1500);
