@@ -1465,6 +1465,18 @@
             }
         }
         if (!removedName) return;
+        // v3.12.6 (Phase 3): if the deleted step is the one the
+        // chatbox FOCUS is set on, clear the FOCUS so the next
+        // chat message doesn't reference a step that no longer
+        // exists. Read the selection from sessionStorage because
+        // _selectedNodeId may not be set (the user can delete
+        // a card without opening its side panel first).
+        if (window.chatbox) {
+            const sel = window.chatbox.getSelectedNode && window.chatbox.getSelectedNode();
+            if (sel && sel.kind === 'workflow_step' && sel.step_name === removedName) {
+                window.chatbox.clearSelectedNode();
+            }
+        }
         // v2.1: checkpoint BEFORE the splice + scrub. The snapshot
         // captures the full step (with all fields) + all
         // depends_on / feedback_to references, so undo restores
@@ -1658,6 +1670,21 @@
             console.warn('visual_workflow: no step for node', nodeId);
             return;
         }
+        // v3.12.6 (Phase 3): context-aware editing. Write the
+        // selected step to sessionStorage so the chatbox LLM can
+        // see it in its system prompt and target apply_workflow_patch
+        // suggestions at this step. No-op if the chatbox isn't
+        // loaded (e.g. standalone workflow without a source project).
+        if (window.chatbox && typeof window.chatbox.setSelectedNode === 'function') {
+            window.chatbox.setSelectedNode({
+                kind: 'workflow_step',
+                workflow_id: _workflowId,
+                step_name: step.name,
+                action: step.action || '',
+                agent_role: step.agent_role || '',
+                depends_on: Array.isArray(step.depends_on) ? step.depends_on : [],
+            });
+        }
         _refreshEditFormFromTemplate(step);
         _sidePanel().classList.add('open');
     }
@@ -1705,6 +1732,11 @@
             _refreshEditFormFromTemplate();
         }
         _selectedNodeId = null;
+        // v3.12.6 (Phase 3): clear the chatbox FOCUS context so the
+        // next chat message doesn't carry a stale step reference.
+        if (window.chatbox && typeof window.chatbox.clearSelectedNode === 'function') {
+            window.chatbox.clearSelectedNode();
+        }
         _sidePanel().classList.remove('open');
     }
 

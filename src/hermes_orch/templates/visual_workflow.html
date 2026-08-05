@@ -629,6 +629,7 @@
 <div class="vf-canvas-wrap relative"
      id="vf-canvas"
      data-workflow-id="{{ workflow.id }}"
+     data-source-project-id="{{ workflow.source_project_id or '' }}"
      data-step-template='{{ workflow.step_template | tojson }}'
      data-variables='{{ workflow.variables | tojson }}'
      data-visual-layout='{{ workflow.visual_layout | tojson }}'>
@@ -723,5 +724,127 @@
 
 {# Save status banner — top right. #}
 <div class="vf-save-banner" id="vf-save-banner"></div>
+
+{# v3.12.6 (Phase 3): chat panel for workflow editor.
+   Mirrors visual_plan.html's chat panel. The chat LLM emits
+   `apply_workflow_patch` suggestions to incrementally modify
+   the current workflow; the hook below reloads the canvas on
+   Apply so the user sees the new step_template without a
+   page refresh.
+
+   The chatbox reads `hermes_chat_selected_node` from
+   sessionStorage (set by visual_workflow.js on card click),
+   so the LLM can target its patch at the currently selected
+   step without the user having to repeat the step name.
+
+   `data-source-project-id` may be empty (the workflow was
+   created standalone, not from a project). In that case the
+   chat panel is hidden — the chatbox needs a project_id to
+   route suggestions. Standalone workflows can still be
+   edited manually via the visual editor; chat-driven edits
+   require a source project. #}
+{% if workflow.source_project_id %}
+<div id="chat-root"
+     data-project-id="{{ workflow.source_project_id }}"
+     data-workflow-id="{{ workflow.id }}"
+     style="display: contents;">
+<button id="chat-toggle-btn" onclick="window.chatbox.toggleChatPanel()"
+    class="fixed bottom-6 right-6 z-40 w-14 h-14 rounded-full bg-blue-600 text-white text-2xl shadow-lg hover:bg-blue-700 flex items-center justify-center"
+    title="Open LLM chat assistant (workflow editing)">
+    💬
+</button>
+<div id="chat-panel" class="hidden fixed inset-y-0 right-0 z-50 w-96 max-w-full bg-white shadow-2xl border-l border-gray-200 flex flex-col">
+    <div class="flex items-center justify-between p-3 border-b border-gray-200 bg-gray-50 shrink-0">
+        <div class="min-w-0 flex-1">
+            <div class="font-semibold text-gray-800">💬 Workflow editor assistant</div>
+            <div id="chat-subtitle" class="text-xs text-gray-500">Click a step card, then ask the assistant to add / edit / remove it.</div>
+        </div>
+        <div class="flex items-center gap-1 shrink-0">
+            <button onclick="window.chatbox.clearChat()" class="text-xs text-gray-500 hover:text-red-600 px-2 py-1" title="Clear chat history">Clear</button>
+            <button onclick="window.chatbox.toggleChatPanel()"
+                class="text-gray-500 hover:text-gray-800 px-2 py-1 text-base leading-none"
+                title="Close chat panel">
+                ✕
+            </button>
+        </div>
+    </div>
+    <div id="chat-messages" class="flex-1 overflow-y-auto p-3 space-y-2 text-sm">
+        <div class="text-center text-gray-400 italic py-8 text-xs">
+            Describe what you want to change about this workflow.
+            Click a step card first so the assistant knows which step
+            you're talking about.
+        </div>
+    </div>
+    <div id="chat-input-area" class="border-t border-gray-200 p-3 shrink-0">
+        <div id="chat-status" class="text-xs text-gray-500 h-4 mb-1"></div>
+        <div class="flex items-stretch gap-2">
+            <textarea id="chat-input" rows="3"
+                class="flex-1 border rounded px-2 py-1 text-sm resize-none"
+                placeholder="Ask something... (Enter to send, Shift+Enter for newline)"
+                onkeydown="if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); window.chatbox.sendChatMessage(); }"
+                oninput="document.getElementById('chat-send-btn').disabled = !this.value.trim();"></textarea>
+            <div class="flex flex-col gap-1 w-20">
+                <button id="chat-send-btn" onclick="window.chatbox.sendChatMessage()" disabled
+                    class="flex-1 px-3 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Send (Enter)">Send</button>
+                <button onclick="window.chatbox.toggleChatPanel()"
+                    class="text-xs text-gray-500 hover:text-gray-800 px-2 py-1"
+                    title="Close panel">Close ✕</button>
+            </div>
+        </div>
+    </div>
+</div>
+</div>
+{% endif %}
+
+{# v3.12.6 (Phase 3): hook registration. When the chatbox applies
+   an apply_workflow_patch to this workflow, the chatbox calls
+   onWorkflowPatchApplied(workflowId, diff). We respond by
+   reloading the canvas from the server so the new step_template
+   replaces the in-memory state. The chat panel only mounts when
+   the workflow has a source_project_id (the chatbox needs a
+   project_id to route suggestions); standalone workflows edit
+   manually and the hook is a no-op. #}
+<script>
+(function() {
+    function ensureHook() {
+        window.ChatboxHooks = window.ChatboxHooks || {};
+        window.ChatboxHooks.onWorkflowPatchApplied = function(workflowId, diff) {
+            if (workflowId !== {{ workflow.id | tojson }}) return;
+            // Reload the workflow from the server so the canvas
+            // reflects the patched step_template. We use a
+            // location.reload() for simplicity — the workflow
+            // editor doesn't have an in-place merge like
+            // visual_plan's loadPlan(). Phase 3.1 follow-up:
+            // add a _loadFromServer() that swaps in the new
+            // step_template without losing the visual_layout.
+            const status = document.getElementById('chat-status');
+            if (status) {
+                status.textContent = '✓ Patch applied — reloading canvas…';
+                status.className = 'text-xs text-green-600 mt-1 h-4';
+            }
+            // Brief delay so the user can see the success message
+            // before the page navigates.
+            setTimeout(() => location.reload(), 800);
+        };
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', ensureHook);
+    } else {
+        ensureHook();
+    }
+})();
+</script>
+{% if workflow.source_project_id %}
+<script>
+(function() {
+    // Set the chatbox project_id from the workflow's source project.
+    // chatbox.js reads window.CHATBOX_PROJECT_ID at init. Set it
+    // before the chatbox script loads so it picks up the right id.
+    window.CHATBOX_PROJECT_ID = {{ workflow.source_project_id | tojson }};
+})();
+</script>
+<script defer src="/static/chatbox.js?v=2026-08-05-v3126p2"></script>
+{% endif %}
 
 {% endblock %}

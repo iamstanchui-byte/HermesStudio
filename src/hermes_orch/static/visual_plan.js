@@ -1204,6 +1204,24 @@
         const step = _plan.steps.find(s => s.name === stepName);
         if (!step) return;
         _selectedNodeName = stepName;
+        // v3.12.6 (Phase 3): context-aware editing. Write the
+        // selected step to sessionStorage so the chatbox LLM sees
+        // it in the FOCUS block and can target proposals at this
+        // step. The plan editor doesn't have apply_plan_patch
+        // yet (deferred to Phase 4 per spec §13), so the LLM uses
+        // this context for prose + update_plan targeting only.
+        if (window.chatbox && typeof window.chatbox.setSelectedNode === 'function') {
+            window.chatbox.setSelectedNode({
+                kind: 'plan_step',
+                project_id: _projectId,
+                step_name: step.name,
+                action: step.action || '',
+                agent_role: step.agent_role || '',
+                required_capability: step.required_capability || '',
+                skill: step.skill || '',
+                depends_on: Array.isArray(step.depends_on) ? step.depends_on : [],
+            });
+        }
         $('vp-side-title').textContent = 'Step: ' + stepName;
         $('vp-f-name').value = step.name;
         $('vp-f-action').value = step.action || '';
@@ -1233,6 +1251,11 @@
 
     function closeSidePanel() {
         _selectedNodeName = null;
+        // v3.12.6 (Phase 3): clear the chatbox FOCUS context so the
+        // next chat message doesn't carry a stale step reference.
+        if (window.chatbox && typeof window.chatbox.clearSelectedNode === 'function') {
+            window.chatbox.clearSelectedNode();
+        }
         $('vp-side-panel').classList.add('hidden');
         document.querySelectorAll('.vp-node').forEach(n => n.classList.remove('selected'));
     }
