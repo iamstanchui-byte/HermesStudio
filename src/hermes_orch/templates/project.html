@@ -1,6 +1,144 @@
 {% extends "base.html" %}
 {% block title %}{{ project.name or project.id }} - Hermes Orchestrator{% endblock %}
 {% block content %}
+<style>
+    /* 2026-08-07: project detail page button styles — single fixed
+       height (h-9 = 36px) for the primary action row, matching
+       the visual_plan editor's toolbar cleanup. The "Run" button
+       is the primary action and uses a filled green treatment so
+       the eye lands on it. The "More" dropdown mirrors the
+       visual_plan Save dropdown style (absolute panel, white
+       bg, shadow, hover highlights, dark-mode variants). */
+    .vp-detail-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        height: 36px;
+        padding: 0 12px;
+        font-size: 12px;
+        font-weight: 500;
+        line-height: 1;
+        border-radius: 6px;
+        border: 1px solid #d1d5db;
+        color: #374151;
+        background: transparent;
+        white-space: nowrap;
+        transition: background 0.1s;
+    }
+    .vp-detail-btn:hover { background: #f3f4f6; }
+    .vp-detail-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .vp-detail-btn-blue {
+        border-color: #93c5fd;
+        color: #1d4ed8;
+    }
+    .vp-detail-btn-blue:hover { background: #eff6ff; }
+    .vp-detail-btn-violet {
+        border-color: #c4b5fd;
+        color: #6d28d9;
+    }
+    .vp-detail-btn-violet:hover { background: #f5f3ff; }
+    /* Run = PRIMARY. Filled green (vs outline), so the user can
+       see it from across the page. Matches the Generate tasks
+       button on the plan editor (also filled green = primary). */
+    .vp-detail-btn-run {
+        background: #059669;
+        border-color: #047857;
+        color: #ffffff;
+        font-weight: 700;
+    }
+    .vp-detail-btn-run:hover { background: #047857; }
+    /* "More" group — wrapper that contains the main button + the
+       dropdown panel. position:relative so the absolute panel
+       positions relative to this wrapper. */
+    .vp-detail-more-group {
+        position: relative;
+        display: inline-block;
+    }
+    .vp-detail-more-menu {
+        display: none;
+        position: absolute;
+        top: 40px;
+        right: 0;
+        min-width: 220px;
+        background: white;
+        border: 1px solid #d1d5db;
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+        z-index: 50;
+        padding: 4px 0;
+    }
+    .vp-detail-more-menu.open { display: block; }
+    .vp-detail-more-menu button,
+    .vp-detail-more-menu a {
+        display: flex; align-items: center; gap: 8px;
+        width: 100%;
+        padding: 8px 12px;
+        font-size: 12px;
+        color: #374151;
+        background: transparent;
+        border: 0;
+        text-align: left;
+        text-decoration: none;
+        cursor: pointer;
+    }
+    .vp-detail-more-menu button:hover,
+    .vp-detail-more-menu a:hover { background: #f3f4f6; }
+    .vp-detail-more-divider {
+        height: 1px;
+        background: #e5e7eb;
+        margin: 4px 0;
+    }
+    /* Destructive variants inside the More menu — red text
+       on hover, not a red bg (which would compete with the
+       active button color). */
+    .vp-detail-more-danger { color: #dc2626 !important; }
+    .vp-detail-more-danger:hover { background: #fef2f2 !important; }
+    .vp-detail-more-restore { color: #1d4ed8 !important; }
+    .vp-detail-more-restore:hover { background: #eff6ff !important; }
+    /* Dark mode — mirrors the visual_plan toolbar pattern. */
+    body.dark .vp-detail-btn {
+        border-color: #4b5563;
+        color: #e5e7eb;
+    }
+    body.dark .vp-detail-btn:hover { background: #374151; }
+    body.dark .vp-detail-btn-blue {
+        border-color: #3b82f6;
+        color: #93c5fd;
+    }
+    body.dark .vp-detail-btn-blue:hover { background: #1e3a8a; }
+    body.dark .vp-detail-btn-violet {
+        border-color: #8b5cf6;
+        color: #c4b5fd;
+    }
+    body.dark .vp-detail-btn-violet:hover { background: #4c1d95; }
+    body.dark .vp-detail-btn-run {
+        background: #10b981;
+        border-color: #34d399;
+        color: #ffffff;
+    }
+    body.dark .vp-detail-btn-run:hover { background: #059669; }
+    body.dark .vp-detail-more-menu {
+        background: #1f2937;
+        border-color: #374151;
+    }
+    body.dark .vp-detail-more-menu button,
+    body.dark .vp-detail-more-menu a {
+        color: #e5e7eb;
+    }
+    body.dark .vp-detail-more-menu button:hover,
+    body.dark .vp-detail-more-menu a:hover { background: #374151; }
+    body.dark .vp-detail-more-divider { background: #374151; }
+    body.dark .vp-detail-more-danger { color: #fca5a5 !important; }
+    body.dark .vp-detail-more-danger:hover { background: #450a0a !important; }
+    body.dark .vp-detail-more-restore { color: #93c5fd !important; }
+    body.dark .vp-detail-more-restore:hover { background: #1e3a8a !important; }
+    body.dark .vp-detail-more-menu .bg-purple-50 {
+        background: #312e81;
+    }
+    body.dark .vp-detail-more-menu .border-purple-200 {
+        border-color: #4c1d95;
+    }
+</style>
 
 <div class="mb-4">
     <a href="/projects" class="text-sm text-blue-600 hover:underline">&larr; All projects</a>
@@ -77,17 +215,29 @@
             {% endif %}
             {% endif %}
         </div>
-        {#
-          Right column: redesigned for visual consistency.
-          - All pills (state, tokens, template, schedule) are the same small size
-            and use outline (transparent-bg) styling that works in dark mode.
-          - Action buttons are all the same size, organized into 2 rows:
-            Row 1 = quick utility actions, Row 2 = state changes / destructive.
-          - No two actions share a color family, so dark-mode contrast is safe.
-        #}
-        <div class="shrink-0 flex flex-col items-end gap-3 max-w-md">
-            {# Row 1: state + tokens (pills, all text-xs) #}
-            <div class="flex items-center gap-1.5">
+        {# 2026-08-07: redesigned action toolbar — single row of
+           primary actions + a "More" dropdown for everything else.
+
+           Primary row (always visible):
+             - Plan editor (open the drawflow canvas)
+             - Run (PRIMARY — green filled; start dispatch)
+             - Live status (toggle the side panel)
+             - More ▾ (dropdown: Open folder, Generate SOUL,
+               Mark/Unmark template, Archive/Unarchive, Delete)
+
+           All buttons use a fixed height (h-9 = 36px) so the row
+           is visually uniform — mirrors the visual_plan editor
+           cleanup from commit a453dd7. The "Run" button is the
+           primary action and gets a filled green treatment (vs
+           outline like the others) so the eye lands on it.
+
+           All pills (state, tokens, template, schedule) live
+           ABOVE the button row instead of in their own right
+           column. The whole right side collapses to a single
+           button row + a small status/tokens strip above. #}
+        <div class="shrink-0 flex flex-col items-end gap-2.5 max-w-2xl">
+            {# Status + tokens + template info — single row of pills #}
+            <div class="flex items-center gap-1.5 flex-wrap justify-end">
                 <span class="px-2 py-0.5 text-xs font-medium rounded-full border
                     {% if project.state == 'running' %}bg-blue-50 text-blue-700 border-blue-200
                     {% elif project.state == 'completed' %}bg-green-50 text-green-700 border-green-200
@@ -98,34 +248,16 @@
                     {{ project.state }}
                 </span>
                 {% if token_total %}
-                {# v3.12.8: show token_true_total (= in + cache + out)
-                   as the headline so the project header matches the
-                   per-task rows below. Tooltip still includes the
-                   legacy `token_total` (= API total, EXCLUDES cache)
-                   + the per-call_kind breakdown. #}
                 <span class="px-2 py-0.5 text-xs font-medium rounded-full border bg-purple-50 text-purple-700 border-purple-200"
-                    title="True total (in + cache + out) for this project: {{ token_true_total }} tokens.
-API total (= in + out, EXCLUDES cache): {{ token_total }} tokens.
-Breakdown by call_kind: {% for b in token_breakdown %}{{ b['call_kind'] }}=API {{ b['total'] }}{% if not loop.last %}, {% endif %}{% endfor %}">
+                    title="True total (in + cache + out): {{ token_true_total }} tokens. API total (excl. cache): {{ token_total }}. Breakdown: {% for b in token_breakdown %}{{ b['call_kind'] }}=API {{ b['total'] }}{% if not loop.last %}, {% endif %}{% endfor %}">
                     {{ '%.1f' % (token_true_total / 1000) }}K tokens
                 </span>
                 {% endif %}
-            </div>
-
-            {# Row 2: template / schedule info (pills, only when applicable) #}
-            {% if project.is_template or source_schedule %}
-            <div class="flex items-center gap-1.5 flex-wrap justify-end">
                 {% if project.is_template %}
                 <span class="px-2 py-0.5 text-xs rounded-full border bg-amber-50 text-amber-700 border-amber-200"
                     title="This project is marked as a reusable template. Schedules can fire it on a cron.">
                     📋 template
                 </span>
-                {% endif %}
-                {% if template_schedule %}
-                <a href="/schedules" class="px-2 py-0.5 text-xs rounded-full border bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100"
-                    title="Schedule: {{ template_schedule.name }} · {{ template_schedule.cron_expr }} ({{ template_schedule.timezone }}) · {{ template_schedule.mode }}">
-                    🔁 {{ template_schedule.name }}
-                </a>
                 {% endif %}
                 {% if source_schedule %}
                 <a href="/schedules" class="px-2 py-0.5 text-xs rounded-full border bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100"
@@ -133,186 +265,153 @@ Breakdown by call_kind: {% for b in token_breakdown %}{{ b['call_kind'] }}=API {
                     🔁 from {{ source_schedule.name }}
                 </a>
                 {% endif %}
-            </div>
-            {% endif %}
-
-            {# Row 3: created date (small text) #}
-            <div class="text-xs text-gray-500">created {{ project.created_at[:16] }}</div>
-
-            {# Row 4: action buttons. All uniform: px-3 py-1.5 text-xs rounded border.
-               Color families don't overlap (gray / blue / purple / amber / red),
-               so dark mode never has two adjacent buttons of similar warm hues.
-
-               UI cleanup 2026-07-27: this toolbar used to have 11 buttons in
-               2 rows. The Promote to workflow + Apply workflow buttons
-               moved to the visual project page (where tasks live, and
-               the blast-radius makes more sense). The Plan (JSON) modal
-               is hidden because the Visual plan editor covers the same
-               surface.
-
-               v3.8.0 (2026-08-01): the "Visual view" (task canvas) link
-               is also removed. Per user feedback "個visual task canvas
-               可以不顯示" — the runtime canvas is read-only and the
-               "Promote to workflow" action moved to the visual plan
-               editor (renamed "Save as workflow"). The visual task
-               canvas page (visual_project.html) is still reachable at
-               /projects/{id}/visual for power users / debugging, but
-               no longer linked from the nav. The plan editor at
-               /api/projects/{id}/plan/visual is the primary surface. #}
-            <div class="flex flex-col gap-1.5 items-end">
-                <div class="flex gap-1.5 flex-wrap justify-end">
-                    <button onclick="openProjectFolder('{{ project.id }}')"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
-                        title="Open the project folder in the host file manager (Explorer / Finder / Files — only works if your browser is on the orchestrator host)">
-                        Open folder
-                    </button>
-                    {# UI cleanup 2026-07-27: the "Generate plan" button
-                       (LLM → tasks) was removed from the project page.
-                       LLM-generate-plan is now in the plan editor
-                       toolbar and produces a plan_json (design-time),
-                       not tasks. See /static/visual_plan.js
-                       (window.vp.openGeneratePlanModal). #}
-                    {# Phase C (2026-07-27): visual plan editor. Links to
-                       the dedicated drawflow-based editor at
-                       /api/projects/{id}/plan/visual. Primary surface
-                       for designing plans; the JSON modal is a
-                       secondary view for power users. #}
-                    <a href="/api/projects/{{ project.id }}/plan/visual"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-violet-300 text-violet-700 hover:bg-violet-50 inline-block"
-                        title="Open the visual plan editor (drawflow canvas with side panel, validate, save, and Generate tasks). This is the primary editing surface.">
-                        🎨 Plan editor
-                    </a>
-                    {# Phase 4+ (2026-07-25): explicit Run button. Originally
-                       only shown when state='planned' (or 'planning') so
-                       the user has to opt-in to dispatch. User feedback
-                       (2026-07-26): "Run button 要長在, 現在時出見時不見"
-                       — the button flashing in/out by state is confusing.
-                       Now always visible. The server's /run endpoint is
-                       idempotent: noop on ready/running, error on
-                       terminal states, dispatch on planned/planning. The
-                       tooltip + the JS runProject() confirm flow explain
-                       what each state will do. #}
-                    <button onclick="runProject('{{ project.id }}')"
-                        class="px-3 py-1.5 text-xs font-bold rounded border-2 border-green-500 text-green-700 hover:bg-green-50"
-                        title="Start dispatch: transitions project from 'planned' to 'ready'. Supervisor's next tick (within ~5s) will pick up pending tasks. Idempotent on ready/running (no-op); errors out on terminal states (completed/failed/cancelled). Requires at least one task.">
-                        ▶️ Run
-                    </button>
-                    {# v3.10.4 (2026-08-02): "Generate SOUL" button —
-                       explicit recovery path. As of v3.10.5, this
-                       button:
-                       1. Calls the LLM with project + plan context
-                          to draft role-specific SOULs (2-4 sentences
-                          per role, tailored to the project topic).
-                       2. Seeds project_soul_presets with the LLM
-                          output, ONLY filling empty presets
-                          (preserves user edits).
-                       Use cases:
-                         - User deleted a SOUL by mistake
-                         - Initial seed at plan-save / plan-run
-                           used the generic template (agents were
-                           offline at the time)
-                       Always available when the project has a
-                       plan_json. #}
-                    {% if project.plan_json %}
-                    <button onclick="generateSoulFromPlan('{{ project.id }}')"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
-                        title="Re-generate SOULs via LLM (project-aware). Fills empty presets only — your manual edits are preserved. Use if you deleted a SOUL or want to upgrade the generic placeholder to a project-specific persona.">
-                        🧠 Generate SOUL
-                    </button>
-                    {% endif %}
-                </div>
-                {# v3.10.5 (2026-08-02): Auto-SOUL info card. Shown
-                   when the project has a plan but no SOUL presets
-                   yet (e.g. user just generated a plan and hasn't
-                   clicked Generate Task). Replaces the old "click
-                   here to seed" wording with an explanation of
-                   what happens automatically when they Generate
-                   Task. Helps the user understand the new flow
-                   without reading docs. #}
-                {% if project.plan_json and (soul_presets|length == 0) %}
-                <div class="mt-2 text-xs text-gray-600 bg-purple-50 border border-purple-200 rounded px-3 py-2 flex items-start gap-2"
-                     title="When you click 'Generate tasks' (Plan editor), the orchestrator will call the LLM to draft role-specific SOULs from your project description + plan. You'll see them in the 'Show SOUL editor' toggle before dispatching.">
-                    <span class="text-purple-500 font-bold">🧠</span>
-                    <span>
-                        <strong>Auto-SOUL:</strong> when you click
-                        <em>Generate tasks</em> in the plan editor, the
-                        orchestrator will call the LLM to write
-                        project-specific SOULs (one per role). They'll
-                        appear below in <em>Show SOUL editor</em> for
-                        review before dispatching.
-                    </span>
-                </div>
+                {% if template_schedule %}
+                <a href="/schedules" class="px-2 py-0.5 text-xs rounded-full border bg-purple-50 text-purple-700 border-purple-200 hover:bg-purple-100"
+                    title="Schedule: {{ template_schedule.name }} · {{ template_schedule.cron_expr }} ({{ template_schedule.timezone }}) · {{ template_schedule.mode }}">
+                    🔁 {{ template_schedule.name }}
+                </a>
                 {% endif %}
-                <div class="flex gap-1.5 flex-wrap justify-end">
-                    {% if project.state == 'archived' %}
-                    <button onclick="unarchiveProject('{{ project.id }}')"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-blue-300 text-blue-700 hover:bg-blue-50">
-                        Unarchive
-                    </button>
-                    {% elif project.state == 'deleted' %}
-                    <button onclick="undeleteProject('{{ project.id }}')"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-green-300 text-green-700 hover:bg-green-50"
-                        title="Restore this soft-deleted project. Goes back to its prior state (e.g. 'completed'). Does NOT re-run any tasks.">
-                        Undelete
-                    </button>
-                    {% else %}
-                    <button onclick="archiveProject('{{ project.id }}')"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
-                        title="Archive (soft-hide from default list)">
-                        Archive
-                    </button>
-                    {% endif %}
-                    {# Task Progress Monitor toggle (T4, 2026-07-29).
-                       Opens the slide-out side panel listing this
-                       project's running tasks with their live loop
-                       status. The panel polls /api/projects/{id}/tasks/running
-                       every 5s. #}
-                    <button id="task-progress-toggle-btn"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-blue-300 text-blue-700 hover:bg-blue-50"
-                        title="Toggle the Task Progress side panel — live loop status for all running tasks in this project">
-                        📊 Live status
-                    </button>
-                    {% if project.state != 'deleted' %}
-                    <button onclick="deleteProject('{{ project.id }}')"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-red-300 text-red-700 hover:bg-red-50">
-                        Delete
-                    </button>
-                    {% endif %}
-                    {# Template + Schedule controls (#22) #}
-                    {% if project.is_template %}
-                    <button onclick="unmarkTemplate('{{ project.id }}', '{{ project.name|e }}')"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-amber-300 text-amber-700 hover:bg-amber-50"
-                        title="Remove the template flag. Existing schedules that reference this project will warn on their next fire.">
-                        Unmark template
-                    </button>
-                    <a href="/schedules?template={{ project.id }}"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
-                        title="Go to the Schedules page to attach a cron expression to this template.">
-                        + Schedule this
-                    </a>
-                    {% else %}
-                    <button onclick="markTemplate('{{ project.id }}', '{{ project.name|e }}')"
-                        class="px-3 py-1.5 text-xs font-medium rounded border border-amber-300 text-amber-700 hover:bg-amber-50"
-                        title="Mark this project as a reusable template. Schedules can then fire it on a cron.">
-                        + Mark as template
-                    </button>
-                    {% endif %}
-                </div>
-                {# v3.8.0 (2026-08-01): the "Open visual task canvas"
-                   link was removed (per user feedback 2026-08-01:
-                   "個visual task canvas 可以不顯示, 並把Promote to
-                   workflow 搬入visual plan"). The runtime canvas
-                   is read-only and the "Promote to workflow"
-                   action moved to the visual plan editor
-                   (renamed "Save as workflow"). The visual task
-                   canvas URL /projects/{id}/visual is still
-                   reachable for power users / debugging, just
-                   not linked from here. #}
             </div>
 
-            {# UI cleanup 2026-07-27: replan hidden fields removed
-               (the LLM-generate-plan flow moved to the plan
-               editor — see visual_plan.html / visual_plan.js). #}
+            {# Action button row (fixed height, single line) #}
+            <div class="flex items-center gap-1.5">
+                {# Phase C (2026-07-27): visual plan editor. Primary
+                   surface for designing plans. Kept in the main row
+                   because the user lands on the plan editor most
+                   often when iterating on a project. #}
+                <a href="/api/projects/{{ project.id }}/plan/visual"
+                    class="vp-detail-btn vp-detail-btn-violet"
+                    title="Open the visual plan editor (drawflow canvas with side panel + Generate tasks). This is the primary editing surface.">
+                    🎨 Plan editor
+                </a>
+                {# Phase 4+ (2026-07-25): explicit Run button.
+                   Always visible per user feedback "Run button 要長在".
+                   Now uses filled green (primary treatment) so it
+                   stands out as THE action to take. The server's
+                   /run endpoint is idempotent. The tooltip explains
+                   what each state will do. #}
+                <button onclick="runProject('{{ project.id }}')"
+                    class="vp-detail-btn vp-detail-btn-run"
+                    title="Start dispatch: transitions project from 'planned' to 'ready'. Supervisor's next tick (within ~5s) will pick up pending tasks. Idempotent on ready/running (no-op); errors out on terminal states. Requires at least one task.">
+                    ▶ Run
+                </button>
+                {# Task Progress Monitor toggle (T4, 2026-07-29).
+                   Opens the slide-out side panel listing running
+                   tasks with their live loop status. Polls
+                   /api/projects/{id}/tasks/running every 5s. #}
+                <button id="task-progress-toggle-btn"
+                    class="vp-detail-btn vp-detail-btn-blue"
+                    title="Toggle the Task Progress side panel — live loop status for all running tasks in this project">
+                    📊 Live status
+                </button>
+                {# 2026-08-07: "More" dropdown — secondary / destructive
+                   actions that don't need to be in the main row.
+                   Contains: Open folder, Generate SOUL (if plan),
+                   Mark/Unmark template (state-dependent), Archive/
+                   Unarchive/Undelete (state-dependent), Delete. #}
+                <div class="vp-detail-more-group">
+                    <button type="button"
+                        id="vp-detail-more-btn"
+                        class="vp-detail-btn"
+                        aria-haspopup="true"
+                        aria-expanded="false"
+                        onclick="window.toggleProjectMoreMenu(event)"
+                        title="More actions: Open folder, Generate SOUL, Mark as template, Archive, Delete">
+                        More
+                        <span style="font-size: 9px; margin-left: 2px;">▾</span>
+                    </button>
+                    <div id="vp-detail-more-menu" class="vp-detail-more-menu" role="menu">
+                        <button type="button"
+                            onclick="openProjectFolder('{{ project.id }}'); window.closeProjectMoreMenu();"
+                            title="Open the project folder in the host file manager (only works if your browser is on the orchestrator host)">
+                            📂 Open folder
+                        </button>
+                        {# v3.10.4 (2026-08-02): "Generate SOUL" — recovery
+                           path. Re-generates role-specific SOULs via
+                           LLM. Fills empty presets only (preserves
+                           user edits). Available when project has a
+                           plan_json. #}
+                        {% if project.plan_json %}
+                        <button type="button"
+                            onclick="generateSoulFromPlan('{{ project.id }}'); window.closeProjectMoreMenu();"
+                            title="Re-generate SOULs via LLM (project-aware). Fills empty presets only — your manual edits are preserved.">
+                            🧠 Generate SOUL
+                        </button>
+                        {% endif %}
+                        {# Template + Schedule controls. The schedule
+                           link goes to /schedules?template=… which the
+                           Schedules page can pre-filter on. #}
+                        {% if project.is_template %}
+                        <button type="button"
+                            onclick="unmarkTemplate('{{ project.id }}', '{{ project.name|e }}'); window.closeProjectMoreMenu();"
+                            title="Remove the template flag. Existing schedules that reference this project will warn on their next fire.">
+                            📋 Unmark template
+                        </button>
+                        <a href="/schedules?template={{ project.id }}"
+                            onclick="window.closeProjectMoreMenu();"
+                            title="Go to the Schedules page to attach a cron expression to this template.">
+                            ⏰ Schedule this
+                        </a>
+                        {% else %}
+                        <button type="button"
+                            onclick="markTemplate('{{ project.id }}', '{{ project.name|e }}'); window.closeProjectMoreMenu();"
+                            title="Mark this project as a reusable template. Schedules can then fire it on a cron.">
+                            📋 Mark as template
+                        </button>
+                        {% endif %}
+                        {# v3.10.5 (2026-08-02): Auto-SOUL info card. Shown
+                           inline in the More menu when the project
+                           has a plan but no SOUL presets yet. Replaces
+                           the old "click here to seed" wording with
+                           an explanation of what happens automatically
+                           when they Generate Task. Helps the user
+                           understand the new flow without reading docs. #}
+                        {% if project.plan_json and (soul_presets|length == 0) %}
+                        <div class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300 bg-purple-50 dark:bg-purple-900/30 border-y border-purple-200 dark:border-purple-800"
+                             title="When you click 'Generate tasks' (Plan editor), the orchestrator will call the LLM to draft role-specific SOULs from your project description + plan. You'll see them in the 'Show SOUL editor' toggle before dispatching.">
+                            <strong>🧠 Auto-SOUL:</strong> when you click
+                            <em>Generate tasks</em> in the plan editor, the
+                            orchestrator will call the LLM to write
+                            project-specific SOULs (one per role).
+                        </div>
+                        {% endif %}
+                        {# Archive / Unarchive / Undelete — state
+                           dependent. Destructive actions go last and
+                           are color-coded (gray for archive, red
+                           for delete). #}
+                        <div class="vp-detail-more-divider"></div>
+                        {% if project.state == 'archived' %}
+                        <button type="button"
+                            onclick="unarchiveProject('{{ project.id }}'); window.closeProjectMoreMenu();"
+                            class="vp-detail-more-restore"
+                            title="Restore this archived project (un-hide from default list)">
+                            ↩ Unarchive
+                        </button>
+                        {% elif project.state == 'deleted' %}
+                        <button type="button"
+                            onclick="undeleteProject('{{ project.id }}'); window.closeProjectMoreMenu();"
+                            class="vp-detail-more-restore"
+                            title="Restore this soft-deleted project. Goes back to its prior state (e.g. 'completed'). Does NOT re-run any tasks.">
+                            ↩ Undelete
+                        </button>
+                        {% else %}
+                        <button type="button"
+                            onclick="archiveProject('{{ project.id }}'); window.closeProjectMoreMenu();"
+                            title="Archive (soft-hide from default list)">
+                            📦 Archive
+                        </button>
+                        {% endif %}
+                        {% if project.state != 'deleted' %}
+                        <button type="button"
+                            onclick="deleteProject('{{ project.id }}'); window.closeProjectMoreMenu();"
+                            class="vp-detail-more-danger"
+                            title="Soft-delete (preserved in DB; can be restored via the projects list filter)">
+                            🗑️ Delete project
+                        </button>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 </div>
@@ -476,6 +575,53 @@ Breakdown by call_kind: {% for b in token_breakdown %}{{ b['call_kind'] }}=API {
     {% endif %}
 </div>
 <script>
+    // 2026-08-07: "More" dropdown — toggles the project detail
+    // page's secondary-action menu. Bound on document.readyState
+    // (the script is at the bottom of the body so the element
+    // exists by the time this runs). Mirrors the visual_plan
+    // editor's save-menu pattern.
+    window.toggleProjectMoreMenu = function(event) {
+        if (event) event.stopPropagation();
+        const menu = document.getElementById('vp-detail-more-menu');
+        const btn = document.getElementById('vp-detail-more-btn');
+        if (!menu || !btn) return;
+        const isOpen = menu.classList.contains('open');
+        if (isOpen) {
+            menu.classList.remove('open');
+            btn.setAttribute('aria-expanded', 'false');
+        } else {
+            menu.classList.add('open');
+            btn.setAttribute('aria-expanded', 'true');
+        }
+    };
+    window.closeProjectMoreMenu = function() {
+        const menu = document.getElementById('vp-detail-more-menu');
+        const btn = document.getElementById('vp-detail-more-btn');
+        if (menu) menu.classList.remove('open');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+    };
+    // Outside-click + Esc close. Bound once via a window flag
+    // (idempotent — the script tag is re-evaluated only on a
+    // full page reload, but the flag protects against accidental
+    // double-binding if the project header is re-rendered by
+    // something like an SPA route).
+    (function() {
+        if (window._vpDetailMoreBound) return;
+        window._vpDetailMoreBound = true;
+        document.addEventListener('click', (e) => {
+            const menu = document.getElementById('vp-detail-more-menu');
+            if (!menu || !menu.classList.contains('open')) return;
+            // Click inside the group = handled by the button.
+            if (e.target.closest('.vp-detail-more-group')) return;
+            menu.classList.remove('open');
+            const btn = document.getElementById('vp-detail-more-btn');
+            if (btn) btn.setAttribute('aria-expanded', 'false');
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') window.closeProjectMoreMenu();
+        });
+    })();
+
     // v3.9.0 (Phase 2 UX): client-side handler for the SOUL editor
     // toggle. The form uses preventDefault() and posts via fetch so
     // the page reload is clean (POST + reload = form submission with
