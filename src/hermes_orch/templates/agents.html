@@ -349,31 +349,45 @@
    The backdrop-click handler uses `event.target === this` (not
    `contains()`) so clicks on the modal card or any of its
    descendants don't accidentally close the modal. #}
-<div id="profile-modal" class="modal-overlay" style="display: none;"
+<div id="profile-modal" class="modal-overlay"
+     style="display: none; align-items: flex-start; padding-top: 2rem;"
      onclick="if(event.target===this) closeProfileModal()">
-    {# v3.13.2: revert fixed-height to auto-height. v3.13.1 made it
-       fixed 720px to stop tab-switch jitter, but the user found the
-       resulting empty space at the bottom (Capabilities tab is ~300px
-       of content, leaves ~400px of empty card) worse than the jitter.
-       So: modal height is now auto (= sum of header + tab bar +
-       content) capped by max-height: 88vh so a long Skills tab (77
-       entries in 2-col) still scrolls inside instead of overflowing
-       the viewport. Width bumped 720 → 800px because the 2-col skills
-       grid at 720px left <174px per cell for the skill name + size +
-       status pill + action buttons, which clipped the right side.
-       800px gives ~374px per cell, enough for "applied" pill + "→"
-       "×" buttons + a long skill name without truncation.
+    {# v3.13.2: revert fixed-height to auto-height AND anchor the modal
+       to the top of the viewport (override the base .modal-overlay's
+       `align-items: center` with `align-items: flex-start; padding-top:
+       2rem`). The previous fixed-720px attempt stopped the tab-switch
+       position jump but left ~400px of empty card for short tabs. The
+       subsequent auto-height attempt fixed the empty space but the
+       centered modal still jumps vertically (Overview centered at y=435
+       while Skills centered at y=365 — different top, different bottom).
+       Anchoring to top makes the top stable across tabs: regardless of
+       which tab is active, the modal starts at the same y (2rem from
+       viewport top), only the BOTTOM moves as the content height
+       changes. User mental model: "modal should always appear in the
+       same place when I open it" — top-anchored delivers that.
+
+       Width bumped 720 → 800px because the 2-col skills grid at 720px
+       left <174px per cell for the skill name + size + status pill +
+       action buttons, which clipped the right side. 800px gives
+       ~374px per cell, enough for "applied" pill + "→" "×" buttons +
+       a long skill name without truncation.
+
+       Modal height is now auto (= sum of header + tab bar + content)
+       capped by max-height: 88vh so a long Skills tab (77 entries in
+       2-col) still scrolls inside instead of overflowing the viewport.
 
        Mechanism (unchanged from v3.7.2): flex column with `flex-shrink-0`
        on header + tab bar and `flex: 1; min-height: 0; overflow-y: auto`
-       on the content area, so the content fills the remaining flex
-       space and scrolls when the modal hits 88vh. We override the base
-       `.modal-card`'s `overflow-y: auto` with `overflow: hidden` so the
-       card itself never scrolls — only the inner content does, keeping
-       the header and tab bar pinned.
+       on the content area. We override the base `.modal-card`'s
+       `overflow-y: auto` with `overflow: hidden` so the card itself
+       never scrolls — only the inner content does, keeping the header
+       and tab bar pinned.
 
-       Trade-off: tab-switch height will jitter again (Overview ~350px
-       vs Skills ~792px). User explicitly chose this over empty space. #}
+       Trade-off: tab-switch height will jitter (Overview ~300px vs
+       Skills ~792px), and the modal's BOTTOM moves as the height
+       changes. The TOP stays at 2rem. User explicitly chose this over
+       both (a) empty space at the bottom AND (b) a fixed-720px modal
+       that jumps in content layout. #}
     <div class="modal-card"
          style="width: 800px; max-width: 92vw; max-height: 88vh; padding: 0; display: flex; flex-direction: column; overflow: hidden;">
         <div class="px-5 py-3 border-b flex items-center justify-between flex-shrink-0">
