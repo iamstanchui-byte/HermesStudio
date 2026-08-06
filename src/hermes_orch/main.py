@@ -125,6 +125,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.config = cfg
 
     db_path = Path.home() / ".hermes-orchestrator" / "hermes-orch.db"
+    # v3.13.0: enforce minimum SQLite version for production DB.
+    # The `root_path` migration uses ADD COLUMN (no IF NOT EXISTS in
+    # SQLite, so we rely on the existing try/except in the migration
+    # runner). The minimum version is mostly a guard against surprising
+    # schema-mismatch errors on truly ancient SQLite builds (< 3.10
+    # from 2020). We allow the orchestrator to START on old SQLite so
+    # existing test setups aren't disrupted, but log a clear warning
+    # that production should be on 3.35+. The migration runner handles
+    # "duplicate column" gracefully so the add-column works regardless.
+    import sqlite3 as _sqlite3
+    _sqlite_version = tuple(int(p) for p in _sqlite3.sqlite_version.split("."))
+    _SQLITE_MIN = (3, 10, 0)  # 2020 release; very conservative
+    if _sqlite_version < _SQLITE_MIN:
+        import logging
+        logging.getLogger("hermes_orch").warning(
+            "SQLite version %s is below minimum %s. Schema migrations "
+            "may fail in unexpected ways. Upgrade SQLite for production.",
+            _sqlite3.sqlite_version, ".".join(str(p) for p in _SQLITE_MIN),
+        )
+
     db = Database(db_path)
     await db.connect()
     app.state.db = db

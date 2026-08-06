@@ -301,6 +301,20 @@
                            class="w-full border rounded px-2 py-1 text-xs font-mono mb-1">
                     <input id="new-profile-desc" type="text" placeholder="description (optional)"
                            class="w-full border rounded px-2 py-1 text-xs mb-1">
+                    {# v3.13.0: explicit profile root path on the agent host.
+                       Optional — leave empty to use auto-derive. Set this
+                       for non-standard installs (custom path, NAS mount,
+                       per-profile directory layout). The wrapper will use
+                       this value verbatim. See
+                       docs/v3.13.0-agent-profile-root-path.md. #}
+                    <input id="new-profile-root-path" type="text"
+                           placeholder="root path on host (optional, e.g. D:\tools\hermes\profiles\<name>)"
+                           title="Optional. The absolute path to this profile's directory on the agent host. Leave empty for auto-detect. The wrapper does NOT validate or create this path — make sure it exists on the host."
+                           class="w-full border rounded px-2 py-1 text-xs font-mono mb-1">
+                    <div class="text-[10px] text-gray-500 mb-1 italic">
+                        If left empty, the agent wrapper will auto-detect the profile location.
+                        If set, this path is used as-is — make sure it exists on the agent host.
+                    </div>
                     <div class="flex items-center gap-2">
                         <button onclick="submitAddProfile()"
                                 class="text-xs px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">
@@ -835,6 +849,13 @@ function renderOverviewTab(profile, content) {
     } else {
         tagsHtml = '<div class="mt-2 text-[10px] text-gray-400 italic">No capability tags declared (routing will fall back to "any online profile").</div>';
     }
+    // v3.13.0: profile root path on the agent host. Display + inline
+    // edit. Empty means "auto-derive from <profiles_dir>/<role>". See
+    // docs/v3.13.0-agent-profile-root-path.md.
+    const rootPath = profile.root_path || '';
+    const rootPathDisplay = rootPath
+        ? `<span class="font-mono text-[10px] break-all">${escapeHtml(rootPath)}</span>`
+        : `<span class="text-[10px] text-gray-400 italic">(auto-derive — wrapper will look under <code>&lt;profiles_dir&gt;/&lt;role&gt;</code>)</span>`;
     content.innerHTML = `
         <div class="space-y-1.5">
             <div class="flex"><span class="text-gray-500 w-20">Model:</span><span class="font-mono">${escapeHtml(model)}</span></div>
@@ -842,6 +863,24 @@ function renderOverviewTab(profile, content) {
             ${baseUrl ? `<div class="flex"><span class="text-gray-500 w-20">Base URL:</span><span class="font-mono text-[10px] break-all">${escapeHtml(baseUrl)}</span></div>` : ''}
             <div class="flex"><span class="text-gray-500 w-20">Status:</span><span>${escapeHtml(profile.status || 'unknown')}</span></div>
             <div class="flex"><span class="text-gray-500 w-20">Task:</span><span class="font-mono text-[10px]">${profile.current_task_id ? escapeHtml(profile.current_task_id) : '(idle)'}</span></div>
+        </div>
+        <div id="root-path-section" class="mt-3 pt-2 border-t border-gray-200">
+            <div class="text-[11px] text-gray-500 mb-1">Profile root path on host (v3.13.0):</div>
+            <div class="flex items-center gap-2">
+                <div class="flex-1 min-w-0">${rootPathDisplay}</div>
+                <button onclick="editRootPath('${escapeHtml(profile.name)}')"
+                        class="text-[10px] px-2 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 rounded hover:bg-blue-100">
+                    ${rootPath ? 'Edit' : 'Set'}
+                </button>
+                ${rootPath ? `<button onclick="clearRootPath('${escapeHtml(profile.name)}')"
+                        class="text-[10px] px-2 py-0.5 bg-gray-50 text-gray-700 border border-gray-200 rounded hover:bg-gray-100">
+                    Clear
+                </button>` : ''}
+            </div>
+            <div class="text-[10px] text-gray-500 mt-1 italic">
+                Override the auto-detected path for non-standard installs (custom path, NAS mount).
+                The wrapper does NOT validate or create this path. After saving, the wrapper picks it up on its next restart.
+            </div>
         </div>
         <div class="mt-3 pt-2 border-t border-gray-200 text-[11px] text-gray-500">
             MCP: <strong>${mcpCount}</strong> server${mcpCount === 1 ? '' : 's'} ·
@@ -1471,8 +1510,82 @@ function showAddProfileForm() {
     document.getElementById('add-profile-btn').style.display = 'none';
     document.getElementById('new-profile-name').value = '';
     document.getElementById('new-profile-desc').value = '';
+    document.getElementById('new-profile-root-path').value = '';
     document.getElementById('add-profile-status').textContent = '';
     setTimeout(() => document.getElementById('new-profile-name').focus(), 50);
+}
+
+// v3.13.0: edit/clear the profile root path from the Overview tab.
+// Uses PATCH /api/agents/{id}/profiles/{name} with `root_path` set
+// to a new value (or null/empty to clear). After success, refresh
+// the profile list so the Overview tab reflects the new state.
+async function editRootPath(profileName) {
+    if (!currentAgentId) return;
+    const profile = currentProfiles.find(p => p.name === profileName);
+    if (!profile) return;
+    const current = profile.root_path || '';
+    const newVal = prompt(
+        `Set root path for profile "${profileName}":\n\n` +
+        `Current: ${current || '(auto-derive)'}\n\n` +
+        `Enter absolute path on the agent host, or leave empty to clear.\n` +
+        `Examples:\n` +
+        `  D:\\tools\\hermes\\profiles\\${profileName}\n` +
+        `  /mnt/nas/hermes/profiles/${profileName}\n` +
+        `  \\\\fileserver\\share\\hermes\\profiles\\${profileName}`,
+        current
+    );
+    if (newVal === null) return;  // user cancelled
+    const trimmed = newVal.trim();
+    try {
+        const r = await fetch(`/api/agents/${encodeURIComponent(currentAgentId)}/profiles/${encodeURIComponent(profileName)}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({root_path: trimmed || null}),
+        });
+        if (!r.ok) {
+            const errText = await r.text();
+            alert(`Save failed (${r.status}): ${errText.slice(0, 300)}`);
+            return;
+        }
+        // v3.13.0: refresh the in-memory profile data so the
+        // Overview tab re-renders with the new value. The wrapper
+        // picks it up on its next restart (≤5 min TimeTrigger or
+        // manual `hermes-orch-agent sync-config && restart`).
+        await _refreshAgentAfterProfileChange();
+        // Re-render the current tab (likely Overview)
+        switchProfileTab(currentProfileTab || 'overview');
+        // Tell the operator about the restart lag so they're not
+        // surprised when the new path "doesn't work" for a few min.
+        alert(
+            `Root path updated for "${profileName}".\n\n` +
+            `The wrapper will use this value after its next restart ` +
+            `(up to 5 min on the default TimeTrigger, or run ` +
+            `\`hermes-orch-agent sync-config && restart\` on the host to apply immediately).`
+        );
+    } catch (e) {
+        alert(`Save failed: ${e.message || e}`);
+    }
+}
+
+async function clearRootPath(profileName) {
+    if (!currentAgentId) return;
+    if (!confirm(`Clear explicit root path for "${profileName}"? The wrapper will fall back to auto-derive (HERMES_PROFILES_DIR/<role>).`)) return;
+    try {
+        const r = await fetch(`/api/agents/${encodeURIComponent(currentAgentId)}/profiles/${encodeURIComponent(profileName)}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({root_path: null}),
+        });
+        if (!r.ok) {
+            const errText = await r.text();
+            alert(`Save failed (${r.status}): ${errText.slice(0, 300)}`);
+            return;
+        }
+        await _refreshAgentAfterProfileChange();
+        switchProfileTab(currentProfileTab || 'overview');
+    } catch (e) {
+        alert(`Save failed: ${e.message || e}`);
+    }
 }
 
 function hideAddProfileForm() {
@@ -1484,6 +1597,10 @@ async function submitAddProfile() {
     if (!currentAgentId) return;
     const name = document.getElementById('new-profile-name').value.trim();
     const desc = document.getElementById('new-profile-desc').value.trim();
+    // v3.13.0: optional explicit root path on the agent host. Trimmed
+    // to handle accidental whitespace; empty string -> null (auto-derive).
+    const rootPathRaw = document.getElementById('new-profile-root-path').value.trim();
+    const rootPath = rootPathRaw || null;
     const status = document.getElementById('add-profile-status');
     if (!name) {
         status.textContent = 'Name is required';
@@ -1496,7 +1613,11 @@ async function submitAddProfile() {
         const r = await fetch(`/api/agents/${encodeURIComponent(currentAgentId)}/profiles`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({name: name, description: desc || null}),
+            body: JSON.stringify({
+                name: name,
+                description: desc || null,
+                root_path: rootPath,
+            }),
         });
         const data = await r.json();
         if (r.ok) {
@@ -1521,6 +1642,7 @@ async function submitAddProfile() {
             // without first clearing the inputs.
             document.getElementById('new-profile-name').value = '';
             document.getElementById('new-profile-desc').value = '';
+            document.getElementById('new-profile-root-path').value = '';
             // Re-show the "Add profile" button after a brief pause
             // (so the success message is visible). User clicks it
             // again to add another — no reload, no scroll loss.

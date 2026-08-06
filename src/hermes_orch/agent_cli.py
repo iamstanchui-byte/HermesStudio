@@ -67,6 +67,77 @@ except Exception:
 from hermes_orch.agent_paths import detect_hermes_profiles_dir
 
 
+# v3.13.0: shared helper for merging orchestrator-reported profile
+# list into the local wrapper-config.json. Used by both `start` and
+# the standalone `sync-config` command so the two paths can never
+# drift. Behavior is "v3.13.0 conservative" (per AC-6):
+#   - All EXISTING cfg entries are treated as user-managed and are
+#     NEVER overwritten by the orchestrator — even when the orch
+#     reports a `root_path`.
+#   - For NEW roles (not in existing cfg):
+#       - if `root_path` is set: use it as `"root"`
+#       - else: try auto-derive from <detected_profiles_dir>/<role>
+#       - else: fall back to relative `./<role>`
+# The helper is idempotent: re-running it on the same input produces
+# the same output. The orchestrator is responsible for delivering
+# accurate `root_path` values; the wrapper does NOT verify the path
+# exists on disk (that's the wrapper's runtime check via
+# resolve_profile_root, which raises FileNotFoundError at task
+# claim time if the dir is missing).
+#
+# Returns (merged_cfg_dict, list_of_newly_added_role_names).
+def _merge_orch_profiles_into_config(
+    cfg: dict,
+    orch_profiles: list[dict],
+    detected_profiles_dir: "Path | None",
+) -> tuple[dict, list[str]]:
+    """Merge orchestrator-reported profile list into wrapper-config.
+
+    v3.13.0 conservative behavior (per AC-6):
+      - All EXISTING cfg entries are treated as user-managed
+        ("manual override") and are NEVER overwritten by the
+        orchestrator — even when the orch reports a `root_path`.
+      - For NEW roles (not in existing cfg):
+          - if `root_path` is set: use it as `"root"`
+          - else: try auto-derive from <detected_profiles_dir>/<role>
+          - else: fall back to relative `./<role>`
+
+    Future (v3.14.0+): differentiate "auto-derived" vs "manually
+    overridden" entries via a `source: "auto" | "manual"` metadata
+    field in wrapper-config.json, then orchestrator's `root_path`
+    can override auto-derived entries. See AC-7 (stretch goal).
+
+    Returns (merged_cfg, list_of_added_role_names).
+    """
+    existing = cfg.get("profiles") or {}
+    merged = dict(existing)
+    added: list[str] = []
+    for p in orch_profiles:
+        role = p["name"]
+        root_path = (p.get("root_path") or "").strip()
+        if role in existing:
+            # v3.13.0: conservative — preserve whatever's in the
+            # wrapper-config.json. This is correct for manual edits
+            # AND for entries the previous run of this helper wrote
+            # (auto-derive). The helper is idempotent on re-runs.
+            # Stretch goal (v3.14.0): see docstring above.
+            continue
+        if root_path:
+            merged[role] = {"root": root_path}
+            added.append(role)
+            continue
+        if detected_profiles_dir:
+            candidate = detected_profiles_dir / role
+            if candidate.exists():
+                merged[role] = {"root": str(candidate)}
+                added.append(role)
+                continue
+        # Last resort: relative path; wrapper will fail later if invalid
+        merged[role] = {"root": f"./{role}"}
+        added.append(role)
+    return merged, added
+
+
 # ===== Helpers =====
 
 
@@ -1745,20 +1816,32 @@ def start(
             )
             if r.status_code == 200:
                 agent = r.json()
-                orch_roles = [p["name"] for p in agent.get("profiles", [])]
+                orch_profiles = agent.get("profiles") or []
+                # v3.13.0: full profile dicts (not just names) so the
+                # helper can honor `root_path` from the orchestrator.
                 existing = cfg.get("profiles") or {}
-                added = [r for r in orch_roles if r not in existing]
-                if added:
+                if any(r for r in orch_profiles if r["name"] not in existing):
                     # Re-read config in case another process wrote it
                     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
-                    existing = cfg.get("profiles") or {}
-                    for r in orch_roles:
-                        if r not in existing:
-                            existing[r] = {"root": f"<profiles_dir>/{r}"}
-                    cfg["profiles"] = existing
-                    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-                    click.echo(f"  synced {len(added)} new role(s): {added}")
-                    profiles_cfg = existing  # use updated
+                    from hermes_orch.agent_paths import detect_hermes_profiles_dir
+                    detected_profiles_dir = detect_hermes_profiles_dir()
+                    new_cfg, added = _merge_orch_profiles_into_config(
+                        cfg, orch_profiles, detected_profiles_dir,
+                    )
+                    if added:
+                        # v3.13.0: helper returns the profiles subdict
+                        # (per spec, see _merge_orch_profiles_into_config
+                        # docstring). Assign directly to cfg["profiles"].
+                        cfg["profiles"] = new_cfg
+                        if detected_profiles_dir:
+                            cfg["_profiles_dir"] = str(detected_profiles_dir)
+                        cfg_path.write_text(
+                            json.dumps(cfg, indent=2) + "\n", encoding="utf-8",
+                        )
+                        click.echo(f"  synced {len(added)} new role(s): {added}")
+                        profiles_cfg = new_cfg  # use updated
+                    else:
+                        click.echo("  config up to date")
                 else:
                     click.echo("  config up to date")
         except Exception as e:
@@ -4096,25 +4179,18 @@ def sync_config(config_file: str) -> None:
     else:
         click.echo("WARN: no hermes profiles dir detected. Set HERMES_PROFILES_DIR.")
 
-    # Merge: keep existing roots, add missing roles
-    existing_profiles = cfg.get("profiles") or {}
-    merged: dict = dict(existing_profiles)  # start with existing
-    added: list[str] = []
-    for role in orch_roles:
-        if role in merged:
-            continue  # don't overwrite user customization
-        # Use template "<profiles_dir>/<role>" if detected, else leave empty
-        if detected_dir:
-            candidate = detected_dir / role
-            if candidate.exists():
-                merged[role] = {"root": f"<profiles_dir>/{role}"}
-                added.append(role)
-                continue
-        # Last resort: absolute path guess
-        merged[role] = {"root": f"./{role}"}  # daemon will try to resolve
-        added.append(role)
-
-    cfg["profiles"] = merged
+    # v3.13.0: delegate the merge to the shared helper so this
+    # command and `start` use the same logic. The helper also
+    # honors orchestrator-reported `root_path` (per-profile custom
+    # install path, e.g. NAS mount or non-standard layout).
+    orch_profiles = [{"name": p["name"], "root_path": p.get("root_path")}
+                    for p in agent.get("profiles", [])]
+    new_cfg, added = _merge_orch_profiles_into_config(
+        cfg, orch_profiles, detected_dir,
+    )
+    # v3.13.0: helper returns the profiles subdict (not the whole
+    # cfg). Assign directly.
+    cfg["profiles"] = new_cfg
     if detected_dir:
         cfg["_profiles_dir"] = str(detected_dir)
 
@@ -4122,7 +4198,7 @@ def sync_config(config_file: str) -> None:
     click.echo(f"Wrote {cfg_path}")
     if added:
         click.echo(f"  added {len(added)} role(s): {added}")
-    click.echo(f"  total profiles: {len(merged)}")
+    click.echo(f"  total profiles: {len(cfg['profiles'])}")
     if not detected_dir:
         click.echo("")
         click.echo("  NOTE: no HERMES_PROFILES_DIR detected. Set it to your hermes")

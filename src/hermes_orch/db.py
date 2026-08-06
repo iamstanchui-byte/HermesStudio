@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     -- Default '[]' = no capabilities declared (old profile behavior;
     -- routing falls back to "any online profile" with a warning).
     skills TEXT NOT NULL DEFAULT '[]',
+    -- v3.13.0: explicit profile root path on the agent host. NULL
+    -- = use the existing auto-derive (HERMES_PROFILES_DIR /
+    -- <profiles_dir>/<role>). Set via dashboard "Add profile" form
+    -- or PATCH. Wrapper sync-config reads this and writes it into
+    -- wrapper-config.json as the explicit "root" field. See
+    -- docs/v3.13.0-agent-profile-root-path.md for full spec.
+    root_path TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
@@ -772,6 +779,15 @@ MIGRATIONS = [
     ")",
     "CREATE INDEX IF NOT EXISTS idx_soul_templates_category "
     "ON project_soul_templates(category)",
+    # v3.13.0: explicit profile root path on the agent host. NULL
+    # = auto-derive from <profiles_dir>/<role> (default for new
+    # installs + all existing rows). The CREATE TABLE block above
+    # also adds this column for fresh DBs; this ALTER is the
+    # safety net for upgrade paths where CREATE TABLE has already
+    # run with the older schema. The "duplicate column" error on
+    # re-run is silently swallowed by the migration runner.
+    # See docs/v3.13.0-agent-profile-root-path.md.
+    "ALTER TABLE agent_profiles ADD COLUMN root_path TEXT",
 ]
 
 

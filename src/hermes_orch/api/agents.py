@@ -130,6 +130,15 @@ class AgentProfileCreate(BaseModel):
     # from file-based skills (which live under <profile>/skills/).
     # Optional — default [] = no capabilities declared.
     skills: list[str] = Field(default_factory=list)
+    # v3.13.0 (Profile root path): explicit path on the agent host
+    # for this profile's directory. None or empty = auto-derive
+    # from <profiles_dir>/<role> (the existing behavior). Set this
+    # when the user has a non-standard install (custom path, NAS
+    # mount, per-profile directory layout). Wrapper reads this via
+    # the next sync-config and writes it into wrapper-config.json
+    # as the explicit "root" field. See
+    # docs/v3.13.0-agent-profile-root-path.md.
+    root_path: str | None = None
 
 
 class AgentProfileUpdate(BaseModel):
@@ -140,6 +149,11 @@ class AgentProfileUpdate(BaseModel):
     # the caller provides it. None = no change (backward compat for
     # existing PATCH calls that don't touch skills).
     skills: list[str] | None = None
+    # v3.13.0 (Profile root path): optional — only update the column
+    # when the caller provides it. None = no change (preserve current
+    # value, including NULL). Empty string "" = clear the explicit
+    # root and fall back to auto-derive on the next wrapper sync.
+    root_path: str | None = None
 
 
 class HeartbeatBody(BaseModel):
@@ -200,6 +214,11 @@ class AgentProfile(BaseModel):
     # capabilities declared; routing engine falls back to "any
     # online profile" with a warning.
     capability_tags: list[str] = Field(default_factory=list)
+    # v3.13.0 (Profile root path): NULL or absent = auto-derive
+    # from <profiles_dir>/<role>. Set = explicit path on the agent
+    # host for this profile's directory. See
+    # docs/v3.13.0-agent-profile-root-path.md.
+    root_path: str | None = None
     created_at: str | None = None
 
 
@@ -378,6 +397,12 @@ def _row_to_profile(row: dict[str, Any]) -> AgentProfile:
         # here is the correct "not loaded" sentinel.
         skills=[],
         capability_tags=capability_tags,
+        # v3.13.0 (Profile root path). NULL = auto-derive from
+        # <profiles_dir>/<role>; otherwise explicit path on the
+        # agent host. row.get() returns None for missing column
+        # (pre-migration DB) or NULL value (post-migration).
+        # See docs/v3.13.0-agent-profile-root-path.md.
+        root_path=row.get("root_path"),
         created_at=row.get("created_at"),
     )
 
@@ -1077,6 +1102,14 @@ async def add_profile(
     cleaned_skills: list[str] = [
         str(s).strip() for s in (body.skills or []) if str(s).strip()
     ]
+    # v3.13.0: explicit profile root path. Treat empty string the
+    # same as null (both mean "no explicit root, use auto-derive").
+    # The OS-specific path syntax (C:\..., \\nas\..., /...) is
+    # passed through unchanged — the wrapper on the agent host is
+    # responsible for interpreting it.
+    cleaned_root_path: str | None = None
+    if body.root_path is not None and str(body.root_path).strip():
+        cleaned_root_path = str(body.root_path).strip()
     await db.insert(
         "agent_profiles",
         {
@@ -1088,6 +1121,7 @@ async def add_profile(
             "capabilities": json.dumps(body.capabilities or {}),
             "storage_refs": json.dumps(cleaned_refs),
             "skills": json.dumps(cleaned_skills),
+            "root_path": cleaned_root_path,
         },
     )
     row = await db.fetchone("SELECT * FROM agent_profiles WHERE id = ?", (profile_id,))
@@ -1100,6 +1134,7 @@ async def add_profile(
             "description": body.description,
             "capabilities": body.capabilities or {},
             "skills": cleaned_skills,
+            "root_path": cleaned_root_path,
         },
     )
     return _row_to_profile(row)
@@ -1203,6 +1238,28 @@ async def update_profile(
         await db.execute(
             "UPDATE agent_profiles SET storage_refs = ? WHERE id = ?",
             (json.dumps(cleaned_refs), profile["id"]),
+        )
+    # v3.13.0: explicit profile root path. We need to distinguish
+    # "user didn't send root_path" (leave unchanged) from "user sent
+    # root_path=null" (clear it). Pydantic v2's `model_fields_set` gives
+    # us exactly this — the set of fields the caller explicitly set.
+    #   not in model_fields_set = leave unchanged (backward compat
+    #                                for existing PATCH calls that
+    #                                don't touch root_path)
+    #   root_path in model_fields_set AND value is None/"" = clear
+    #   root_path in model_fields_set AND value is "C:\..." = set
+    # The OS-specific path syntax is passed through unchanged; the
+    # wrapper on the agent host interprets it. We do NOT verify the
+    # path exists — that's the wrapper's responsibility.
+    if "root_path" in body.model_fields_set:
+        # Caller explicitly sent root_path (or null). Apply it.
+        raw_value = body.root_path
+        cleaned_root_path: str | None = (
+            str(raw_value).strip() if raw_value is not None else None
+        ) or None  # empty string → None
+        await db.execute(
+            "UPDATE agent_profiles SET root_path = ? WHERE id = ?",
+            (cleaned_root_path, profile["id"]),
         )
     row = await db.fetchone("SELECT * FROM agent_profiles WHERE id = ?", (profile["id"],))
     # Audit log payload — convert Pydantic StorageRef list to plain
