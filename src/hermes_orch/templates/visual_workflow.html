@@ -585,7 +585,7 @@
         </button>
         {# v2.2 (2026-07-30): separator + primary action (rightmost) #}
         <span class="w-px h-6 bg-gray-300 mx-1"></span>
-        <button onclick="window.visualBuilder.save()"
+        <button id="vf-save-btn" onclick="window.visualBuilder.save()"
             class="px-4 py-1.5 text-xs font-medium rounded bg-blue-600 text-white hover:bg-blue-700"
             title="PUT step_template + variables back to the API">
             💾 Save
@@ -694,14 +694,22 @@
                For human_approval the `action` field is still required
                (used as the human_approval step's "action" in the DB),
                and an `approval` object should be added via the JSON
-               view (summary_template, on_reject, etc.). #}
+               view (summary_template, on_reject, etc.).
+
+               v3.14.0 (Phase 3 followup): changed from free-text to a
+               dropdown. Only 2 valid values for now; a free-text
+               input invited typos. The dropdown stays a dropdown
+               when more types are added in future. #}
             <label>type
                 <span class="text-xs text-gray-400 font-normal"
                     title='Step execution type. "do_task" (default) runs the step; "human_approval" pauses the workflow and creates an inbox approval request. The `approval` object (summary_template, on_reject, etc.) is edited in the JSON form.'>
                     (?)
                 </span>
             </label>
-            <input type="text" id="vf-edit-type" placeholder="do_task" value="do_task">
+            <select id="vf-edit-type">
+                <option value="do_task">do_task — run the step</option>
+                <option value="human_approval">human_approval — pause for inbox approval</option>
+            </select>
             <label>action</label>
             <input type="text" id="vf-edit-action">
             <label>depends_on (comma-separated step names, no forward refs)</label>

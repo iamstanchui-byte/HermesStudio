@@ -53,6 +53,15 @@
     let _projectMaxIterations = 3;  // v3.10.10: cached at init, used by the Generate Tasks modal
     let _selectedNodeName = null;   // which step's details are shown in the side panel
     let _jsonMode = false;          // toggle between visual and JSON textarea
+    // v3.14.0 (Phase 3 followup): count of unsaved step edits. The
+    // top "Save" button shows this count so the user can see when
+    // their in-memory edits haven't been persisted to the server
+    // yet. Without this, users assumed "Save step" auto-saved to
+    // the server, which it doesn't (saveStepEdits only updates
+    // the in-memory _plan; server-side persistence is in
+    // savePlan() which the user must trigger explicitly). Reset
+    // to 0 after each successful savePlan().
+    let _dirtyStepCount = 0;
     // Map from step name -> drawflow's INTERNAL node id (the
     // counter it uses as the key in its data map, e.g. '1' / '2'
     // for the first two nodes, NOT the name we passed to addNode
@@ -1357,7 +1366,37 @@
         // Re-open the side panel on the same step (render cleared
         // the selection).
         openSidePanel(step.name);
-        showBanner('Step saved', 'success');
+        // v3.14.0 (Phase 3 followup): mark the plan as having
+        // unsaved step changes. The top "Save" button shows the
+        // count (e.g. "Save (1 change)"). Without this, users
+        // assumed "Save step" persisted to the server — it only
+        // updates the in-memory _plan model. The server-side
+        // persistence happens in savePlan() which the user must
+        // trigger explicitly. This was a recurring confusion
+        // reported during Phase 3 testing.
+        _dirtyStepCount = (_dirtyStepCount || 0) + 1;
+        _updateSaveDirtyIndicator();
+        showBanner('Step saved (click top "Save" to persist)', 'success');
+    }
+
+    // v3.14.0 (Phase 3 followup): helper to update the top "Save"
+    // button with the number of unsaved step changes. Reset to 0
+    // after a successful savePlan().
+    function _updateSaveDirtyIndicator() {
+        const btn = $('vp-save-btn');
+        if (!btn) return;
+        const n = _dirtyStepCount || 0;
+        if (n > 0) {
+            btn.textContent = `💾 Save (${n} change${n === 1 ? '' : 's'})`;
+            btn.classList.add('bg-amber-600', 'hover:bg-amber-700');
+            btn.classList.remove('bg-cyan-600', 'hover:bg-cyan-700');
+            btn.title = `${n} unsaved step change${n === 1 ? '' : 's'} — click to persist to server`;
+        } else {
+            btn.textContent = '💾 Save';
+            btn.classList.remove('bg-amber-600', 'hover:bg-amber-700');
+            btn.classList.add('bg-cyan-600', 'hover:bg-cyan-700');
+            btn.title = 'Persist the current plan to the server';
+        }
     }
 
     // v1.9.4: side-panel inline error display. Mirrors
@@ -1442,6 +1481,12 @@
             // the project page); the next drag/edit will re-render
             // with the fresh data.
             _presetCache = null;
+            // v3.14.0 (Phase 3 followup): clear the dirty-step
+            // counter on successful save. The button reverts to
+            // its default "Save" label and the unsaved-changes
+            // highlight goes away.
+            _dirtyStepCount = 0;
+            _updateSaveDirtyIndicator();
             showBanner('Plan saved (' + _plan.steps.length + ' step(s))', 'success');
         } catch (e) {
             showBanner('Network error: ' + e.message, 'error');

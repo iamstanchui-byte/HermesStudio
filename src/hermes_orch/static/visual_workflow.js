@@ -1958,6 +1958,13 @@
                 'info'
             );
         }
+        // v3.14.0 (Phase 3 followup): mark the workflow as having
+        // unsaved step changes. The top "Save" button shows the
+        // count (e.g. "Save (1 change)"). This is the same UX
+        // pattern as visual_plan.js — without it, users assumed
+        // the side-panel "Apply" button persisted to the server.
+        _dirtyStepCount = (_dirtyStepCount || 0) + 1;
+        _updateSaveDirtyIndicator();
     }
 
     // ESC key closes the side panel (standard UX).
@@ -2126,12 +2133,41 @@
                 _showBanner(`Save failed (${r.status}): ${detail.slice(0, 200)}`, 'error');
                 return;
             }
+            // v3.14.0 (Phase 3 followup): clear the dirty-step
+            // counter on successful save. The button reverts to
+            // its default "Save" label.
+            _dirtyStepCount = 0;
+            _updateSaveDirtyIndicator();
             _showBanner('Saved', 'success');
             // Re-render so the canvas reflects the new server state
             // (especially if the JSON form was the source of truth)
             _render();
         } catch (e) {
             _showBanner('Save error: ' + e.message, 'error');
+        }
+    }
+
+    // v3.14.0 (Phase 3 followup): unsaved-changes indicator for
+    // the top "Save" button. Mirrors the same pattern in
+    // visual_plan.js. Without this, users assumed the side-panel
+    // "Apply" button persisted the change — it only updates
+    // _stepTemplate in memory; the server-side persistence is
+    // triggered by the top Save button.
+    let _dirtyStepCount = 0;
+    function _updateSaveDirtyIndicator() {
+        const btn = document.getElementById('vf-save-btn');
+        if (!btn) return;
+        const n = _dirtyStepCount || 0;
+        if (n > 0) {
+            btn.textContent = `💾 Save (${n} change${n === 1 ? '' : 's'})`;
+            btn.classList.remove('bg-blue-600', 'hover:bg-blue-700');
+            btn.classList.add('bg-amber-600', 'hover:bg-amber-700');
+            btn.title = `${n} unsaved change${n === 1 ? '' : 's'} — click to PUT to the server`;
+        } else {
+            btn.textContent = '💾 Save';
+            btn.classList.add('bg-blue-600', 'hover:bg-blue-700');
+            btn.classList.remove('bg-amber-600', 'hover:bg-amber-700');
+            btn.title = 'PUT step_template + variables back to the API';
         }
     }
 

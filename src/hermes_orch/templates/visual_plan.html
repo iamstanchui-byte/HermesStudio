@@ -552,7 +552,7 @@
             title="Materialize the plan into tasks (POST /api/projects/{id}/plan/run). The supervisor will dispatch the new tasks on the next tick.">
             ▶ Generate tasks
         </button>
-        <button onclick="window.vp.savePlan()"
+        <button id="vp-save-btn" onclick="window.vp.savePlan()"
             class="px-3 py-1.5 text-xs font-bold rounded border-2 border-cyan-500 text-cyan-700 hover:bg-cyan-50"
             title="Save the plan JSON to the server (PUT /api/projects/{id}/plan)">
             💾 Save
@@ -675,14 +675,23 @@
            and creates an inbox approval request when the plan is
            promoted to a workflow run. The `approval` object
            (summary_template, on_reject, etc.) is edited in the JSON
-           form — see /projects/{id}#plan for now. #}
+           form — see /projects/{id}#plan for now.
+
+           v3.14.0 (Phase 3 followup): changed from free-text to a
+           dropdown. Only 2 valid values for now; a free-text input
+           invited typos and "human-approval" vs "human_approval" /
+           "approve" / etc. v3.14.0+ will add more types — when that
+           happens, the dropdown stays a dropdown with more options. #}
         <label>type
             <span class="text-xs text-gray-400 font-normal"
                 title='Step execution type. "do_task" (default) runs the step; "human_approval" pauses the workflow and creates an inbox approval request. The `approval` object (summary_template, on_reject, etc.) is edited in the JSON form.'>
                 (?)
             </span>
         </label>
-        <input id="vp-f-type" type="text" placeholder="do_task" value="do_task">
+        <select id="vp-f-type" class="vp-sp-input">
+            <option value="do_task">do_task — run the step</option>
+            <option value="human_approval">human_approval — pause for inbox approval</option>
+        </select>
         <label>Required capability</label>
         <input id="vp-f-capability" type="text" placeholder="(optional) e.g. summarize">
         <label>Skill (canonical name)</label>
