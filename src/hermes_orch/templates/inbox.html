@@ -40,7 +40,16 @@
                 <th class="text-left px-3 py-2 font-medium text-gray-700">Step</th>
                 <th class="text-left px-3 py-2 font-medium text-gray-700">Summary</th>
                 <th class="text-left px-3 py-2 font-medium text-gray-700 w-32">On reject</th>
-                <th class="text-left px-3 py-2 font-medium text-gray-700 w-32">Waiting</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700 w-24">Waiting</th>
+                {# v3.14.0 (Phase 3 followup 6): "Auto-reject in" column.
+                   Shows the remaining time before the sweeper expires
+                   this approval (default 24h). Color: gray > 1h, amber
+                   5m-1h, red < 5m. The user can always override via
+                   the JSON form (params_template.timeout_seconds for
+                   plans, approval.timeout_seconds for workflows) —
+                   this column is a read-only signal of the current
+                   value, not a configurable field. #}
+                <th class="text-left px-3 py-2 font-medium text-gray-700 w-32">Auto-reject in</th>
                 <th class="text-right px-3 py-2 font-medium text-gray-700 w-44">Action</th>
             </tr>
         </thead>
@@ -74,6 +83,12 @@
                 <dd class="col-span-2 text-gray-700 tabular-nums" id="inbox-detail-created">—</dd>
                 <dt class="text-gray-500">On reject</dt>
                 <dd class="col-span-2" id="inbox-detail-on-reject">—</dd>
+                {# v3.14.0 (Phase 3 followup 6): auto-reject countdown
+                   in the detail modal. Same color logic as the list
+                   column (red < 5min, amber < 1h, gray otherwise).
+                   Tooltip explains the default + how to override. #}
+                <dt class="text-gray-500">Auto-reject in</dt>
+                <dd class="col-span-2 tabular-nums" id="inbox-detail-expires">—</dd>
             </dl>
 
             <h3 class="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-1">Summary</h3>
@@ -143,6 +158,40 @@
         return `${Math.floor(diff / 86400)}d`;
     }
 
+    // v3.14.0 (Phase 3 followup 6): "expires in X" countdown for the
+    // auto-reject column. Returns {text, color} so the row render can
+    // pick a color. < 5 min = red (urgent), < 1 hour = amber
+    // (heads up), >= 1 hour = gray (default), negative = "soon" +
+    // red (sweeper will fire on the next tick).
+    function _inboxExpiresIn(createdAt, timeoutSec) {
+        if (!createdAt || !timeoutSec || timeoutSec <= 0) {
+            return {text: '24h (default)', color: '#6b7280'};
+        }
+        const t = new Date(createdAt);
+        if (isNaN(t.getTime())) return {text: '—', color: '#6b7280'};
+        const now = Date.now();
+        const elapsed = Math.max(0, Math.floor((now - t.getTime()) / 1000));
+        const remaining = timeoutSec - elapsed;
+        if (remaining <= 0) {
+            return {text: 'imminent', color: '#dc2626'};
+        }
+        // Format: "23h 45m" / "45m" / "5m" / "45s"
+        let text;
+        if (remaining < 60) text = `${remaining}s`;
+        else if (remaining < 3600) text = `${Math.floor(remaining / 60)}m`;
+        else {
+            const h = Math.floor(remaining / 3600);
+            const m = Math.floor((remaining % 3600) / 60);
+            text = m > 0 ? `${h}h ${m}m` : `${h}h`;
+        }
+        // Color: red < 5min, amber 5min-1hr, gray otherwise
+        let color;
+        if (remaining < 300) color = '#dc2626';
+        else if (remaining < 3600) color = '#d97706';
+        else color = '#4b5563';
+        return {text, color};
+    }
+
     function _inboxOnRejectBadge(onReject) {
         // Map on_reject value to a small colored pill so the user
         // sees the consequence at a glance. stop = red (most
@@ -175,6 +224,12 @@
                 const onReject = a.on_reject || 'stop';
                 const routeNote = onReject === 'route' && a.route_to
                     ? ` → ${a.route_to}` : '';
+                // v3.14.0 (Phase 3 followup 6): "Auto-reject in" countdown.
+                // Computed client-side from created_at + timeout_seconds
+                // (both in the API response). Default 86400 (24h) is
+                // applied by the API helper when timeout_seconds is
+                // missing — so the column always shows a useful value.
+                const exp = _inboxExpiresIn(a.created_at, a.timeout_seconds);
                 const tr = document.createElement('tr');
                 tr.className = 'border-b last:border-0 hover:bg-gray-50 cursor-pointer';
                 tr.onclick = () => inboxOpenDetail(a);
@@ -187,6 +242,8 @@
                     <td class="px-3 py-2 text-gray-700 max-w-md truncate" title="${_inboxEsc(a.summary)}">${_inboxEsc(a.summary)}</td>
                     <td class="px-3 py-2">${_inboxOnRejectBadge(onReject)}${_inboxEsc(routeNote) ? `<span class="text-[10px] text-gray-500 ml-1">${_inboxEsc(routeNote)}</span>` : ''}</td>
                     <td class="px-3 py-2 text-xs text-gray-500 tabular-nums" title="${_inboxEsc(a.created_at || '')}">${_inboxTimeAgo(a.created_at)}</td>
+                    <td class="px-3 py-2 text-xs font-medium tabular-nums" style="color: ${exp.color}"
+                        title="Default 24h. Override via the JSON form on the workflow / plan (params_template.timeout_seconds for plans, approval.timeout_seconds for workflows). The supervisor sweeper expires pending approvals on every tick.">${exp.text}</td>
                     <td class="px-3 py-2 text-right">
                         <button type="button" onclick="event.stopPropagation(); inboxApprove('${_inboxEsc(a.workflow_id)}', '${_inboxEsc(a.step_name)}')"
                             class="px-2 py-0.5 text-xs font-medium rounded bg-green-600 text-white hover:bg-green-700"
@@ -235,6 +292,16 @@
             (a.on_reject === 'route' && a.route_to
                 ? ` <span class="text-xs text-gray-500">→ ${_inboxEsc(a.route_to)}</span>`
                 : '');
+        // v3.14.0 (Phase 3 followup 6): auto-reject countdown in the
+        // detail modal. Computed from created_at + timeout_seconds
+        // (the API returns timeout_seconds via _lookup_timeout_seconds
+        // enrichment; default 86400 if missing).
+        const detailExp = _inboxExpiresIn(a.created_at, a.timeout_seconds);
+        const detailExpEl = document.getElementById('inbox-detail-expires');
+        detailExpEl.textContent = detailExp.text;
+        detailExpEl.style.color = detailExp.color;
+        detailExpEl.style.fontWeight = '500';
+        detailExpEl.title = 'Default 24h. Override via the JSON form on the workflow / plan (params_template.timeout_seconds for plans, approval.timeout_seconds for workflows). The supervisor sweeper expires pending approvals on every tick.';
         document.getElementById('inbox-detail-summary').textContent = a.summary || '(empty)';
         document.getElementById('inbox-detail-payload').textContent = a.payload || '(no payload)';
         // Reset error + close
@@ -256,6 +323,18 @@
                     _inboxCurrent = d;
                     document.getElementById('inbox-detail-summary').textContent = d.summary || '(empty)';
                     document.getElementById('inbox-detail-payload').textContent = d.payload || '(no payload)';
+                    // v3.14.0 (Phase 3 followup 6): refresh the
+                    // expires countdown when the detail endpoint
+                    // returns the full timeout_seconds value (the
+                    // list view may have used the default 24h
+                    // fallback for tasks created before the helper
+                    // was added).
+                    const reExp = _inboxExpiresIn(d.created_at, d.timeout_seconds);
+                    const reEl = document.getElementById('inbox-detail-expires');
+                    if (reEl) {
+                        reEl.textContent = reExp.text;
+                        reEl.style.color = reExp.color;
+                    }
                 }
             })
             .catch(() => { /* ignore — list view is good enough */ });

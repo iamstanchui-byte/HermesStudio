@@ -137,6 +137,43 @@ async def _lookup_workflow_name(db, workflow_id: str) -> str:
     return row.get("name") or ""
 
 
+async def _lookup_timeout_seconds(db, workflow_id: str, step_name: str) -> int:
+    """Read the approval timeout (in seconds) from tasks.params._workflow_approval.
+
+    v3.14.0 (Phase 3 followup 6): the inbox UI shows the
+    "expires in" countdown so the user knows when the auto-reject
+    fires. Default is 86400 (24h) per `_build_default_approval_cfg`
+    (plan-run helper) and `validate_approval_object` (workflow
+    save-time helper). The default is duplicated here as a
+    defensive fallback so the UI never shows "expires in 0s" or
+    a NaN/empty value.
+
+    Returns the timeout in seconds, or 86400 on any failure.
+    """
+    try:
+        row = await db.fetchone(
+            "SELECT params FROM tasks WHERE project_id = ? AND name = ?",
+            (workflow_id, step_name),
+        )
+    except Exception:
+        return 86400
+    if not row:
+        return 86400
+    try:
+        params_obj = json.loads(row.get("params") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return 86400
+    if not isinstance(params_obj, dict):
+        return 86400
+    approval_cfg = params_obj.get("_workflow_approval") or {}
+    if not isinstance(approval_cfg, dict):
+        return 86400
+    ts = approval_cfg.get("timeout_seconds")
+    if not isinstance(ts, int) or ts <= 0:
+        return 86400
+    return ts
+
+
 def _get_current_user_id(request: Request) -> str:
     """Get the current user_id from the session cookie.
 
@@ -380,6 +417,9 @@ async def list_workflow_approvals(
         if r.get("status") == "pending":
             serialized["on_reject"] = await _lookup_on_reject(db, workflow_id, r["step_name"])
             serialized["route_to"] = await _lookup_route_to(db, workflow_id, r["step_name"])
+            serialized["timeout_seconds"] = await _lookup_timeout_seconds(
+                db, workflow_id, r["step_name"]
+            )
         items.append(serialized)
     return {
         "count": len(items),
@@ -424,6 +464,9 @@ async def list_inbox_approvals(
     # round-trip. Only for pending (others are history; cheap to
     # skip). N+1 query is acceptable here — pending inbox is
     # typically <20 rows; if it grows we can batch via IN().
+    #
+    # v3.14.0 (Phase 3 followup 6): also enrich with
+    # timeout_seconds for the inbox "expires in" countdown.
     items = []
     for r in rows:
         serialized = _serialize_approval_row(r)
@@ -431,6 +474,9 @@ async def list_inbox_approvals(
             serialized["workflow_name"] = await _lookup_workflow_name(db, r["workflow_id"])
             serialized["on_reject"] = await _lookup_on_reject(db, r["workflow_id"], r["step_name"])
             serialized["route_to"] = await _lookup_route_to(db, r["workflow_id"], r["step_name"])
+            serialized["timeout_seconds"] = await _lookup_timeout_seconds(
+                db, r["workflow_id"], r["step_name"]
+            )
         items.append(serialized)
     return {
         "count": len(items),
@@ -470,7 +516,14 @@ async def get_approval_detail(
     # route_to so the detail page can show the correct Reject
     # confirm message ("stop" / "skip" / "route to X"). For
     # non-pending these are still useful (audit view).
+    #
+    # v3.14.0 (Phase 3 followup 6): also enrich with
+    # timeout_seconds for the "expires in" countdown (detail modal
+    # shows it next to the on_reject row).
     out["workflow_name"] = await _lookup_workflow_name(db, apr["workflow_id"])
     out["on_reject"] = await _lookup_on_reject(db, apr["workflow_id"], apr["step_name"])
     out["route_to"] = await _lookup_route_to(db, apr["workflow_id"], apr["step_name"])
+    out["timeout_seconds"] = await _lookup_timeout_seconds(
+        db, apr["workflow_id"], apr["step_name"]
+    )
     return out
