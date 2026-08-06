@@ -1902,8 +1902,26 @@ async def suggest_vars(workflow_id: str, request: Request) -> dict:
 # `tool` and `required_capability` are task-level columns, not
 # workflow step fields; they're populated when a workflow is
 # materialized into a project, not in the template.
+#
+# v3.14.0 (Phase 3 followup 5): added `type` and `approval`.
+# The chat LLM now knows about human_approval steps
+# (per SYSTEM_PROMPT rule 13 in core/planner.py) and the
+# chat-style editor (api/projects.py:_CHAT_SYSTEM_PROMPT)
+# hints at them too — so the LLM's apply_plan_patch can
+# legitimately try to set the `type` field (e.g. flip a
+# do_task step into a human_approval step) or set the
+# `approval` sub-object (on_reject / summary_template /
+# route_to). Without these in the whitelist, the LLM's
+# patch fails with "field 'type' is not editable" and
+# the user has to edit the visual editor by hand — which
+# defeats the purpose of the chat planner. Validation of
+# the human_approval shape still happens at /plan/run time
+# (via _build_default_approval_cfg for plans, or
+# validate_human_approval_step for workflow save time), so
+# the whitelist is a gate, not the safety check.
 _EDITABLE_STEP_FIELDS = (
-    "agent_role", "action", "depends_on", "feedback_to",
+    "agent_role", "action", "type", "approval",
+    "depends_on", "feedback_to",
     "params_template", "timeout_seconds", "retry",
     "max_retries", "output_path",
 )
