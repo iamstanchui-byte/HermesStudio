@@ -196,10 +196,24 @@ document.getElementById('filter-form').addEventListener('submit', (e) => {
                         {% else %}bg-yellow-100 text-yellow-800{% endif %}">
                         {{ p.state }}
                     </span>
-                    {% set tk = token_map.get(p.id, 0) %}
-                    {% if tk %}
+                    {# v3.12.8 (Phase 5): cache-aware per-project token
+                       badge. `tk` is now a dict (true_total, api_total,
+                       prompt, cache_read, completion) rather than a
+                       bare integer — the old `token_map.get(p.id, 0)`
+                       pattern silently returned 0 for projects with
+                       no token data, which is still the default for
+                       `tk is none` paths below. #}
+                    {% set tk = token_map.get(p.id) %}
+                    {% if tk and tk.true_total %}
                     <div class="mt-1">
-                        <span class="px-2 py-0.5 text-xs rounded bg-purple-50 text-purple-700 whitespace-nowrap" title="Total LLM tokens consumed by this project across all tasks">{% if tk >= 1000000 %}{{ '%.1f' % (tk / 1000000) }}M{% else %}{{ '%.1f' % (tk / 1000) }}K{% endif %} tokens</span>
+                        <span class="px-2 py-0.5 text-xs rounded bg-purple-50 text-purple-700 whitespace-nowrap"
+                              title="True total (in + cache + out) = {{ tk.true_total }} tokens.
+API total (= in + out, EXCLUDES cache) = {{ tk.api_total }} tokens.
+  prompt (fresh): {{ tk.prompt }}
+  cache read:    {{ tk.cache_read }} ({{ (tk.cache_read * 100 / (tk.prompt + tk.cache_read))|round(0) if (tk.prompt + tk.cache_read) else 0 }}% of input, billed at ~10%)
+  completion:    {{ tk.completion }}">
+                            {% if tk.true_total >= 1000000 %}{{ '%.1f' % (tk.true_total / 1000000) }}M{% else %}{{ '%.1f' % (tk.true_total / 1000) }}K{% endif %} tokens
+                        </span>
                     </div>
                     {% endif %}
                     <div class="text-xs text-gray-500 mt-1 whitespace-nowrap">{{ p.created_at }}</div>

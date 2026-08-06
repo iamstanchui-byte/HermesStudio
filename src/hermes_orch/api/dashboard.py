@@ -1227,16 +1227,47 @@ async def projects_list_page(
     # Per-project token totals — single grouped query (subquery) so we
     # don't issue N+1. Used to show "X tokens" badge on each row in the
     # list. Empty dict means no rows (e.g. brand-new project).
+    #
+    # v3.12.8 (Phase 5): cache-aware. We pull prompt / cache_read /
+    # completion in the same query and compute `true_total` in Python
+    # (= prompt + cache + completion = "tokens the model actually
+    # saw"). The legacy `total` field (= API total, EXCLUDES cache)
+    # is kept so the template can show it as a sub-line for reference.
+    # Without this fix, the projects list "X tokens" badge was
+    # showing API total, which is misleading now that the global
+    # token_usage page + the project detail page use true_total —
+    # the same project would show different numbers on different
+    # pages.
     if projects:
         proj_ids = [p["id"] for p in projects]
         placeholders = ",".join("?" for _ in proj_ids)
         token_rows = await db.fetchall(
-            f"SELECT project_id, COALESCE(SUM(total_tokens), 0) AS total "
+            f"SELECT project_id, "
+            f"COALESCE(SUM(total_tokens), 0) AS total, "
+            f"COALESCE(SUM(prompt_tokens), 0) AS prompt, "
+            f"COALESCE(SUM(cache_read_tokens), 0) AS cache_read, "
+            f"COALESCE(SUM(completion_tokens), 0) AS completion "
             f"FROM token_usage WHERE project_id IN ({placeholders}) "
             f"GROUP BY project_id",
             tuple(proj_ids),
         )
-        token_map = {r["project_id"]: int(r["total"] or 0) for r in token_rows}
+        token_map = {}
+        for r in token_rows:
+            api_total = int(r["total"] or 0)
+            prompt = int(r["prompt"] or 0)
+            cache_read = int(r["cache_read"] or 0)
+            completion = int(r["completion"] or 0)
+            token_map[r["project_id"]] = {
+                # true_total is the headline number now
+                # (= prompt + cache + completion).
+                "true_total": prompt + cache_read + completion,
+                # API total kept as sub-line / tooltip reference
+                # (= prompt + completion, EXCLUDES cache).
+                "api_total": api_total,
+                "prompt": prompt,
+                "cache_read": cache_read,
+                "completion": completion,
+            }
     else:
         token_map = {}
     # Profiles for the "Coordinator role" dropdown in the create form
