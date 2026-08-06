@@ -351,28 +351,31 @@
    descendants don't accidentally close the modal. #}
 <div id="profile-modal" class="modal-overlay" style="display: none;"
      onclick="if(event.target===this) closeProfileModal()">
-    {# v3.7.2 + v3.13.1: fixed-height modal so all 5 tabs (Overview / MCP /
-       Skills / Storage / Capabilities) are visually consistent.
-       Previously the card's height followed its content — the Skills
-       tab (77 entries) was ~600px tall while Overview / MCP / Storage
-       (~280px) shrank to match, so switching tabs made the modal
-       "jitter" up and down.
+    {# v3.13.2: revert fixed-height to auto-height. v3.13.1 made it
+       fixed 720px to stop tab-switch jitter, but the user found the
+       resulting empty space at the bottom (Capabilities tab is ~300px
+       of content, leaves ~400px of empty card) worse than the jitter.
+       So: modal height is now auto (= sum of header + tab bar +
+       content) capped by max-height: 88vh so a long Skills tab (77
+       entries in 2-col) still scrolls inside instead of overflowing
+       the viewport. Width bumped 720 → 800px because the 2-col skills
+       grid at 720px left <174px per cell for the skill name + size +
+       status pill + action buttons, which clipped the right side.
+       800px gives ~374px per cell, enough for "applied" pill + "→"
+       "×" buttons + a long skill name without truncation.
 
-       Mechanism: a flex column where the header and tab bar use
-       `flex-shrink-0` (fixed size) and the content fills remaining
-       space and scrolls when needed (`flex: 1; min-height: 0;
-       overflow-y: auto`). We override the base `.modal-card`'s
-       `overflow-y: auto` with `overflow: hidden` here so the card
-       itself never scrolls — only the inner content does, keeping
-       the header and tab bar pinned at the top.
+       Mechanism (unchanged from v3.7.2): flex column with `flex-shrink-0`
+       on header + tab bar and `flex: 1; min-height: 0; overflow-y: auto`
+       on the content area, so the content fills the remaining flex
+       space and scrolls when the modal hits 88vh. We override the base
+       `.modal-card`'s `overflow-y: auto` with `overflow: hidden` so the
+       card itself never scrolls — only the inner content does, keeping
+       the header and tab bar pinned.
 
-       v3.13.1: bumped height 600 → 720px (user feedback "modal too
-       small after adding root path section, scroll bar shows").
-       720px is the tallest comfortable content (Skills tab 77
-       entries); `max-height: 88vh` caps the card on short
-       viewports. #}
+       Trade-off: tab-switch height will jitter again (Overview ~350px
+       vs Skills ~792px). User explicitly chose this over empty space. #}
     <div class="modal-card"
-         style="width: 720px; max-width: 92vw; height: 720px; max-height: 88vh; padding: 0; display: flex; flex-direction: column; overflow: hidden;">
+         style="width: 800px; max-width: 92vw; max-height: 88vh; padding: 0; display: flex; flex-direction: column; overflow: hidden;">
         <div class="px-5 py-3 border-b flex items-center justify-between flex-shrink-0">
             <div>
                 <div class="text-xs text-gray-500 uppercase tracking-wide">Profile settings</div>
@@ -944,8 +947,13 @@ function renderSkillsTab(profile, content) {
     if (skills.length === 0) {
         html += `<div class="text-xs text-gray-400 italic">No skills applied yet.</div>`;
     } else {
-        const visible = 10;
-        html += `<div class="space-y-1" id="skills-list">`;
+        // v3.13.2: 2-column grid so profiles with 15-20 skills
+        // (e.g. win-agent01 with 77 SKILL.md) fit in the modal
+        // without scrolling. Each grid cell is one skill, the
+        // name+size+status+actions are the same as the 1-col
+        // version but with smaller padding to fit 2 across.
+        const visible = 100;  // effectively no hidden-by-default limit
+        html += `<div class="grid grid-cols-2 gap-x-3 gap-y-0.5" id="skills-list">`;
         skills.forEach((s, i) => {
             const parts = (s.file_path || '').split('/');
             const name = parts.length >= 2 ? parts[parts.length - 2] : (s.file_path || 'unknown');
@@ -953,8 +961,8 @@ function renderSkillsTab(profile, content) {
             // Only render size when known (>0). Otherwise leave a
             // spacer of the same width so the status pill still aligns.
             const sizeHtml = sizeBytes > 0
-                ? `<span class="text-[10px] text-gray-400 w-14 text-right">${(sizeBytes / 1024).toFixed(1)} KB</span>`
-                : `<span class="w-14"></span>`;
+                ? `<span class="text-[10px] text-gray-400 w-12 text-right">${(sizeBytes / 1024).toFixed(1)} KB</span>`
+                : `<span class="w-12"></span>`;
             const status = s.status || 'unknown';
             const statusClass = status === 'applied' ? 'pill-healthy' : 'pill-degraded';
             // Rows past `visible` are hidden by default; the toggle
@@ -980,11 +988,11 @@ function renderSkillsTab(profile, content) {
                         class="skill-action-btn text-red-600 hover:text-red-800 dark:text-red-400">×</button>
             `;
             html += `
-                <div class="flex items-center gap-2${hiddenCls}" data-skill-idx="${i}">
-                    <span class="font-mono text-[11px] flex-1 truncate">${escapeHtml(name)}</span>
+                <div class="flex items-center gap-1.5${hiddenCls}" data-skill-idx="${i}">
+                    <span class="font-mono text-[11px] flex-1 truncate" title="${escapeAttr(name)}">${escapeHtml(name)}</span>
                     ${sizeHtml}
                     <span class="pill-status ${statusClass}" style="font-size: 0.65rem; padding: 0 0.3rem;">${escapeHtml(status)}</span>
-                    <span class="flex items-center gap-1">${actionsHtml}</span>
+                    <span class="flex items-center gap-0.5">${actionsHtml}</span>
                 </div>
             `;
         });
