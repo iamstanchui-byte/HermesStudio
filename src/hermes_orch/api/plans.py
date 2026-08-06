@@ -2318,6 +2318,15 @@ async def generate_plan_from_llm(
             name=name,
             agent_role=str(t.get("agent_role") or ""),
             action=str(t.get("action") or "do_task"),
+            # v3.14.0 (Phase 3 followup 4): pass through the LLM's
+            # `type` field. The LLM may set "human_approval" when
+            # the goal explicitly asks for a confirmation/review
+            # step (per Planner.SYSTEM_PROMPT rule 13). The
+            # PlanStep model defaults to "" (= "do_task"), so
+            # omitting the field for ordinary tasks keeps the
+            # saved plan JSON clean (the "type":"do_task" is the
+            # default; not worth writing everywhere).
+            type=str(t.get("type") or ""),
             skill="",
             tool="",
             required_capability=str(t.get("required_capability") or ""),

@@ -3241,6 +3241,19 @@ project page.
     planner LLM to generate the structured plan. You just
     describe the IDEA; the planner makes it concrete.
 
+# v3.14.0: human_approval step
+  When the user's request EXPLICITLY mentions a confirmation,
+  review, sign-off, or human approval step (e.g. "review
+  before sending", "wait for me to approve", "human approval
+  step", "之後有個 human approval step 確認後再 send"), call
+  this out in your prose so the planner LLM sees the intent
+  and generates a `type: "human_approval"` step at the right
+  position. E.g. "Step 2 will pause for human approval before
+  step 3 sends the result to Telegram."
+  Do NOT add human_approval steps when the user doesn't ask
+  for one — the LLM planner has the same rule (SYSTEM_PROMPT
+  rule 13). Most plans should not have any.
+
 # What you MUST NEVER do
   - NEVER output JSON / code blocks / DAG diagrams
   - NEVER create tasks directly (no `create_task` suggestion)

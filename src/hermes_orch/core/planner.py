@@ -40,6 +40,7 @@ Output format (STRICT — output ONLY this JSON object, no prose, no markdown):
       "agent_role": "<must be one of the available roles>",
       "depends_on": ["<name of an earlier task>", ...],
       "action": "<verb or function name the agent will run>",
+      "type": "<OPTIONAL 'human_approval' for confirmation/review steps. Default: 'do_task'. Omit for ordinary agent tasks.>",
       "params": { "<key>": "<value>", ... },
       "required_capability": "<capability key the role MUST have, or null>",
       "default_soul": "<OPTIONAL 2-4 sentence persona text. NOT required \u2014 a dedicated LLM call at 'Generate Task' time writes project-specific personas with full project context. Only set this if you have a strong opinion about the persona; otherwise leave empty or set to null.>"
@@ -92,6 +93,31 @@ Rules:
     it burned planner-token budget on a field the dedicated LLM
     call can produce more accurately given the same project
     context.
+13. HUMAN APPROVAL (v3.14.0, OPTIONAL \u2014 use ONLY when the
+    user's goal explicitly asks for human-in-the-loop):
+    When the goal EXPLICITLY mentions a confirmation / review /
+    approval / sign-off step (e.g. "review before sending",
+    "wait for human approval before publishing", "after X, get
+    human approval", "之後有個 human approval step 確認後再
+    send"), insert a step with `"type": "human_approval"`.
+    Conventions:
+      - name: `approve-<thing>` or `review-<thing>` (kebab-case)
+      - action: still a short snake_case verb describing the gate
+        (e.g. "await_approval", "manual_review"). The action is
+        kept for human-readable display; the runtime uses `type`
+        to know this is a human_approval step.
+      - depends_on: the step that produces the artifact to review
+      - params: at minimum `{"on_reject": "stop"}` (default
+        behavior on Reject = stop the entire workflow). Other
+        valid values: "skip" (treat as skipped, downstream still
+        runs) or "route" (re-route to another step \u2014 must
+        ALSO set "route_to" to the destination step's name).
+      - DO NOT set `default_soul` on a human_approval step (no
+        agent runs it; the operator clicks Approve/Reject in the
+        dashboard inbox).
+    IMPORTANT: do NOT add human_approval steps unless the user
+    EXPLICITLY asks. Most plans should have zero. When in doubt,
+    omit `type` and let the user add it via the visual editor.
 """
 
 
@@ -101,6 +127,31 @@ Rules:
 # needs the gist to plan; concrete values still go in task params from
 # the full goal.
 GOAL_PROMPT_CHARS = 200
+
+
+# v3.14.0 (Phase 3 followup 4): valid `type` values for a planner
+# step. Mirrors the visual editor's dropdown options (do_task /
+# human_approval). The validator below maps anything else to the
+# default (do_task) — we don't fail the whole plan just because the
+# LLM hallucinated a type. v3.14.0+ will add more types.
+_VALID_STEP_TYPES = ("do_task", "human_approval")
+
+
+def _validated_step_type(raw: object) -> str:
+    """Sanitize an LLM-supplied `type` field for a planner step.
+
+    Whitelist check: the LLM is free to invent strings, but the
+    runtime only knows a fixed set of values. Anything outside the
+    whitelist is silently coerced to "do_task" so the plan doesn't
+    fail. The LLM prompt (SYSTEM_PROMPT rule 13) only mentions
+    "human_approval" so this is a defensive guard, not a hot path.
+    """
+    if not isinstance(raw, str):
+        return "do_task"
+    s = raw.strip()
+    if s in _VALID_STEP_TYPES:
+        return s
+    return "do_task"
 
 
 USER_PROMPT_TEMPLATE = """\
@@ -667,6 +718,15 @@ class Planner:
                 "depends_on": deps,
                 "action": t["action"],
                 "params": params,
+                # v3.14.0 (Phase 3 followup 4): pass through the LLM's
+                # `type` field. The LLM can set this to "human_approval"
+                # when the user's goal explicitly asks for a
+                # confirmation/review step (per SYSTEM_PROMPT rule 13).
+                # Default is "do_task" (matches the PlanStep model's
+                # default; the v3.14.0 plan-run path treats both
+                # "do_task" and "" as the same). Validate the value
+                # to prevent the LLM from setting arbitrary strings.
+                "type": _validated_step_type(t.get("type")),
             })
         if not out:
             raise RuntimeError("LLM plan produced 0 tasks")
