@@ -396,6 +396,27 @@
     body.dark .vf-palette-chip:hover {
         background: #1d4ed8;       /* blue-700 */
     }
+    /* v3.14.0 (Phase 3): human_approval palette chip — visually
+       distinct from the 4 do_task chips (amber palette mirroring
+       the node card marker + the plan editor's matching chip).
+       The 4 base chips stay blue (vf-palette-chip); this one
+       adds a second class for the color override. */
+    .vf-palette-chip.vf-palette-chip-approval {
+        background: #fffbeb;
+        border-color: #fbbf24;
+        color: #92400e;
+    }
+    .vf-palette-chip.vf-palette-chip-approval:hover {
+        background: #fef3c7;
+    }
+    body.dark .vf-palette-chip.vf-palette-chip-approval {
+        background: #422006;
+        border-color: #f59e0b;
+        color: #fcd34d;
+    }
+    body.dark .vf-palette-chip.vf-palette-chip-approval:hover {
+        background: #78350f;
+    }
     /* Save status banner */
     body.dark .vf-save-banner.success {
         background: #064e3b;       /* emerald-900 */
@@ -642,13 +663,25 @@
 </div>
 
 {# Add Step palette (Phase 1.4 in design). 4 templates pre-fill a
-   new step card. Phase 1 skeleton ships the chips + a stub handler. #}
+   new step card. Phase 1 skeleton ships the chips + a stub handler.
+
+   v3.14.0 (Phase 3): added a 5th chip `human_approval` that
+   pre-fills the step with `type: "human_approval"` and a
+   placeholder action. Clicking it adds a step that pauses the
+   workflow for the operator (see the inbox UI for Approve /
+   Reject). The amber color marks it as a different step type
+   from the 4 do_task templates. The `approval` sub-object
+   (on_reject / summary_template / etc.) is still configured
+   in the side panel after adding. Mirrors the plan editor's
+   matching chip (visual_plan.html) so the two editors read
+   the same way. #}
 <div class="bg-white border rounded-lg p-2 mb-2 flex items-center gap-2">
     <span class="text-xs font-semibold text-gray-700">Add step:</span>
     <span class="vf-palette-chip" data-template="search">search</span>
     <span class="vf-palette-chip" data-template="analyze">analyze</span>
     <span class="vf-palette-chip" data-template="audit">audit</span>
     <span class="vf-palette-chip" data-template="write">write</span>
+    <span class="vf-palette-chip vf-palette-chip-approval" data-template="human_approval">⏸ human_approval</span>
     <span class="text-xs text-gray-400 ml-2">click to add (chain-mode: auto-wires to last step)</span>
 </div>
 

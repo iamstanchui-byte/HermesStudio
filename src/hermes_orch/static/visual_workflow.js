@@ -1642,11 +1642,26 @@
         // 4 palette templates. The base shape is the same; the action
         // and skill differ. We pick a unique name by appending a
         // numeric suffix (collision-checked against existing names).
+        //
+        // v3.14.0 (Phase 3): added human_approval — pre-fills the
+        // step with `type: "human_approval"` and a placeholder
+        // action. The runtime recognizes the step by its `type`
+        // field (not by action). The `approval` sub-object
+        // (on_reject / summary_template / etc.) is configured in
+        // the side panel after adding — we don't pre-fill a default
+        // summary_template because that's user-specific copy.
+        // agent_role stays "win-agent01" by default for consistency
+        // with the other templates, but the user can change it
+        // (the runtime ignores agent_role for human_approval steps
+        // — no agent runs them).
         const baseNames = {
             search:  { action: 'fetch_url',     skill: '' },
             analyze: { action: 'summarize',     skill: '' },
             audit:   { action: 'audit_check',   skill: '' },
             write:   { action: 'write_output',  skill: '' },
+            // human_approval gets a descriptive action. The actual
+            // step type is set below; this is just for display.
+            human_approval: { action: 'manual_review', skill: '' },
         };
         const cfg = baseNames[tmpl] || { action: 'do_thing', skill: '' };
         let n = 1;
@@ -1655,7 +1670,7 @@
             n += 1;
             name = `${tmpl}-${n}`;
         }
-        return {
+        const step = {
             name,
             agent_role: 'win-agent01',
             action: cfg.action,
@@ -1664,6 +1679,14 @@
             output_path: `out/${name}.json`,
             skill: cfg.skill,
         };
+        // v3.14.0 (Phase 3): human_approval chip sets the type
+        // explicitly. Without this, the step would default to
+        // do_task and the supervisor would dispatch an agent
+        // task instead of creating an inbox approval.
+        if (tmpl === 'human_approval') {
+            step.type = 'human_approval';
+        }
+        return step;
     }
 
     function openSidePanel(nodeId) {
