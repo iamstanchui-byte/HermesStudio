@@ -85,6 +85,17 @@ class PlanStep(BaseModel):
     # can interpret. Free-form prose is also accepted but the
     # canonical form is short and verb-first.
     action: str = Field(..., min_length=1, max_length=200)
+    # v3.14.0 (Phase 3 followup 3): type — execution type. Default
+    # is "do_task" (legacy behavior). "human_approval" pauses the
+    # workflow and creates an inbox approval request when the plan
+    # is materialized into tasks via /plan/run. The `action` field
+    # is preserved as a human-readable description, but the task's
+    # `action` is overridden to "human_approval" at /plan/run time
+    # so the supervisor gate can recognize it (mirrors the
+    # workflow runner's behavior in api/workflows.py:run_workflow).
+    # Optional so existing plans round-trip cleanly. Empty string
+    # = "do_task" (treated as default).
+    type: str = ""
     skill: str = ""  # canonical skill name (not row id)
     tool: str = ""   # canonical tool name (not row id)
     required_capability: str = ""
@@ -1450,6 +1461,77 @@ async def reset_plan_to_planned(
     )
 
 
+# ===== v3.14.0 (Phase 3 followup 3): human_approval default cfg builder =====
+
+
+def _build_default_approval_cfg(
+    step: PlanStep,
+    params: dict,
+    db: Any,
+    project_id: str,
+) -> dict:
+    """Construct a `_workflow_approval` config from a project plan step.
+
+    v3.14.0 project plans don't require a full `approval` object
+    (unlike workflow packages, which validate `summary_template` at
+    save time). For plan runs, we auto-construct the approval cfg
+    from the step's params_template + sensible defaults. This keeps
+    the UX simple — the user can mark a step as `type:
+    "human_approval"` and just put `on_reject: "stop"` in
+    params_template, and the system fills in the rest.
+
+    Defaults (when not in params_template):
+      - summary_template: "Please review step: {step.name}"
+      - on_reject: "stop"
+      - route_to: "" (only meaningful when on_reject=route)
+      - timeout_seconds: 86400 (24h)
+      - params_template: a string→string hint dict (not the same as
+        the task's params_template — just describes what vars the
+        summary_template wants to use)
+
+    Returns the cfg dict that gets stashed in
+    `task.params._workflow_approval` for the supervisor /
+    approval_runtime to read.
+    """
+    user_on_reject = (
+        (params.get("on_reject") or "stop").strip().lower()
+    )
+    if user_on_reject not in ("stop", "skip", "route"):
+        user_on_reject = "stop"
+    user_route_to = (params.get("route_to") or "").strip()
+    user_summary = (params.get("summary_template") or "").strip()
+    if not user_summary:
+        # Default summary — just the step name. The user can edit
+        # this in the project's plan JSON form (the visual editor
+        # doesn't expose the approval object yet, that's v3.14.0+
+        # future work). On Reject confirm dialog, the default
+        # message still works (we read the result via
+        # create_approval_request which renders the template).
+        user_summary = f"Please review step: {step.name}"
+    # Build the params_template hint from the user's params, minus
+    # the keys we already extracted. The runtime
+    # render_summary_template uses this to know which {{var}} to
+    # substitute. We just record the keys as type=string; richer
+    # type info is in the user's params_template on the plan step.
+    hint_keys = {
+        k: {"type": "string", "description": f"From {step.name}.{k}"}
+        for k in params.keys()
+        if k not in ("on_reject", "route_to", "summary_template",
+                     "_workflow_skill", "_workflow_approval")
+    }
+    try:
+        timeout = int(params.get("timeout_seconds") or 86400)
+    except (ValueError, TypeError):
+        timeout = 86400
+    return {
+        "summary_template": user_summary,
+        "on_reject": user_on_reject,
+        "route_to": user_route_to,
+        "timeout_seconds": timeout,
+        "params_template": hint_keys,
+    }
+
+
 # ===== Phase B: materialize plan → tasks (POST /api/projects/{id}/plan/run) =====
 
 
@@ -1695,6 +1777,34 @@ async def run_project_plan(
             task_name = f"{task_name}{body.name_suffix}"
         # params stored as JSON. No variable substitution in Phase B.
         params = dict(step.params_template or {})
+        # v3.14.0 (Phase 3 followup 3): if this step is a
+        # human_approval step, force the task's action to the
+        # magic string "human_approval" and stash the approval
+        # config in params._workflow_approval. This mirrors what
+        # the workflow runner does in api/workflows.py:run_workflow
+        # and is what the supervisor's gate in
+        # core/supervisor.py:_handle_execution looks for. Without
+        # this conversion, a project plan with `type: "human_approval"`
+        # would not trigger the approval flow — the task's action
+        # would just be the user's free-form description
+        # (e.g. "await_human_approval").
+        #
+        # The approval config is auto-constructed from the step's
+        # params_template + sensible defaults. We use defaults
+        # rather than requiring the user to provide a full
+        # `approval` object (workflows have this; project plans
+        # are a lighter-weight authoring surface where the user
+        # is more likely to want "just make it work with
+        # on_reject=stop" than to write a full summary template).
+        step_type = (step.type or "do_task").strip() or "do_task"
+        if step_type == "human_approval":
+            task_action = "human_approval"
+            approval_cfg = _build_default_approval_cfg(
+                step, params, db, project_id,
+            )
+            params["_workflow_approval"] = approval_cfg
+        else:
+            task_action = step.action or "do_task"
         # Skill / tool name carry-through (Object Layer refs).
         # Mirrors apply-workflow's _workflow_skill param convention
         # so the supervisor can resolve at dispatch time.
@@ -1709,7 +1819,7 @@ async def run_project_plan(
             "on_parent_failure": "skip",
             "status": "pending",
             "priority": "normal",
-            "action": step.action or "do_task",
+            "action": task_action,
             "params": json.dumps(params),
             "retry_count": 0,
             "max_retries": 2,
