@@ -409,8 +409,14 @@
         <span class="text-base">📊</span>
         <div class="flex-1 text-left">
             <div class="font-medium text-sm text-gray-800">Analytics (token usage, last 7 days)</div>
+            {# v3.12.8: use true_total (= prompt + cache + completion)
+               for the summary line so cache is part of the headline
+               number, not a hidden add-on. The % sub-line below
+               also uses true_total as the denominator so Input %
+               + Output % + Cache % always add to 100% (within
+               rounding). #}
             <div class="text-xs text-gray-500 mt-0.5">
-                {{ token_usage.totals["7d"].total|format_tokens }} tokens ·
+                {{ token_usage.totals["7d"].true_total|format_tokens }} tokens ·
                 {{ token_usage.totals["7d"].calls }} calls ·
                 {{ token_usage.by_model|length }} model{{ '' if token_usage.by_model|length == 1 else 's' }} ·
                 {{ token_usage.by_provider|length }} provider{{ '' if token_usage.by_provider|length == 1 else 's' }}
@@ -422,22 +428,30 @@
         <div class="kpi-grid-4 mb-4">
             <div class="kpi">
                 <div class="kpi-label">Total (7d)</div>
-                <div class="kpi-value">{{ token_usage.totals["7d"].total|format_tokens }}</div>
-                <div class="kpi-sub">{{ token_usage.totals["7d"].calls }} calls</div>
+                {# v3.12.8: true_total for the headline. #}
+                <div class="kpi-value">{{ token_usage.totals["7d"].true_total|format_tokens }}</div>
+                <div class="kpi-sub">{{ token_usage.totals["7d"].calls }} calls · API {{ token_usage.totals["7d"].total|format_tokens }}</div>
             </div>
             <div class="kpi">
                 <div class="kpi-label">Input (7d)</div>
-                <div class="kpi-value">{{ token_usage.totals["7d"].prompt|format_tokens }}</div>
-                <div class="kpi-sub">{{ ((token_usage.totals["7d"].prompt / token_usage.totals["7d"].total * 100) if token_usage.totals["7d"].total else 0)|round(1) }}% of total</div>
+                {# v3.12.8: input = prompt + cache (both are input the
+                   model received). % is now of true_total. #}
+                {% set _t7 = token_usage.totals["7d"] %}
+                {% set _inp = _t7.prompt + _t7.cache_read %}
+                <div class="kpi-value">{{ _inp|format_tokens }}</div>
+                <div class="kpi-sub">
+                    <span class="text-emerald-700">{{ _t7.cache_read|format_tokens }} cached</span> ·
+                    {{ ((_inp / _t7.true_total * 100) if _t7.true_total else 0)|round(1) }}% of total
+                </div>
             </div>
             <div class="kpi">
                 <div class="kpi-label">Output (7d)</div>
                 <div class="kpi-value">{{ token_usage.totals["7d"].completion|format_tokens }}</div>
-                <div class="kpi-sub">{{ ((token_usage.totals["7d"].completion / token_usage.totals["7d"].total * 100) if token_usage.totals["7d"].total else 0)|round(1) }}% of total</div>
+                <div class="kpi-sub">{{ ((token_usage.totals["7d"].completion / token_usage.totals["7d"].true_total * 100) if token_usage.totals["7d"].true_total else 0)|round(1) }}% of total</div>
             </div>
             <div class="kpi">
                 <div class="kpi-label">24h</div>
-                <div class="kpi-value">{{ token_usage.totals["24h"].total|format_tokens }}</div>
+                <div class="kpi-value">{{ token_usage.totals["24h"].true_total|format_tokens }}</div>
                 <div class="kpi-sub">{{ token_usage.totals["24h"].calls }} calls</div>
             </div>
         </div>

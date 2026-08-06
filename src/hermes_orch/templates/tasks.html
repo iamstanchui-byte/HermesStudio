@@ -369,6 +369,42 @@ async function submitNewTask() {
             </div>
             <div></div>
         </div>
+        {# v3.12.8 (Phase 5): per-task token usage. Same shape as
+           project.html. Only render when this task has at least one
+           LLM call recorded. The breakdown: in (new) + cache hit +
+           out. total_processed = in + cache + out (the "tokens the
+           model actually saw"). We intentionally do NOT show the
+           provider's api_total (= in + out, EXCLUDES cache) — see
+           design note in dashboard.py project_page. #}
+        {% set tu = tasks_token_usage.get(task.id) %}
+        {% if tu and tu.n_calls and tu.n_calls > 0 %}
+        <div class="mt-2 text-xs text-gray-500 flex items-center gap-2 flex-wrap"
+             title="Token usage for this task across {{ tu.n_calls }} LLM call(s).
+In (new) = prompt billed at full rate.
+Cache hit = prompt served from cache (billed at ~10% of fresh input).
+Out = completion tokens.
+Total = in + cache + out (the 'tokens the model actually saw').">
+            <span class="text-gray-400">🪙</span>
+            <span class="font-mono font-semibold text-gray-700"
+                  data-testid="tasks-page-tokens-total">{{ tu.total_processed|format_tokens }}</span>
+            <span class="text-gray-400">total</span>
+            <span class="text-gray-300">·</span>
+            <span class="text-gray-500">in</span>
+            <span class="font-mono text-gray-700">{{ tu.in_new|format_tokens }}</span>
+            <span class="text-gray-300">·</span>
+            <span class="text-gray-500">cache</span>
+            <span class="font-mono text-emerald-700"
+                  title="Cache hit = {{ tu.cache_hit|format_tokens }} tokens ({{ (tu.cache_pct * 100)|round(1) }}% of input). Billed at ~10% of fresh input — these are savings.">
+                {{ tu.cache_hit|format_tokens }}
+                <span class="text-emerald-500 text-[10px]">({{ (tu.cache_pct * 100)|round(0) }}%)</span>
+            </span>
+            <span class="text-gray-300">·</span>
+            <span class="text-gray-500">out</span>
+            <span class="font-mono text-amber-700">{{ tu.out|format_tokens }}</span>
+            <span class="text-gray-300">·</span>
+            <span class="text-gray-400 text-[10px]">{{ tu.n_calls }} call{{ '' if tu.n_calls == 1 else 's' }}</span>
+        </div>
+        {% endif %}
         {% if task.error %}
         <div class="mt-2 text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2">
             {{ task.error }}

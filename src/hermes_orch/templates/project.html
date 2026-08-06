@@ -98,9 +98,16 @@
                     {{ project.state }}
                 </span>
                 {% if token_total %}
+                {# v3.12.8: show token_true_total (= in + cache + out)
+                   as the headline so the project header matches the
+                   per-task rows below. Tooltip still includes the
+                   legacy `token_total` (= API total, EXCLUDES cache)
+                   + the per-call_kind breakdown. #}
                 <span class="px-2 py-0.5 text-xs font-medium rounded-full border bg-purple-50 text-purple-700 border-purple-200"
-                    title="Total LLM tokens consumed by this project. Breakdown: {% for b in token_breakdown %}{{ b['call_kind'] }}={{ b['total'] }}{% if not loop.last %}, {% endif %}{% endfor %}">
-                    {{ '%.1f' % (token_total / 1000) }}K tokens
+                    title="True total (in + cache + out) for this project: {{ token_true_total }} tokens.
+API total (= in + out, EXCLUDES cache): {{ token_total }} tokens.
+Breakdown by call_kind: {% for b in token_breakdown %}{{ b['call_kind'] }}=API {{ b['total'] }}{% if not loop.last %}, {% endif %}{% endfor %}">
+                    {{ '%.1f' % (token_true_total / 1000) }}K tokens
                 </span>
                 {% endif %}
             </div>
@@ -766,6 +773,49 @@ they target different agent profiles. -->
                     </span>
                 </div>
             </div>
+            {# v3.12.8 (Phase 5): per-task token usage. Only render the
+               row when this task has at least one LLM call recorded in
+               the token_usage table (n_calls > 0). Empty for tasks that
+               never reached an LLM (e.g. early-pending, cancelled before
+               dispatch). The breakdown is:
+                 - in (new)  : prompt_tokens the provider billed at full rate
+                 - cache hit : cache_read_input_tokens (Anthropic prompt cache
+                               hit, billed at ~10% of fresh input)
+                 - out       : completion_tokens (billed at output rate)
+                 - total     : sum of all three = "tokens the model saw"
+               Note: we intentionally do NOT show the provider's
+               usage.total_tokens (which is in + out, EXCLUDING cache)
+               because it is misleading next to a non-zero cache number.
+               See v3.12.8 design note in the dashboard.py handler. #}
+            {% set tu = task_token_usage.get(t.id) %}
+            {% if tu and tu.n_calls and tu.n_calls > 0 %}
+            <div class="text-xs text-gray-500 mt-1 flex items-center gap-2 flex-wrap"
+                 title="Token usage for this task across {{ tu.n_calls }} LLM call(s).
+In (new) = prompt billed at full rate.
+Cache hit = prompt served from cache (billed at ~10% of fresh input).
+Out = completion tokens.
+Total = in + cache + out (the 'tokens the model actually saw' — the provider's API total is in + out and EXCLUDES cache, so it is not shown here).">
+                <span class="text-gray-400">🪙</span>
+                <span class="font-mono font-semibold text-gray-700"
+                      data-testid="task-tokens-total">{{ tu.total_processed|format_tokens }}</span>
+                <span class="text-gray-400">total</span>
+                <span class="text-gray-300">·</span>
+                <span class="text-gray-500">in</span>
+                <span class="font-mono text-gray-700">{{ tu.in_new|format_tokens }}</span>
+                <span class="text-gray-300">·</span>
+                <span class="text-gray-500">cache</span>
+                <span class="font-mono text-emerald-700"
+                      title="Cache hit = {{ tu.cache_hit|format_tokens }} tokens ({{ (tu.cache_pct * 100)|round(1) }}% of input). Billed at ~10% of fresh input — these are savings.">
+                    {{ tu.cache_hit|format_tokens }}
+                    <span class="text-emerald-500 text-[10px]">({{ (tu.cache_pct * 100)|round(0) }}%)</span>
+                </span>
+                <span class="text-gray-300">·</span>
+                <span class="text-gray-500">out</span>
+                <span class="font-mono text-amber-700">{{ tu.out|format_tokens }}</span>
+                <span class="text-gray-300">·</span>
+                <span class="text-gray-400 text-[10px]">{{ tu.n_calls }} call{{ '' if tu.n_calls == 1 else 's' }}</span>
+            </div>
+            {% endif %}
             {% if t.error %}
             <div class="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mt-1">
                 {{ t.error }}

@@ -580,7 +580,23 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
         # completion: 0.5M, total: 1.7M, calls: 312}, ...]
         "daily_breakdown": [],
     }
-    # Totals for each window
+    # Totals for each window.
+    #
+    # v3.12.8 (Phase 5) — cache-aware totals. The `total` field is what
+    # the LLM provider reports as usage.total_tokens (= prompt + output,
+    # EXCLUDING cache_read_input_tokens). The new `true_total` field
+    # is the "tokens the model actually saw" = prompt + cache_read +
+    # completion. Without this fix, the dashboard can show a single
+    # task with `cache_read` > `total` (looks like a bug) and the
+    # input/output percentages as % of API total (misleading — the
+    # real input billed is prompt + cache_read, and the "true total"
+    # the operator cares about includes cache).
+    #
+    # Both fields are kept so existing consumers (e.g. the project
+    # page header that shows "X tokens" as a quick KPI) keep
+    # working; the new template uses `true_total` for the headline
+    # number. External JSON consumers can still read `total` (= API
+    # total) and add `cache_read` to get the true number.
     for window, cutoff in cutoffs.items():
         row = await db.fetchone(
             "SELECT COALESCE(SUM(total_tokens),0) as total, "
@@ -590,50 +606,105 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
             "COUNT(*) as calls FROM token_usage WHERE created_at >= ?",
             (cutoff,),
         )
+        prompt_v = int(row["prompt"]) if row else 0
+        completion_v = int(row["completion"]) if row else 0
+        cache_read_v = int(row["cache_read"]) if row else 0
         out["totals"][window] = {
+            # Provider-reported total (= input + output, EXCLUDES cache).
             "total": int(row["total"]) if row else 0,
-            "prompt": int(row["prompt"]) if row else 0,
-            "completion": int(row["completion"]) if row else 0,
-            "cache_read": int(row["cache_read"]) if row else 0,  # v3.1.2
+            "prompt": prompt_v,
+            "completion": completion_v,
+            "cache_read": cache_read_v,  # v3.1.2
+            # v3.12.8: true total = prompt + cache_read + completion.
+            # This is the "tokens the model actually saw" — the right
+            # number to display in the headline KPI. Cache hit tokens
+            # are billed at ~10% of fresh input but they ARE tokens
+            # the provider processed, so they belong in the total.
+            "true_total": prompt_v + cache_read_v + completion_v,
             "calls": int(row["calls"]) if row else 0,
         }
     cutoff_7d = cutoffs["7d"]
-    # by_model (7d)
+    # by_model (7d). v3.12.8: also fetch prompt / cache_read so we
+    # can compute true_total per model (sorting by true_total, not
+    # API total, so the ranking is "tokens the model actually
+    # served" rather than "tokens the model charged for at full
+    # rate").
     out["by_model"] = [
-        {"model": r["model"], "total": int(r["total"] or 0), "calls": int(r["calls"] or 0)}
+        {
+            "model": r["model"],
+            "total": int(r["total"] or 0),       # API total
+            "prompt": int(r["prompt"] or 0),
+            "cache_read": int(r["cache_read"] or 0),
+            "completion": int(r["completion"] or 0),
+            "true_total": (int(r["prompt"] or 0)
+                           + int(r["cache_read"] or 0)
+                           + int(r["completion"] or 0)),
+            "calls": int(r["calls"] or 0),
+        }
         for r in await db.fetchall(
-            "SELECT model, SUM(total_tokens) as total, COUNT(*) as calls "
+            "SELECT model, "
+            "SUM(total_tokens) as total, "
+            "SUM(prompt_tokens) as prompt, "
+            "SUM(cache_read_tokens) as cache_read, "
+            "SUM(completion_tokens) as completion, "
+            "COUNT(*) as calls "
             "FROM token_usage WHERE created_at >= ? GROUP BY model "
-            "ORDER BY total DESC LIMIT 10",
+            "ORDER BY (prompt + cache_read + completion) DESC LIMIT 10",
             (cutoff_7d,),
         )
     ]
-    # by_agent (7d) — group by agent_id, take top 10
+    # by_agent (7d) — group by agent_id, take top 10.
+    # v3.12.8: same pattern — true_total + sort by true_total.
     out["by_agent"] = [
         {
             "agent_id": r["agent_id"] or "(orchestrator)",
             "total": int(r["total"] or 0),
+            "prompt": int(r["prompt"] or 0),
+            "cache_read": int(r["cache_read"] or 0),
+            "completion": int(r["completion"] or 0),
+            "true_total": (int(r["prompt"] or 0)
+                           + int(r["cache_read"] or 0)
+                           + int(r["completion"] or 0)),
             "calls": int(r["calls"] or 0),
         }
         for r in await db.fetchall(
-            "SELECT agent_id, SUM(total_tokens) as total, COUNT(*) as calls "
+            "SELECT agent_id, "
+            "SUM(total_tokens) as total, "
+            "SUM(prompt_tokens) as prompt, "
+            "SUM(cache_read_tokens) as cache_read, "
+            "SUM(completion_tokens) as completion, "
+            "COUNT(*) as calls "
             "FROM token_usage WHERE created_at >= ? "
-            "GROUP BY agent_id ORDER BY total DESC LIMIT 10",
+            "GROUP BY agent_id ORDER BY (prompt + cache_read + completion) DESC LIMIT 10",
             (cutoff_7d,),
         )
     ]
     # by_project (7d) — top 5
     by_proj_rows = await db.fetchall(
         "SELECT tu.project_id, COALESCE(p.name, '?') as name, "
-        "SUM(tu.total_tokens) as total, COUNT(*) as calls "
+        "SUM(tu.total_tokens) as total, "
+        "SUM(tu.prompt_tokens) as prompt, "
+        "SUM(tu.cache_read_tokens) as cache_read, "
+        "SUM(tu.completion_tokens) as completion, "
+        "COUNT(*) as calls "
         "FROM token_usage tu LEFT JOIN projects p ON p.id = tu.project_id "
         "WHERE tu.created_at >= ? AND tu.project_id IS NOT NULL "
-        "GROUP BY tu.project_id ORDER BY total DESC LIMIT 5",
+        "GROUP BY tu.project_id ORDER BY (prompt + cache_read + completion) DESC LIMIT 5",
         (cutoff_7d,),
     )
     out["by_project"] = [
-        {"project_id": r["project_id"], "name": r["name"],
-         "total": int(r["total"] or 0), "calls": int(r["calls"] or 0)}
+        {
+            "project_id": r["project_id"],
+            "name": r["name"],
+            "total": int(r["total"] or 0),
+            "prompt": int(r["prompt"] or 0),
+            "cache_read": int(r["cache_read"] or 0),
+            "completion": int(r["completion"] or 0),
+            "true_total": (int(r["prompt"] or 0)
+                           + int(r["cache_read"] or 0)
+                           + int(r["completion"] or 0)),
+            "calls": int(r["calls"] or 0),
+        }
         for r in by_proj_rows
     ]
     # v3.0: by_provider (7d) — group by base_url. The base_url column
@@ -664,15 +735,29 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
         return s or "(unknown)"
 
     provider_rows = await db.fetchall(
-        "SELECT base_url, SUM(total_tokens) as total, COUNT(*) as calls "
+        "SELECT base_url, "
+        "SUM(total_tokens) as total, "
+        "SUM(prompt_tokens) as prompt, "
+        "SUM(cache_read_tokens) as cache_read, "
+        "SUM(completion_tokens) as completion, "
+        "COUNT(*) as calls "
         "FROM token_usage WHERE created_at >= ? "
-        "GROUP BY base_url ORDER BY total DESC LIMIT 10",
+        "GROUP BY base_url "
+        "ORDER BY (prompt + cache_read + completion) DESC LIMIT 10",
         (cutoff_7d,),
     )
+    # by_provider (7d). v3.12.8: also pull prompt / cache_read so we
+    # can compute true_total per provider (sorting by true_total).
     out["by_provider"] = [
         {
             "provider": _provider_label(r["base_url"]),
             "total": int(r["total"] or 0),
+            "prompt": int(r["prompt"] or 0),
+            "cache_read": int(r["cache_read"] or 0),
+            "completion": int(r["completion"] or 0),
+            "true_total": (int(r["prompt"] or 0)
+                           + int(r["cache_read"] or 0)
+                           + int(r["completion"] or 0)),
             "calls": int(r["calls"] or 0),
         }
         for r in provider_rows
@@ -708,11 +793,27 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
             "completion": int((by_day.get(d.isoformat()) or {}).get("completion") or 0),
             "cache_read": int((by_day.get(d.isoformat()) or {}).get("cache_read") or 0),  # v3.1.2
             "total": int((by_day.get(d.isoformat()) or {}).get("total") or 0),
+            # v3.12.8: true_total per day. The stacked bar chart
+            # already shows cache / input / output as 3 separate
+            # bars (so the bar widths were already correct), but
+            # the headline tooltip used `d.total` (= API total,
+            # excludes cache) and made cache appear "extra". Now
+            # true_total = prompt + cache_read + completion = sum
+            # of all 3 bars in the chart, matching what the
+            # operator sees.
+            "true_total": (
+                int((by_day.get(d.isoformat()) or {}).get("prompt") or 0)
+                + int((by_day.get(d.isoformat()) or {}).get("cache_read") or 0)
+                + int((by_day.get(d.isoformat()) or {}).get("completion") or 0)
+            ),
             "calls": int((by_day.get(d.isoformat()) or {}).get("calls") or 0),
         }
         for d in days
     ]
-    # top_tasks (7d) — top 5
+    # top_tasks (7d) — top 5. v3.12.8: also pull prompt/cache_read/
+    # completion so true_total can be computed; sort by true_total
+    # so the ranking reflects "tokens the model actually served"
+    # rather than the API-reported total (which excluded cache).
     out["top_tasks"] = [
         {
             "task_id": r["task_id"],
@@ -720,30 +821,51 @@ async def _load_token_usage_overview(db: Any) -> dict[str, Any]:
             "role": r["role"],
             "model": r["model"],
             "total": int(r["total"] or 0),
+            "prompt": int(r["prompt"] or 0),
+            "cache_read": int(r["cache_read"] or 0),
+            "completion": int(r["completion"] or 0),
+            "true_total": (int(r["prompt"] or 0)
+                           + int(r["cache_read"] or 0)
+                           + int(r["completion"] or 0)),
             "calls": int(r["calls"] or 0),
         }
         for r in await db.fetchall(
             "SELECT task_id, project_id, role, model, "
-            "SUM(total_tokens) as total, COUNT(*) as calls "
+            "SUM(total_tokens) as total, "
+            "SUM(prompt_tokens) as prompt, "
+            "SUM(cache_read_tokens) as cache_read, "
+            "SUM(completion_tokens) as completion, "
+            "COUNT(*) as calls "
             "FROM token_usage WHERE created_at >= ? AND task_id IS NOT NULL "
-            "GROUP BY task_id ORDER BY total DESC LIMIT 5",
+            "GROUP BY task_id "
+            "ORDER BY (prompt + cache_read + completion) DESC LIMIT 5",
             (cutoff_7d,),
         )
     ]
-    # 7-day sparkline (oldest first)
+    # 7-day sparkline (oldest first). v3.12.8: also pull prompt +
+    # cache_read + completion so the sparkline shows true_total
+    # rather than the API-reported total (which excluded cache).
     for i in range(7):
         day_start = (now - timedelta(days=6 - i)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         day_end = day_start + timedelta(days=1)
         r = await db.fetchone(
-            "SELECT COALESCE(SUM(total_tokens),0) as total FROM token_usage "
+            "SELECT COALESCE(SUM(total_tokens),0) as total, "
+            "COALESCE(SUM(prompt_tokens),0) as prompt, "
+            "COALESCE(SUM(cache_read_tokens),0) as cache_read, "
+            "COALESCE(SUM(completion_tokens),0) as completion "
+            "FROM token_usage "
             "WHERE created_at >= ? AND created_at < ?",
             (day_start.isoformat(), day_end.isoformat()),
         )
+        prompt_v = int(r["prompt"]) if r else 0
+        cache_v = int(r["cache_read"]) if r else 0
+        comp_v = int(r["completion"]) if r else 0
         out["sparkline"].append({
             "date": day_start.strftime("%m-%d"),
             "total": int(r["total"]) if r else 0,
+            "true_total": prompt_v + cache_v + comp_v,
         })
     return out
 
@@ -920,6 +1042,44 @@ async def tasks_page(
             t["profile_label"] = t["assigned_agent_id"]
         else:
             t["profile_label"] = "—"
+    # v3.12.8 (Phase 5): per-task token aggregation for the tasks page
+    # task cards. Same shape as the project-page task_token_usage dict.
+    # We pull ALL task IDs in the current page (the page is already
+    # paginated), so this is a single SQL with IN (...).
+    if tasks:
+        task_ids = [t["id"] for t in tasks]
+        # Build placeholders for the IN clause
+        placeholders = ",".join("?" for _ in task_ids)
+        per_task_rows = await db.fetchall(
+            f"SELECT t.id AS task_id, "
+            f"COUNT(tu.id) AS n_calls, "
+            f"COALESCE(SUM(tu.prompt_tokens), 0) AS in_new, "
+            f"COALESCE(SUM(tu.cache_read_tokens), 0) AS cache_hit, "
+            f"COALESCE(SUM(tu.completion_tokens), 0) AS out, "
+            f"COALESCE(SUM(tu.total_tokens), 0) AS api_total "
+            f"FROM tasks t LEFT JOIN token_usage tu ON tu.task_id = t.id "
+            f"WHERE t.id IN ({placeholders}) "
+            f"GROUP BY t.id",
+            tuple(task_ids),
+        )
+        tasks_token_usage: dict[str, dict] = {}
+        for r in per_task_rows:
+            d = dict(r)
+            in_new = int(d.get("in_new") or 0)
+            cache_hit = int(d.get("cache_hit") or 0)
+            out = int(d.get("out") or 0)
+            d["in_new"] = in_new
+            d["cache_hit"] = cache_hit
+            d["out"] = out
+            d["total_processed"] = in_new + cache_hit + out
+            d["cache_pct"] = (
+                round(cache_hit / (in_new + cache_hit), 4)
+                if (in_new + cache_hit) > 0
+                else 0.0
+            )
+            tasks_token_usage[d["task_id"]] = d
+    else:
+        tasks_token_usage = {}
     # Per the 2026-07-27 commit 3: action preset chips. Top 10
     # distinct actions, ordered by frequency. Helps the user not
     # have to remember / type the exact action name for common
@@ -968,6 +1128,9 @@ async def tasks_page(
             "filter_search": search,
             "filter_kind": kind,
             "total_count": total,
+            # v3.12.8 (Phase 5): per-task token breakdown keyed by
+            # task_id; same shape as the project-page task_token_usage.
+            "tasks_token_usage": tasks_token_usage,
         },
     )
 
@@ -1343,6 +1506,61 @@ async def project_page(
     )
     token_breakdown = [dict(r) for r in token_rows]
     token_total = sum(r["total"] for r in token_breakdown)
+    # v3.12.8 (Phase 5): also compute the cache-aware "true total"
+    # for the project header KPI. Same logic as the global token
+    # usage page — the headline should include cache hits so the
+    # operator doesn't see a number that looks smaller than the
+    # sum of (in + cache + out) shown in the per-task rows
+    # below. The legacy `token_total` (= API total) is kept for
+    # backward compat (it's used in the tooltip / break-down
+    # title that already shows call_kind percentages).
+    token_true_total = sum(
+        (r.get("prompt") or 0) + (r.get("completion") or 0) + (r.get("cache_read") or 0)
+        for r in token_breakdown
+    )
+    # v3.12.8 (Phase 5): per-task token aggregation for the project page
+    # task list. Returns in (new prompt), cache_hit, out, n_calls per task.
+    # `total_processed` is computed in Python (= in + cache_hit + out) so it
+    # always covers the full "tokens the model actually saw" — note this is
+    # different from the `total_tokens` field above, which is what the LLM
+    # provider reports as `usage.total_tokens` (= input + output, NOT
+    # including cache_read_input_tokens). See v3.12.8 design note.
+    task_token_rows = await db.fetchall(
+        "SELECT t.id AS task_id, t.name AS task_name, "
+        "COUNT(tu.id) AS n_calls, "
+        "COALESCE(SUM(tu.prompt_tokens), 0) AS in_new, "
+        "COALESCE(SUM(tu.cache_read_tokens), 0) AS cache_hit, "
+        "COALESCE(SUM(tu.completion_tokens), 0) AS out, "
+        "COALESCE(SUM(tu.total_tokens), 0) AS api_total "
+        "FROM tasks t "
+        "LEFT JOIN token_usage tu ON tu.task_id = t.id "
+        "WHERE t.project_id = ? "
+        "GROUP BY t.id "
+        "ORDER BY t.created_at ASC",
+        (project_id,),
+    )
+    task_token_usage: dict[str, dict] = {}
+    for r in task_token_rows:
+        d = dict(r)
+        in_new = int(d.get("in_new") or 0)
+        cache_hit = int(d.get("cache_hit") or 0)
+        out = int(d.get("out") or 0)
+        # `total_processed` = sum of all token categories the LLM saw.
+        # This is the right "total" for operator display — the column
+        # `api_total` in the DB is what the LLM provider reports
+        # (= in_new + out, EXCLUDES cache_hit) so it's misleading.
+        d["in_new"] = in_new
+        d["cache_hit"] = cache_hit
+        d["out"] = out
+        d["total_processed"] = in_new + cache_hit + out
+        # `cache_pct` of input billed = how much of the input was served
+        # from prompt cache (vs new tokens). 0..1. Used for the green bar.
+        d["cache_pct"] = (
+            round(cache_hit / (in_new + cache_hit), 4)
+            if (in_new + cache_hit) > 0
+            else 0.0
+        )
+        task_token_usage[d["task_id"]] = d
     # Schedule info (#22): if this project is marked as a template or
     # was created by a recurring schedule, pull the schedule row so the
     # page can show "this project is a template for <schedule>" or
@@ -1431,6 +1649,15 @@ async def project_page(
             "soul_presets": soul_presets,
             "token_breakdown": token_breakdown,
             "token_total": token_total,
+            # v3.12.8: cache-aware true total (= in + cache + out)
+            # for the project header KPI. See design note above.
+            "token_true_total": token_true_total,
+            # v3.12.8 (Phase 5): per-task token breakdown. Keyed by
+            # task_id; empty dict if no tasks have token data. Each
+            # entry has in_new / cache_hit / out / total_processed /
+            # n_calls / cache_pct. The template only shows the row
+            # when n_calls > 0.
+            "task_token_usage": task_token_usage,
             "template_schedule": dict(template_schedule) if template_schedule else None,
             "source_schedule": dict(source_schedule) if source_schedule else None,
             "iteration_events": iteration_events,

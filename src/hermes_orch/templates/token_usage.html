@@ -27,24 +27,47 @@
     </div>
 </div>
 
-{# ===== KPI cards: 5 actionable numbers (v3.1.2 added Cache read) ===== #}
+{# ===== KPI cards: 5 actionable numbers (v3.1.2 added Cache read, v3.12.8 added true_total) ===== #}
 {% set t7 = token_usage.totals["7d"] %}
-{% set input_pct = (t7.prompt / t7.total * 100) if t7.total else 0 %}
-{% set output_pct = (t7.completion / t7.total * 100) if t7.total else 0 %}
-{# Cache read % of input. When 0, show 0.0% (not "0 of 0") so the
-   operator immediately sees "we have no cache hits in this window"
-   rather than "the number is undefined". #}
-{% set cache_pct = (t7.cache_read / t7.prompt * 100) if t7.prompt else 0 %}
+{# v3.12.8 (Phase 5): cache-aware percentages.
+   - `true_total` is prompt + cache_read + completion = "tokens the
+     model actually saw" (the right denominator for the headline KPI
+     and for percentages). The old `t7.total` is the API-reported
+     total (= prompt + completion, EXCLUDES cache) and is kept only
+     for backward compat.
+   - `input_pct`: input (new + cache) as % of true total — the
+     right "share of total" number now that cache is part of input.
+   - `output_pct`: completion as % of true total — now reflects
+     the true output share (was misleadingly ~50% before because
+     the API total excluded cache).
+   - `cache_pct`: cache as % of total input (prompt + cache_read)
+     — unchanged meaning, just a more accurate denominator. #}
+{% set true_total = t7.true_total %}
+{% set input_total = t7.prompt + t7.cache_read %}
+{% set input_pct = (input_total / true_total * 100) if true_total else 0 %}
+{% set output_pct = (t7.completion / true_total * 100) if true_total else 0 %}
+{% set cache_pct = (t7.cache_read / input_total * 100) if input_total else 0 %}
 <div class="kpi-grid-5 mb-4">
     <div class="kpi">
         <div class="kpi-label">Total tokens (7d)</div>
-        <div class="kpi-value">{{ t7.total|format_tokens }}</div>
-        <div class="kpi-sub">{{ t7.calls }} requests</div>
+        {# v3.12.8: use true_total (= prompt + cache + completion),
+           the right headline number now that cache is its own
+           category. Sub-line shows the API-reported total for
+           reference (helps spot when the provider is reporting
+           differently from what the model actually saw). #}
+        <div class="kpi-value">{{ true_total|format_tokens }}</div>
+        <div class="kpi-sub">{{ t7.calls }} requests · API total {{ t7.total|format_tokens }}</div>
     </div>
     <div class="kpi">
         <div class="kpi-label">Input tokens (7d)</div>
-        <div class="kpi-value">{{ t7.prompt|format_tokens }}</div>
-        <div class="kpi-sub">{{ input_pct|round(1) }}% of total</div>
+        {# v3.12.8: input is now "new prompt + cache read" (both
+           are input tokens the model received). Show as 2 rows so
+           the operator can see how much was cache vs fresh. #}
+        <div class="kpi-value">{{ input_total|format_tokens }}</div>
+        <div class="kpi-sub">
+            <span class="text-emerald-700">{{ t7.cache_read|format_tokens }} cached</span> ·
+            {{ input_pct|round(1) }}% of total
+        </div>
     </div>
     <div class="kpi">
         <div class="kpi-label">Output tokens (7d)</div>
@@ -54,7 +77,7 @@
     <div class="kpi">
         <div class="kpi-label">Cache read (7d)</div>
         <div class="kpi-value" style="color: #6366f1;">{{ t7.cache_read|format_tokens }}</div>
-        <div class="kpi-sub">{{ cache_pct|round(1) }}% of input</div>
+        <div class="kpi-sub">{{ cache_pct|round(1) }}% of input · billed at ~10%</div>
     </div>
     <div class="kpi">
         <div class="kpi-label">Total requests (7d)</div>
@@ -82,7 +105,7 @@
             </span>
         </div>
     </div>
-    {% set max_day = (token_usage.daily_breakdown|map(attribute='total')|list|max) or 1 %}
+    {% set max_day = (token_usage.daily_breakdown|map(attribute='true_total')|list|max) or 1 %}
     {% if t7.total %}
     <div class="space-y-1.5">
         {% for d in token_usage.daily_breakdown %}
@@ -90,9 +113,12 @@
            tooltip (no JS needed). Format: "Jul 25 — Cache 4.5K ·
            Input 12.3K · Output 4.5K · Total 21.3K · 312 calls". For
            days with 0 calls the tooltip still shows (helps the user
-           see "yes, 0 is real"). #}
+           see "yes, 0 is real"). v3.12.8: Total now shows
+           true_total (cache + input + output) instead of API total,
+           so the bar widths and the headline number are
+           consistent. #}
         <div class="stacked-bar-row"
-             title="{{ d.label }} — Cache {{ d.cache_read|format_tokens }} · Input {{ d.prompt|format_tokens }} · Output {{ d.completion|format_tokens }} · Total {{ d.total|format_tokens }} · {{ d.calls }} calls">
+             title="{{ d.label }} — Cache {{ d.cache_read|format_tokens }} · Input {{ d.prompt|format_tokens }} · Output {{ d.completion|format_tokens }} · Total {{ d.true_total|format_tokens }} · {{ d.calls }} calls">
             <div class="stacked-bar-label">{{ d.label }}</div>
             <div class="stacked-bar-track">
                 {% if d.total > 0 %}
@@ -107,7 +133,12 @@
                 {% endif %}
             </div>
             <div class="stacked-bar-label" style="text-align: right; color: #4b5563;">
-                {{ d.total|format_tokens }}<br>
+                {# v3.12.8: show true_total (cache + input + output) in
+                   the right-hand label so the bar widths and the
+                   headline number are consistent. Before this fix the
+                   label showed d.total (= API total, EXCLUDES cache),
+                   which made the bar look "wider" than the number. #}
+                {{ d.true_total|format_tokens }}<br>
                 <span style="font-size: 0.7rem; color: #9ca3af;">{{ d.calls }} calls</span>
             </div>
         </div>
@@ -133,6 +164,7 @@
                     <th class="text-left py-1 font-medium">Project</th>
                     <th class="text-right py-1 font-medium">Requests</th>
                     <th class="text-right py-1 font-medium">Input</th>
+                    <th class="text-right py-1 font-medium">Cache</th>
                     <th class="text-right py-1 font-medium">Output</th>
                     <th class="text-right py-1 font-medium">Total</th>
                 </tr>
@@ -144,9 +176,18 @@
                         <a href="/projects/{{ p.project_id }}" class="text-blue-600 hover:underline">{{ p.name }}</a>
                     </td>
                     <td class="text-right py-1.5 text-gray-600">{{ p.calls }}</td>
-                    <td class="text-right py-1.5 text-gray-600">—</td>
-                    <td class="text-right py-1.5 text-gray-600">—</td>
-                    <td class="text-right py-1.5 font-medium">{{ p.total|format_tokens }}</td>
+                    {# v3.12.8: input = prompt + cache_read, both are
+                       input tokens the model received. Cache is now
+                       its own column so the operator can see how
+                       much of input was the discounted (cache hit)
+                       portion. #}
+                    <td class="text-right py-1.5 text-gray-600"
+                        title="fresh prompt (excl. cache)">{{ p.prompt|format_tokens }}</td>
+                    <td class="text-right py-1.5 text-emerald-700"
+                        title="cache read (billed at ~10%)">{{ p.cache_read|format_tokens }}</td>
+                    <td class="text-right py-1.5 text-gray-600">{{ p.completion|format_tokens }}</td>
+                    <td class="text-right py-1.5 font-medium"
+                        title="true_total = prompt + cache + completion">{{ p.true_total|format_tokens }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -163,12 +204,18 @@
             <span class="text-xs text-gray-500">{{ token_usage.by_model|length }} models</span>
         </div>
         {% if token_usage.by_model %}
-        {% set max_m = (token_usage.by_model|map(attribute='total')|list|max) or 1 %}
+        {# v3.12.8: bar width and label now use true_total
+           (prompt + cache + completion) so the bar widths and
+           headline number are consistent. The ranking is also
+           now by true_total (set in the SQL), so the
+           "biggest model" really is "served the most tokens" —
+           not just "billed the most at full rate". #}
+        {% set max_m = (token_usage.by_model|map(attribute='true_total')|list|max) or 1 %}
         {% for m in token_usage.by_model[:8] %}
         <div class="bar-row">
             <div class="bar-label" title="{{ m.model }}">{{ m.model }}</div>
-            <div class="bar-track"><div class="bar-fill" style="width: {{ (m.total / max_m * 100)|round(1) }}%;"></div></div>
-            <div class="bar-value">{{ m.total|format_tokens }} <span class="text-gray-400 text-[10px]">({{ m.calls }})</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width: {{ (m.true_total / max_m * 100)|round(1) }}%;"></div></div>
+            <div class="bar-value">{{ m.true_total|format_tokens }} <span class="text-gray-400 text-[10px]">({{ m.calls }})</span></div>
         </div>
         {% endfor %}
         {% if token_usage.by_model|length > 8 %}
@@ -186,12 +233,13 @@
             <span class="text-xs text-gray-500">{{ token_usage.by_agent|length }} agents</span>
         </div>
         {% if token_usage.by_agent %}
-        {% set max_a = (token_usage.by_agent|map(attribute='total')|list|max) or 1 %}
+        {# v3.12.8: same — use true_total for bar widths and labels #}
+        {% set max_a = (token_usage.by_agent|map(attribute='true_total')|list|max) or 1 %}
         {% for a in token_usage.by_agent[:8] %}
         <div class="bar-row">
             <div class="bar-label" title="{{ a.agent_id }}">{{ a.agent_id or '(orchestrator)' }}</div>
-            <div class="bar-track"><div class="bar-fill" style="width: {{ (a.total / max_a * 100)|round(1) }}%;"></div></div>
-            <div class="bar-value">{{ a.total|format_tokens }} <span class="text-gray-400 text-[10px]">({{ a.calls }})</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width: {{ (a.true_total / max_a * 100)|round(1) }}%;"></div></div>
+            <div class="bar-value">{{ a.true_total|format_tokens }} <span class="text-gray-400 text-[10px]">({{ a.calls }})</span></div>
         </div>
         {% endfor %}
         {% else %}
@@ -206,7 +254,13 @@
             <span class="text-xs text-gray-500">{{ token_usage.by_provider|length }} providers</span>
         </div>
         {% if token_usage.by_provider %}
-        {% set total_prov = t7.total %}
+        {# v3.12.8: use true_total (prompt + cache + completion) for
+           the donut center + slice percentages so the donut
+           shares match the by_X tables. The API-reported `total`
+           is still available as p.total if needed for cost
+           calculations (billed_amount is API total * provider
+           price, NOT true_total). #}
+        {% set total_prov = true_total %}
         {% set providers_data = token_usage.by_provider %}
         {# Donut + center are wrapped in a positioned container. Without
            the wrapper, the center text (position: absolute) would
@@ -229,21 +283,21 @@
                      style="background: conic-gradient(
                          {% set ns = namespace(segments=[]) %}
                          {% for p in providers_data %}
-                             {% set pct = (p.total / total_prov * 100) if total_prov else 0 %}
+                             {% set pct = (p.true_total / total_prov * 100) if total_prov else 0 %}
                              {% set _ = ns.segments.append(p.provider ~ ' ' ~ pct ~ '%') %}
                          {% endfor %}
                          {{ ns.segments|join(', ') }}
                          #f1f5f9 0
                      )">
                     <div class="donut-center">
-                        <div class="big">{{ t7.total|format_tokens }}</div>
-                        <div class="small">Total tokens</div>
+                        <div class="big">{{ true_total|format_tokens }}</div>
+                        <div class="small">Total processed</div>
                     </div>
                 </div>
             </div>
             <div class="flex-1 space-y-1.5 text-xs">
                 {% for p in providers_data %}
-                {% set pct = (p.total / total_prov * 100) if total_prov else 0 %}
+                {% set pct = (p.true_total / total_prov * 100) if total_prov else 0 %}
                 <div class="flex items-center gap-2">
                     <span style="display:inline-block;width:8px;height:8px;background:{{ ['#3b82f6', '#a78bfa', '#10b981', '#f59e0b', '#ef4444', '#06b6d4'][loop.index0 % 6] }};border-radius:2px;"></span>
                     <span class="flex-1 text-gray-700" title="{{ p.provider }}">{{ p.provider }}</span>
