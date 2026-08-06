@@ -141,6 +141,29 @@
         font-size: 10px;
         margin-top: 3px;
     }
+    /* v3.14.0 (Phase 3): human_approval node visual marker — same
+       convention as the workflow editor (visual_workflow.html).
+       Yellow border + ⏸ "human approval" sub-label so the user
+       sees at a glance which steps pause the workflow for human
+       review. Per design doc §5.4. */
+    .vp-node-approval {
+        border: 2px solid #f59e0b !important;
+        background: #fffbeb !important;
+    }
+    body.dark .vp-node-approval {
+        background: #422006 !important;
+        border-color: #fbbf24 !important;
+    }
+    .vp-node-approval-label {
+        color: #92400e;
+        font-size: 10px;
+        font-weight: 600;
+        margin-top: 3px;
+        letter-spacing: 0.02em;
+    }
+    body.dark .vp-node-approval-label {
+        color: #fcd34d;
+    }
     /* v1.9.4: loop-back handle (output_2). Red, dashed border,
        positioned LOWER on the right side so the two outputs are
        visually distinct. drawflow's default puts both outputs at
@@ -646,6 +669,20 @@
             <option value="{{ r }}">{{ r }}</option>
             {% endfor %}
         </select>
+        {# v3.14.0 (Phase 3): type field — matches visual_workflow.html
+           so the two editors read the same way. "do_task" (default /
+           legacy) runs the step; "human_approval" pauses the workflow
+           and creates an inbox approval request when the plan is
+           promoted to a workflow run. The `approval` object
+           (summary_template, on_reject, etc.) is edited in the JSON
+           form — see /projects/{id}#plan for now. #}
+        <label>type
+            <span class="text-xs text-gray-400 font-normal"
+                title='Step execution type. "do_task" (default) runs the step; "human_approval" pauses the workflow and creates an inbox approval request. The `approval` object (summary_template, on_reject, etc.) is edited in the JSON form.'>
+                (?)
+            </span>
+        </label>
+        <input id="vp-f-type" type="text" placeholder="do_task" value="do_task">
         <label>Required capability</label>
         <input id="vp-f-capability" type="text" placeholder="(optional) e.g. summarize">
         <label>Skill (canonical name)</label>

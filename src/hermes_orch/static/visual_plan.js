@@ -806,6 +806,16 @@
         const action = step.action
             ? `<div class="vp-node-action">${escapeHtml(step.action)}</div>`
             : '';
+        // v3.14.0 (Phase 3): human_approval visual marker — mirror
+        // the same yellow border + ⏸ label used in visual_workflow
+        // (see _stepToCardHtml in visual_workflow.js). The
+        // .vp-node-approval class is added to the card wrapper,
+        // CSS in visual_plan.html gives it the yellow border.
+        const isApproval = step.type === 'human_approval';
+        const approvalClass = isApproval ? ' vp-node-approval' : '';
+        const approvalLabel = isApproval
+            ? `<div class="vp-node-approval-label">⏸ human approval</div>`
+            : '';
         // v1.9.4: also show a small loop-back indicator when the
         // step has any feedback_to wires. Red color matches the
         // wire so the user can see at a glance "this step listens
@@ -817,7 +827,7 @@
             ? `<div class="vp-node-fb" style="color:#dc2626;font-size:10px;margin-top:1px;font-weight:500">↻ ${step.feedback_to.length} loop-back${step.feedback_to.length === 1 ? '' : 's'}</div>`
             : '';
         return `
-            <div class="vp-node" data-step-name="${escapeHtml(step.name)}">
+            <div class="vp-node${approvalClass}" data-step-name="${escapeHtml(step.name)}">
                 <button class="vp-node-delete" data-node-name="${escapeHtml(step.name)}" title="Delete step">×</button>
                 <div class="vp-node-header">
                     <span class="vp-node-name">${escapeHtml(step.name)}</span>
@@ -825,6 +835,7 @@
                     ${soulPill}
                 </div>
                 ${action}
+                ${approvalLabel}
                 ${depsHtml}
                 ${fbHtml}
             </div>
@@ -1226,6 +1237,11 @@
         $('vp-f-name').value = step.name;
         $('vp-f-action').value = step.action || '';
         $('vp-f-role').value = step.agent_role || '';
+        // v3.14.0 (Phase 3): type field — default to "do_task" for
+        // legacy steps that don't have the field set yet. The server
+        // already defaults this, but populating it client-side gives
+        // a clearer UX.
+        $('vp-f-type').value = step.type || 'do_task';
         $('vp-f-capability').value = step.required_capability || '';
         $('vp-f-skill').value = step.skill || '';
         $('vp-f-output').value = step.output_path || '';
@@ -1303,6 +1319,16 @@
         }
         step.action = $('vp-f-action').value.trim();
         step.agent_role = $('vp-f-role').value.trim();
+        // v3.14.0 (Phase 3): persist the type field. Use null when
+        // it equals the default to keep plan_json minimal (matches
+        // the server's behavior of defaulting missing type to
+        // "do_task"). This keeps round-tripped plans looking clean.
+        const newType = ($('vp-f-type').value || 'do_task').trim();
+        if (newType && newType !== 'do_task') {
+            step.type = newType;
+        } else {
+            delete step.type;
+        }
         step.required_capability = $('vp-f-capability').value.trim();
         step.skill = $('vp-f-skill').value.trim();
         step.output_path = $('vp-f-output').value.trim();
