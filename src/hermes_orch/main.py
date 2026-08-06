@@ -405,6 +405,11 @@ def create_app() -> FastAPI:
     # project-scoped `/api/projects/{id}/soul-presets/from-template/{name}`).
     app.include_router(soul_templates_router, tags=["soul-templates"])
     app.include_router(workflows_router, tags=["workflows"])
+    # v3.14.0 (Phase 2): human approval endpoints. The routes already
+    # include their full /api/... paths (`/api/workflows/{id}/steps/...`,
+    # `/api/inbox/approvals`), so we mount WITHOUT a prefix.
+    from hermes_orch.api.approvals import router as approvals_router
+    app.include_router(approvals_router, tags=["approvals"])
     app.include_router(dashboard_router, tags=["dashboard"])
     app.include_router(single_tasks_pages_router, tags=["pages"])
 

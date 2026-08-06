@@ -298,6 +298,22 @@ class Supervisor:
         except Exception as e:
             log.debug(f"stale-profile scan failed: {e}")
 
+        # v3.14.0 (Phase 2): timeout sweeper for human_approval steps.
+        # Lazily run on every supervisor tick (no separate cron / worker
+        # — see design doc §4.6.1). Finds pending ApprovalRequests past
+        # their `timeout_seconds` and applies `on_reject` semantics
+        # (sweeper treats expired == rejected for v1). Cheap when no
+        # approvals exist (single SELECT, early return).
+        try:
+            from hermes_orch.core.approval_runtime import (
+                sweep_expired_approvals,
+            )
+            n_expired = await sweep_expired_approvals(self.db)
+            if n_expired:
+                log.info(f"sweep_expired_approvals: expired {n_expired} approval(s)")
+        except Exception as e:
+            log.error(f"approval sweep failed: {e}")
+
         # Stale-recovery check: when an agent comes back to 'verified'
         # (heartbeat resumed), any profile that was previously marked
         # 'stale' should be re-evaluated. The stale-profile check above
@@ -1181,6 +1197,29 @@ class Supervisor:
         ready = await self._find_ready_tasks(pid)
         no_progress = True  # assume no progress until we actually do something
         for t in ready:
+            # v3.14.0: human_approval tasks do NOT dispatch to an
+            # agent. Instead, we create an ApprovalRequest row (or
+            # no-op if one already exists) and leave the task in
+            # 'pending' state until the user Approves / Rejects via
+            # the API. The supervisor's normal dispatch path is
+            # short-circuited for these tasks.
+            if t.get("action") == "human_approval":
+                from hermes_orch.core.approval_runtime import (
+                    create_approval_request,
+                )
+                try:
+                    apr = await create_approval_request(self.db, task=t)
+                    if apr is not None:
+                        log.info(
+                            f"created approval_request id={apr['id']} "
+                            f"for task {t['id']} (project={pid}, step={t.get('name')})"
+                        )
+                        no_progress = False
+                except Exception as e:
+                    log.error(
+                        f"create_approval_request failed for task {t['id']}: {e}"
+                    )
+                continue
             # v3.9.0: the project dispatch path goes through
             # `_dispatch_via_soul_dispatch` which calls the new
             # `orchestrator.soul_dispatch.dispatch_step` (routing +

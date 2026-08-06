@@ -824,6 +824,17 @@ MIGRATIONS = [
     ")",
     "CREATE INDEX IF NOT EXISTS idx_soul_templates_category "
     "ON project_soul_templates(category)",
+    # v3.14.0: human_approval task metadata. completion_reason records
+    # WHY a task completed (e.g. 'approved_by_human' for human_approval
+    # steps that the user approved; 'dispatched' for normal do_task
+    # work that finished). failure_reason records WHY a task failed
+    # (e.g. 'rejected_by_human' for human_approval steps the user
+    # rejected with on_reject='stop'). Both default to '' so existing
+    # rows (and existing code paths) don't need to set them. The
+    # supervisor / approval_runtime writes these when transitioning
+    # a task to terminal state.
+    "ALTER TABLE tasks ADD COLUMN completion_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE tasks ADD COLUMN failure_reason TEXT NOT NULL DEFAULT ''",
     # v3.13.0: explicit profile root path on the agent host. NULL
     # = auto-derive from <profiles_dir>/<role> (default for new
     # installs + all existing rows). The CREATE TABLE block above
