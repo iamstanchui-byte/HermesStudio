@@ -584,6 +584,7 @@
         // (search / analyze / audit / write). Idempotent — guarded
         // by window._vpChipsBound so re-init doesn't double-bind.
         _bindPaletteChips();
+        _bindSaveMenuOutsideClick();
         _updateHistoryButtons();
     }
 
@@ -1099,6 +1100,14 @@
         analyze: 'summarize',
         audit:   'audit_check',
         write:   'write_output',
+        // v3.14.0 (Phase 3): human_approval palette chip — adds a
+        // step with type="human_approval" pre-set. The action is
+        // descriptive ("manual_review") for display; the runtime
+        // recognizes the step by its type, not its action. The
+        // `approval` sub-object is configured in the side panel
+        // after the step is added (we don't pre-fill a default
+        // summary_template because that's user-specific copy).
+        human_approval: 'manual_review',
     };
     function _newStepFromTemplate(tmpl) {
         const action = _PALETTE_ACTIONS[tmpl] || '';
@@ -1112,7 +1121,7 @@
             n += 1;
             name = `${tmpl}-${n}`;
         }
-        return {
+        const step = {
             name,
             agent_role: '',
             action: action,
@@ -1124,6 +1133,16 @@
             params_template: {},
             output_path: '',
         };
+        // v3.14.0 (Phase 3): human_approval chip sets type
+        // explicitly. Without this, the step would default to
+        // do_task and the supervisor would dispatch an agent
+        // task instead of creating an inbox approval. We don't
+        // set default_soul on a human_approval step (no agent
+        // runs it).
+        if (tmpl === 'human_approval') {
+            step.type = 'human_approval';
+        }
+        return step;
     }
     function _addStepFromChip(tmpl) {
         const newStep = _newStepFromTemplate(tmpl);
@@ -1836,6 +1855,39 @@
         $('vp-save-as-workflow-overlay').classList.add('hidden');
     }
 
+    // 2026-08-07: Save dropdown menu (the arrow next to the main
+    // Save button). Toggles visibility; closes on outside click.
+    // The dropdown contains the v3.8.0 "Save as workflow" action
+    // (moved out of the toolbar to save horizontal space).
+    function toggleSaveMenu(event) {
+        // Stop propagation so the outside-click handler below
+        // doesn't immediately close the menu we just opened.
+        if (event) event.stopPropagation();
+        const menu = $('vp-save-menu');
+        if (menu) menu.classList.toggle('open');
+    }
+    function closeSaveMenu() {
+        const menu = $('vp-save-menu');
+        if (menu) menu.classList.remove('open');
+    }
+    function _bindSaveMenuOutsideClick() {
+        // Idempotent (guarded by a window flag) so re-init (e.g.
+        // after SPA navigation) doesn't double-bind.
+        if (window._vpSaveMenuBound) return;
+        window._vpSaveMenuBound = true;
+        document.addEventListener('click', (e) => {
+            const menu = $('vp-save-menu');
+            const group = e.target.closest('.vp-save-group');
+            if (!menu || !menu.classList.contains('open')) return;
+            if (group) return;  // click inside the save group = handled by the button
+            menu.classList.remove('open');
+        });
+        // Esc closes the menu (standard dropdown UX).
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeSaveMenu();
+        });
+    }
+
     async function submitSaveAsWorkflow() {
         const nameEl = $('vp-save-as-workflow-name');
         const descEl = $('vp-save-as-workflow-description');
@@ -2152,6 +2204,11 @@
         openSaveAsWorkflowModal: openSaveAsWorkflowModal,
         closeSaveAsWorkflowModal: closeSaveAsWorkflowModal,
         submitSaveAsWorkflow: submitSaveAsWorkflow,
+        // 2026-08-07: Save dropdown (the arrow next to the main
+        // Save button). The dropdown contains "Save as workflow";
+        // the main button still calls savePlan().
+        toggleSaveMenu: toggleSaveMenu,
+        closeSaveMenu: closeSaveMenu,
         saveStepEdits: saveStepEdits,
         deleteSelectedStep: deleteSelectedStep,
         // v2.2 (2026-07-30): Undo / Redo / Copy / Paste — mirror the

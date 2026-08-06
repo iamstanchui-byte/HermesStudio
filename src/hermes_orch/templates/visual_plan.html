@@ -404,6 +404,90 @@
         background: #450a0a;
         color: #fca5a5;
     }
+    /* 2026-08-07: toolbar button class — fixed height + standard
+       shape so all toolbar buttons are visually uniform regardless
+       of the variant (default / cyan / purple / emerald). Use
+       `h-8` instead of `py-1.5` to guarantee identical heights
+       across text-only buttons and icon-prefixed buttons (e.g.
+       "💾 Save" vs "↶ Undo"). */
+    .vp-toolbar-btn {
+        display: inline-flex;
+        align-items: center;
+        height: 32px;
+        padding: 0 12px;
+        font-size: 12px;
+        font-weight: 500;
+        line-height: 1;
+        border-radius: 4px;
+        border: 1px solid #d1d5db;
+        color: #374151;
+        background: transparent;
+        white-space: nowrap;
+        transition: background 0.1s;
+    }
+    .vp-toolbar-btn:hover { background: #f3f4f6; }
+    .vp-toolbar-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    /* Color variants — same as the old per-button classes but
+       consolidated so the visual rule lives in one place. */
+    .vp-toolbar-btn-cyan    { border-color: #67e8f9; color: #0e7490; }
+    .vp-toolbar-btn-cyan:hover    { background: #ecfeff; }
+    .vp-toolbar-btn-purple  { border-color: #d8b4fe; color: #6b21a8; }
+    .vp-toolbar-btn-purple:hover  { background: #faf5ff; }
+    .vp-toolbar-btn-emerald { border-color: #34d399; color: #047857; font-weight: 700; }
+    .vp-toolbar-btn-emerald:hover { background: #ecfdf5; }
+    .vp-toolbar-btn-emerald-primary { border-width: 2px; border-color: #10b981; color: #047857; font-weight: 700; }
+    .vp-toolbar-btn-emerald-primary:hover { background: #ecfdf5; }
+    .vp-toolbar-btn-cyan-primary    { border-width: 2px; border-color: #06b6d4; color: #0e7490; font-weight: 700; }
+    .vp-toolbar-btn-cyan-primary:hover    { background: #ecfeff; }
+    /* Save split button — main button + dropdown arrow share
+       a single border. The dropdown arrow is a separate <button>
+       inside the wrapper so it has its own click handler. */
+    .vp-save-group {
+        position: relative;
+        display: inline-flex;
+        height: 32px;
+        border: 2px solid #06b6d4;
+        border-radius: 4px;
+        overflow: visible;
+    }
+    .vp-save-group > .vp-toolbar-btn-cyan-primary {
+        border: 0; border-right: 1px solid #06b6d4; border-radius: 0;
+    }
+    .vp-save-arrow {
+        display: inline-flex; align-items: center; justify-content: center;
+        height: 32px; padding: 0 8px;
+        background: transparent; color: #0e7490;
+        font-size: 10px; line-height: 1;
+        cursor: pointer;
+    }
+    .vp-save-arrow:hover { background: #ecfeff; }
+    /* Dropdown panel — positioned below the arrow. Hidden by
+       default; opened by the JS click handler. We use absolute
+       positioning relative to the .vp-save-group so the menu
+       follows the button on scroll. */
+    .vp-save-menu {
+        display: none;
+        position: absolute;
+        top: 36px;
+        right: 0;
+        min-width: 180px;
+        background: white;
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+        z-index: 50;
+    }
+    .vp-save-menu.open { display: block; }
+    .vp-save-menu button {
+        display: block; width: 100%;
+        padding: 8px 12px; text-align: left;
+        font-size: 12px; color: #047857; font-weight: 500;
+        background: transparent; border: 0; cursor: pointer;
+    }
+    .vp-save-menu button:hover { background: #ecfdf5; }
+    body.dark .vp-save-menu { background: #1f2937; border-color: #374151; }
+    body.dark .vp-save-menu button { color: #6ee7b7; }
+    body.dark .vp-save-menu button:hover { background: #064e3b; }
     /* v3.12.5: Add-step palette chips (mirror of .vf-palette-chip in
        visual_workflow.html so the 4 templates look identical across
        both editors). The class is `vp-palette-chip` (vs `vf-palette-chip`
@@ -429,6 +513,29 @@
     body.dark .vp-palette-chip:hover {
         background: #1d4ed8;
     }
+    /* v3.14.0 (Phase 3): human_approval palette chip — visually
+       distinct from the 4 do_task chips so the user immediately
+       sees that clicking this creates a different step type.
+       Amber palette mirrors the human_approval node card marker
+       in the canvas. The chip still uses the `vp-palette-chip`
+       base class for layout, but adds `vp-palette-chip-approval`
+       for the color override. */
+    .vp-palette-chip.vp-palette-chip-approval {
+        background: #fffbeb;
+        border-color: #fbbf24;
+        color: #92400e;
+    }
+    .vp-palette-chip.vp-palette-chip-approval:hover {
+        background: #fef3c7;
+    }
+    body.dark .vp-palette-chip.vp-palette-chip-approval {
+        background: #422006;
+        border-color: #f59e0b;
+        color: #fcd34d;
+    }
+    body.dark .vp-palette-chip.vp-palette-chip-approval:hover {
+        background: #78350f;
+    }
 </style>
 {% endblock %}
 
@@ -453,32 +560,25 @@
             </a>
             <span class="text-gray-400 font-normal text-base">/ plan</span>
         </h1>
-        <p class="text-xs text-gray-500 mt-0.5 flex items-center gap-2 flex-wrap">
-            <span>Visual plan editor (Phase C) · design-time only · changes here don't dispatch until you click "Generate tasks"</span>
-            {# v1.9.4.1: explicit project id display. User feedback
-               "在visual plan 中可不可以加個project id 顯示". The id
-               is also in the URL but a visible chip makes
-               it copyable + harder to miss when sharing the page.
-               Monospace + slightly muted so it doesn't compete
-               with the project name. #}
+        <div class="text-xs text-gray-500 mt-0.5 flex items-center gap-2 flex-wrap">
+            {# v1.9.4.1: explicit project id display. The verbose
+               "Visual plan editor (Phase C) · design-time only..."
+               and "gray wire = chain (depends_on)..." lines were
+               removed 2026-08-07 — the user found them too noisy
+               for a 1-line description. The toolbar Save button
+               tells them when there are unsaved changes (amber
+               "Save (N changes)"), and the wire legend is now
+               only in the visual_workflow editor's "?" tooltips
+               (it doesn't really differ between the two editors). #}
             <button type="button"
                 onclick="navigator.clipboard.writeText('{{ project.id }}'); this.textContent='✓ copied'; setTimeout(() => this.textContent='{{ project.id }}', 1200);"
                 class="font-mono text-[10px] text-gray-400 hover:text-blue-600 hover:bg-blue-50 px-1.5 py-0.5 rounded border border-gray-200"
                 title="Click to copy project id">
                 {{ project.id }}
             </button>
-        </p>
+        </div>
     </div>
-    <div class="flex items-center gap-2">
-        {# v1.9.4: legend explaining the two wire kinds. Mirrors
-           visual_workflow.html's legend so the two editors read
-           the same way. The user said the workflow template's
-           red loop-back line should be copied to the plan editor. #}
-        <span class="text-xs text-gray-500 hidden md:inline">
-            <span class="font-semibold text-gray-600">gray</span> wire = chain (depends_on)
-            ·
-            <span class="font-semibold" style="color: #dc2626;">red dashed</span> wire = loop-back (feedback_to)
-        </span>
+    <div class="flex items-center gap-1.5">
         {# v2.2 (2026-07-30): Undo / Redo + Copy / Paste. Mirror of
            visual_workflow.html. Disabled state is managed by
            visual_plan.js's _updateHistoryButtons(). Keyboard
@@ -486,32 +586,32 @@
            selected step, Ctrl+V = paste, Escape = close panel. #}
         <button id="vp-undo-btn" type="button" disabled
             onclick="window.vp.undo()"
-            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+            class="vp-toolbar-btn"
             title="Nothing to undo (Ctrl+Z)">
             ↶ Undo
         </button>
         <button id="vp-redo-btn" type="button" disabled
             onclick="window.vp.redo()"
-            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+            class="vp-toolbar-btn"
             title="Nothing to redo (Ctrl+Y)">
             ↷ Redo
         </button>
-        <span class="w-px h-6 bg-gray-300 mx-1"></span>
+        <span class="w-px h-5 bg-gray-300 mx-0.5"></span>
         <button type="button"
             onclick="window.vp.copyStep()"
-            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            class="vp-toolbar-btn"
             title="Copy the selected step to clipboard (Ctrl+C). Then click an empty spot or another card and Ctrl+V to clone.">
             📋 Copy
         </button>
         <button type="button"
             onclick="window.vp.pasteStep()"
-            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            class="vp-toolbar-btn"
             title="Paste the copied step as a new step with a unique -copy name (Ctrl+V). No edges auto-wired.">
             📥 Paste
         </button>
-        <span class="w-px h-6 bg-gray-300 mx-1"></span>
+        <span class="w-px h-5 bg-gray-300 mx-0.5"></span>
         <button onclick="window.vp.openJsonModal()"
-            class="px-3 py-1.5 text-xs font-medium rounded border border-gray-300 text-gray-700 hover:bg-gray-50"
+            class="vp-toolbar-btn"
             title="Open the JSON editor in a modal (for power users who prefer raw JSON). v3.8.0: was a hidden bottom-of-page form, now a proper modal so the JSON content is visible without scrolling.">
             📝 Edit JSON
         </button>
@@ -529,7 +629,7 @@
            can then either Save + Generate tasks from the plan, or
            skip the plan and let the imported tasks run as-is. #}
         <button onclick="openApplyWorkflowModal()"
-            class="px-3 py-1.5 text-xs font-medium rounded border border-cyan-300 text-cyan-700 hover:bg-cyan-50"
+            class="vp-toolbar-btn vp-toolbar-btn-cyan"
             title="Import a saved workflow package as new pending tasks. Additive — existing tasks are kept. Modal opens below.">
             📥 Apply workflow
         </button>
@@ -538,39 +638,57 @@
            (design-time), not tasks. The user reviews in the canvas
            then clicks Save (persist) or Run (materialize + dispatch). #}
         <button onclick="window.vp.openGeneratePlanModal()"
-            class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
+            class="vp-toolbar-btn vp-toolbar-btn-purple"
             title="Ask the LLM to draft a plan from a goal. Returns a plan_json (not tasks) — you review and edit on the canvas, then Save or Run.">
             ✨ Generate plan
         </button>
         <button onclick="window.vp.generateTasks()"
-            class="px-3 py-1.5 text-xs font-bold rounded border-2 border-emerald-500 text-emerald-700 hover:bg-emerald-50"
+            class="vp-toolbar-btn vp-toolbar-btn-emerald-primary"
             title="Materialize the plan into tasks (POST /api/projects/{id}/plan/run). The supervisor will dispatch the new tasks on the next tick.">
             ▶ Generate tasks
         </button>
-        <button id="vp-save-btn" onclick="window.vp.savePlan()"
-            class="px-3 py-1.5 text-xs font-bold rounded border-2 border-cyan-500 text-cyan-700 hover:bg-cyan-50"
-            title="Save the plan JSON to the server (PUT /api/projects/{id}/plan)">
-            💾 Save
-        </button>
-        {# v3.8.0 (2026-08-01): "Save as workflow" — package the current
-           plan as a reusable workflow template. v3.7.x had this action
-           on the runtime project page (visual_project.html) as
-           "Promote to workflow", but the design-time source is the
-           plan, not the runtime tasks, so it belongs HERE. The action
-           calls POST /api/projects/{id}/plan/to-workflow, which loads
-           the plan, calls the LLM to generalize concrete values into
-           {{var}} placeholders, and writes a workflow_packages row
-           with source_project_id = this project. The user is then
-           redirected to /workflows/{new_id} for review.
-           Different from "Save" (which persists the plan on the
-           project) and "Generate tasks" (which dispatches the plan
-           to the supervisor). This button packages the plan as a
-           TEMPLATE, separate from the project itself. #}
-        <button onclick="window.vp.openSaveAsWorkflowModal()"
-            class="px-3 py-1.5 text-xs font-bold rounded border-2 border-emerald-600 text-emerald-700 hover:bg-emerald-50"
-            title="Package the current plan as a reusable workflow template. POST /api/projects/{id}/plan/to-workflow — LLM generalizes concrete values into {{var}} placeholders. Redirects to the new workflow's detail page.">
-            💼 Save as workflow
-        </button>
+        {# 2026-08-07: Save split button — main "Save" + dropdown
+           arrow. The arrow opens a small menu with "Save as
+           workflow" (the v3.8.0 template-packaging action that
+           used to be a sibling button). The main button still
+           triggers the dirty-count update via savePlan(). The
+           dropdown closes on outside click (bound in
+           visual_plan.js). #}
+        <div class="vp-save-group">
+            <button id="vp-save-btn" onclick="window.vp.savePlan()"
+                class="vp-toolbar-btn-cyan-primary"
+                style="height: 32px; padding: 0 12px; font-size: 12px; font-weight: 700; color: #0e7490; background: transparent;"
+                title="Save the plan JSON to the server (PUT /api/projects/{id}/plan)">
+                💾 Save
+            </button>
+            <button type="button"
+                onclick="window.vp.toggleSaveMenu(event)"
+                class="vp-save-arrow"
+                aria-label="More save options"
+                title="More save options">
+                ▾
+            </button>
+            <div id="vp-save-menu" class="vp-save-menu" role="menu">
+                {# v3.8.0 (2026-08-01): "Save as workflow" — package the
+                   current plan as a reusable workflow template. The
+                   action calls POST /api/projects/{id}/plan/to-workflow,
+                   which loads the plan, calls the LLM to generalize
+                   concrete values into {{var}} placeholders, and
+                   writes a workflow_packages row. The user is then
+                   redirected to /workflows/{new_id} for review.
+                   Different from "Save" (which persists the plan
+                   on the project) and "Generate tasks" (which
+                   dispatches the plan to the supervisor). This
+                   packages the plan as a TEMPLATE, separate from
+                   the project itself. Now lives inside the Save
+                   dropdown to save toolbar space. #}
+                <button type="button"
+                    onclick="window.vp.openSaveAsWorkflowModal(); window.vp.closeSaveMenu();"
+                    title="Package the current plan as a reusable workflow template. POST /api/projects/{id}/plan/to-workflow — LLM generalizes concrete values into {{var}} placeholders. Redirects to the new workflow's detail page.">
+                    💼 Save as workflow
+                </button>
+            </div>
+        </div>
     </div>
 </div>
 
@@ -579,13 +697,23 @@
    `action` (search→fetch_url, analyze→summarize, audit→audit_check,
    write→write_output) and chain-mode auto-wire depends_on to the last
    step. The wrapper class is `bg-white border rounded-lg p-2 mb-2`
-   to visually match workflow's `Add step:` row. #}
+   to visually match workflow's `Add step:` row.
+
+   v3.14.0 (Phase 3): added a 5th chip `human_approval` that
+   pre-fills the step with `type: "human_approval"` and a
+   placeholder action. Clicking it adds a step that pauses the
+   workflow for the operator (see the inbox UI for Approve /
+   Reject). The amber color marks it as a different step type
+   from the 4 do_task templates. The `approval` sub-object
+   (on_reject / summary_template / etc.) is still configured
+   in the side panel after adding. #}
 <div class="bg-white border rounded-lg p-2 mb-2 flex items-center gap-2">
     <span class="text-xs font-semibold text-gray-700">Add step:</span>
     <span class="vp-palette-chip" data-template="search">search</span>
     <span class="vp-palette-chip" data-template="analyze">analyze</span>
     <span class="vp-palette-chip" data-template="audit">audit</span>
     <span class="vp-palette-chip" data-template="write">write</span>
+    <span class="vp-palette-chip vp-palette-chip-approval" data-template="human_approval">⏸ human_approval</span>
     <span class="text-xs text-gray-400 ml-2">click to add (chain-mode: auto-wires to last step)</span>
 </div>
 
