@@ -58,6 +58,15 @@ _STEP_FIELDS = (
     # depends_on)". Default: null/omitted (no loop-back).
     # Cap: project.max_iterations.
     "feedback_to",
+    # v3.14.0: `type` is the workflow step semantic type. Defaults to
+    # "do_task" if absent (backward compat with v3.13.x workflows).
+    # Currently supported values: "do_task", "human_approval".
+    # Future values: "wait", "webhook", "branch" (per design doc §4.1).
+    "type",
+    # v3.14.0: `approval` is the config object for `type: "human_approval"`
+    # steps. Schema: {on_reject, route_to?, summary_template, timeout_seconds?}.
+    # See hermes_orch.core.approval_validation.validate_approval_object.
+    "approval",
 )
 # Fields whose VALUES may contain {{var}} placeholders. Excludes
 # `skill` (a static identifier) and `depends_on` (a list of step
@@ -750,8 +759,13 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
         # Duplicate name check already done in pre-pass; keep seen_names
         # for the depends_on forward-ref check.
         seen_names.add(name)
-        # action
-        action = step.get("action", "")
+        # v3.14.0: `type` is the preferred field. If absent, fall back
+        # to the legacy `action` field (backward compat with v3.13.x
+        # workflows that pre-date the type field). The `action` column
+        # on the `tasks` table is what the supervisor dispatches on;
+        # `_STEP_FIELDS` already lists `type` alongside `action`.
+        # Default to "do_task" if neither is set.
+        action = step.get("action") or step.get("type") or "do_task"
         if not isinstance(action, str) or not action:
             return False, f"step_template[{i}].action missing or empty"
         if any(s in action for s in ("coord_pickup", "handoff:", "_iteration_review")):
@@ -800,6 +814,39 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
                 # Self-reference is silently dropped at runtime; we don't
                 # reject it because the LLM sometimes produces it
                 # defensively. It's just a no-op.
+
+        # v3.14.0: validate `type: "human_approval"` step schema +
+        # summary_template vars + route_to wiring. This is in the
+        # same step loop because the errors are per-step and we want
+        # the LLM-synth flow to surface a clear "step N failed" error
+        # pointing at the specific step. The validation itself lives
+        # in `core.approval_validation` for testability.
+        #
+        # We pass the full step list for route_to existence verification
+        # and this step's params_template keys (which is what the
+        # summary template can reference at runtime — see design doc
+        # §4.7.1 "params: 本 step 的 params_template / runtime params").
+        # Top-level workflow variables are NOT in the summary template
+        # context (they get substituted INTO params_template values at
+        # run time, but they don't appear as keys themselves).
+        step_type = step.get("type", "do_task")
+        if step_type == "human_approval":
+            step_params = step.get("params_template") or {}
+            params_keys: set[str] = set()
+            if isinstance(step_params, dict):
+                params_keys.update(
+                    k for k in step_params.keys() if isinstance(k, str)
+                )
+            from hermes_orch.core.approval_validation import (
+                validate_human_approval_step as _validate_ha_step,
+            )
+            step_errors = _validate_ha_step(
+                step,
+                all_steps=step_template,
+                params_keys=params_keys,
+            )
+            for err in step_errors:
+                return False, f"step_template[{i}] (type=human_approval): {err}"
 
     # Variables
     variables = pkg["variables"]
@@ -1563,6 +1610,28 @@ async def run_workflow(
             feedback_to = [f for f in raw_fb if f != sname]
         else:
             feedback_to = []
+        # v3.14.0: compute task.action from step `type` (preferred) or
+        # the legacy `action` field (backward compat with v3.13.x
+        # workflows that pre-date the `type` field). Default to
+        # "do_task" if neither is set.
+        #
+        # `type: "human_approval"` → task.action = "human_approval"
+        # (the supervisor recognizes this and does NOT dispatch an
+        # agent task; instead it creates an ApprovalRequest on the
+        # side, see docs/v3.14.0-workflow-human-approval.md §4.4).
+        # The approval config (on_reject / route_to / summary_template
+        # / timeout_seconds) is preserved on the task row as
+        # `_workflow_approval` so the supervisor can read it on
+        # every tick without a re-fetch from workflow_packages.
+        step_type = step.get("type", "do_task")
+        if step_type == "human_approval":
+            task_action = "human_approval"
+            approval_cfg = step.get("approval") or {}
+            if isinstance(params, dict):
+                params = dict(params)
+                params["_workflow_approval"] = dict(approval_cfg)
+        else:
+            task_action = step.get("action") or "do_task"
         task_rows.append({
             "id": tid,
             "project_id": new_pid,
@@ -1572,7 +1641,7 @@ async def run_workflow(
             "on_parent_failure": "skip",
             "status": "pending",
             "priority": "normal",
-            "action": step.get("action") or "do_task",
+            "action": task_action,
             "params": params,
             "max_retries": 2,
             "timeout_seconds": 1800,

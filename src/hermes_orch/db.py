@@ -458,6 +458,51 @@ CREATE TABLE IF NOT EXISTS project_schedules (
 CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON project_schedules(enabled);
 CREATE INDEX IF NOT EXISTS idx_schedules_template ON project_schedules(template_project_id);
 CREATE INDEX IF NOT EXISTS idx_schedules_next_fire ON project_schedules(next_fire_at);
+
+-- ===== v3.14.0 (Phase 1): approval_requests table for human_approval =====
+-- One row per pending/decided approval for `type: "human_approval"`
+-- workflow steps. workflow_id is the project that contains the step;
+-- step_name is the workflow step name. status is a separate state
+-- machine from tasks.status (which is the execution state). The two
+-- are joined by FK from the supervisor: when a `human_approval` step's
+-- ApprovalRequest is approved, the corresponding tasks row transitions
+-- to 'completed' with completion_reason='approved_by_human'.
+--
+-- payload is a TEXT serialized string (NOT a structured object) — see
+-- §4.2 of the v3.14.0 design doc. The 15MB cap is on the serialized
+-- length. Empty string allowed (no payload to review).
+--
+-- decided_at is NULL until status moves out of 'pending'. reason is
+-- only meaningful for 'rejected' / 'expired' (user-provided reject
+-- reason OR 'timeout' / 'workflow_cancelled'). user_id is audit-only
+-- (v1 single-user always sets to dashboard session user, or 'system'
+-- for sweeper / cancel auto-reject).
+--
+-- ON DELETE CASCADE: when a workflow (project) is deleted, all
+-- approval_requests for it are auto-removed. Soft-delete can be added
+-- later if long-term audit retention becomes a requirement.
+--
+-- Indexes:
+--   idx_approval_workflow: per-workflow history list
+--   idx_approval_status: inbox badge count WHERE status='pending'
+--   idx_approval_created: sweeper scan WHERE status='pending'
+--                          AND created_at + timeout_seconds < now
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id              TEXT PRIMARY KEY,            -- "apr-{short_id}"
+    workflow_id     TEXT NOT NULL,               -- projects.id (the workflow run)
+    step_name       TEXT NOT NULL,               -- step name within the workflow
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | expired
+    summary         TEXT NOT NULL,               -- rendered summary string
+    payload         TEXT NOT NULL DEFAULT '',    -- serialized string, 15MB cap
+    created_at      TEXT NOT NULL,               -- ISO 8601
+    decided_at      TEXT,                        -- ISO 8601, null until decided
+    reason          TEXT NOT NULL DEFAULT '',    -- reject/expired/cancelled reason
+    user_id         TEXT NOT NULL DEFAULT '',    -- audit
+    FOREIGN KEY (workflow_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_approval_workflow ON approval_requests(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_approval_status   ON approval_requests(status);
+CREATE INDEX IF NOT EXISTS idx_approval_created  ON approval_requests(created_at);
 """
 
 # Idempotent migrations for older DBs that may be missing columns added later.
