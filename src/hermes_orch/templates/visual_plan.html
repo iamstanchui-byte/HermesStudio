@@ -515,11 +515,6 @@
             title="Open the JSON editor in a modal (for power users who prefer raw JSON). v3.8.0: was a hidden bottom-of-page form, now a proper modal so the JSON content is visible without scrolling.">
             📝 Edit JSON
         </button>
-        <button onclick="window.vp.validatePlan()"
-            class="px-3 py-1.5 text-xs font-medium rounded border border-amber-300 text-amber-700 hover:bg-amber-50"
-            title="Client-side check: duplicate step names, missing depends_on, etc. Doesn't run the plan.">
-            Validate plan
-        </button>
         {# Apply workflow (2026-07-28): moved into the plan editor
            because the plan is the new design-time entry point and
            the user expects to seed the plan from a saved workflow

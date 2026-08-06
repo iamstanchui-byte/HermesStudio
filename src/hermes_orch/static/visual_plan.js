@@ -1734,48 +1734,15 @@
         }
     }
 
-    function validatePlan() {
-        // Client-side validation only. Doesn't catch everything
-        // (the server is the authority), but the common cases
-        // — duplicate names, missing deps, empty names — surface
-        // here as fast feedback.
-        const issues = [];
-        const names = new Set();
-        for (const s of _plan.steps) {
-            if (!s.name) issues.push('Step with empty name');
-            else if (!KEBAB_RE.test(s.name)) issues.push('Step name "' + s.name + '" not kebab-case');
-            else if (names.has(s.name)) issues.push('Duplicate step name: ' + s.name);
-            else names.add(s.name);
-        }
-        // Check depends_on
-        for (const s of _plan.steps) {
-            if (!s.depends_on) continue;
-            for (const d of s.depends_on) {
-                if (!names.has(d)) {
-                    issues.push('Step "' + s.name + '" depends on unknown step "' + d + '"');
-                }
-            }
-        }
-        // v1.9.4: check feedback_to. Same rules as depends_on
-        // (must be a known step name; self-ref is a silent no-op
-        // at run time, but we still surface it as a client-side
-        // warning so the user can see it before saving).
-        for (const s of _plan.steps) {
-            if (!s.feedback_to) continue;
-            for (const f of s.feedback_to) {
-                if (f === s.name) {
-                    issues.push('Step "' + s.name + '" loops back to itself (silently dropped at run)');
-                } else if (!names.has(f)) {
-                    issues.push('Step "' + s.name + '" feedback_to references unknown step "' + f + '"');
-                }
-            }
-        }
-        if (issues.length === 0) {
-            showBanner('Plan OK: ' + _plan.steps.length + ' step(s), no issues', 'success');
-        } else {
-            alert('Validation issues:\n\n' + issues.map((i, idx) => (idx + 1) + '. ' + i).join('\n'));
-        }
-    }
+    // NOTE: validatePlan() was removed in 2026-08-07. The button
+    // was redundant — the Save button (savePlan → PUT /api/projects/{id}/plan)
+    // does the authoritative server-side validation, and the
+    // client-side check was a strict subset of what the server
+    // catches. Plus the alert() dialog was jarring vs. the
+    // inline error elements used everywhere else in the UI.
+    // If a fast-feedback "validate as you type" UX is wanted
+    // later, re-add it with inline errors (mirror the visual_workflow
+    // editor's #vf-edit-error pattern) and a new button label.
 
     // ===== JSON mode toggle =====
     // v3.8.0: the "Edit JSON" button now opens a modal overlay
@@ -2173,7 +2140,6 @@
         // handlers call internal helpers directly.
         savePlan: savePlan,
         generateTasks: generateTasks,
-        validatePlan: validatePlan,
         // v3.8.0: Edit JSON is now a modal (openJsonModal/closeJsonModal)
         // — toggleJsonMode is kept as a backward-compat shim that
         // delegates to openJsonModal().

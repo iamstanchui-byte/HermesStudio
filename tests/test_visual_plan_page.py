@@ -109,16 +109,18 @@ def test_visual_plan_page_renders_with_plan():
         assert "visual_plan.js" in html
         # Embedded plan JSON
         assert "vp-render-test" in html
-        # Toolbar buttons
-        for label in ("Add step", "Apply workflow", "Validate plan",
+        # Toolbar buttons. "Validate plan" was removed 2026-08-07
+        # (redundant with Save's server-side validation; the alert()
+        # dialog was jarring). Will be redesigned in a followup.
+        for label in ("Add step", "Apply workflow",
                       "Generate plan", "Generate tasks", "Save"):
             assert label in html, f"missing toolbar button: {label}"
         # Side panel DOM. The minimap was removed 2026-07-28
         # (no interactivity + was the source of the fade-text bug)
         # so we no longer assert on its id.
         assert 'id="vp-side-panel"' in html
-        # JS function bindings
-        for fn in ("addStep", "savePlan", "generateTasks", "validatePlan",
+        # JS function bindings. validatePlan removed 2026-08-07.
+        for fn in ("addStep", "savePlan", "generateTasks",
                    "toggleJsonMode", "saveStepEdits", "deleteSelectedStep",
                    "openGeneratePlanModal", "generatePlanFromLlm"):
             assert fn in html, f"missing JS function: {fn}"
