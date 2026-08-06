@@ -507,15 +507,17 @@
             <a href="/workflows/{{ workflow.id }}" class="text-blue-600 hover:underline">{{ workflow.name }}</a>
             <span class="text-gray-400 font-normal">/ visual</span>
         </h1>
-        <p class="text-xs text-gray-500 mt-0.5">
-            v{{ workflow.version }} ·
-            {{ workflow.step_count if workflow.step_count is defined else '?' }} step(s) ·
-            Phase 1 skeleton
-            <span class="text-gray-400 ml-2">
-                · <span class="font-semibold text-gray-600">blue</span> wires = chain (depends_on)
-                · <span class="font-semibold" style="color: #dc2626;">red dashed</span> wire = if I fail, re-run target (feedback_to, v2.0)
-            </span>
-        </p>
+        {# 2026-08-07: trimmed the verbose sub-header that used to
+           show "v0.1.0 · 2 step(s) · Phase 1 skeleton · blue wires
+           = chain (depends_on) · red dashed wire = if I fail,
+           re-run target (feedback_to, v2.0)". The step count
+           is already on the workflow detail page (/workflows/{id})
+           and the wire legend belongs to the drawflow canvas
+           itself (the user can hover the input/output handles
+           for inline tooltips). The version label "v" is
+           meaningless to a single-package user. The "Phase 1
+           skeleton" tag was a development-era marker that
+           shouldn't be in production UI. #}
     </div>
     <div class="flex gap-2 items-center">
         {# v2.1 (2026-07-30): Undo / Redo buttons. Disabled when
@@ -572,19 +574,17 @@
             title="Download the current step_template + variables as a .workflow.json file you can share or archive. Re-importable via the Import button.">
             ⬇ Export
         </button>
-        {# v2.2 (2026-07-30): separator + AI assist group #}
-        <span class="w-px h-6 bg-gray-300 mx-1"></span>
-        {# v2.1 (2026-07-30): parameter hints. Calls the backend
-           /suggest-vars endpoint which extracts {{var}}
-           placeholders + infers types from literal values in
-           the same step's params_template. No LLM call (the v2.1
-           implementation is local + deterministic). #}
-        <button type="button"
-            onclick="window.visualBuilder.suggestVars()"
-            class="px-3 py-1.5 text-xs font-medium rounded border border-purple-300 text-purple-700 hover:bg-purple-50"
-            title="Scan all step params for {{var}} placeholders and add missing variables to the variables list. Inferred type comes from literal values in the same step (v2.1: local, deterministic; v2.2: LLM-backed).">
-            ✨ Suggest
-        </button>
+        {# 2026-08-07: the "Suggest" button (v2.1, /suggest-vars
+           endpoint) was removed. It scanned all step params for
+           {{var}} placeholders and inferred types from literal
+           values in the same step — useful in theory but in
+           practice the user always ends up editing the variables
+           list by hand anyway (type inference is naive; the user
+           knows their domain better). The associated JS
+           function, public-API export, and POST
+           /api/workflows/{id}/suggest-vars endpoint are also
+           removed (no other consumers).
+        #}
         {# v2.2 (2026-07-30): separator + layout + advanced group #}
         <span class="w-px h-6 bg-gray-300 mx-1"></span>
         {# Topo sort button removed in v2.2 (2026-07-30): the workflow

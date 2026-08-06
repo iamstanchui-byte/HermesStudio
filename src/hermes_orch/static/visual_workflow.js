@@ -513,82 +513,12 @@
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;');
     }
-    // ===== v2.1: Parameter hints (LLM suggest var types) =====
-    // Calls POST /api/workflows/{id}/suggest-vars and merges the
-    // suggestions into _variables. The backend does a LOCAL
-    // extraction of {{var}} placeholders + infers type from
-    // literal values in the same step's params (no LLM call —
-    // see the backend docstring for the algorithm + future LLM
-    // extension). User can review each suggestion before applying.
-    async function _suggestAndMergeVars() {
-        if (!_workflowId) {
-            _showBanner('Cannot suggest: workflow id missing (refresh the page)', 'error');
-            return;
-        }
-        // v2.1: checkpoint BEFORE the merge so undo can restore
-        // the pre-suggestion variable list.
-        _checkpoint('Suggest variables from LLM');
-        try {
-            const r = await fetch('/api/workflows/' + encodeURIComponent(_workflowId) + '/suggest-vars', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: '{}',
-            });
-            if (!r.ok) {
-                const errBody = await r.json().catch(() => ({}));
-                _showBanner('Suggest failed: ' + (errBody.detail || r.status), 'error');
-                return;
-            }
-            const data = await r.json();
-            const suggestions = data.suggestions || [];
-            if (suggestions.length === 0) {
-                _showBanner('No {{var}} placeholders found in any step. Add placeholders in params_template, then try again.', 'info');
-                return;
-            }
-            // Merge into _variables. For each suggestion:
-            //   - If already defined, skip (or update if the existing
-            //     type is "string" and we have a better type)
-            //   - If not defined, add a new entry
-            if (!Array.isArray(_variables)) _variables = [];
-            const byName = new Map(_variables.map((v) => [v.name, v]));
-            let added = 0;
-            let updated = 0;
-            for (const s of suggestions) {
-                if (byName.has(s.name)) {
-                    const existing = byName.get(s.name);
-                    // Conservative update: only update the type
-                    // if the existing one is the default "string"
-                    // and we inferred something more specific.
-                    if ((existing.type || "string") === "string" && s.type && s.type !== "string") {
-                        existing.type = s.type;
-                        updated += 1;
-                    }
-                } else {
-                    _variables.push({
-                        name: s.name,
-                        type: s.type || "string",
-                        default: s.default || "",
-                        description: s.description || "",
-                        required: true,
-                    });
-                    byName.set(s.name, _variables[_variables.length - 1]);
-                    added += 1;
-                }
-            }
-            // Re-render the JSON form (where the variables textbox
-            // lives) so the user sees the new variables.
-            const ta = document.getElementById('vf-variables-json');
-            if (ta) ta.value = JSON.stringify(_variables, null, 2);
-            // Re-render canvas (in case the JS auto-adds anything
-            // for new placeholders; the existing _autoAddVariablesFromParams
-            // is a no-op here but we keep the call for consistency).
-            _render();
-            _showBanner('Suggested ' + suggestions.length + ' variable(s); added ' + added + ', updated ' + updated + '. Review in the JSON form, then Save.', 'success');
-        } catch (e) {
-            _showBanner('Suggest failed: ' + e.message, 'error');
-        }
-    }
-    // ===== end v2.1 Parameter hints =====
+    // 2026-08-07: _suggestAndMergeVars() removed. The Suggest
+    // button + POST /api/workflows/{id}/suggest-vars endpoint
+    // were removed (the user found the button rarely useful —
+    // type inference is naive, and the user knows their domain
+    // better than the local extractor). The variables list is
+    // now edited directly via the Edit as JSON form.
 
     // ---- DOM lookup ----
     function _canvas() { return document.getElementById('vf-canvas'); }
@@ -2305,13 +2235,9 @@
         // re-renders. The user still has to click Save to persist.
         exportJson: _exportWorkflowAsJson,
         importJson: _importWorkflowFromJson,
-        // v2.1: parameter hints. Calls the backend
-        // /suggest-vars endpoint which extracts {{var}}
-        // placeholders + infers types from literal values in
-        // the same step's params. No LLM call (the v2.1
-        // implementation is local + deterministic; the LLM-
-        // backed version is a v2.2 followup).
-        suggestVars: _suggestAndMergeVars,
+        // 2026-08-07: suggestVars export removed (button + endpoint
+        // also removed; see the function's old location for the
+        // removal rationale).
         topoSort: () => {
             const changed = _topoSortSteps();
             _showBanner(
