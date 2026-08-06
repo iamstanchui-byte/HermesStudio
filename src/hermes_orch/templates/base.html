@@ -152,6 +152,26 @@
             overflow: hidden; text-overflow: ellipsis;
         }
         body.sidebar-collapsed .sidebar-label { display: none; }
+        /* v3.14.0 (Phase 3): inbox badge — small red pill that shows
+           the pending-approvals count. Anchored to the right of the
+           sidebar item. Hidden when count is 0 (set by
+           _updateSidebarBadge in JS). margin-left:auto to push it
+           to the right edge. In collapsed mode, the label is gone
+           so the badge sits next to the icon. */
+        .sidebar-badge {
+            display: inline-block;
+            min-width: 20px;
+            padding: 0.1rem 0.4rem;
+            margin-left: auto;
+            background: #dc2626;
+            color: #fff;
+            border-radius: 999px;
+            font-size: 0.65rem;
+            font-weight: 600;
+            text-align: center;
+            line-height: 1.1;
+            font-variant-numeric: tabular-nums;
+        }
         .sidebar-group-toggle {
             display: flex; align-items: center; gap: 0.625rem;
             padding: 0.5rem 0.75rem;
@@ -735,6 +755,18 @@
                 <span class="sidebar-icon">☑️</span>
                 <span class="sidebar-label">Tasks</span>
             </a>
+            {# v3.14.0 (Phase 3): inbox — cross-workflow pending human
+               approvals. The badge count is the number of pending
+               approvals and is refreshed every 30s by the
+               _updateSidebarBadge() helper below (same interval as
+               the inbox page itself, per design doc §5.2). Hidden
+               when the count is 0 so the sidebar stays clean for
+               operators who never use the approval workflow. #}
+            <a href="/inbox" class="sidebar-item {% if active_page == 'inbox' %}active{% endif %}" id="sidebar-inbox">
+                <span class="sidebar-icon">📥</span>
+                <span class="sidebar-label">Inbox</span>
+                <span id="sidebar-inbox-badge" class="sidebar-badge" style="display: none;">0</span>
+            </a>
             <button type="button" class="sidebar-group-toggle {% if active_page in ('settings', 'models', 'evaluations', 'guardrails', 'integrations', 'token_usage', 'schedules', 'history', 'admin_users') %}expanded{% endif %}" onclick="toggleSettingsGroup()">
                 <span class="sidebar-icon">⚙️</span>
                 <span class="sidebar-label">Settings</span>
@@ -994,6 +1026,70 @@
         stopPolling();
         setAutoRefreshUI(true);
     };
+
+    // ===== v3.14.0 (Phase 3): inbox badge polling =====
+    // The sidebar inbox icon shows a small red badge with the
+    // count of pending human_approval requests. The count is
+    // refreshed by polling GET /api/inbox/approvals?status=pending
+    // every 30s (same interval as the inbox page itself, per
+    // design doc §5.2). The poll runs in parallel with the page's
+    // own 10s auto-refresh — they are independent (badge reflects
+    // global state, page reflects local state).
+    //
+    // The polling is paused when the tab is hidden (visibility API)
+    // and resumes when the tab comes back, so backgrounded tabs
+    // don't hammer the API.
+    //
+    // The poll is also exposed as _updateSidebarBadge(n) so the
+    // inbox page can call it with a fresh count from its own
+    // response (avoids the small window where the badge would lag
+    // the inbox list for up to 30s after a decision).
+    let _sidebarInboxPollTimer = null;
+    function _updateSidebarBadge(n) {
+        const badge = document.getElementById('sidebar-inbox-badge');
+        if (!badge) return;
+        if (n > 0) {
+            badge.textContent = n > 99 ? '99+' : String(n);
+            badge.style.display = '';
+        } else {
+            badge.style.display = 'none';
+        }
+    }
+    async function _pollSidebarInbox() {
+        try {
+            const r = await fetch('/api/inbox/approvals?status=pending', { cache: 'no-store' });
+            if (!r.ok) return;  // silent: 401/5xx just keep last count
+            const data = await r.json();
+            _updateSidebarBadge((data.items || []).length);
+        } catch (e) {
+            // Network error: keep the last known count visible. The
+            // user can still click the inbox link — the page itself
+            // does its own fetch on load.
+        }
+    }
+    function startSidebarInboxPoll() {
+        _pollSidebarInbox();  // immediate first call
+        if (_sidebarInboxPollTimer) return;
+        _sidebarInboxPollTimer = setInterval(_pollSidebarInbox, 30000);
+    }
+    function stopSidebarInboxPoll() {
+        if (_sidebarInboxPollTimer) { clearInterval(_sidebarInboxPollTimer); _sidebarInboxPollTimer = null; }
+    }
+    // Expose globally so the inbox page can push a fresh count
+    // after a decision without waiting for the next tick.
+    window._updateSidebarBadge = _updateSidebarBadge;
+
+    // Only run the poll if the user is authenticated. Unauth pages
+    // (e.g. /login) don't have a session cookie and would 401 on
+    // every poll, polluting the log. We detect this by checking
+    // for the user pill (set on authed pages only).
+    if (document.getElementById('user-pill-wrap') || document.getElementById('sidebar-inbox')) {
+        startSidebarInboxPoll();
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) stopSidebarInboxPoll();
+            else startSidebarInboxPoll();
+        });
+    }
     </script>
 </body>
 </html>

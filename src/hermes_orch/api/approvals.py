@@ -66,6 +66,77 @@ def _serialize_approval_row(row: dict) -> dict:
     return out
 
 
+async def _lookup_on_reject(db, workflow_id: str, step_name: str) -> str:
+    """Read the step's on_reject from tasks.params._workflow_approval.
+
+    v3.14.0 Phase 3 (UI): the inbox page needs the on_reject value
+    to show the correct confirm message ("Rejecting will stop the
+    workflow" / "skip" / "route to X"). We do a small best-effort
+    lookup; on any failure we return "stop" (the safe default that
+    prompts the strongest confirm). Returns empty string if the
+    step is missing entirely.
+    """
+    try:
+        row = await db.fetchone(
+            "SELECT params FROM tasks WHERE project_id = ? AND name = ?",
+            (workflow_id, step_name),
+        )
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    try:
+        params_obj = json.loads(row.get("params") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(params_obj, dict):
+        return ""
+    approval_cfg = params_obj.get("_workflow_approval") or {}
+    if not isinstance(approval_cfg, dict):
+        return ""
+    return approval_cfg.get("on_reject") or ""
+
+
+async def _lookup_route_to(db, workflow_id: str, step_name: str) -> str:
+    """Read the step's route_to from tasks.params._workflow_approval.
+
+    Companion to _lookup_on_reject — only meaningful when on_reject
+    is "route", but cheap to fetch in the same row.
+    """
+    try:
+        row = await db.fetchone(
+            "SELECT params FROM tasks WHERE project_id = ? AND name = ?",
+            (workflow_id, step_name),
+        )
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    try:
+        params_obj = json.loads(row.get("params") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(params_obj, dict):
+        return ""
+    approval_cfg = params_obj.get("_workflow_approval") or {}
+    if not isinstance(approval_cfg, dict):
+        return ""
+    return approval_cfg.get("route_to") or ""
+
+
+async def _lookup_workflow_name(db, workflow_id: str) -> str:
+    """Read the project name. Best-effort: returns "" on any failure."""
+    try:
+        row = await db.fetchone(
+            "SELECT name FROM projects WHERE id = ?", (workflow_id,)
+        )
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    return row.get("name") or ""
+
+
 def _get_current_user_id(request: Request) -> str:
     """Get the current user_id from the session cookie.
 
@@ -299,9 +370,20 @@ async def list_workflow_approvals(
             "ORDER BY created_at DESC",
             (workflow_id,),
         )
+    # v3.14.0 Phase 3: enrich each row with on_reject + route_to so the
+    # workflow detail page can show the Reject confirm message without
+    # a second round-trip. Skip for terminal statuses (decided/expired)
+    # to keep the list cheap.
+    items = []
+    for r in rows:
+        serialized = _serialize_approval_row(r)
+        if r.get("status") == "pending":
+            serialized["on_reject"] = await _lookup_on_reject(db, workflow_id, r["step_name"])
+            serialized["route_to"] = await _lookup_route_to(db, workflow_id, r["step_name"])
+        items.append(serialized)
     return {
-        "count": len(rows),
-        "items": [_serialize_approval_row(r) for r in rows],
+        "count": len(items),
+        "items": items,
     }
 
 
@@ -336,9 +418,23 @@ async def list_inbox_approvals(
         "ORDER BY created_at DESC",
         (status,),
     )
+    # v3.14.0 Phase 3 (UI): enrich each row with workflow_name +
+    # on_reject + route_to so the inbox page can show meaningful
+    # labels and the Reject confirm message without a second
+    # round-trip. Only for pending (others are history; cheap to
+    # skip). N+1 query is acceptable here — pending inbox is
+    # typically <20 rows; if it grows we can batch via IN().
+    items = []
+    for r in rows:
+        serialized = _serialize_approval_row(r)
+        if r.get("status") == "pending":
+            serialized["workflow_name"] = await _lookup_workflow_name(db, r["workflow_id"])
+            serialized["on_reject"] = await _lookup_on_reject(db, r["workflow_id"], r["step_name"])
+            serialized["route_to"] = await _lookup_route_to(db, r["workflow_id"], r["step_name"])
+        items.append(serialized)
     return {
-        "count": len(rows),
-        "items": [_serialize_approval_row(r) for r in rows],
+        "count": len(items),
+        "items": items,
     }
 
 
@@ -369,4 +465,12 @@ async def get_approval_detail(
     if not apr:
         raise HTTPException(404, f"approval {approval_id} not found")
     # Full detail: do NOT truncate summary or payload
-    return dict(apr)
+    out = dict(apr)
+    # v3.14.0 Phase 3 (UI): enrich with workflow_name + on_reject +
+    # route_to so the detail page can show the correct Reject
+    # confirm message ("stop" / "skip" / "route to X"). For
+    # non-pending these are still useful (audit view).
+    out["workflow_name"] = await _lookup_workflow_name(db, apr["workflow_id"])
+    out["on_reject"] = await _lookup_on_reject(db, apr["workflow_id"], apr["step_name"])
+    out["route_to"] = await _lookup_route_to(db, apr["workflow_id"], apr["step_name"])
+    return out

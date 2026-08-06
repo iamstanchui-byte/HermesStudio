@@ -696,18 +696,31 @@
         const skill = step.skill
             ? `<div class="vf-node-skill">skill: ${esc(step.skill)}</div>`
             : '';
+        // v3.14.0 (Phase 3): human_approval steps get a distinct
+        // visual marker. We add the .vf-node-approval class to the
+        // card wrapper (CSS gives it a yellow border + ⏸ icon) and
+        // append a small "human approval" sub-label under the
+        // action. The action itself is still "do_task" (workflow
+        // step type is carried in the `type` field per design doc
+        // §4.1), so the action line stays the same.
+        const isApproval = step.type === 'human_approval';
+        const approvalClass = isApproval ? ' vf-node-approval' : '';
+        const approvalLabel = isApproval
+            ? `<div class="vf-node-approval-label">⏸ human approval</div>`
+            : '';
         // Tag the wrapper div with data-step-name so the click handler
         // can look up the step directly from the DOM without having
         // to know drawflow's internal module/container/numeric-id
         // structure (which varies by version and is not documented).
         return `
-            <div class="vf-node" data-step-name="${esc(step.name || '')}">
+            <div class="vf-node${approvalClass}" data-step-name="${esc(step.name || '')}">
                 <button type="button" class="vf-node-delete" title="Delete step (or press Delete key when selected)">&times;</button>
                 <div class="vf-node-header">
                     <span class="vf-node-name">${esc(step.name || '(unnamed)')}</span>
                     <span class="vf-node-role">${esc(step.agent_role || '?')}</span>
                 </div>
                 <div class="vf-node-action">${esc(step.action || '?')}</div>
+                ${approvalLabel}
                 ${skill}
             </div>
         `;
@@ -1705,6 +1718,11 @@
         }
         document.getElementById('vf-edit-name').value = step.name || '';
         document.getElementById('vf-edit-role').value = step.agent_role || '';
+        // v3.14.0 (Phase 3): type field — default to "do_task" for
+        // legacy steps that don't have the field set yet. The server
+        // already defaults this, but populating it client-side gives
+        // a clearer UX.
+        document.getElementById('vf-edit-type').value = step.type || 'do_task';
         document.getElementById('vf-edit-action').value = step.action || '';
         document.getElementById('vf-edit-deps').value =
             Array.isArray(step.depends_on) ? step.depends_on.join(', ') : '';
@@ -1771,6 +1789,11 @@
         // Read all fields
         const newName = document.getElementById('vf-edit-name').value.trim();
         const newRole = document.getElementById('vf-edit-role').value.trim();
+        // v3.14.0 (Phase 3): read the type field. Default to
+        // "do_task" if blank, matching the server-side default.
+        // We don't validate the type here — the server validator
+        // (approval_validation.py) is the source of truth.
+        const newType = (document.getElementById('vf-edit-type').value || 'do_task').trim();
         const newAction = document.getElementById('vf-edit-action').value.trim();
         const depsStr = document.getElementById('vf-edit-deps').value;
         const newDeps = depsStr
@@ -1861,6 +1884,16 @@
             (oldNameLocal !== newName ? ' → "' + newName + '"' : ''));
         step.name = newName;
         step.agent_role = newRole;
+        // v3.14.0 (Phase 3): persist the type field. Use null when
+        // it equals the default to keep step_template JSON minimal
+        // (matches the server's behavior of defaulting missing type
+        // to "do_task"). This keeps round-tripped workflows looking
+        // clean — no spurious "type":"do_task" everywhere.
+        if (newType && newType !== 'do_task') {
+            step.type = newType;
+        } else {
+            delete step.type;
+        }
         step.action = newAction;
         step.depends_on = newDeps;
         step.skill = newSkill || null;

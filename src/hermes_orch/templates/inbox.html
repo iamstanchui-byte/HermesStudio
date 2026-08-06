@@ -1,0 +1,402 @@
+{% extends "base.html" %}
+
+{# v3.14.0 (Phase 3): cross-workflow pending approvals inbox.
+   Lists all human_approval steps awaiting user decision. Click a
+   row to open a detail modal with the full payload + Approve /
+   Reject buttons. The list auto-refreshes every 30s; the badge in
+   the sidebar polls the same endpoint. AC-22, AC-23, AC-25, AC-26
+   are covered here. #}
+
+{% block content %}
+<div class="flex items-center justify-between mb-4">
+    <div>
+        <h1 class="text-xl font-bold text-gray-800">Inbox · Pending approvals</h1>
+        <p class="text-sm text-gray-500 mt-1">
+            Workflow steps waiting for human decision. Approve to let the workflow
+            continue, or Reject to apply the step's <code>on_reject</code> policy
+            (stop / skip / route).
+        </p>
+    </div>
+    <div class="flex items-center gap-2 text-xs text-gray-500">
+        <span id="inbox-last-refresh" class="tabular-nums">—</span>
+        <button type="button" onclick="inboxRefresh(true)" id="inbox-refresh-btn"
+            class="px-2 py-1 text-xs font-medium rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+            title="Refresh now (auto-refreshes every 30s)">
+            ↻ Refresh
+        </button>
+    </div>
+</div>
+
+<div id="inbox-empty" class="bg-white border rounded-lg p-8 text-center text-gray-500" style="display: none;">
+    <p class="text-sm">No pending approvals.</p>
+    <p class="text-xs mt-2">When a workflow hits a <code>human_approval</code> step, the row will appear here.</p>
+</div>
+
+<div id="inbox-list-wrap" class="bg-white border rounded-lg shadow-sm overflow-hidden" style="display: none;">
+    <table class="w-full text-sm">
+        <thead class="bg-gray-50 border-b">
+            <tr>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Workflow</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Step</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700">Summary</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700 w-32">On reject</th>
+                <th class="text-left px-3 py-2 font-medium text-gray-700 w-32">Waiting</th>
+                <th class="text-right px-3 py-2 font-medium text-gray-700 w-44">Action</th>
+            </tr>
+        </thead>
+        <tbody id="inbox-rows"></tbody>
+    </table>
+</div>
+
+{# Detail modal. Reused across all rows. The body content is rebuilt
+   on each open so the Approve/Reject buttons always know which
+   (workflow_id, step_name) they target. #}
+<div id="inbox-detail-modal" class="modal-overlay"
+     style="display: none; align-items: flex-start; padding-top: 2rem;"
+     onclick="if(event.target===this) inboxCloseDetail()">
+    <div class="modal-card"
+         style="width: 800px; max-width: 92vw; max-height: 88vh; padding: 0;
+                display: flex; flex-direction: column; overflow: hidden;">
+        <div class="px-4 py-3 border-b flex items-center gap-2">
+            <h2 class="text-base font-semibold text-gray-800" id="inbox-detail-title">Approval detail</h2>
+            <span id="inbox-detail-status" class="pill-status pill-yellow ml-1">pending</span>
+            <button type="button" onclick="inboxCloseDetail()"
+                class="ml-auto text-gray-400 hover:text-gray-600 text-lg leading-none"
+                title="Close (Esc)">×</button>
+        </div>
+        <div class="px-4 py-3 overflow-y-auto" style="flex: 1 1 auto;">
+            <dl class="grid grid-cols-3 gap-x-4 gap-y-2 text-sm mb-4">
+                <dt class="text-gray-500">Workflow</dt>
+                <dd class="col-span-2" id="inbox-detail-workflow">—</dd>
+                <dt class="text-gray-500">Step</dt>
+                <dd class="col-span-2 font-mono text-gray-800" id="inbox-detail-step">—</dd>
+                <dt class="text-gray-500">Created</dt>
+                <dd class="col-span-2 text-gray-700 tabular-nums" id="inbox-detail-created">—</dd>
+                <dt class="text-gray-500">On reject</dt>
+                <dd class="col-span-2" id="inbox-detail-on-reject">—</dd>
+            </dl>
+
+            <h3 class="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-1">Summary</h3>
+            <pre id="inbox-detail-summary"
+                 class="text-sm bg-gray-50 border rounded p-3 whitespace-pre-wrap break-words font-sans mb-4"></pre>
+
+            <h3 class="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-1">Payload</h3>
+            <pre id="inbox-detail-payload"
+                 class="text-xs bg-gray-900 text-gray-100 border rounded p-3 whitespace-pre-wrap break-words font-mono"
+                 style="max-height: 320px; overflow-y: auto;"></pre>
+        </div>
+        <div class="px-4 py-3 border-t flex items-center gap-2" id="inbox-detail-actions">
+            <button type="button" id="inbox-detail-approve"
+                onclick="inboxApproveFromDetail()"
+                class="px-4 py-1.5 text-sm font-medium rounded bg-green-600 text-white hover:bg-green-700"
+                title="Approve this step — the workflow will continue past this step.">
+                ✓ Approve
+            </button>
+            <button type="button" id="inbox-detail-reject"
+                onclick="inboxRejectFromDetail()"
+                class="px-4 py-1.5 text-sm font-medium rounded bg-red-600 text-white hover:bg-red-700"
+                title="Reject — the step's on_reject policy will be applied (stop / skip / route).">
+                ✗ Reject
+            </button>
+            <span id="inbox-detail-error" class="text-sm text-red-600 ml-auto" style="display: none;"></span>
+            <button type="button" onclick="inboxCloseDetail()"
+                class="ml-auto px-3 py-1.5 text-sm text-gray-600 hover:text-gray-800">
+                Close
+            </button>
+        </div>
+    </div>
+</div>
+
+<script>
+    // ===== State =====
+    // v3.14.0 Phase 3: current detail-modal target. Set when the
+    // modal opens, cleared when it closes. The Approve/Reject
+    // buttons read this to know which (workflow_id, step_name)
+    // pair to act on.
+    let _inboxCurrent = null;  // { workflow_id, step_name, on_reject, route_to, status, summary, payload, created_at, workflow_name }
+    let _inboxPollTimer = null;
+
+    // ===== Helpers =====
+    function _inboxEsc(s) {
+        // Defensive escape for any text injected into innerHTML
+        // (workflow names, summaries). The API is internal so this
+        // is mainly belt-and-suspenders.
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function _inboxTimeAgo(iso) {
+        if (!iso) return '—';
+        // iso is "YYYY-MM-DDTHH:MM:SS" (no timezone). Treat as
+        // local-naive. Compute seconds since and format a compact
+        // "5m ago" / "2h ago" / "1d ago" string.
+        const t = new Date(iso);
+        if (isNaN(t.getTime())) return iso;
+        const now = Date.now();
+        const diff = Math.max(0, Math.floor((now - t.getTime()) / 1000));
+        if (diff < 60) return `${diff}s`;
+        if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+        if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+        return `${Math.floor(diff / 86400)}d`;
+    }
+
+    function _inboxOnRejectBadge(onReject) {
+        // Map on_reject value to a small colored pill so the user
+        // sees the consequence at a glance. stop = red (most
+        // severe), skip = gray, route = blue.
+        const v = onReject || 'stop';
+        const cls = v === 'stop' ? 'pill-status pill-degraded'
+                  : v === 'skip' ? 'pill-status pill-offline'
+                  : v === 'route' ? 'pill-status pill-online'
+                  : 'pill-status pill-offline';
+        return `<span class="${cls}">${_inboxEsc(v)}</span>`;
+    }
+
+    // ===== Render =====
+    async function inboxRefresh(verbose) {
+        const list = document.getElementById('inbox-list-wrap');
+        const empty = document.getElementById('inbox-empty');
+        const tbody = document.getElementById('inbox-rows');
+        const lastEl = document.getElementById('inbox-last-refresh');
+        try {
+            const r = await fetch('/api/inbox/approvals?status=pending', { cache: 'no-store' });
+            if (!r.ok) {
+                lastEl.textContent = `error (${r.status})`;
+                return;
+            }
+            const data = await r.json();
+            const items = data.items || [];
+            // Rebuild table body.
+            tbody.innerHTML = '';
+            for (const a of items) {
+                const onReject = a.on_reject || 'stop';
+                const routeNote = onReject === 'route' && a.route_to
+                    ? ` → ${a.route_to}` : '';
+                const tr = document.createElement('tr');
+                tr.className = 'border-b last:border-0 hover:bg-gray-50 cursor-pointer';
+                tr.onclick = () => inboxOpenDetail(a);
+                tr.innerHTML = `
+                    <td class="px-3 py-2">
+                        <a href="/projects/${encodeURIComponent(a.workflow_id)}" class="text-blue-600 hover:underline"
+                           onclick="event.stopPropagation()">${_inboxEsc(a.workflow_name || a.workflow_id)}</a>
+                    </td>
+                    <td class="px-3 py-2 font-mono text-gray-800">${_inboxEsc(a.step_name)}</td>
+                    <td class="px-3 py-2 text-gray-700 max-w-md truncate" title="${_inboxEsc(a.summary)}">${_inboxEsc(a.summary)}</td>
+                    <td class="px-3 py-2">${_inboxOnRejectBadge(onReject)}${_inboxEsc(routeNote) ? `<span class="text-[10px] text-gray-500 ml-1">${_inboxEsc(routeNote)}</span>` : ''}</td>
+                    <td class="px-3 py-2 text-xs text-gray-500 tabular-nums" title="${_inboxEsc(a.created_at || '')}">${_inboxTimeAgo(a.created_at)}</td>
+                    <td class="px-3 py-2 text-right">
+                        <button type="button" onclick="event.stopPropagation(); inboxApprove('${_inboxEsc(a.workflow_id)}', '${_inboxEsc(a.step_name)}')"
+                            class="px-2 py-0.5 text-xs font-medium rounded bg-green-600 text-white hover:bg-green-700"
+                            title="Approve this step">✓ Approve</button>
+                        <button type="button" onclick="event.stopPropagation(); inboxRejectPrompt('${_inboxEsc(a.workflow_id)}', '${_inboxEsc(a.step_name)}', '${_inboxEsc(onReject)}', '${_inboxEsc(a.route_to || '')}')"
+                            class="px-2 py-0.5 text-xs font-medium rounded bg-red-600 text-white hover:bg-red-700"
+                            title="Reject — apply the step's on_reject policy">✗ Reject</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            }
+            list.style.display = items.length ? '' : 'none';
+            empty.style.display = items.length ? 'none' : '';
+            // Sidebar badge is updated by _updateSidebarBadge() in
+            // base.html — call it here so the inbox page keeps the
+            // badge in sync (otherwise the badge would only refresh
+            // on the sidebar's own poll).
+            if (typeof _updateSidebarBadge === 'function') {
+                _updateSidebarBadge(items.length);
+            }
+            lastEl.textContent = items.length
+                ? `${items.length} pending · ${new Date().toLocaleTimeString()}`
+                : `0 pending · ${new Date().toLocaleTimeString()}`;
+        } catch (e) {
+            if (verbose) alert('Refresh failed: ' + e.message);
+            lastEl.textContent = 'network error';
+        }
+    }
+
+    // ===== Detail modal =====
+    function inboxOpenDetail(a) {
+        // The list response is already enriched with workflow_name,
+        // on_reject, route_to, summary (truncated), but we want the
+        // FULL payload for the detail view. Fetch the detail
+        // endpoint so we can show the untruncated text.
+        _inboxCurrent = { ...a };  // shallow copy from list
+        document.getElementById('inbox-detail-title').textContent =
+            `${a.workflow_name || a.workflow_id} · ${a.step_name}`;
+        document.getElementById('inbox-detail-status').textContent = a.status || 'pending';
+        document.getElementById('inbox-detail-workflow').textContent =
+            a.workflow_name ? `${a.workflow_name} (${a.workflow_id})` : a.workflow_id;
+        document.getElementById('inbox-detail-step').textContent = a.step_name;
+        document.getElementById('inbox-detail-created').textContent = a.created_at || '—';
+        document.getElementById('inbox-detail-on-reject').innerHTML =
+            _inboxOnRejectBadge(a.on_reject || 'stop') +
+            (a.on_reject === 'route' && a.route_to
+                ? ` <span class="text-xs text-gray-500">→ ${_inboxEsc(a.route_to)}</span>`
+                : '');
+        document.getElementById('inbox-detail-summary').textContent = a.summary || '(empty)';
+        document.getElementById('inbox-detail-payload').textContent = a.payload || '(no payload)';
+        // Reset error + close
+        const errEl = document.getElementById('inbox-detail-error');
+        errEl.style.display = 'none';
+        errEl.textContent = '';
+        // Disable buttons if status is no longer pending
+        const isPending = (a.status === 'pending');
+        document.getElementById('inbox-detail-approve').disabled = !isPending;
+        document.getElementById('inbox-detail-reject').disabled = !isPending;
+        document.getElementById('inbox-detail-modal').style.display = 'flex';
+        // Fetch the full detail (untruncated payload) async.
+        fetch(`/api/inbox/approvals/${encodeURIComponent(a.id)}`, { cache: 'no-store' })
+            .then((r) => r.ok ? r.json() : null)
+            .then((d) => {
+                if (!d) return;
+                // Don't clobber a fresh decision made in the modal.
+                if (_inboxCurrent && _inboxCurrent.id === a.id) {
+                    _inboxCurrent = d;
+                    document.getElementById('inbox-detail-summary').textContent = d.summary || '(empty)';
+                    document.getElementById('inbox-detail-payload').textContent = d.payload || '(no payload)';
+                }
+            })
+            .catch(() => { /* ignore — list view is good enough */ });
+    }
+
+    function inboxCloseDetail() {
+        document.getElementById('inbox-detail-modal').style.display = 'none';
+        _inboxCurrent = null;
+    }
+
+    // ESC closes the detail modal.
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && _inboxCurrent) inboxCloseDetail();
+    });
+
+    function _inboxShowError(msg) {
+        const el = document.getElementById('inbox-detail-error');
+        el.textContent = msg;
+        el.style.display = '';
+    }
+
+    // ===== Approve / Reject from detail =====
+    async function inboxApproveFromDetail() {
+        if (!_inboxCurrent) return;
+        const a = _inboxCurrent;
+        if (!confirm(`Approve step "${a.step_name}" in workflow "${a.workflow_name || a.workflow_id}"?`)) return;
+        await _inboxPostDecision(`/api/workflows/${encodeURIComponent(a.workflow_id)}/steps/${encodeURIComponent(a.step_name)}/approve`, null);
+    }
+
+    async function inboxRejectFromDetail() {
+        if (!_inboxCurrent) return;
+        const a = _inboxCurrent;
+        const msg = _inboxRejectMessage(a.on_reject || 'stop', a.route_to);
+        if (!confirm(msg)) return;
+        const reason = prompt('Optional reason (will be recorded in the audit log):') || '';
+        await _inboxPostDecision(
+            `/api/workflows/${encodeURIComponent(a.workflow_id)}/steps/${encodeURIComponent(a.step_name)}/reject`,
+            { reason }
+        );
+    }
+
+    // ===== Approve / Reject from list row =====
+    async function inboxApprove(workflowId, stepName) {
+        if (!confirm(`Approve step "${stepName}"?`)) return;
+        await _inboxPostDecision(
+            `/api/workflows/${encodeURIComponent(workflowId)}/steps/${encodeURIComponent(stepName)}/approve`,
+            null,
+            { closeDetail: false }
+        );
+    }
+
+    function inboxRejectPrompt(workflowId, stepName, onReject, routeTo) {
+        const msg = _inboxRejectMessage(onReject, routeTo);
+        if (!confirm(msg)) return;
+        const reason = prompt('Optional reason:') || '';
+        _inboxPostDecision(
+            `/api/workflows/${encodeURIComponent(workflowId)}/steps/${encodeURIComponent(stepName)}/reject`,
+            { reason },
+            { closeDetail: false }
+        );
+    }
+
+    function _inboxRejectMessage(onReject, routeTo) {
+        // §5.3 of design doc: confirm message differs by on_reject
+        // policy. stop is the most severe (full workflow stops);
+        // skip and route continue downstream with different
+        // semantics.
+        if (onReject === 'route') {
+            return `Rejecting will ROUTE the workflow to step "${routeTo || '(unknown)'}" instead. Continue?`;
+        }
+        if (onReject === 'skip') {
+            return 'Rejecting will mark this step as SKIPPED. Downstream steps will still run. Continue?';
+        }
+        // Default to stop (the safe assumption per design doc §4.5).
+        return 'Rejecting will STOP the entire workflow. Continue?';
+    }
+
+    async function _inboxPostDecision(url, body, opts) {
+        opts = opts || {};
+        const errEl = document.getElementById('inbox-detail-error');
+        if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+        const init = { method: 'POST' };
+        if (body) {
+            init.headers = { 'Content-Type': 'application/json' };
+            init.body = JSON.stringify(body);
+        }
+        try {
+            const r = await fetch(url, init);
+            if (r.ok) {
+                if (opts.closeDetail !== false) inboxCloseDetail();
+                // Refresh list — next 30s tick will also pick it up,
+                // but the user gets instant feedback.
+                await inboxRefresh(false);
+            } else if (r.status === 409) {
+                // Race: someone else (sweeper / cancel) already
+                // decided. Refresh + close; tell the user briefly.
+                if (opts.closeDetail !== false) inboxCloseDetail();
+                await inboxRefresh(false);
+                alert('This approval was already decided by another action (e.g. timeout or workflow cancel).');
+            } else if (r.status === 404) {
+                if (opts.closeDetail !== false) inboxCloseDetail();
+                await inboxRefresh(false);
+                alert('Approval not found (may have been removed).');
+            } else {
+                const text = await r.text();
+                const msg = `Decision failed (${r.status}): ${text || r.statusText}`;
+                if (opts.closeDetail === false) {
+                    alert(msg);
+                } else {
+                    _inboxShowError(msg);
+                }
+            }
+        } catch (e) {
+            const msg = 'Decision failed: ' + e.message;
+            if (opts.closeDetail === false) {
+                alert(msg);
+            } else {
+                _inboxShowError(msg);
+            }
+        }
+    }
+
+    // ===== Polling =====
+    function inboxStartPolling() {
+        inboxRefresh(false);
+        // 30s polling per design doc §5.2. Single timer per page —
+        // we don't poll faster even if the modal is open (modal's
+        // own decision button is the fast path).
+        if (_inboxPollTimer) clearInterval(_inboxPollTimer);
+        _inboxPollTimer = setInterval(() => inboxRefresh(false), 30000);
+    }
+    function inboxStopPolling() {
+        if (_inboxPollTimer) { clearInterval(_inboxPollTimer); _inboxPollTimer = null; }
+    }
+
+    // Auto-start on load. Only poll when the page is visible to
+    // avoid wasted requests on hidden tabs.
+    inboxStartPolling();
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) inboxStopPolling();
+        else inboxStartPolling();
+    });
+</script>
+{% endblock %}

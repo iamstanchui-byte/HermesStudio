@@ -77,6 +77,35 @@
         font-size: 10px;
         margin-top: 3px;
     }
+    /* v3.14.0 (Phase 3): human_approval node visual marker. The
+       .vf-node-approval class is added to cards whose step.type is
+       "human_approval" (see _stepToCardHtml in visual_workflow.js).
+       Visual: amber/yellow border (so it stands out from the
+       normal slate cards), and a small "⏸ human approval" sub-label
+       under the action line. Per design doc §5.4 — distinct icon
+       and color so users immediately see which steps pause the
+       workflow for human review. Runtime status colors (pending
+       / approved / rejected) are not yet applied here; the
+       canvas shows the static "this is a human_approval step"
+       marker, and the inbox badge is the dynamic signal. */
+    .vf-node-approval {
+        border: 2px solid #f59e0b !important;
+        background: #fffbeb !important;
+    }
+    body.dark .vf-node-approval {
+        background: #422006 !important;
+        border-color: #fbbf24 !important;
+    }
+    .vf-node-approval-label {
+        color: #92400e;
+        font-size: 10px;
+        font-weight: 600;
+        margin-top: 3px;
+        letter-spacing: 0.02em;
+    }
+    body.dark .vf-node-approval-label {
+        color: #fcd34d;
+    }
     /* Phase 1.7: explicit "×" delete button on each card. drawflow's
        default delete (the .drawflow-delete / .btn-delete) is hidden
        because it's tiny, hard to hit, and not discoverable. We
@@ -659,6 +688,20 @@
             <input type="text" id="vf-edit-name">
             <label>agent_role</label>
             <input type="text" id="vf-edit-role">
+            {# v3.14.0 (Phase 3): type field. "do_task" (default /
+               legacy) runs the step normally; "human_approval" pauses
+               the workflow and creates an inbox approval request.
+               For human_approval the `action` field is still required
+               (used as the human_approval step's "action" in the DB),
+               and an `approval` object should be added via the JSON
+               view (summary_template, on_reject, etc.). #}
+            <label>type
+                <span class="text-xs text-gray-400 font-normal"
+                    title='Step execution type. "do_task" (default) runs the step; "human_approval" pauses the workflow and creates an inbox approval request. The `approval` object (summary_template, on_reject, etc.) is edited in the JSON form.'>
+                    (?)
+                </span>
+            </label>
+            <input type="text" id="vf-edit-type" placeholder="do_task" value="do_task">
             <label>action</label>
             <input type="text" id="vf-edit-action">
             <label>depends_on (comma-separated step names, no forward refs)</label>

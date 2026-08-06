@@ -2122,6 +2122,30 @@ async def workflow_detail_page(workflow_id: str, request: Request) -> HTMLRespon
     )
 
 
+@router.get("/inbox", response_class=HTMLResponse)
+async def inbox_page(request: Request) -> HTMLResponse:
+    """v3.14.0 (Phase 3): cross-workflow pending approvals inbox.
+
+    Renders a list of all pending human_approval requests across
+    workflows. Clicking a row opens a detail modal with the full
+    payload + Approve / Reject buttons. The page polls the API
+    every 30s to refresh the list (consistent with the sidebar
+    badge polling).
+
+    Approve and Reject actions POST to the existing
+    /api/workflows/{id}/steps/{step}/(approve|reject) endpoints
+    (introduced in Phase 2). On success the row is removed from
+    the list and the next poll confirms the state.
+    """
+    return templates.TemplateResponse(
+        request=request,
+        name="inbox.html",
+        context={
+            **(await _base_context(request, "inbox")),
+        },
+    )
+
+
 @router.get("/workflows/{workflow_id}/visual", response_class=HTMLResponse)
 async def workflow_visual_page(workflow_id: str, request: Request) -> HTMLResponse:
     """Visual workflow builder (Phase 1 of visual-builder rollout, 2026-07-24).
