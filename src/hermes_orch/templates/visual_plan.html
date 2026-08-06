@@ -439,6 +439,71 @@
     .vp-toolbar-btn-emerald-primary:hover { background: #ecfdf5; }
     .vp-toolbar-btn-cyan-primary    { border-width: 2px; border-color: #06b6d4; color: #0e7490; font-weight: 700; }
     .vp-toolbar-btn-cyan-primary:hover    { background: #ecfeff; }
+    /* 2026-08-07: dark-mode color overrides. The light-mode rules
+       use gray-300 borders + gray-700 text on a white surface
+       (good contrast). In dark mode the page background is
+       near-black (#111827) so the gray-700 text + transparent
+       fill makes buttons look ghosted — especially the
+       disabled Undo / Redo which have opacity:0.4 on top of
+       that. The dark-mode palette uses lighter borders + light
+       text so every variant stays visible. The color variants
+       use the same hue family as light mode but shifted to the
+       300-weight Tailwind scale (cyan-300, purple-300, etc.)
+       which is bright enough against the dark background. */
+    body.dark .vp-toolbar-btn {
+        border-color: #4b5563;          /* gray-600 — visible against #111827 */
+        color: #e5e7eb;                  /* gray-200 — high contrast text */
+    }
+    body.dark .vp-toolbar-btn:hover { background: #374151; }  /* gray-700 */
+    body.dark .vp-toolbar-btn:disabled {
+        /* Disabled buttons still need to be visible (not invisible)
+           so the user can see "Undo" / "Redo" exist and understand
+           they're empty. Drop the opacity from 0.4 to 0.5 and
+           lighten the text to gray-400. */
+        opacity: 0.5;
+        color: #9ca3af;                  /* gray-400 */
+    }
+    body.dark .vp-toolbar-btn-cyan {
+        border-color: #06b6d4;          /* cyan-500 */
+        color: #67e8f9;                  /* cyan-300 */
+    }
+    body.dark .vp-toolbar-btn-cyan:hover { background: #164e63; }  /* cyan-900 */
+    body.dark .vp-toolbar-btn-purple {
+        border-color: #a855f7;          /* purple-500 */
+        color: #d8b4fe;                  /* purple-300 */
+    }
+    body.dark .vp-toolbar-btn-purple:hover { background: #4c1d95; }  /* purple-900 */
+    body.dark .vp-toolbar-btn-emerald {
+        border-color: #10b981;          /* emerald-500 */
+        color: #6ee7b7;                  /* emerald-300 */
+    }
+    body.dark .vp-toolbar-btn-emerald:hover { background: #064e3b; }  /* emerald-900 */
+    body.dark .vp-toolbar-btn-emerald-primary {
+        border-color: #34d399;          /* emerald-400 (slightly brighter) */
+        color: #6ee7b7;                  /* emerald-300 */
+    }
+    body.dark .vp-toolbar-btn-emerald-primary:hover { background: #064e3b; }
+    body.dark .vp-toolbar-btn-cyan-primary {
+        border-color: #22d3ee;          /* cyan-400 (slightly brighter) */
+        color: #67e8f9;                  /* cyan-300 */
+    }
+    body.dark .vp-toolbar-btn-cyan-primary:hover { background: #164e63; }
+    /* Save split button dark mode. The wrapper border is cyan
+       (cyan-500) so it stays visible; the dropdown arrow uses
+       cyan-300 (matches the main button text). */
+    body.dark .vp-save-group { border-color: #22d3ee; }  /* cyan-400 */
+    body.dark .vp-save-group > .vp-toolbar-btn-cyan-primary {
+        border-right-color: #22d3ee;
+        color: #67e8f9;
+    }
+    body.dark .vp-save-arrow { color: #67e8f9; }
+    body.dark .vp-save-arrow:hover { background: #164e63; }
+    /* The Save main button has inline style="color: #0e7490" which
+       beats the CSS class — the !important override below fixes
+       the dark-mode color leakage from the inline style. Without
+       this the Save button stays cyan-700-on-dark which is
+       invisible. */
+    body.dark #vp-save-btn { color: #67e8f9 !important; }
     /* Save split button — main button + dropdown arrow share
        a single border. The dropdown arrow is a separate <button>
        inside the wrapper so it has its own click handler. */
@@ -535,6 +600,22 @@
     }
     body.dark .vp-palette-chip.vp-palette-chip-approval:hover {
         background: #78350f;
+    }
+    /* 2026-08-07: dark-mode for the "Add step" palette row.
+       The wrapper is `bg-white` (hard-coded light bg) and the
+       label is `text-gray-700` (hard-coded light fg) — both
+       would be invisible in dark mode without these overrides. */
+    body.dark .bg-white.border.rounded-lg.flex.items-center.gap-2.mb-2 {
+        background: #1f2937;            /* gray-800 — matches sidebar */
+        border-color: #374151;           /* gray-700 */
+    }
+    body.dark .text-gray-700.font-semibold {
+        color: #d1d5db;                  /* gray-300 */
+    }
+    /* Dividers between button groups. Light mode uses bg-gray-300
+       which is invisible in dark mode without an override. */
+    body.dark .w-px.h-5.bg-gray-300 {
+        background: #4b5563;             /* gray-600 */
     }
 </style>
 {% endblock %}
