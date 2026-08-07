@@ -214,10 +214,28 @@ def validate_human_approval_step(
     that has `type == "human_approval"`.
 
     Returns a list of error messages (empty = valid).
+
+    v3.14.x: the `approval` sub-object is now OPTIONAL. If missing,
+    we skip strict validation and let the runtime auto-build defaults
+    (on_reject="stop", summary_template="Please review step: {name}",
+    timeout_seconds=86400) — the runtime at api/workflows.py:1629
+    already does `step.get("approval") or {}`. The plan editor's
+    `_build_default_approval_cfg` builds the same defaults for
+    /plan/run, so behavior is consistent across editors. This fix
+    matches the plan editor's behavior (its Pydantic model has no
+    strict approval-object requirement) and unblocks the visual
+    editor's human_approval chip, which creates a step with just
+    `type: "human_approval"` and no `approval` sub-object.
     """
     errors: list[str] = []
     name = step.get("name", "<unnamed>")
     approval = step.get("approval")
+    if approval is None:
+        # No approval sub-object → use runtime defaults, skip strict
+        # validation. The runtime fills in sensible defaults at
+        # run-time; the user can edit them in the side panel later
+        # (or via Edit as JSON).
+        return errors
     errors.extend(validate_approval_object(approval, name))
 
     if isinstance(approval, dict) and isinstance(approval.get("summary_template"), str):

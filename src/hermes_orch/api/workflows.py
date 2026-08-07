@@ -777,11 +777,20 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
         for d in deps:
             if d not in seen_names:
                 return False, f"step_template[{i}].depends_on references {d!r} which is not an EARLIER step (or doesn't exist)"
-        # skill (optional, Stage 1.5)
+        # skill (optional, Stage 1.5). Treat empty string same as
+        # None — the visual editor's side panel serializes cleared
+        # fields as "" (not omitted), so we accept "" as "no skill"
+        # to match the plan editor's Pydantic model which has
+        # `skill: str = ""` as the default. The plan editor has
+        # always accepted empty skill; this brings the workflow
+        # editor in line. Without this, the user gets a 422 every
+        # time they leave the skill field blank in the side panel.
         skill = step.get("skill")
+        if isinstance(skill, str) and not skill:
+            skill = None
         if skill is not None:
-            if not isinstance(skill, str) or not skill:
-                return False, f"step_template[{i}].skill must be a non-empty string"
+            if not isinstance(skill, str):
+                return False, f"step_template[{i}].skill must be a string"
             if not re.match(r"^[a-z0-9][a-z0-9-]*$", skill):
                 return False, f"step_template[{i}].skill={skill!r} not kebab-case"
             if len(skill) > 40:
@@ -2406,3 +2415,404 @@ async def apply_workflow_patch(
         "workflow": detail,
         "diff": diff_summary,
     }
+
+
+# ===== v3.14.0 (Phase 4): Workflow chatbox =====
+# Mirrors the project plan editor's chat (api/projects.py:chat_with_project)
+# but scoped to a workflow package instead of a project. The user
+# can describe a workflow in plain language and the LLM emits
+# `apply_workflow_patch` suggestions.
+#
+# Persistence: workflow chat history is IN-MEMORY ONLY (the
+# project's chat persists to project_chat_messages; workflows
+# don't have a parallel table yet). On page refresh the chat
+# starts empty. This is fine for design-time editing — workflows
+# are less transient than projects. If persistence is wanted
+# later, add a workflow_chat_messages table mirroring the
+# project one (cheap to add when needed).
+
+_WORKFLOW_CHAT_SYSTEM_PROMPT = """\
+You are the chatbox workflow editor for a single workflow package
+in hermes-orchestrator. The operator sees you as a panel in the
+visual workflow editor (/workflows/{id}/visual).
+
+# Your job
+  - Read the workflow's current state from the snapshot below
+  - Discuss the workflow design in plain language with the user
+  - When the user wants a new/changed workflow, DESCRIBE the
+    workflow in 1-3 short paragraphs
+  - End your response with a question like
+    "Want me to apply this change?" (the user clicks Apply)
+
+# CRITICAL: emit apply_workflow_patch JSON
+  v3.12.6 (Phase 2, 2026-08-05): if the user asks to MODIFY the
+  EXISTING workflow (add a step, remove a step, edit a step's
+  action, rename a step, insert a step before/after another, add
+  a human_approval step, change a step's type), you MUST end
+  your prose with a fenced JSON code block containing an
+  `apply_workflow_patch` suggestion. The block is what the
+  Apply button dispatches \u2014 without it, the synthetic fallback
+  picks `create_plan_from_chat` which OVERWRITES the workflow
+  and silently drops the user's existing steps.
+
+  The two cases are easy to tell apart:
+    - User has NO workflow (workflow is null): describe in
+      prose, no JSON block needed.
+    - User has an existing workflow AND asks for any kind of
+      modification: ALWAYS include the apply_workflow_patch
+      JSON. End the response with prose summary + the JSON code
+      block.
+
+  JSON shape (the workflow_id is implicit from the URL \u2014 do NOT
+  include it in the suggestion, the server fills it in):
+    ```json
+    {
+      "suggestions": [
+        {
+          "type": "apply_workflow_patch",
+          "patch": {
+            "add":    [{"name": "...", "agent_role": "...", "action": "...", "depends_on": [...]}],
+            "edit":   [{"name": "<existing_step_name>", "patch": {"field": "value"}}],
+            "remove": ["<existing_step_name>"],
+            "position": {"after": "<name>", "before": "<name>"}
+          },
+          "reason": "short reason"
+        }
+      ]
+    }
+    ```
+
+  Step names in the patch MUST exist in the current workflow (for
+  edit/remove) or be NEW (for add). Use kebab-case. Reference
+  the actual step names from the snapshot.
+
+# v3.14.0: human_approval step type
+  When the user asks to add a confirmation / review / sign-off
+  step, include `"type": "human_approval"` in the new step's
+  patch entry. Also include an `approval` sub-object with
+  `summary_template` (a {{var}}-template that renders when the
+  step is reached) and `on_reject` ("stop" / "skip" / "route"
+  \u2014 default "stop" if the user doesn't say). Example:
+    {
+      "name": "approve-send",
+      "agent_role": "reviewer",
+      "action": "await_approval",
+      "type": "human_approval",
+      "approval": {
+        "summary_template": "Please review: {{subject}}",
+        "on_reject": "stop"
+      }
+    }
+  Do NOT add human_approval steps unless the user EXPLICITLY
+  asks for one.
+
+# CRITICAL: keep your response BRIEF
+  - Total response: < 500 words
+  - 1-3 short paragraphs MAX
+  - DO NOT output JSON, DAG diagrams, or code blocks (except the
+    one apply_workflow_patch block at the end)
+  - DO NOT list every step in detail \u2014 describe the SHAPE only
+  - The Apply button does the actual work \u2014 the server reads
+    your last response and applies the patch.
+
+# What you MUST NEVER do
+  - NEVER output JSON / code blocks / DAG diagrams (except the
+    one apply_workflow_patch at the end)
+  - NEVER create steps directly (no `create_step` suggestion)
+  - NEVER trigger dispatch (no `run` / `materialize`)
+  - NEVER invent agent_role / skill / tool names that are not
+    in the `agents_info` block below
+  - Run is human-only (user clicks the Run button on dashboard)
+
+# Snapshot you receive (per turn, see below)
+  - `workflow`: id, name, description, version
+  - `step_template`: current array of step dicts (the source of
+    truth \u2014 your suggestions must reference these by name)
+  - `variables`: current array of variable definitions
+  - `source_project`: brief context from the project this
+    workflow was synthesized from (may be null for
+    hand-authored workflows)
+  - `agents_info`: valid agent_role / skill / tool names from
+    the project. The plan builder uses these at apply time so
+    your agent_role suggestions must match.
+
+# Drift detection (per turn)
+  If the user has been editing in the visual editor, the
+  snapshot may differ from your last message. Trust the
+  snapshot; describe based on the current state.
+
+# FOCUS (context-aware editing)
+  If the user has a node selected in the visual editor, your
+  suggestions should target that step (use the name field as
+  the edit/remove key). For "modify this step"-style requests,
+  emit edit=[{"name": "<selected>", "patch": {...}}].
+
+# Available profiles for step.agent_role
+{available_profiles_inline}
+"""
+
+
+class _WorkflowChatRequest(BaseModel):
+    """Body for POST /api/workflows/{id}/chat.
+    Mirrors the project chatbox's ChatRequest but simpler:
+    no DB-persisted history, so `history` is the only context
+    the frontend carries across requests.
+    """
+    message: str  # user's current turn
+    history: list[dict] | None = None  # [{role, content}, ...]
+    # v3.12.6 (Phase 2) context-aware editing: which step the
+    # user has currently selected in the visual editor.
+    selected_node: dict | None = None
+
+
+async def _build_workflow_chat_context(workflow_id: str, db) -> dict | None:
+    """Build the workflow snapshot the chat LLM sees. Mirrors
+    _build_chat_context for projects but workflow-shaped.
+
+    Returns None if the workflow doesn't exist (404). Otherwise
+    returns a dict with workflow metadata + step_template +
+    variables + the source project context (if any).
+    """
+    row = await db.fetchone(
+        "SELECT * FROM workflow_packages WHERE id = ?", (workflow_id,)
+    )
+    if not row:
+        return None
+    detail = _row_to_workflow_detail(row)
+    # Source project context \u2014 helps the LLM understand intent
+    # (e.g. what the workflow is supposed to do). Null for
+    # hand-authored workflows.
+    source_project = None
+    if detail.get("source_project_id"):
+        proj = await db.fetchone(
+            "SELECT id, name, goal FROM projects WHERE id = ?",
+            (detail["source_project_id"],),
+        )
+        if proj:
+            # Cap the goal so we don't blow the prompt budget.
+            goal = (proj.get("goal") or "").strip()
+            if len(goal) > 500:
+                goal = goal[:500] + "\u2026"
+            source_project = {
+                "id": proj["id"],
+                "name": proj["name"],
+                "goal": goal,
+            }
+    # Available agent_role names (same trick as project chat \u2014
+    # the LLM must pick from real profiles or the plan validator
+    # 422s).
+    profile_rows = await db.fetchall(
+        "SELECT DISTINCT name FROM agent_profiles "
+        "WHERE name IS NOT NULL AND name != ''"
+    )
+    agent_roles = sorted({r["name"] for r in profile_rows if r["name"]})
+    return {
+        "workflow": {
+            "id": detail["id"],
+            "name": detail["name"],
+            "description": detail.get("description") or "",
+            "version": detail.get("version") or "1.0",
+        },
+        "step_template": detail.get("step_template") or [],
+        "variables": detail.get("variables") or [],
+        "source_project": source_project,
+        "agents_info": {"agent_roles": agent_roles},
+    }
+
+
+def _extract_workflow_suggestions(llm_text: str) -> list[dict]:
+    """Pull the last ```json``` block from the LLM response and
+    return its `suggestions` array (empty list if none).
+    Mirrors _extract_plan_suggestions in api/projects.py.
+    """
+    matches = list(_TRUNCATED_JSON_RE.finditer(llm_text))
+    if not matches:
+        return []
+    raw = matches[-1].group(1).strip()
+    # Strip the closing fence if present
+    if raw.endswith("```"):
+        raw = raw[:-3].strip()
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    suggestions = parsed.get("suggestions")
+    if not isinstance(suggestions, list):
+        return []
+    # Defensive: filter to dicts only.
+    return [s for s in suggestions if isinstance(s, dict)]
+
+
+@router.post("/{workflow_id}/chat")
+async def chat_with_workflow(
+    workflow_id: str, body: _WorkflowChatRequest, request: Request
+) -> dict:
+    """v3.14.0 (Phase 4): workflow-scoped chat endpoint.
+
+    Sends a message to the LLM with the workflow's current state
+    (step_template + variables + source project + agent_role
+    options) and returns the assistant's reply. Suggestions
+    extracted from the LAST ```json``` fenced block drive the
+    Apply button on the frontend.
+
+    Pipeline:
+      1. Build workflow context snapshot
+      2. Use the supplied history (or default to [] \u2014 no
+         DB persistence for workflow chats)
+      3. Build the LLM messages: system prompt + context + history
+         + new user message
+      4. Call the LLM via _call_llm_chat (defined below)
+      5. Extract suggestions from the LLM text
+      6. Return {message, suggestions, history_count}
+    """
+    if not body.message or not body.message.strip():
+        raise HTTPException(400, "message is required")
+    db = request.app.state.db
+    cfg = request.app.state.config
+    ctx = await _build_workflow_chat_context(workflow_id, db)
+    if ctx is None:
+        raise HTTPException(404, f"Workflow not found: {workflow_id}")
+    # Use client-supplied history. Workflow chat has no DB
+    # persistence yet, so the client IS the source of truth
+    # for the conversation. Cap at 30 turns (defensive \u2014 same
+    # cap as the project chat).
+    history = body.history or []
+    if len(history) > 30:
+        history = history[-30:]
+    # Profile list for the system prompt (mirrors the project
+    # chat's pattern \u2014 the LLM must pick from real profiles or
+    # the plan/apply validator 422s).
+    profile_names = list(ctx.get("agents_info", {}).get("agent_roles", []))
+    if profile_names:
+        inline = ", ".join(f"`{n}`" for n in profile_names)
+    else:
+        inline = "(no profiles registered \u2014 leave agent_role empty)"
+    system_prompt = _WORKFLOW_CHAT_SYSTEM_PROMPT.replace(
+        "{available_profiles_inline}", inline
+    )
+    # v3.12.6 (Phase 2) context-aware editing: surface the
+    # selected node as a FOCUS block.
+    if body.selected_node and isinstance(body.selected_node, dict):
+        focus_dict = dict(body.selected_node)
+        focus_str = json.dumps(focus_dict, ensure_ascii=False, indent=2)
+        if len(focus_str) > 1024:
+            focus_str = focus_str[:1024] + "\n... (truncated)"
+        system_prompt = (
+            system_prompt
+            + "\n\n# FOCUS (v3.12.6 context-aware editing)\n"
+            + "The user has a node selected in the visual editor.\n"
+            + "When the user asks to modify THIS node (or 'this step'),\n"
+            + "target your suggestions at it. To modify an EXISTING\n"
+            + "workflow, emit an apply_workflow_patch suggestion with\n"
+            + "edit[] / remove[] pointing at this step.\n"
+            + f"Selected node:\n{focus_str}"
+        )
+    # Build the messages array
+    messages = [{"role": "system", "content": system_prompt}]
+    # Serialize the context snapshot into a human-readable
+    # summary the LLM can reason about. The full step_template
+    # is included as compact JSON (no pretty-printing) to save
+    # tokens \u2014 the LLM understands compact JSON.
+    ctx_block_lines = [
+        "# Snapshot",
+        f"workflow.id: {ctx['workflow']['id']}",
+        f"workflow.name: {ctx['workflow']['name']}",
+        f"workflow.description: {ctx['workflow']['description'] or '(empty)'}",
+        f"workflow.version: {ctx['workflow']['version']}",
+        f"step_template ({len(ctx['step_template'])} steps):",
+        json.dumps(ctx["step_template"], ensure_ascii=False),
+        f"variables ({len(ctx['variables'])}):",
+        json.dumps(ctx["variables"], ensure_ascii=False),
+    ]
+    if ctx.get("source_project"):
+        sp = ctx["source_project"]
+        ctx_block_lines.append(
+            f"source_project: {sp['name']} ({sp['id']}) \u2014 goal: {sp.get('goal') or '(empty)'}"
+        )
+    messages.append({
+        "role": "user",
+        "content": "\n".join(ctx_block_lines),
+    })
+    # Append history (alternating user/assistant)
+    for h in history:
+        if h.get("role") in ("user", "assistant") and h.get("content"):
+            messages.append({"role": h["role"], "content": h["content"]})
+    # Append the new user message
+    messages.append({"role": "user", "content": body.message})
+    # Call the LLM. The project chat uses an internal
+    # _call_llm helper (see api/projects.py). For v1 we share
+    # the same path \u2014 if a workflow ever needs a different
+    # model, this is the spot to swap.
+    try:
+        from hermes_orch.api.projects import _call_llm_chat
+        llm_text = await _call_llm_chat(cfg, messages)
+    except ImportError:
+        # Fallback: call our own minimal _call_llm_chat if the
+        # project one isn't importable. Both call the same LLM
+        # so this should never trigger in production.
+        llm_text = await _call_llm_chat(cfg, messages)
+    except Exception as e:
+        log.warning("workflow chat LLM call failed: %s", e)
+        raise HTTPException(
+            502, f"LLM call failed: {type(e).__name__}: {e}"
+        )
+    suggestions = _extract_workflow_suggestions(llm_text)
+    return {
+        "message": llm_text,
+        "suggestions": suggestions,
+        "history_count": len(history) + 1,  # +1 for the new user turn
+    }
+
+
+# v3.12.6 (Phase 2) apply endpoint \u2014 mirrors
+# _apply_workflow_patch_from_chat in api/projects.py but
+# workflow-scoped (the workflow_id is in the URL, not the
+# suggestion body). The chat box sends the suggestion as-is
+# and we delegate to the existing apply_workflow_patch logic
+# (the workflow_id in the URL is the source of truth).
+@router.post("/{workflow_id}/chat/apply")
+async def apply_workflow_chat_suggestion(
+    workflow_id: str, body: "ChatApplyRequest", request: Request
+) -> dict:
+    """Apply a chat-suggested workflow patch.
+
+    The chat emits suggestions of type `apply_workflow_patch`
+    (see the _WORKFLOW_CHAT_SYSTEM_PROMPT for the JSON shape).
+    The frontend shows a diff preview; on Apply we delegate
+    to the existing workflow PATCH endpoint logic so the
+    validation (cycle detection, path safety, etc.) is shared.
+    """
+    s = body.suggestion
+    patch_data = s.get("patch") if isinstance(s, dict) else None
+    if not isinstance(patch_data, dict):
+        raise HTTPException(
+            400, "apply_workflow_patch suggestion missing 'patch' object"
+        )
+    # Re-validate the patch through Pydantic so the workflow
+    # endpoint gets a well-typed object. Same shape as the
+    # existing apply_workflow_patch endpoint's body.
+    try:
+        patch_body = WorkflowStepsPatchBody(
+            add=patch_data.get("add") or [],
+            edit=patch_data.get("edit") or [],
+            remove=patch_data.get("remove") or [],
+            position=patch_data.get("position"),
+            reason=s.get("reason") or "",
+        )
+    except Exception as e:
+        raise HTTPException(422, f"apply_workflow_patch: invalid patch: {e}")
+    # Reuse the existing apply endpoint. We construct a
+    # minimal request-like object (the endpoint only needs
+    # `request.app.state.db` + the URL path's workflow_id).
+    new_request = type("R", (), {"app": request.app})()
+    try:
+        result = await apply_workflow_patch(
+            workflow_id=workflow_id, body=patch_body, request=new_request
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"apply_workflow_patch failed: {e}")
+    return result

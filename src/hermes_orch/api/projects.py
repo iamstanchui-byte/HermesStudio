@@ -3869,6 +3869,66 @@ def _render_dag_section(suggestions: list | None) -> str:
     return "\n\nCurrent plan:\n```text\n" + "\n\n".join(dag_blocks) + "\n```"
 
 
+
+
+# ===== v3.14.0 (Phase 4): Shared chat LLM helper =====
+# v3.14.0: extracted the LLM-call logic from chat_with_project
+# into a module-level helper so the workflow chat
+# (api/workflows.py:chat_with_workflow) can reuse it. Both
+# chats use the same model + base_url + api_key + max_tokens
+# — the only thing that differs is the system prompt +
+# context snapshot. Future model-per-surface config can be
+# added as an optional argument.
+async def _call_llm_chat(cfg: dict, messages: list[dict], max_tokens: int = 2000) -> str:
+    """Single LLM call for the chatbox surfaces (project + workflow).
+    Returns the raw content string (with any <think> traces
+    still embedded — the caller strips them). Raises 502 on
+    network error or unexpected response shape.
+    """
+    import copy as _copy
+    import httpx
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    llm_cfg = cfg.get("llm", {}) or {}
+    base_url = (llm_cfg.get("base_url") or "https://api.minimax.io/v1").rstrip("/")
+    api_key = (llm_cfg.get("api_key") or "").strip()
+    model = llm_cfg.get("model") or "MiniMax-M3"
+    timeout = float(llm_cfg.get("timeout_seconds") or 90)
+    if not api_key:
+        raise HTTPException(
+            503, "LLM api_key not configured — set llm.api_key in config.yaml"
+        )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    p = _copy.deepcopy({
+        "model": model,
+        "temperature": 0.4,
+        "max_tokens": max_tokens,
+    })
+    p["messages"] = messages
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(
+                f"{base_url}/chat/completions",
+                json=p, headers=headers,
+            )
+        if r.status_code != 200:
+            raise HTTPException(502, f"LLM returned HTTP {r.status_code}: {r.text[:300]}")
+        data = r.json()
+        try:
+            text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise HTTPException(502, f"LLM response shape unexpected: {e}")
+    except httpx.HTTPError as e:
+        log.warning(f"chat LLM call failed: {e}")
+        raise HTTPException(502, f"LLM unreachable: {e}")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(502, "LLM returned empty content")
+    return text
+
+
 @router.post("/{project_id}/chat")
 async def chat_with_project(
     project_id: str, body: ChatRequest, request: Request

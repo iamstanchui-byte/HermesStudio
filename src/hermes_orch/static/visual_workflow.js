@@ -1696,8 +1696,21 @@
         // explicitly. Without this, the step would default to
         // do_task and the supervisor would dispatch an agent
         // task instead of creating an inbox approval.
+        //
+        // v3.14.x: also pre-populate a default `approval`
+        // sub-object so the user has something to edit before
+        // saving. Defaults match the plan editor's
+        // _build_default_approval_cfg and the runtime's
+        // `step.get("approval") or {}` fallback. The user can
+        // edit on_reject / route_to / summary_template /
+        // timeout_seconds in the side panel (or via Edit as JSON).
         if (tmpl === 'human-approval') {
             step.type = 'human_approval';
+            step.approval = {
+                on_reject: 'stop',
+                summary_template: `Please review step: ${name}`,
+                timeout_seconds: 86400,
+            };
         }
         return step;
     }
