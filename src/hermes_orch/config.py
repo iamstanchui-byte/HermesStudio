@@ -14,7 +14,20 @@ import yaml
 DEFAULT_CONFIG: dict[str, Any] = {
     "orchestrator": {
         "port": 8765,
-        "host": "0.0.0.0",
+        # v1.0.1 (new-user-activation): bind host defaults to loopback only.
+        # Operators who want LAN access must explicitly enable it via
+        # /settings#network — that requires a server restart, gated by the
+        # `restart-required` flag (see `core/restart.py`). The legacy `host`
+        # key is still read for backward-compat in `load_config()`; once the
+        # next config save lands, the legacy key is replaced.
+        #
+        # NOTE: `bind_host` is intentionally NOT in DEFAULT_CONFIG. The
+        # `load_config()` migration block (below) needs to be able to
+        # distinguish "no bind_host in file, no legacy host either → use
+        # loopback default" from "no bind_host in file, legacy host present
+        # → migrate to bind_host = legacy value". If bind_host were in
+        # DEFAULT_CONFIG, _deep_merge would always add it before the
+        # migration block could fire.
         "log_level": "INFO",
     },
     "artifacts": {
@@ -157,10 +170,36 @@ def load_config() -> dict[str, Any]:
 
     # Load from file
     config_path = find_config_path()
-    if config_path:
+    if config_path and config_path.exists():
         with open(config_path) as f:
             file_cfg = yaml.safe_load(f) or {}
         _deep_merge(cfg, file_cfg)
+
+    # v1.0.1: legacy `host:` key migration (see docs/v1.0.1-new-user-activation.md §3.1.1).
+    # If the loaded config has the legacy `host` key in `orchestrator` but no
+    # `bind_host`, copy the value over and log a one-time migration notice.
+    # This protects operators who previously opted into `host: 0.0.0.0` from
+    # being silently downgraded to loopback-only on upgrade.
+    #
+    # Note: `bind_host` is intentionally NOT in DEFAULT_CONFIG (see comment
+    # there). This lets us detect the "no bind_host in file" case below.
+    orch = cfg.get("orchestrator") or {}
+    if isinstance(orch, dict) and "bind_host" not in orch:
+        if "host" in orch:
+            # Legacy migration: copy value, log to stderr once.
+            legacy_host = orch["host"]
+            orch["bind_host"] = legacy_host
+            import sys
+            print(
+                f"[config-migration] Migrating legacy config key 'host' -> "
+                f"'bind_host' (value: {legacy_host!r} retained).",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            # Neither legacy `host` nor new `bind_host` in the file — fall
+            # back to the loopback default.
+            orch["bind_host"] = "127.0.0.1"
 
     # Apply env var overrides (HERMES_ORCH_<SECTION>_<KEY>)
     _apply_env_overrides(cfg)

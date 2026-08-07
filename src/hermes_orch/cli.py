@@ -46,11 +46,17 @@ def init(config_dir: str | None, admin_username: str) -> None:
     # Config file (if not exists)
     config_file = base / "config.yaml"
     if not config_file.exists():
+        # v1.0.1 (new-user-activation): default bind host is loopback only
+        # (127.0.0.1). Operators wanting LAN access must explicitly enable it
+        # via /settings#network (which requires a server restart). See
+        # docs/v1.0.1-new-user-activation.md §3.1 for the full rationale.
+        # Write as UTF-8 (no BOM) so the § / non-ASCII characters survive
+        # round-trips on Windows where the default locale is cp1252.
         config_file.write_text(
             """# Hermes Orchestrator config (see REVIEW.md §8.2 for full reference)
 orchestrator:
   port: 8765
-  host: "0.0.0.0"
+  bind_host: "127.0.0.1"
   log_level: INFO
 
 artifacts:
@@ -70,7 +76,8 @@ supervisor:
 logging:
   audit_log_path: ./audit.log
   audit_log_retention_days: 90
-"""
+""",
+            encoding="utf-8",
         )
         click.echo(f"Created config: {config_file}")
     else:
@@ -157,7 +164,7 @@ def serve(host: str | None, port: int | None, reload: bool) -> None:
     from hermes_orch.config import load_config
 
     cfg = load_config()
-    bind_host = host or cfg["orchestrator"]["host"]
+    bind_host = host or cfg["orchestrator"]["bind_host"]
     bind_port = port or cfg["orchestrator"]["port"]
 
     # v3.12.0: optional HTTPS via self-signed or user-supplied cert.
@@ -184,10 +191,38 @@ def serve(host: str | None, port: int | None, reload: bool) -> None:
     else:
         scheme = "http"
 
+    # v1.0.1: clearly indicate whether LAN access is enabled. The bind host
+    # is 0.0.0.0 when LAN is enabled, anything else (127.0.0.1, ::1) is
+    # loopback-only. Surface this to the operator at startup so they can
+    # verify the runtime binding matches their config intent — no silent
+    # bind mismatch.
+    lan_enabled = bind_host == "0.0.0.0"
+
+    # v1.0.1: detect the local LAN IP that agent hosts should use to reach
+    # the dashboard. Only meaningful when lan_enabled; otherwise agents
+    # must be on the same host. We resolve via the routing table to a
+    # public IP (8.8.8.8) which never actually gets a packet — it just
+    # tells the kernel which interface would carry outbound traffic, and
+    # we read the local IP of that interface.
+    lan_url = ""
+    if lan_enabled:
+        try:
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                lan_ip = s.getsockname()[0]
+            lan_url = f"{scheme}://{lan_ip}:{bind_port}"
+        except OSError:
+            lan_url = "(could not detect LAN IP — set bind_host to a specific interface if needed)"
+
     click.echo(f"Starting Hermes Orchestrator on {scheme}://{bind_host}:{bind_port}")
-    click.echo(f"  Dashboard: {scheme}://localhost:{bind_port}/")
-    click.echo(f"  API docs:  {scheme}://localhost:{bind_port}/docs")
-    click.echo(f"  Health:    {scheme}://localhost:{bind_port}/api/health")
+    click.echo(f"  Dashboard:     {scheme}://localhost:{bind_port}/")
+    if lan_enabled and lan_url:
+        click.echo(f"  LAN access:    {lan_url}/  (use this for agent host enrollment)")
+    else:
+        click.echo("  LAN access:    disabled (loopback only — set bind_host: 0.0.0.0 in config to enable)")
+    click.echo(f"  API docs:       {scheme}://localhost:{bind_port}/docs")
+    click.echo(f"  Health:         {scheme}://localhost:{bind_port}/api/health")
 
     uvicorn.run(
         "hermes_orch.main:app",
