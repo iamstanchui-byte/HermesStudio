@@ -147,51 +147,32 @@
        (when n_inputs=1, the only input is .input_1; for n_outputs=2
        the outputs are .output_1 + .output_2). Phase 1.2 wire/unwire
        uses .input_1 / .output_1. Phase 2 loop-back uses .output_2
-       (red dashed, signals feedback_to not depends_on). */
-    .input_1, .output_1 {
-        width: 12px !important;
-        height: 12px !important;
-        background: #6b7280 !important;
-        border: 2px solid #fff !important;
-    }
-    /* Phase 2: loop-back handle (output_2). Red, dashed border,
-       positioned LOWER on the right side so the two outputs are
-       visually distinct. drawflow's default puts both outputs at
-       top:50% which would overlap; we override to 70% (closer to
-       bottom) and offset right by 0px. */
+       (red dashed, signals feedback_to not depends_on).
+
+       v3.14.x: aligned with visual_plan.html's .vp-node .output_2
+       styling so the two editors' wire ports look identical. Plan
+       editor uses drawflow's default input_1 / output_1 (yellow),
+       so we drop the gray+white override here. The output_2 is
+       light-pink + red-dashed (no positioning override, no ↻
+       icon) to match plan editor's `.vp-node .output_2`. */
+    /* Phase 2: loop-back handle (output_2). Red dashed border on a
+       light-pink fill — matches visual_plan.html's `.vp-node .output_2`
+       rule exactly. We rely on drawflow's default position
+       (top:50%, side:0) so the two outputs are vertically stacked
+       at center; the plan editor does the same. */
     .drawflow .drawflow-node .output_2 {
-        background: #dc2626 !important;
-        border: 2px dashed #fca5a5 !important;
-        top: 70% !important;
-        right: -4px !important;
-    }
-    .drawflow .drawflow-node .output_2::after {
-        content: "↻";
-        position: absolute;
-        top: -2px;
-        right: -16px;
-        font-size: 10px;
-        color: #dc2626;
-        font-weight: bold;
-        pointer-events: none;
+        background: #fee2e2 !important;
+        border: 2px dashed #dc2626 !important;
     }
     /* Phase 2: loop-back connection (output_2 source). Red dashed
        stroke to match the handle color. The CSS class on the
-       connection SVG includes the output class name. */
+       connection SVG includes the output class name. Matches
+       visual_plan.html's `svg.output_2 .drawflow-path` selector
+       (same colors, same dasharray) so the two editors' loop-back
+       wires look identical. */
     svg.connection.output_2 .main-path {
         stroke: #dc2626;
-        stroke-width: 1.5;
-        stroke-dasharray: 5 3;
-    }
-    /* Tooltip hint: the user might not know the difference
-       between output_1 (chain) and output_2 (loop-back). Add a
-       subtle hint on the handle via CSS title attr (set by JS in
-       _stepToCardHtml below). */
-    .drawflow .drawflow-node .output_1:hover {
-        background: #374151 !important;
-    }
-    .drawflow .drawflow-node .output_2:hover {
-        background: #b91c1c !important;
+        stroke-dasharray: 4 3;
     }
     /* Hide drawflow's default delete button (we use the side panel) */
     .drawflow-node .btn-delete { display: none !important; }
@@ -358,25 +339,15 @@
         background: #450a0a;     /* red-950 */
         color: #fca5a5;          /* red-300 */
     }
-    /* Connection handles: keep gray/red in dark mode but brighten the
-       hover state. The red dashed loop-back handle is a "data signal"
-       not a surface — keep red in both modes (same lesson as the
-       status pill colors from v3.7.0: signals are content, not chrome). */
-    body.dark .drawflow .drawflow-node .input_1,
-    body.dark .drawflow .drawflow-node .output_1 {
-        background: #94a3b8 !important;
-        border-color: #1e293b !important;
-    }
-    body.dark .drawflow .drawflow-node .output_1:hover {
-        background: #cbd5e1 !important;
-    }
-    /* Loop-back handle (output_2): keep red-600 base + brighten border */
+    /* Connection handles: v3.14.x — drop the workflow's custom
+       slate-700 input_1 / output_1 fill. The plan editor doesn't
+       override these in dark mode (drawflow's default yellow ports
+       are the same in both modes), so we match by removing the
+       override. Loop-back output_2 dark bg matches plan editor's
+       #450a0a (very dark red, vs workflow's old #ef4444). */
     body.dark .drawflow .drawflow-node .output_2 {
-        background: #ef4444 !important;        /* red-500 (slightly brighter for dark bg) */
-        border-color: #fca5a5 !important;       /* red-300 */
-    }
-    body.dark .drawflow .drawflow-node .output_2:hover {
-        background: #f87171 !important;        /* red-400 */
+        background: #450a0a !important;
+        border-color: #fca5a5 !important;
     }
     /* Side panel: matches the plan editor's "elevated layer" treatment
        (slate-800 card on slate-900 canvas). Inputs are slate-900
@@ -457,30 +428,29 @@
        structure). Output_2 (loop-back, red dashed) is a data signal
        and stays red — the v3.7.0 "status colors are content" rule. */
     body.dark .drawflow .connection .main-path {
-        stroke: #60a5fa !important;            /* blue-400 */
+        stroke: #64748b !important;            /* slate-500 — matches plan editor */
     }
     body.dark .drawflow .connection .main-path:hover {
-        stroke: #93c5fd !important;            /* blue-300 (hover) */
+        stroke: #94a3b8 !important;            /* slate-400 (hover) */
     }
     body.dark .drawflow .connection .main-path.selected {
-        stroke: #86efac !important;            /* emerald-300 (selected) */
+        stroke: #93c5fd !important;            /* blue-300 (selected) */
     }
     /* v3.11.1 (2026-08-03): loop-back (feedback_to) wire in dark mode.
-       The catch-all above paints ALL .main-path blue, which silently
+       The catch-all above paints ALL .main-path slate, which silently
        overrides the light-mode red-dashed style on output_2 connections.
        Keep output_2 red dashed in dark mode — it's a "data signal"
        (mirrors the v3.7.0 status-color rule and the light-mode rule
        on line ~145). Without this, the feedback_to wire in dark mode
        looks identical to a chain wire, defeating the legend at the top
-       of the visual editor. Repro: open wf-ab4cca76755c (saving-game-v1)
-       in dark mode — check-total's loop-back wire to add-savings shows
-       blue solid instead of red dashed. */
+       of the visual editor. v3.14.x: dasharray 4 3 to match plan
+       editor's `.vp-canvas-wrap svg.output_2` rule. */
     body.dark .drawflow svg.connection.output_2 .main-path {
-        stroke: #dc2626 !important;            /* red-600, matches light mode */
-        stroke-dasharray: 5 3 !important;
+        stroke: #f87171 !important;            /* red-400, brighter for dark bg (matches plan) */
+        stroke-dasharray: 4 3 !important;
     }
     body.dark .drawflow svg.connection.output_2 .main-path:hover {
-        stroke: #f87171 !important;            /* red-400 (hover) */
+        stroke: #fca5a5 !important;            /* red-300 (hover) */
     }
     /* "Add step" wrapper card (white bg + border) */
     body.dark .vf-canvas-wrap + div.bg-white,
