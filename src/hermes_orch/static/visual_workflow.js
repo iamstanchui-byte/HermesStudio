@@ -790,11 +790,22 @@
         _clearConnections(_editor);
 
         // Lay out steps. Phase 2.5: if a saved position exists for this
-        // step in _visualLayout, use it; otherwise fall back to the
-        // default vertical stack (50, 50 + i*120). This is the difference
-        // between "refresh resets everything" and "cards stay where I
-        // left them" — the whole point of persisting visual_layout.
-        const defaultX = 50, defaultY = 50, defaultDy = 120;
+        // step in _visualLayout, use it; otherwise fall back to a
+        // 3-column grid (matches the plan editor's addNodeToCanvas
+        // default at visual_plan.js:1203-1208). The previous
+        // single-column vertical stack (50, 50 + i*120) had a
+        // nasty property: every new step pushed the next one 120px
+        // further down the page, so adding 5+ steps left the
+        // canvas in a tall vertical column. The grid keeps the
+        // canvas compact and matches what the plan editor does
+        // when the user adds steps via the palette chips.
+        //
+        // Phase 2.5: the saved-position branch is unchanged — if
+        // the user already dragged a card somewhere, that wins
+        // over the default. New workflows (or new steps added to
+        // an empty plan) get the grid.
+        const defaultX = 50, defaultY = 50;
+        const colW = 280, rowH = 130, cols = 3;
         try {
             _stepTemplate.forEach((step, i) => {
                 const html = _stepToCardHtml(step);
@@ -804,8 +815,8 @@
                     action: step.action,
                 };
                 const saved = _visualLayout[step.name];
-                const posX = (saved && typeof saved.x === 'number') ? saved.x : defaultX;
-                const posY = (saved && typeof saved.y === 'number') ? saved.y : (defaultY + i * defaultDy);
+                const posX = (saved && typeof saved.x === 'number') ? saved.x : (defaultX + (i % cols) * colW);
+                const posY = (saved && typeof saved.y === 'number') ? saved.y : (defaultY + Math.floor(i / cols) * rowH);
                 // drawflow 0.0.59 addNode signature:
                 //   addNode(name, n_inputs, n_outputs, posx, posy, classoverride, data, html)
                 // The inputs/outputs args are NUMBERS (count of
