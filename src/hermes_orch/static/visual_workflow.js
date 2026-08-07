@@ -1390,8 +1390,57 @@
                 return;
             }
             if (!Array.isArray(target.depends_on)) target.depends_on = [];
-            if (!target.depends_on.includes(sourceName)) {
-                // v2.1: checkpoint BEFORE the data change.
+            // v3.14.x: REWIRE semantics — each step has exactly
+            // one input port, so it can have at most one direct
+            // chain dep. When the user draws a new wire, the old
+            // wire (if any) is REPLACED, not appended. Before this
+            // fix, the depends_on array grew on every wire draw
+            // and the user had to manually disconnect the old
+            // wire to "replace" it — the new wire just stacked on
+            // top. Now the new wire IS the replacement: the old
+            // source is removed, the new one added. If the user
+            // really wants multiple direct deps, they can use
+            // Edit as JSON (the data model still allows it — only
+            // the canvas enforces the visual constraint).
+            if (target.depends_on.includes(sourceName)) {
+                // Same wire redrawn — no-op, no checkpoint.
+                return;
+            }
+            if (target.depends_on.length > 0) {
+                // Rewire: remove the old source(s) from depends_on.
+                // We also need to remove the visual connection
+                // (drawflow keeps the old wire even though we
+                // replaced the data; the wire is dead data but
+                // visually misleading). We splice out the old
+                // drawflow connection(s) targeting this target.
+                const oldSources = target.depends_on.slice();
+                _checkpoint('Rewire chain: ' + oldSources.join(',') +
+                    ' → ' + sourceName + ' → ' + targetName);
+                target.depends_on = [sourceName];
+                // Remove the stale visual connection(s) for the
+                // old source(s). drawflow doesn't fire
+                // connectionRemoved for our manual removeConnection
+                // call, so we wrap it (init block already patches
+                // _editor.removeConnection to call our handler).
+                const allNodes = _getAllNodes();
+                for (const oldSrc of oldSources) {
+                    const oldSrcId = _findNodeIdByStepName(oldSrc, allNodes);
+                    const tgtId = _findNodeIdByStepName(targetName, allNodes);
+                    if (oldSrcId != null && tgtId != null) {
+                        try {
+                            _editor.removeConnection(
+                                'node-' + oldSrcId, 'node-' + tgtId,
+                                'output_1', 'input_1',
+                            );
+                        } catch (e) { /* already removed */ }
+                    }
+                }
+                _showBanner(
+                    `Rewired ${oldSources.join(', ')} → ${targetName} (now depends on ${sourceName}). Click Save to persist.`,
+                    'success',
+                );
+            } else {
+                // First chain dep — standard add.
                 _checkpoint('Add chain: ' + sourceName + ' → ' + targetName);
                 target.depends_on.push(sourceName);
                 _showBanner(
