@@ -324,6 +324,22 @@
         document.addEventListener('keydown', (e) => {
             const ctrl = e.ctrlKey || e.metaKey;
             if (!ctrl) {
+                // v3.14.x: Delete / Backspace on a selected card
+                // deletes the step (same as the X button + confirm).
+                // Before this, the keydown handler only handled
+                // Escape so pressing Delete on a focused card did
+                // nothing — the user had to find the tiny X. Skipped
+                // if focus is in a text field so users can delete
+                // characters normally.
+                const tag = (e.target && e.target.tagName || '').toLowerCase();
+                const isTextField = tag === 'input' || tag === 'textarea' || (e.target && e.target.isContentEditable);
+                if (!isTextField && (e.key === 'Delete' || e.key === 'Backspace')) {
+                    if (_selectedNodeName) {
+                        e.preventDefault();
+                        deleteSelectedStep();
+                        return;
+                    }
+                }
                 // Escape: close whichever modal/sheet is open (top-most
                 // wins). v3.8.0: JSON modal + Save-as-workflow modal
                 // were added; same pattern as closeSidePanel — only

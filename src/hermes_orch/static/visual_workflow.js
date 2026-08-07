@@ -1040,44 +1040,110 @@
                         ? confirm(`Delete step "${stepName}"?`)
                         : confirm('Delete this step?');
                     if (!ok) return;
-                    // Filter _stepTemplate FIRST so the in-memory
-                    // model is correct even if the nodeRemoved
-                    // listener bails (DOM gone, fallback would grab
-                    // the wrong step). Same pattern as plan
-                    // editor's deleteStepByName. The nodeRemoved
-                    // listener still runs as a safety net but its
-                    // work is a no-op (step already gone).
-                    if (stepName) {
-                        _checkpoint('Delete step "' + stepName + '"');
-                        const idx = _stepTemplate.findIndex(
-                            (s) => s.name === stepName
-                        );
-                        if (idx >= 0) {
-                            _stepTemplate.splice(idx, 1);
-                        }
-                        // Scrub the removed name from any other
-                        // step's depends_on / feedback_to so the
-                        // workflow doesn't carry dangling refs.
-                        for (const s of _stepTemplate) {
-                            if (Array.isArray(s.depends_on)) {
-                                s.depends_on = s.depends_on.filter(
-                                    (d) => d !== stepName
-                                );
-                            }
-                            if (Array.isArray(s.feedback_to)) {
-                                s.feedback_to = s.feedback_to.filter(
-                                    (d) => d !== stepName
-                                );
-                            }
-                        }
-                    }
-                    // Drawflow expects id like "node-1" for removeNodeId
-                    _editor.removeNodeId(nodeEl.id);
+                    // v3.14.x: refactored to call the shared
+                    // deleteStepByName helper so the X-click and
+                    // Delete-key paths share the same in-memory
+                    // model logic (checkpoint, filter, scrub
+                    // dangling refs, removeNodeId, close panel).
+                    deleteStepByName(stepName);
+                    _showBanner(
+                        `Deleted step: ${stepName}. Click Save to persist.`,
+                        'success'
+                    );
                 });
                 wrap._vfDeleteBound = true;
             }
             wrap._vfClickBound = true;
         }
+    }
+
+    // v3.14.x: extracted from the X-click handler so the Delete
+    // key on a focused card can call the same path. Mirrors the
+    // plan editor's `deleteStepByName`. The X-click handler is
+    // refactored to call this too.
+    //
+    // Side-effects (in order):
+    //  1. Pushes a checkpoint onto the undo stack with the step
+    //     name in the label, so undo restores it.
+    //  2. Removes the step from _stepTemplate in place. Drawflow
+    //     fires nodeRemoved synchronously inside removeNodeId; our
+    //     listener's _onNodeRemoved is a no-op safety net for
+    //     paths that bypass this caller (the DOM may be gone
+    //     when the listener fires).
+    //  3. Scrubs the removed name from any other step's
+    //     depends_on / feedback_to so we don't carry dangling refs.
+    //  4. Calls _editor.removeNodeId(nodeId) with the drawflow
+    //     wrapper id (e.g. "node-3"). This is the foreign API
+    //     that triggers the nodeRemoved event + DOM teardown.
+    //  5. Closes the side panel if it was open for this step.
+    function deleteStepByName(name) {
+        if (!name) return;
+        _checkpoint('Delete step "' + name + '"');
+        // Filter _stepTemplate FIRST so the in-memory model is
+        // correct even if removeNodeId throws or the nodeRemoved
+        // listener bails (it has a "take index 0" fallback that
+        // was a footgun, removed in commit 4d75c76). Same pattern
+        // as plan editor's deleteStepByName.
+        const idx = _stepTemplate.findIndex((s) => s.name === name);
+        if (idx >= 0) {
+            _stepTemplate.splice(idx, 1);
+        }
+        // Scrub the removed name from any other step's
+        // depends_on / feedback_to so the workflow doesn't carry
+        // dangling refs. Without this, a step that referenced
+        // the deleted one would be invalid.
+        for (const s of _stepTemplate) {
+            if (Array.isArray(s.depends_on)) {
+                s.depends_on = s.depends_on.filter((d) => d !== name);
+            }
+            if (Array.isArray(s.feedback_to)) {
+                s.feedback_to = s.feedback_to.filter((d) => d !== name);
+            }
+        }
+        // Remove the card from the canvas. drawflow expects the
+        // DOM id (e.g. "node-3") for removeNodeId. We translate
+        // step name → nodeId via _findNodeIdByStepName, but the
+        // nodeRemoved listener is the safety net if this returns
+        // null (e.g. race with re-render).
+        if (_editor) {
+            const allNodes = _getAllNodes();
+            const nodeId = _findNodeIdByStepName(name, allNodes);
+            if (nodeId != null) {
+                try { _editor.removeNodeId('node-' + nodeId); }
+                catch (e) { /* may already be removed */ }
+            }
+        }
+        // Close the side panel + clear selection if it was
+        // showing this step. Without this, the form would still
+        // show the deleted step's data after the card disappears
+        // from the canvas.
+        if (_selectedNodeId) {
+            const inner = document.getElementById(_selectedNodeId);
+            const selName = inner && inner.querySelector('[data-step-name]')
+                ? inner.querySelector('[data-step-name]').dataset.stepName : null;
+            if (selName === name) closeSidePanel();
+        }
+    }
+
+    // v3.14.x: confirms with the user, then calls deleteStepByName.
+    // Bindable from the Delete / Backspace key handler. The plan
+    // editor has the same wrapper (visual_plan.js:1272) — keeps
+    // the two editors in sync.
+    function deleteSelectedStep() {
+        if (!_selectedNodeId) return false;
+        const inner = document.getElementById(_selectedNodeId);
+        const stepName = inner && inner.querySelector('[data-step-name]')
+            ? inner.querySelector('[data-step-name]').dataset.stepName : null;
+        if (!stepName) return false;
+        if (!confirm(
+            `Delete step "${stepName}"?\n\n` +
+            `This also removes it from any other step's depends_on.`
+        )) {
+            return false;
+        }
+        deleteStepByName(stepName);
+        _showBanner(`Deleted step: ${stepName}. Click Save to persist.`, 'success');
+        return true;
     }
 
     function _showInitError(err) {
@@ -1875,6 +1941,17 @@
             console.warn('visual_workflow: no step for node', nodeId);
             return;
         }
+        // v3.14.x: highlight the selected card. Mirrors the plan
+        // editor's openSidePanel — toggles `.selected` on the
+        // .drawflow-node wrapper (which has the .vf-node class
+        // from addNode's classoverride). The CSS in
+        // visual_workflow.html (.vf-node.selected) gives a blue
+        // border + ring like the plan editor. Without this, the
+        // user has no visual cue for which card the side panel
+        // is editing.
+        document.querySelectorAll('.vf-node.selected')
+            .forEach((n) => n.classList.remove('selected'));
+        if (wrapperEl) wrapperEl.classList.add('selected');
         // v3.12.6 (Phase 3): context-aware editing. Write the
         // selected step to sessionStorage so the chatbox LLM can
         // see it in its system prompt and target apply_workflow_patch
@@ -1942,6 +2019,12 @@
             _refreshEditFormFromTemplate();
         }
         _selectedNodeId = null;
+        // v3.14.x: clear the selected-card highlight (mirrors
+        // openSidePanel adding the .selected class). Without this
+        // the card stays visually highlighted after the side panel
+        // closes, suggesting it's still selected.
+        document.querySelectorAll('.vf-node.selected')
+            .forEach((n) => n.classList.remove('selected'));
         // v3.12.6 (Phase 3): clear the chatbox FOCUS context so the
         // next chat message doesn't carry a stale step reference.
         if (window.chatbox && typeof window.chatbox.clearSelectedNode === 'function') {
@@ -2165,6 +2248,24 @@
         if (window._vfShortcutsBound) return;
         window._vfShortcutsBound = true;
         document.addEventListener('keydown', (ev) => {
+            // v3.14.x: Delete / Backspace on a focused card
+            // deletes the step (same as the X button + confirm).
+            // Before this, only the X click worked — pressing
+            // Delete on a focused card did nothing, and users had
+            // to find the tiny × in the top-right corner. Skipped
+            // if focus is in a text field so users can delete
+            // characters normally.
+            if (ev.key === 'Delete' || ev.key === 'Backspace') {
+                const tag = (ev.target && ev.target.tagName || '').toLowerCase();
+                const isTextField = tag === 'input' || tag === 'textarea' || (ev.target && ev.target.isContentEditable);
+                if (!isTextField) {
+                    if (_selectedNodeId) {
+                        ev.preventDefault();
+                        deleteSelectedStep();
+                        return;
+                    }
+                }
+            }
             if (ev.key === 'Escape') {
                 // v3.8.0: JSON editor is now a modal. Close the
                 // topmost open sheet (modal > side panel) so Esc

@@ -185,6 +185,20 @@
     .drawflow .parent-node {
         width: 220px !important;
     }
+    /* v3.14.x: blue ring on the selected card. Mirrors
+       visual_plan.html's `.vp-node.selected` so the two editors
+       look the same when a card is selected. The class is toggled
+       by openSidePanel / closeSidePanel in visual_workflow.js. We
+       target the .vf-node class (which is on the .drawflow-node
+       wrapper via addNode's classoverride) plus a higher-specificity
+       override so the !important elsewhere in this stylesheet
+       (border-color, background) doesn't silently trump the
+       selected state. */
+    .drawflow .parent-node .vf-node.selected,
+    .drawflow-node.vf-node.selected {
+        border-color: #1d4ed8 !important;
+        box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.25);
+    }
     /* drawflow's default `.drawflow-node { position: absolute; z-index: 2 }`
        already puts the card on top of the selected highlight.
        Do NOT override `position` to `relative` — that would make
@@ -319,6 +333,15 @@
     body.dark .vf-node {
         background: #1e293b !important;
         border-color: #334155 !important;
+    }
+    /* v3.14.x: brighten the selected-card ring in dark mode to match
+       the plan editor's `.vp-node.selected` (blue-300 instead of
+       blue-700). The default light-mode ring (blue-700 + 25% alpha)
+       is too dim against the slate-800 card. */
+    body.dark .drawflow .parent-node .vf-node.selected,
+    body.dark .drawflow-node.vf-node.selected {
+        border-color: #60a5fa !important;
+        box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.35);
     }
     body.dark .vf-node-name { color: #f1f5f9; }
     body.dark .vf-node-role {
