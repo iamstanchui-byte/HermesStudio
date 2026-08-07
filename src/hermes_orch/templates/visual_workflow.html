@@ -831,7 +831,29 @@
    chat panel is hidden — the chatbox needs a project_id to
    route suggestions. Standalone workflows can still be
    edited manually via the visual editor; chat-driven edits
-   require a source project. #}
+   require a source project.
+
+   v3.14.x: if the workflow was created from a project that has
+   since been deleted (orphan source_project_id), the page
+   handler clears source_project_id and surfaces a small banner
+   explaining why chat is unavailable. The DB row is preserved
+   so the original link can be restored later (or the workflow
+   can be cloned + re-attached to a new project). #}
+{% if workflow._orphan_source_project %}
+<div class="bg-amber-50 border border-amber-300 text-amber-900 px-4 py-2 text-sm rounded mb-3 mx-3"
+     role="status" aria-label="Orphan source project warning">
+    <strong>Chatbox unavailable:</strong>
+    this workflow was created from project
+    <code class="font-mono">{{ workflow._orphan_source_project }}</code>,
+    but that project no longer exists (deleted or archived).
+    The chatbox needs a live project to route history and
+    suggestions. You can still edit the workflow manually via
+    the visual editor; chat-driven edits are disabled until
+    the workflow is re-attached to a project (clone the
+    workflow and run it under a different project, or restore
+    the source project from backup if available).
+</div>
+{% endif %}
 {% if workflow.source_project_id %}
 <div id="chat-root"
      data-project-id="{{ workflow.source_project_id }}"

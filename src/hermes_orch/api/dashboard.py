@@ -2203,6 +2203,27 @@ async def workflow_visual_page(workflow_id: str, request: Request) -> HTMLRespon
     if not isinstance(d["visual_layout"], dict):
         d["visual_layout"] = {}
     d["step_count"] = len(d["step_template"]) if isinstance(d["step_template"], list) else 0
+    # v3.14.x (2026-08-07): orphan source_project_id guard. If the
+    # workflow has a source_project_id that no longer points to an
+    # existing project (e.g. the source project was deleted but the
+    # workflow still references it), the chatbox would mount with
+    # an invalid project_id and the history API would return
+    # 404 → "Failed to load history: Project not found". Clear
+    # source_project_id in the rendered dict so the template's
+    # `{% if workflow.source_project_id %}` block is skipped and
+    # the chatbox is hidden. The user can still edit the workflow
+    # manually via the visual editor (which doesn't need a project);
+    # chat-driven edits just aren't available for orphaned
+    # workflows. The DB row is untouched (we don't UPDATE), so the
+    # original source_project_id is preserved for audit/cleanup.
+    if d.get("source_project_id"):
+        proj_check = await db.fetchone(
+            "SELECT 1 FROM projects WHERE id = ? LIMIT 1",
+            (d["source_project_id"],),
+        )
+        if not proj_check:
+            d["_orphan_source_project"] = d["source_project_id"]
+            d["source_project_id"] = None
     return templates.TemplateResponse(
         request=request,
         name="visual_workflow.html",
