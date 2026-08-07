@@ -1000,7 +1000,22 @@
                 if (ev.target.closest('.vf-palette-chip')) return;
                 const stepEl = ev.target.closest('[data-step-name]');
                 if (!stepEl) {
-                    if (sp.classList.contains('open')) {
+                    // v3.14.x: any non-card click (empty canvas, wire,
+                    // output/input handle) clears the card selection.
+                    // Without this, _selectedNodeId stays set from a
+                    // previous card click, and pressing Delete later
+                    // shows a confirm dialog for a card the user is
+                    // no longer focused on — confusing UX (the user
+                    // thinks the confirm is for the wire, not for
+                    // the stale card selection).
+                    //
+                    // closeSidePanel() does the full cleanup:
+                    // _refreshEditFormFromTemplate (revert), clear
+                    // _selectedNodeId + _selectedStepName, remove
+                    // .selected class from cards, clear chatbox FOCUS,
+                    // hide the side panel. Safe to call even when
+                    // the panel is already closed.
+                    if (_selectedNodeId || sp.classList.contains('open')) {
                         closeSidePanel();
                     }
                     return;
@@ -2410,6 +2425,23 @@
                 const tag = (ev.target && ev.target.tagName || '').toLowerCase();
                 const isTextField = tag === 'input' || tag === 'textarea' || (ev.target && ev.target.isContentEditable);
                 if (!isTextField) {
+                    // v3.14.x: wire-guard. If drawflow currently
+                    // has a connection (wire) selected — set by
+                    // drawflow's own click handler when the user
+                    // clicks a .main-path SVG — let drawflow's own
+                    // keydown listener handle the silent wire
+                    // deletion. Our card-confirm path doesn't run,
+                    // so the user doesn't see a misleading
+                    // "Delete step X?" dialog for a card that's no
+                    // longer the focus. Also fires when the user
+                    // clicks an output handle and starts dragging
+                    // (drawflow sets connection_selected for that
+                    // too, briefly).
+                    const wireSelected = _editor && _editor.connection_selected;
+                    if (wireSelected) {
+                        console.log('[vf] Delete key — wire selected, deferring to drawflow', { key: ev.key });
+                        return;  // let drawflow's handler fire
+                    }
                     if (_selectedNodeId) {
                         console.log('[vf] Delete key on selected card', { selectedNodeId: _selectedNodeId, key: ev.key });
                         ev.preventDefault();
