@@ -38,6 +38,18 @@
     // a renamed step) are harmless — we just ignore them on render.
     let _visualLayout = {};
     let _selectedNodeId = null;  // drawflow node id (e.g. "node-3") of the focused card
+    // v3.14.x: also track the selected step NAME. _selectedNodeId
+    // is a DOM id (the .drawflow-node element's id) which can go
+    // stale after a re-render (drawflow re-creates the DOM and
+    // may assign different numeric ids). The step NAME is the
+    // stable identity and is what `deleteSelectedStep` needs to
+    // look up the step in _stepTemplate. Without this, pressing
+    // Delete on a selected card after any re-render silently
+    // no-ops (getElementById returns null → stepName is null →
+    // confirm never shows). Plan editor uses _selectedNodeName
+    // (string) for the same reason — workflow editor is now
+    // bringing that pattern in.
+    let _selectedStepName = null;
     // Track mousedown position so we can distinguish a pure click
     // (no movement → open the side panel) from a drag (movement > 5px
     // → leave the card where the user dropped it, do not auto-open).
@@ -1163,16 +1175,50 @@
     // Bindable from the Delete / Backspace key handler. The plan
     // editor has the same wrapper (visual_plan.js:1272) — keeps
     // the two editors in sync.
+    //
+    // v3.14.x: resolution is now in 3 layers (most-reliable first):
+    //  1. _selectedStepName (string, set by _selectCard on click).
+    //     Survives re-renders because it's just a string in JS
+    //     state — the DOM is rebuilt, but our state isn't.
+    //  2. document.getElementById(_selectedNodeId) → data-step-name
+    //     attribute. Works if the DOM is fresh and the card is
+    //     still in the same position.
+    //  3. Bail with a banner if neither resolves. The user needs
+    //     to single-click the card to re-select it.
     function deleteSelectedStep() {
-        if (!_selectedNodeId) return false;
-        const inner = document.getElementById(_selectedNodeId);
-        const stepName = inner && inner.querySelector('[data-step-name]')
-            ? inner.querySelector('[data-step-name]').dataset.stepName : null;
-        if (!stepName) return false;
+        console.log('[vf] deleteSelectedStep called', {
+            _selectedNodeId,
+            _selectedStepName,
+        });
+        // Layer 1: step name from JS state.
+        let stepName = _selectedStepName || null;
+        // Layer 2: step name from DOM (fallback if state is stale).
+        if (!stepName && _selectedNodeId) {
+            const inner = document.getElementById(_selectedNodeId);
+            if (inner) {
+                const stepEl = inner.querySelector('[data-step-name]');
+                if (stepEl && stepEl.dataset.stepName) {
+                    stepName = stepEl.dataset.stepName;
+                }
+            }
+        }
+        if (!stepName) {
+            _showBanner(
+                'Cannot delete: selected card is no longer on the canvas. ' +
+                'Click the card first to re-select it.',
+                'error'
+            );
+            // Clear stale state so the next click is a clean select.
+            _selectedNodeId = null;
+            _selectedStepName = null;
+            return false;
+        }
+        console.log('[vf] deleteSelectedStep: about to confirm', { stepName });
         if (!confirm(
             `Delete step "${stepName}"?\n\n` +
             `This also removes it from any other step's depends_on.`
         )) {
+            console.log('[vf] deleteSelectedStep: confirm cancelled');
             return false;
         }
         deleteStepByName(stepName);
@@ -1987,6 +2033,11 @@
         if (!step) step = _findStepByNodeId(nodeId);
         if (!step) return;
         _selectedNodeId = nodeId;
+        // v3.14.x: also track the step name so deleteSelectedStep
+        // can resolve the step even if the DOM is rebuilt (e.g.
+        // after a save that triggers _render). Without this, the
+        // Delete key path was silently no-op'ing on stale DOM.
+        _selectedStepName = step.name;
         // Highlight (single source of truth — openSidePanel and
         // the click handler both call this; no risk of one
         // caller forgetting to clear the old .selected first).
@@ -2076,6 +2127,7 @@
             _refreshEditFormFromTemplate();
         }
         _selectedNodeId = null;
+        _selectedStepName = null;  // v3.14.x: mirror close-side-panel with clear-selection
         // v3.14.x: clear the selected-card highlight (mirrors
         // openSidePanel adding the .selected class). Without this
         // the card stays visually highlighted after the side panel
