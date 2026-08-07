@@ -1058,6 +1058,7 @@
                     const inner = nodeEl.querySelector('.vf-node');
                     const stepName = inner && inner.dataset
                         ? (inner.dataset.stepName || '') : '';
+                    console.log('[vf] X-click on step', { stepName, domId: nodeEl.id, hasInner: !!inner });
                     const ok = stepName
                         ? confirm(`Delete step "${stepName}"?`)
                         : confirm('Delete this step?');
@@ -1123,16 +1124,27 @@
             }
         }
         // Remove the card from the canvas. drawflow expects the
-        // DOM id (e.g. "node-3") for removeNodeId. We translate
-        // step name → nodeId via _findNodeIdByStepName, but the
+        // DOM id (e.g. "node-3") for removeNodeId, so we translate
+        // step name → bare internal key via _findNodeIdByStepName,
+        // then prefix with "node-" to get the DOM id. The
         // nodeRemoved listener is the safety net if this returns
         // null (e.g. race with re-render).
+        //
+        // v3.14.x: console.log so the user can verify the delete
+        // path in DevTools. (Previous bug: _findNodeIdByStepName
+        // returned the prefixed form, and we re-prefixed it —
+        // removeNodeId("node-node-3") silently no-op'd, leaving
+        // the card on canvas.)
         if (_editor) {
             const allNodes = _getAllNodes();
-            const nodeId = _findNodeIdByStepName(name, allNodes);
-            if (nodeId != null) {
-                try { _editor.removeNodeId('node-' + nodeId); }
-                catch (e) { /* may already be removed */ }
+            const internalId = _findNodeIdByStepName(name, allNodes);
+            if (internalId != null) {
+                const domId = 'node-' + internalId;
+                console.log('[vf] deleteStepByName: removing card', { name, internalId, domId });
+                try { _editor.removeNodeId(domId); }
+                catch (e) { console.warn('[vf] removeNodeId threw:', e); /* may already be removed */ }
+            } else {
+                console.warn('[vf] deleteStepByName: could not resolve node for', name, '— nodeRemoved listener is the safety net');
             }
         }
         // Close the side panel + clear selection if it was
@@ -1864,14 +1876,26 @@
         });
     }
 
-    // Find drawflow's node id (e.g. "node-7") for a step name.
-    // Used by auto-wire after a render where the new cards are
-    // already on the canvas but the connection hasn't been drawn
-    // yet.
+    // Find drawflow's BARE internal data key (e.g. "7") for a step name.
+    // Returns the bare key — callers that need a DOM id (e.g. removeNodeId)
+    // must prefix with "node-" themselves. Callers that pass to
+    // addConnection/removeConnection use the bare key directly.
+    //
+    // v3.14.x BUG FIX: previously this function returned the entry key
+    // of the allNodes map, which _getAllNodes populates with the "node-"
+    // prefix (e.g. "node-7"). Returning the prefixed form broke
+    // removeNodeId (which is then called as removeNodeId("node-node-7")
+    // → silent no-op → delete from in-memory but card stays on canvas
+    // → next _render re-adds the card → user sees the delete fail).
+    // The fix is to return the BARE key (stripping "node-") so callers
+    // can prefix as they need. Plan editor uses a separate
+    // _internalIdFromStepName() that already returns bare.
     function _findNodeIdByStepName(stepName, allNodes) {
         for (const [id, node] of Object.entries(allNodes)) {
             if (node && node.data && node.data.name === stepName) {
-                return id;
+                // id looks like "node-7" (from _getAllNodes). Strip the
+                // "node-" prefix so callers get the bare internal key.
+                return id.startsWith('node-') ? id.slice(5) : id;
             }
         }
         return null;
@@ -2293,9 +2317,14 @@
                 const isTextField = tag === 'input' || tag === 'textarea' || (ev.target && ev.target.isContentEditable);
                 if (!isTextField) {
                     if (_selectedNodeId) {
+                        console.log('[vf] Delete key on selected card', { selectedNodeId: _selectedNodeId, key: ev.key });
                         ev.preventDefault();
                         deleteSelectedStep();
                         return;
+                    } else {
+                        // Diagnostic: helps the user see why Delete
+                        // does nothing (no card selected).
+                        console.log('[vf] Delete key ignored (no card selected). Click a card first.', { key: ev.key, targetTag: tag });
                     }
                 }
             }
