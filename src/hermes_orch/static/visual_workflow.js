@@ -999,9 +999,11 @@
                 window.visualBuilder.openSidePanel(nodeEl.id);
             });
             // Phase 1.7: explicit "×" delete button. Click → confirm
-            // (matches the plan editor's X-click UX) → call
-            // drawflow's removeNodeId (which fires nodeRemoved,
-            // which our listener handles to update _stepTemplate).
+            // (matches the plan editor's X-click UX) → filter
+            // _stepTemplate FIRST (mirrors plan editor's
+            // deleteStepByName pattern) → call drawflow's
+            // removeNodeId (which fires nodeRemoved, which our
+            // listener handles as a safety net).
             // Bound on the wrap so it survives re-renders.
             //
             // v3.14.x: confirm() added to match the plan editor's
@@ -1011,6 +1013,16 @@
             // destroys the step. The Delete key path is unchanged
             // (still immediate) because it requires an explicit
             // selection first.
+            //
+            // v3.14.x followup: also filter _stepTemplate IN THIS
+            // HANDLER, not just in the nodeRemoved listener. The
+            // nodeRemoved listener's DOM lookup was unreliable
+            // (drawflow 0.0.59 fires the event AFTER clearing the
+            // DOM, so the lookup returned null and the listener's
+            // fallback grabbed the FIRST step in _stepTemplate —
+            // meaning every delete removed the wrong step). The
+            // plan editor's `deleteStepByName` has always done
+            // the filter here; we copy that pattern.
             if (!wrap._vfDeleteBound) {
                 wrap.addEventListener('click', (ev) => {
                     const btn = ev.target.closest('.vf-node-delete');
@@ -1028,6 +1040,37 @@
                         ? confirm(`Delete step "${stepName}"?`)
                         : confirm('Delete this step?');
                     if (!ok) return;
+                    // Filter _stepTemplate FIRST so the in-memory
+                    // model is correct even if the nodeRemoved
+                    // listener bails (DOM gone, fallback would grab
+                    // the wrong step). Same pattern as plan
+                    // editor's deleteStepByName. The nodeRemoved
+                    // listener still runs as a safety net but its
+                    // work is a no-op (step already gone).
+                    if (stepName) {
+                        _checkpoint('Delete step "' + stepName + '"');
+                        const idx = _stepTemplate.findIndex(
+                            (s) => s.name === stepName
+                        );
+                        if (idx >= 0) {
+                            _stepTemplate.splice(idx, 1);
+                        }
+                        // Scrub the removed name from any other
+                        // step's depends_on / feedback_to so the
+                        // workflow doesn't carry dangling refs.
+                        for (const s of _stepTemplate) {
+                            if (Array.isArray(s.depends_on)) {
+                                s.depends_on = s.depends_on.filter(
+                                    (d) => d !== stepName
+                                );
+                            }
+                            if (Array.isArray(s.feedback_to)) {
+                                s.feedback_to = s.feedback_to.filter(
+                                    (d) => d !== stepName
+                                );
+                            }
+                        }
+                    }
                     // Drawflow expects id like "node-1" for removeNodeId
                     _editor.removeNodeId(nodeEl.id);
                 });
@@ -1428,20 +1471,20 @@
                 removedName = stepEl.dataset.stepName;
             }
         }
-        // Fallback: walk the _stepTemplate and find the one whose
-        // data-step-name matches. We use the in-memory template
-        // since it was in sync with drawflow at last render.
-        if (!removedName) {
-            for (const s of _stepTemplate) {
-                if (s && s.name) {
-                    // Heuristic: if we can't find the DOM, try to
-                    // match the most recently-active step. But
-                    // this is rare; usually the DOM is still there.
-                    removedName = s.name;
-                    break;
-                }
-            }
-        }
+        // v3.14.x followup: REMOVED the "take the FIRST step in
+        // _stepTemplate" fallback. It was a footgun: drawflow
+        // 0.0.59 fires nodeRemoved AFTER clearing the DOM, so the
+        // DOM lookup above returns null and the fallback would
+        // grab `_stepTemplate[0]` — meaning every delete removed
+        // the WRONG step. The X click handler now filters
+        // _stepTemplate first (see wrap.addEventListener('click',
+        // .vf-node-delete) above), so this listener is just a
+        // safety net for paths that don't go through that handler
+        // (Delete key, programmatic removeNodeId calls). For those
+        // paths, if the DOM is gone we have no way to know which
+        // step was actually removed, so we bail and let the
+        // in-memory state be the source of truth (the caller
+        // already updated it).
         if (!removedName) return;
         // v3.12.6 (Phase 3): if the deleted step is the one the
         // chatbox FOCUS is set on, clear the FOCUS so the next
