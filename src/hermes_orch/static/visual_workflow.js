@@ -1422,6 +1422,11 @@
                 // connectionRemoved for our manual removeConnection
                 // call, so we wrap it (init block already patches
                 // _editor.removeConnection to call our handler).
+                // drawflow's addConnection / removeConnection take
+                // the INTERNAL data key (e.g. "7"), NOT the
+                // "node-7" DOM id (the DOM id is only for
+                // removeNodeId). _findNodeIdByStepName returns the
+                // internal key, so we use it directly.
                 const allNodes = _getAllNodes();
                 for (const oldSrc of oldSources) {
                     const oldSrcId = _findNodeIdByStepName(oldSrc, allNodes);
@@ -1429,7 +1434,7 @@
                     if (oldSrcId != null && tgtId != null) {
                         try {
                             _editor.removeConnection(
-                                'node-' + oldSrcId, 'node-' + tgtId,
+                                oldSrcId, tgtId,
                                 'output_1', 'input_1',
                             );
                         } catch (e) { /* already removed */ }
@@ -1494,6 +1499,89 @@
                     'success',
                 );
             }
+        }
+    }
+
+    // v3.14.x: rebuild each step's depends_on / feedback_to
+    // from drawflow's current wire state. Called on save to
+    // guarantee the JSON we send matches the canvas. The
+    // connection event handlers (_onConnectionCreated /
+    // _onConnectionRemoved) maintain the in-memory model in
+    // 99% of cases, but drawflow 0.0.59 doesn't fire
+    // connectionRemoved when the user removes a wire via Delete
+    // key on a selected wire (it removes the line internally,
+    // bypassing our patched removeConnection). So the
+    // depends_on / feedback_to arrays can go stale when the
+    // user removes wires. Walking drawflow's internal data map
+    // and rebuilding from the live wire state closes this gap.
+    //
+    // v3.14.x: corrected the direction. The earlier draft of
+    // this function mixed up outputs (which are the targets of
+    // THIS step's wires) with inputs (which are the sources).
+    // depends_on is the SOURCES, so we walk node.inputs. feedback_to
+    // is the TARGETS of the source's output_2 wires, so we walk
+    // THIS step's output_2 outputs.
+    function _syncFromCanvas() {
+        if (!_editor) return;
+        // Walk the entire drawflow tree (mirrors _getAllNodes'
+        // approach so we don't hardcode the module name "Home").
+        const allNodes = _getAllNodes();
+        if (!allNodes || Object.keys(allNodes).length === 0) return;
+        // Build step-name → node object map. Workflow editor
+        // stores the step name as the node name (no prefix).
+        const nameToNode = {};
+        for (const [id, node] of Object.entries(allNodes)) {
+            if (node && node.data && node.data.name) {
+                nameToNode[node.data.name] = node;
+            }
+        }
+        for (const step of _stepTemplate) {
+            const node = nameToNode[step.name];
+            if (!node) continue;
+            // depends_on: walk THIS step's INPUTS. Each input
+            // connection points to a source step; that source
+            // is what this step depends on. The plan editor
+            // does the same walk in its syncDepsFromCanvas.
+            const deps = [];
+            const inputs = node.inputs || {};
+            for (const inputKey of Object.keys(inputs)) {
+                const input = inputs[inputKey];
+                if (!input || !Array.isArray(input.connections)) continue;
+                for (const conn of input.connections) {
+                    if (conn == null || conn.node == null) continue;
+                    // conn.node is the SOURCE's internal data key
+                    // (e.g. "7") — same namespace as Object.keys
+                    // of allNodes. Look it up directly.
+                    const sourceNode = allNodes[conn.node];
+                    const sourceName = sourceNode && sourceNode.data
+                        ? sourceNode.data.name : null;
+                    if (sourceName && sourceName !== step.name
+                        && !deps.includes(sourceName)) {
+                        deps.push(sourceName);
+                    }
+                }
+            }
+            step.depends_on = deps;
+            // feedback_to (v2.0 FLIPPED 2026-07-30): on the
+            // SOURCE (failing step). Walk THIS step's output_2
+            // connections, collect their targets.
+            const loopBackTargets = [];
+            const outputs = node.outputs || {};
+            const ob2 = outputs['output_2'];
+            if (ob2 && Array.isArray(ob2.connections)) {
+                for (const conn of ob2.connections) {
+                    if (conn == null || conn.node == null) continue;
+                    // Find target name by walking allNodes
+                    const targetNode = allNodes[conn.node];
+                    if (targetNode && targetNode.data) {
+                        const targetName = targetNode.data.name;
+                        if (targetName && !loopBackTargets.includes(targetName)) {
+                            loopBackTargets.push(targetName);
+                        }
+                    }
+                }
+            }
+            step.feedback_to = loopBackTargets;
         }
     }
 
@@ -2167,6 +2255,20 @@
             _stepTemplate = stepTemplate;
             _variables = variables;
         } else {
+            // v3.14.x: re-sync depends_on / feedback_to from the
+            // drawflow data map before reading _stepTemplate.
+            // drawflow 0.0.59 doesn't fire connectionRemoved when
+            // the user removes a wire (Delete key on a selected
+            // wire removes the line internally, bypassing our
+            // patched _editor.removeConnection). So the
+            // depends_on array can go stale when the user removes
+            // wires without also re-wiring. Walking drawflow's
+            // internal data map and rebuilding depends_on /
+            // feedback_to from the live wire state guarantees
+            // the JSON we send to the server matches what's on
+            // the canvas. Plan editor has the same helper at
+            // visual_plan.js:syncDepsFromCanvas.
+            _syncFromCanvas();
             stepTemplate = _stepTemplate;
             variables = _variables;
         }

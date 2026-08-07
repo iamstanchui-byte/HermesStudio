@@ -1511,12 +1511,24 @@
         // Refresh plan model from the toolbar inputs
         _plan.name = $('vp-plan-name').value.trim();
         _plan.description = $('vp-plan-description').value.trim();
-        // depends_on is kept in sync by the connectionCreated /
-        // connectionRemoved listeners we registered in init() — no
-        // need to walk the drawflow data map here. (The old
-        // syncDepsFromCanvas() did this walk and had a wrong path,
-        // which is why wires were silently lost on Save before
-        // 2026-07-27.)
+        // v3.14.x: re-sync depends_on / feedback_to from the
+        // drawflow data map before saving. The connection event
+        // handlers maintain the in-memory model in 99% of cases,
+        // but drawflow 0.0.59 doesn't fire connectionRemoved when
+        // the user removes a wire via Delete key on a selected
+        // wire (it removes the line internally, bypassing our
+        // patched removeConnection). So the depends_on array
+        // can go stale when the user removes wires. The defensive
+        // syncDepsFromCanvas() walk closes this gap. Reusing the
+        // same helper the workflow editor added (commit
+        // 747d256 / 747d256) — both editors get the same fix.
+        syncDepsFromCanvas();
+        // depends_on is otherwise kept in sync by the
+        // connectionCreated / connectionRemoved listeners we
+        // registered in init() — no need to walk the drawflow
+        // data map here. (The old syncDepsFromCanvas() did this
+        // walk and had a wrong path, which is why wires were
+        // silently lost on Save before 2026-07-27.)
         try {
             const r = await fetch('/api/projects/' + _projectId + '/plan', {
                 method: 'PUT',
@@ -1550,11 +1562,29 @@
         }
     }
 
-    // Keep syncDepsFromCanvas around as a defensive backup in case
-    // a connection was created/removed before our listeners were
-    // bound (race during init). It's not used by savePlan() anymore
-    // — the connection lifecycle is the source of truth. If we ever
-    // need to forcibly resync (e.g. after a JSON import), call this.
+    // Re-sync each step's depends_on from drawflow's current wire
+    // state. Called on save to guarantee the JSON we send matches
+    // the canvas. The connection event handlers
+    // (_onConnectionCreated / _onConnectionRemoved) maintain the
+    // in-memory model in 99% of cases, but drawflow 0.0.59 doesn't
+    // fire connectionRemoved when the user removes a wire via
+    // Delete key on a selected wire (it removes the line
+    // internally, bypassing our patched removeConnection). So
+    // the depends_on array can go stale when the user removes
+    // wires. Walking drawflow's internal data map and rebuilding
+    // depends_on from the live wire state closes this gap.
+    //
+    // v3.14.x: corrected the direction. The earlier version of
+    // this function walked node.outputs and collected the target
+    // names of each output's connections, then set
+    // step.depends_on to that list. That's wrong: the targets of
+    // THIS step's outputs are the step's DEPENDENTS, not its
+    // dependencies. To get depends_on we need to walk THIS step's
+    // INPUTS and collect the source names of each input's
+    // connections. drawflow 0.0.59 exposes `node.inputs` with the
+    // same shape as `node.outputs` (per-input dict, each with a
+    // .connections array, each connection having a .node field
+    // pointing to the SOURCE's internal id).
     function syncDepsFromCanvas() {
         if (!_editor) return;
         const data = _dataMap();
@@ -1563,15 +1593,21 @@
             const internalId = _internalIdFromStepName(step.name);
             if (internalId == null) { step.depends_on = []; continue; }
             const node = data[internalId];
-            if (!node || !node.outputs) { step.depends_on = []; continue; }
+            if (!node) { step.depends_on = []; continue; }
             const deps = [];
-            for (const outKey of Object.keys(node.outputs)) {
-                const out = node.outputs[outKey];
-                if (!out || !out.connections) continue;
-                for (const conn of out.connections) {
-                    if (conn.node == null) continue;
+            // Walk THIS step's inputs. Each input connection
+            // points to a source step; that source is what this
+            // step depends on.
+            const inputs = node.inputs || {};
+            for (const inputKey of Object.keys(inputs)) {
+                const input = inputs[inputKey];
+                if (!input || !Array.isArray(input.connections)) continue;
+                for (const conn of input.connections) {
+                    if (conn == null || conn.node == null) continue;
                     const sourceName = _stepNameFromInternalId(String(conn.node));
-                    if (sourceName) deps.push(sourceName);
+                    if (sourceName && !deps.includes(sourceName)) {
+                        deps.push(sourceName);
+                    }
                 }
             }
             step.depends_on = deps;
