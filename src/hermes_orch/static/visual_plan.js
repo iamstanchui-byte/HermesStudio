@@ -673,7 +673,37 @@
             const target = _plan.steps.find(s => s.name === targetName);
             if (!target) return;
             if (!Array.isArray(target.depends_on)) target.depends_on = [];
-            if (!target.depends_on.includes(sourceName)) {
+            // v3.14.x: REWIRE semantics — each step has exactly
+            // one input port, so it can have at most one direct
+            // chain dep. When the user draws a new wire, the old
+            // wire (if any) is REPLACED, not appended. Same fix
+            // as the workflow editor (commit 747d256). Draws the
+            // new wire as the single source; removeConnection
+            // cleans the stale visual line. If the user wants
+            // multiple direct deps, they can use Edit as JSON.
+            if (target.depends_on.includes(sourceName)) {
+                return; // same wire redrawn — no-op
+            }
+            if (target.depends_on.length > 0) {
+                const oldSources = target.depends_on.slice();
+                target.depends_on = [sourceName];
+                // Clean the stale visual connection(s) for the
+                // old source(s). removeConnection is patched in
+                // init to fire _onConnectionRemoved, so the
+                // data state stays in sync.
+                for (const oldSrc of oldSources) {
+                    const oldSrcInternal = _internalIdFromStepName(oldSrc);
+                    const tgtInternal = _internalIdFromStepName(targetName);
+                    if (oldSrcInternal != null && tgtInternal != null) {
+                        try {
+                            _editor.removeConnection(
+                                oldSrcInternal, tgtInternal,
+                                'output_1', 'input_1',
+                            );
+                        } catch (e) { /* already removed */ }
+                    }
+                }
+            } else {
                 target.depends_on.push(sourceName);
             }
         }
