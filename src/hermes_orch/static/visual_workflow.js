@@ -1529,8 +1529,18 @@
         if (!allNodes || Object.keys(allNodes).length === 0) return;
         // Build step-name → node object map. Workflow editor
         // stores the step name as the node name (no prefix).
+        // v3.14.x BUG FIX: _getAllNodes returns keys as "node-N"
+        // (DOM id form), but drawflow's connection.node is the
+        // INTERNAL data key (e.g. "N", without the "node-"
+        // prefix). When we look up `allNodes[conn.node]` we need
+        // the prefixed form. Without this, every conn.node lookup
+        // returns undefined → empty deps → save wipes all wires.
+        const lookupByInternalId = (internalId) => {
+            if (internalId == null) return null;
+            return allNodes['node-' + String(internalId)] || null;
+        };
         const nameToNode = {};
-        for (const [id, node] of Object.entries(allNodes)) {
+        for (const node of Object.values(allNodes)) {
             if (node && node.data && node.data.name) {
                 nameToNode[node.data.name] = node;
             }
@@ -1549,10 +1559,7 @@
                 if (!input || !Array.isArray(input.connections)) continue;
                 for (const conn of input.connections) {
                     if (conn == null || conn.node == null) continue;
-                    // conn.node is the SOURCE's internal data key
-                    // (e.g. "7") — same namespace as Object.keys
-                    // of allNodes. Look it up directly.
-                    const sourceNode = allNodes[conn.node];
+                    const sourceNode = lookupByInternalId(conn.node);
                     const sourceName = sourceNode && sourceNode.data
                         ? sourceNode.data.name : null;
                     if (sourceName && sourceName !== step.name
@@ -1571,8 +1578,7 @@
             if (ob2 && Array.isArray(ob2.connections)) {
                 for (const conn of ob2.connections) {
                     if (conn == null || conn.node == null) continue;
-                    // Find target name by walking allNodes
-                    const targetNode = allNodes[conn.node];
+                    const targetNode = lookupByInternalId(conn.node);
                     if (targetNode && targetNode.data) {
                         const targetName = targetNode.data.name;
                         if (targetName && !loopBackTargets.includes(targetName)) {
