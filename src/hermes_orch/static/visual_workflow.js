@@ -638,6 +638,20 @@
         const approvalLabel = isApproval
             ? `<div class="vf-node-approval-label">⏸ human approval</div>`
             : '';
+        // v3.14.x: deps / loop-back indicators — mirror the plan
+        // editor's `.vp-node-deps` and `.vp-node-fb` so the two
+        // editors render the same info on a card. The plan editor
+        // uses `step.depends_on` (this step depends on those) and
+        // `step.feedback_to` (this step loops back to those on
+        // failure). Same data model in the workflow.
+        const depsCount = Array.isArray(step.depends_on) ? step.depends_on.length : 0;
+        const fbCount = Array.isArray(step.feedback_to) ? step.feedback_to.length : 0;
+        const depsHtml = depsCount > 0
+            ? `<div class="vf-node-deps" style="color:#6b7280;font-size:10px;margin-top:3px">← ${depsCount} dep${depsCount === 1 ? '' : 's'}</div>`
+            : '';
+        const fbHtml = fbCount > 0
+            ? `<div class="vf-node-fb" style="color:#dc2626;font-size:10px;margin-top:1px;font-weight:500">↻ ${fbCount} loop-back${fbCount === 1 ? '' : 's'}</div>`
+            : '';
         // Tag the wrapper div with data-step-name so the click handler
         // can look up the step directly from the DOM without having
         // to know drawflow's internal module/container/numeric-id
@@ -651,6 +665,8 @@
                 </div>
                 <div class="vf-node-action">${esc(step.action || '?')}</div>
                 ${approvalLabel}
+                ${depsHtml}
+                ${fbHtml}
                 ${skill}
             </div>
         `;
@@ -982,10 +998,19 @@
                 }
                 window.visualBuilder.openSidePanel(nodeEl.id);
             });
-            // Phase 1.7: explicit "×" delete button. Click → call
+            // Phase 1.7: explicit "×" delete button. Click → confirm
+            // (matches the plan editor's X-click UX) → call
             // drawflow's removeNodeId (which fires nodeRemoved,
             // which our listener handles to update _stepTemplate).
             // Bound on the wrap so it survives re-renders.
+            //
+            // v3.14.x: confirm() added to match the plan editor's
+            // "Delete step \"X\"?" pattern. The X is a 20×20 button
+            // in the top-right corner and is trivially easy to
+            // misclick; without a confirm, a stray click silently
+            // destroys the step. The Delete key path is unchanged
+            // (still immediate) because it requires an explicit
+            // selection first.
             if (!wrap._vfDeleteBound) {
                 wrap.addEventListener('click', (ev) => {
                     const btn = ev.target.closest('.vf-node-delete');
@@ -993,6 +1018,16 @@
                     ev.stopPropagation();
                     const nodeEl = btn.closest('.drawflow-node');
                     if (!nodeEl || !_editor) return;
+                    // Look up the step name for the confirm prompt.
+                    // data-step-name is on the .vf-node inner div
+                    // (set by _stepToCardHtml).
+                    const inner = nodeEl.querySelector('.vf-node');
+                    const stepName = inner && inner.dataset
+                        ? (inner.dataset.stepName || '') : '';
+                    const ok = stepName
+                        ? confirm(`Delete step "${stepName}"?`)
+                        : confirm('Delete this step?');
+                    if (!ok) return;
                     // Drawflow expects id like "node-1" for removeNodeId
                     _editor.removeNodeId(nodeEl.id);
                 });

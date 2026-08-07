@@ -53,7 +53,14 @@
     .vf-node-header {
         display: flex;
         align-items: center;
-        justify-content: space-between;
+        /* v3.14.x: changed from `justify-content: space-between` to
+           `gap: 6px` to match the plan editor's header layout. The
+           space-between form pushed the role pill to the far right;
+           the gap form keeps everything flowing left-to-right so
+           the role pill sits right next to the name (same look as
+           .vp-node-header in visual_plan.html). Identical to plan
+           editor for visual consistency between the two editors. */
+        gap: 6px;
         margin-bottom: 4px;
     }
     .vf-node-name {
@@ -339,6 +346,11 @@
     }
     body.dark .vf-node-action { color: #93c5fd; }   /* blue-300 — same hue as light's #2563eb, one step brighter */
     body.dark .vf-node-skill { color: #d8b4fe; }    /* purple-300 */
+    /* v3.14.x: deps / loop-back indicators on workflow cards —
+       match the plan editor's `.vp-node-deps` / `.vp-node-fb`
+       dark-mode treatment. */
+    body.dark .vf-node-deps { color: #94a3b8; }
+    body.dark .vf-node-fb { color: #fca5a5; }
     body.dark .vf-node-delete {
         color: #94a3b8;
     }
