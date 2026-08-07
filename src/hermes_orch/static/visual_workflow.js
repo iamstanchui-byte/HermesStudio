@@ -1589,9 +1589,14 @@
             analyze: { action: 'summarize',     skill: '' },
             audit:   { action: 'audit_check',   skill: '' },
             write:   { action: 'write_output',  skill: '' },
-            // human_approval gets a descriptive action. The actual
-            // step type is set below; this is just for display.
-            human_approval: { action: 'manual_review', skill: '' },
+            // v3.14.0 (Phase 3 followup): kebab-case "human-approval"
+            // (not "human_approval" with underscore) so the auto-
+            // generated step name passes the workflow validator
+            // directly. The step.type field still uses the
+            // canonical "human_approval" (underscore) per
+            // SYSTEM_PROMPT rule 13 — the validator only checks
+            // step.name, not step.type.
+            'human-approval': { action: 'manual_review', skill: '' },
         };
         const cfg = baseNames[tmpl] || { action: 'do_thing', skill: '' };
         let n = 1;
@@ -1609,11 +1614,11 @@
             output_path: `out/${name}.json`,
             skill: cfg.skill,
         };
-        // v3.14.0 (Phase 3): human_approval chip sets the type
+        // v3.14.0 (Phase 3): human-approval chip sets the type
         // explicitly. Without this, the step would default to
         // do_task and the supervisor would dispatch an agent
         // task instead of creating an inbox approval.
-        if (tmpl === 'human_approval') {
+        if (tmpl === 'human-approval') {
             step.type = 'human_approval';
         }
         return step;

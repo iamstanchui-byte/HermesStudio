@@ -1100,14 +1100,22 @@
         analyze: 'summarize',
         audit:   'audit_check',
         write:   'write_output',
-        // v3.14.0 (Phase 3): human_approval palette chip — adds a
+        // v3.14.0 (Phase 3): human-approval palette chip — adds a
         // step with type="human_approval" pre-set. The action is
         // descriptive ("manual_review") for display; the runtime
         // recognizes the step by its type, not its action. The
         // `approval` sub-object is configured in the side panel
         // after the step is added (we don't pre-fill a default
         // summary_template because that's user-specific copy).
-        human_approval: 'manual_review',
+        //
+        // v3.14.0 (Phase 3 followup): the chip key is kebab-case
+        // "human-approval" (not "human_approval" with an
+        // underscore) because the kebab-case name validator
+        // rejects underscores. Using "human-approval" as the
+        // template key means the auto-generated step name
+        // (e.g. "human-approval-1") passes validation directly
+        // — no post-processing needed.
+        'human-approval': 'manual_review',
     };
     function _newStepFromTemplate(tmpl) {
         const action = _PALETTE_ACTIONS[tmpl] || '';
@@ -1133,13 +1141,13 @@
             params_template: {},
             output_path: '',
         };
-        // v3.14.0 (Phase 3): human_approval chip sets type
+        // v3.14.0 (Phase 3): human-approval chip sets type
         // explicitly. Without this, the step would default to
         // do_task and the supervisor would dispatch an agent
         // task instead of creating an inbox approval. We don't
-        // set default_soul on a human_approval step (no agent
+        // set default_soul on a human-approval step (no agent
         // runs it).
-        if (tmpl === 'human_approval') {
+        if (tmpl === 'human-approval') {
             step.type = 'human_approval';
         }
         return step;
