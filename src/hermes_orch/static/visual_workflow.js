@@ -980,6 +980,17 @@
                     if (sp.classList.contains('open')) {
                         closeSidePanel();
                     }
+                    return;
+                }
+                // v3.14.x: single-click on a card selects it.
+                // _selectCard sets _selectedNodeId + adds the
+                // .selected highlight + updates the chatbox FOCUS,
+                // but does NOT open the side panel. The side
+                // panel still only opens on dblclick. Mirrors
+                // the plan editor's single-click fix.
+                const nodeEl = ev.target.closest('.drawflow-node');
+                if (nodeEl && nodeEl.id !== _selectedNodeId) {
+                    _selectCard(nodeEl.id);
                 }
             });
             wrap.addEventListener('dblclick', (ev) => {
@@ -1924,39 +1935,32 @@
         return step;
     }
 
-    function openSidePanel(nodeId) {
-        _selectedNodeId = nodeId;
-        // The data-step-name attribute is on the inner .vf-node div
-        // (set in _stepToCardHtml), not on the drawflow wrapper.
-        // Walk all descendants to find it.
+    // v3.14.x: factored out of openSidePanel so single-click
+    // selection can use the same code path without popping the
+    // side panel open. Single-click sets _selectedNodeId +
+    // adds the .selected highlight + updates the chatbox FOCUS,
+    // but does NOT open the side panel. The side panel only
+    // opens on dblclick (and via openSidePanel directly, e.g.
+    // from the chatbox's apply_workflow_patch callback).
+    function _selectCard(nodeId) {
         const wrapperEl = document.getElementById(nodeId);
         const stepEl = wrapperEl ? wrapperEl.querySelector('[data-step-name]') : null;
         let step = null;
         if (stepEl && stepEl.dataset.stepName) {
             step = _stepTemplate.find((s) => s.name === stepEl.dataset.stepName) || null;
         }
-        // Fallback: use the older _findStepByNodeId path
         if (!step) step = _findStepByNodeId(nodeId);
-        if (!step) {
-            console.warn('visual_workflow: no step for node', nodeId);
-            return;
-        }
-        // v3.14.x: highlight the selected card. Mirrors the plan
-        // editor's openSidePanel — toggles `.selected` on the
-        // .drawflow-node wrapper (which has the .vf-node class
-        // from addNode's classoverride). The CSS in
-        // visual_workflow.html (.vf-node.selected) gives a blue
-        // border + ring like the plan editor. Without this, the
-        // user has no visual cue for which card the side panel
-        // is editing.
+        if (!step) return;
+        _selectedNodeId = nodeId;
+        // Highlight (single source of truth — openSidePanel and
+        // the click handler both call this; no risk of one
+        // caller forgetting to clear the old .selected first).
         document.querySelectorAll('.vf-node.selected')
             .forEach((n) => n.classList.remove('selected'));
         if (wrapperEl) wrapperEl.classList.add('selected');
-        // v3.12.6 (Phase 3): context-aware editing. Write the
-        // selected step to sessionStorage so the chatbox LLM can
-        // see it in its system prompt and target apply_workflow_patch
-        // suggestions at this step. No-op if the chatbox isn't
-        // loaded (e.g. standalone workflow without a source project).
+        // v3.12.6 (Phase 3): chatbox FOCUS context. Mirrors what
+        // openSidePanel did, so the LLM sees the same context
+        // whether the user selected via click or dblclick.
         if (window.chatbox && typeof window.chatbox.setSelectedNode === 'function') {
             window.chatbox.setSelectedNode({
                 kind: 'workflow_step',
@@ -1967,6 +1971,24 @@
                 depends_on: Array.isArray(step.depends_on) ? step.depends_on : [],
             });
         }
+    }
+
+    function openSidePanel(nodeId) {
+        // v3.14.x: refactored to call _selectCard for the
+        // selection + chatbox FOCUS update (shared with
+        // single-click). Then does the side-panel-specific
+        // work (form populate, panel open).
+        _selectCard(nodeId);
+        // If the selection was a no-op (step not found), bail.
+        // _selectCard leaves _selectedNodeId as its previous
+        // value on no-op, so the easiest check is whether
+        // _selectedNodeId is now nodeId.
+        if (_selectedNodeId !== nodeId) {
+            console.warn('visual_workflow: no step for node', nodeId);
+            return;
+        }
+        const step = _findStepByNodeId(nodeId);
+        if (!step) return;
         _refreshEditFormFromTemplate(step);
         _sidePanel().classList.add('open');
     }

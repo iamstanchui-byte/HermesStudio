@@ -1225,13 +1225,17 @@
         // + Add step button didn't draw any wire (depends_on was
         // always []), so chip flow is strictly better.
         wireDepsForStep(newStep);
-        // v2.2: auto-select the new step so the user can immediately
-        // Ctrl+C → Ctrl+V to clone, or dblclick to edit. We also
-        // open the side panel so the user sees what fields still
-        // need filling (agent_role, params_template, etc.) without
-        // a second click.
+        // v3.14.x: do NOT auto-open the side panel. The user
+        // clicked a palette chip to ADD a step — opening the side
+        // panel on every add is intrusive, especially when adding
+        // a batch of related steps. The user can dblclick the
+        // new card (or single-click → select → dblclick) when
+        // they want to edit fields. Default the new step to
+        // selected so the keyboard Delete flow (single-click
+        // select + Delete to remove a step they just added by
+        // mistake) works without an extra dblclick.
         _selectedNodeName = newStep.name;
-        openSidePanel(newStep.name);
+        _highlightSelectedCard();
         updateMinimap();
         showBanner(
             `Added step: ${newStep.name}` +
@@ -1292,6 +1296,25 @@
         showBanner('Step deleted', 'success');
     }
 
+    // v3.14.x: highlight the card whose name matches
+    // _selectedNodeName. Shared by openSidePanel, closeSidePanel,
+    // the single-click selection handler, and _addStepFromChip
+    // (so the new card is auto-selected). Keeps the visual
+    // indicator in one place — no risk of one caller forgetting
+    // to remove the old .selected class before adding it to a
+    // new card.
+    function _highlightSelectedCard() {
+        document.querySelectorAll('.vp-node').forEach(
+            (n) => n.classList.remove('selected')
+        );
+        if (_selectedNodeName) {
+            const nodeEl = document.getElementById(
+                'node-vp-' + _selectedNodeName
+            );
+            if (nodeEl) nodeEl.classList.add('selected');
+        }
+    }
+
     // ===== Side panel =====
     function openSidePanel(stepName) {
         const step = _plan.steps.find(s => s.name === stepName);
@@ -1337,14 +1360,9 @@
         const errEl = $('vp-f-error');
         if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
         $('vp-side-panel').classList.remove('hidden');
-        // Highlight the selected node visually. drawflow wraps the
-        // node in <div id="node-vp-{name}" class="parent-node
-        // drawflow-node vp-node ...">. The .vp-node class is the one
-        // we apply via addNode's classoverride; we just need to
-        // query the .drawflow-node element by its id.
-        document.querySelectorAll('.vp-node').forEach(n => n.classList.remove('selected'));
-        const nodeEl = document.getElementById('node-vp-' + stepName);
-        if (nodeEl) nodeEl.classList.add('selected');
+        // v3.14.x: shared highlight helper (used by single-click
+        // select too). Same DOM-id pattern as before.
+        _highlightSelectedCard();
     }
 
     function closeSidePanel() {
@@ -1355,7 +1373,8 @@
             window.chatbox.clearSelectedNode();
         }
         $('vp-side-panel').classList.add('hidden');
-        document.querySelectorAll('.vp-node').forEach(n => n.classList.remove('selected'));
+        // v3.14.x: shared highlight helper (mirrors openSidePanel).
+        _highlightSelectedCard();
     }
 
     function saveStepEdits() {
@@ -2087,14 +2106,52 @@
             const sp = document.getElementById('vp-side-panel');
             if (sp && sp.contains(ev.target)) return;
             const nodeInner = ev.target.closest('.vp-node[data-step-name]');
-            if (!nodeInner) {
-                if (sp && !sp.classList.contains('hidden')) {
-                    closeSidePanel();
+            if (nodeInner) {
+                // v3.14.x: single-click on a card selects it (sets
+                // _selectedNodeName + adds the .selected highlight
+                // via the shared helper). This matches the workflow
+                // editor's UX and makes the keyboard Delete / X
+                // delete flow work without a forced dblclick. The
+                // side panel still only opens on dblclick (below)
+                // — selecting a card and deleting it should be a
+                // 2-step flow (click → Delete), not a 1-step
+                // surprise. drawflow's own single-click visuals
+                // (the cyan box) are also active; we add a
+                // dedicated .vp-node.selected ring on top for a
+                // clearer persistent indicator.
+                const newName = nodeInner.dataset.stepName;
+                if (newName && newName !== _selectedNodeName) {
+                    _selectedNodeName = newName;
+                    _highlightSelectedCard();
+                    // v3.12.6 (Phase 3): write the FOCUS context
+                    // so the chatbox LLM knows which step the
+                    // user is currently focused on. Same as
+                    // openSidePanel does, minus the form-population
+                    // (the side panel only opens on dblclick).
+                    const step = _plan.steps.find(
+                        (s) => s.name === newName
+                    );
+                    if (step && window.chatbox
+                        && typeof window.chatbox.setSelectedNode === 'function') {
+                        window.chatbox.setSelectedNode({
+                            kind: 'plan_step',
+                            project_id: _projectId,
+                            step_name: step.name,
+                            action: step.action || '',
+                            agent_role: step.agent_role || '',
+                            required_capability: step.required_capability || '',
+                            skill: step.skill || '',
+                            depends_on: Array.isArray(step.depends_on)
+                                ? step.depends_on : [],
+                        });
+                    }
                 }
+                return;
             }
-            // Click on a card: no-op here (drawflow already handles
-            // selection visuals via .selected class). The user
-            // double-clicks to actually open the side panel.
+            // Click on empty area: close the side panel if open.
+            if (sp && !sp.classList.contains('hidden')) {
+                closeSidePanel();
+            }
         });
         // dblclick: open side panel. Same drag-detection as
         // visual_workflow.js (skip if movement > 8px between
