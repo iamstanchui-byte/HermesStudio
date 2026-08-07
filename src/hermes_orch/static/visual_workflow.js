@@ -1012,9 +1012,9 @@
                     // closeSidePanel() does the full cleanup:
                     // _refreshEditFormFromTemplate (revert), clear
                     // _selectedNodeId + _selectedStepName, remove
-                    // .selected class from cards, clear chatbox FOCUS,
-                    // hide the side panel. Safe to call even when
-                    // the panel is already closed.
+                    // .selected class from cards, hide the side
+                    // panel. Safe to call even when the panel is
+                    // already closed.
                     if (_selectedNodeId || sp.classList.contains('open')) {
                         closeSidePanel();
                     }
@@ -1022,10 +1022,10 @@
                 }
                 // v3.14.x: single-click on a card selects it.
                 // _selectCard sets _selectedNodeId + adds the
-                // .selected highlight + updates the chatbox FOCUS,
-                // but does NOT open the side panel. The side
-                // panel still only opens on dblclick. Mirrors
-                // the plan editor's single-click fix.
+                // .selected highlight, but does NOT open the
+                // side panel. The side panel still only opens
+                // on dblclick. Mirrors the plan editor's
+                // single-click fix.
                 const nodeEl = ev.target.closest('.drawflow-node');
                 if (nodeEl && nodeEl.id !== _selectedNodeId) {
                     _selectCard(nodeEl.id);
@@ -1832,18 +1832,11 @@
         // in-memory state be the source of truth (the caller
         // already updated it).
         if (!removedName) return;
-        // v3.12.6 (Phase 3): if the deleted step is the one the
-        // chatbox FOCUS is set on, clear the FOCUS so the next
-        // chat message doesn't reference a step that no longer
-        // exists. Read the selection from sessionStorage because
-        // _selectedNodeId may not be set (the user can delete
-        // a card without opening its side panel first).
-        if (window.chatbox) {
-            const sel = window.chatbox.getSelectedNode && window.chatbox.getSelectedNode();
-            if (sel && sel.kind === 'workflow_step' && sel.step_name === removedName) {
-                window.chatbox.clearSelectedNode();
-            }
-        }
+        // v3.14.x: chatbox removed from workflow page. The previous
+        // "clear chatbox FOCUS on delete" hook is no longer needed
+        // (window.chatbox is never loaded on this page). Visual
+        // selection state (_selectedNodeId, _selectedStepName) is
+        // the only selection mechanism now.
         // v2.1: checkpoint BEFORE the splice + scrub. The snapshot
         // captures the full step (with all fields) + all
         // depends_on / feedback_to references, so undo restores
@@ -2076,10 +2069,10 @@
     // v3.14.x: factored out of openSidePanel so single-click
     // selection can use the same code path without popping the
     // side panel open. Single-click sets _selectedNodeId +
-    // adds the .selected highlight + updates the chatbox FOCUS,
-    // but does NOT open the side panel. The side panel only
-    // opens on dblclick (and via openSidePanel directly, e.g.
-    // from the chatbox's apply_workflow_patch callback).
+    // adds the .selected highlight, but does NOT open the
+    // side panel. The side panel only opens on dblclick
+    // (and via openSidePanel directly, e.g. from a future
+    // programmatic caller).
     function _selectCard(nodeId) {
         const wrapperEl = document.getElementById(nodeId);
         const stepEl = wrapperEl ? wrapperEl.querySelector('[data-step-name]') : null;
@@ -2101,26 +2094,22 @@
         document.querySelectorAll('.vf-node.selected')
             .forEach((n) => n.classList.remove('selected'));
         if (wrapperEl) wrapperEl.classList.add('selected');
-        // v3.12.6 (Phase 3): chatbox FOCUS context. Mirrors what
-        // openSidePanel did, so the LLM sees the same context
-        // whether the user selected via click or dblclick.
-        if (window.chatbox && typeof window.chatbox.setSelectedNode === 'function') {
-            window.chatbox.setSelectedNode({
-                kind: 'workflow_step',
-                workflow_id: _workflowId,
-                step_name: step.name,
-                action: step.action || '',
-                agent_role: step.agent_role || '',
-                depends_on: Array.isArray(step.depends_on) ? step.depends_on : [],
-            });
-        }
+        // v3.14.x: chatbox removed. Previously this called
+        // window.chatbox.setSelectedNode(...) so the LLM chat
+        // assistant saw the same context whether the user
+        // selected via click or dblclick. With the chatbox
+        // gone, no LLM context to push — visual selection
+        // (the .selected ring) is the only side-effect of
+        // _selectCard now.
     }
 
     function openSidePanel(nodeId) {
         // v3.14.x: refactored to call _selectCard for the
-        // selection + chatbox FOCUS update (shared with
-        // single-click). Then does the side-panel-specific
-        // work (form populate, panel open).
+        // visual selection (shared with single-click). Then
+        // does the side-panel-specific work (form populate,
+        // panel open). Previously also pushed the selected
+        // step's context to window.chatbox; the chatbox is
+        // removed on this page now.
         _selectCard(nodeId);
         // If the selection was a no-op (step not found), bail.
         // _selectCard leaves _selectedNodeId as its previous
@@ -2191,11 +2180,13 @@
         // closes, suggesting it's still selected.
         document.querySelectorAll('.vf-node.selected')
             .forEach((n) => n.classList.remove('selected'));
-        // v3.12.6 (Phase 3): clear the chatbox FOCUS context so the
-        // next chat message doesn't carry a stale step reference.
-        if (window.chatbox && typeof window.chatbox.clearSelectedNode === 'function') {
-            window.chatbox.clearSelectedNode();
-        }
+        // v3.14.x: chatbox removed. Previously this called
+        // window.chatbox.clearSelectedNode() so the next chat
+        // message didn't reference a stale step. With the
+        // chatbox gone, nothing to clear here. Visual selection
+        // was already removed by the .selected class strip
+        // above; _selectedNodeId is also cleared below.
+        _selectedStepName = null;  // mirror with clear-selection
         _sidePanel().classList.remove('open');
     }
 
