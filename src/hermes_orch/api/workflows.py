@@ -740,7 +740,6 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
         all_step_names.add(name)
 
     # Step-level checks
-    seen_names: set[str] = set()
     for i, step in enumerate(step_template):
         if not isinstance(step, dict):
             return False, f"step_template[{i}] must be a dict"
@@ -756,9 +755,13 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
             return False, f"step_template[{i}].name={name!r} not kebab-case"
         if len(name) > 40:
             return False, f"step_template[{i}].name={name!r} too long ({len(name)} > 40)"
-        # Duplicate name check already done in pre-pass; keep seen_names
-        # for the depends_on forward-ref check.
-        seen_names.add(name)
+        # Duplicate name check already done in pre-pass.
+        # Note: previously we built `seen_names` here for the
+        # depends_on forward-ref check ("must be an EARLIER step").
+        # That check was relaxed (now: "must exist in the workflow")
+        # so `seen_names` is no longer needed — the pre-pass
+        # `all_step_names` set covers existence. Kept the pre-pass
+        # set because the feedback_to validation below uses it.
         # v3.14.0: `type` is the preferred field. If absent, fall back
         # to the legacy `action` field (backward compat with v3.13.x
         # workflows that pre-date the type field). The `action` column
@@ -770,13 +773,25 @@ def _validate_workflow_package(pkg: dict) -> tuple[bool, str]:
             return False, f"step_template[{i}].action missing or empty"
         if any(s in action for s in ("coord_pickup", "handoff:", "_iteration_review")):
             return False, f"step_template[{i}].action={action!r} contains L3 scaffolding"
-        # depends_on
+        # depends_on. We check the dep exists in the workflow
+        # (all_step_names), not that it appears earlier in the
+        # array — the runtime at api/workflows.py:1583 already
+        # drops forward refs (`dep_tids = [... if d in name_to_tid]`)
+        # so accepting them in the validator matches runtime
+        # behavior. The previous "must be earlier" rule forced the
+        # JSON array order to mirror the dep graph, which broke
+        # whenever the user re-wired a step into a new position
+        # (the array didn't auto-reorder, the validator rejected
+        # the save). After this fix, the user can save any
+        # depends_on graph; the visual editor's _topoSortSteps
+        # reorders the array for nicer display + the runtime's
+        # name_to_tid resolution drops the actual forward refs.
         deps = step.get("depends_on", [])
         if not isinstance(deps, list):
             return False, f"step_template[{i}].depends_on must be list"
         for d in deps:
-            if d not in seen_names:
-                return False, f"step_template[{i}].depends_on references {d!r} which is not an EARLIER step (or doesn't exist)"
+            if d not in all_step_names:
+                return False, f"step_template[{i}].depends_on references {d!r} which doesn't exist in this workflow (known steps: {sorted(all_step_names)})"
         # skill (optional, Stage 1.5). Treat empty string same as
         # None — the visual editor's side panel serializes cleared
         # fields as "" (not omitted), so we accept "" as "no skill"
