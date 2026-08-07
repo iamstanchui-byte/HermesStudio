@@ -1137,26 +1137,49 @@
         }
         // Remove the card from the canvas. drawflow expects the
         // DOM id (e.g. "node-3") for removeNodeId, so we translate
-        // step name → bare internal key via _findNodeIdByStepName,
-        // then prefix with "node-" to get the DOM id. The
-        // nodeRemoved listener is the safety net if this returns
-        // null (e.g. race with re-render).
+        // step name → DOM id.
         //
-        // v3.14.x: console.log so the user can verify the delete
-        // path in DevTools. (Previous bug: _findNodeIdByStepName
-        // returned the prefixed form, and we re-prefixed it —
-        // removeNodeId("node-node-3") silently no-op'd, leaving
-        // the card on canvas.)
+        // v3.14.x: two-stage lookup (drawflow data first, DOM as
+        // fallback). The Node.js unit test on drawflow 0.0.59
+        // confirms _findNodeIdByStepName works correctly when the
+        // data is in sync, but the user's stale-page scenario
+        // (DB updated to 5 steps via previous X+Save, page never
+        // reloaded → DOM still has the deleted card with the old
+        // step name, drawflow data doesn't) made the data lookup
+        // fail. DOM lookup is the source of truth for "what the
+        // user sees on canvas" — if a card is visible, it can be
+        // deleted.
         if (_editor) {
+            let domId = null;
+            // Stage 1: drawflow data lookup (fast path when in sync)
             const allNodes = _getAllNodes();
             const internalId = _findNodeIdByStepName(name, allNodes);
             if (internalId != null) {
-                const domId = 'node-' + internalId;
-                console.log('[vf] deleteStepByName: removing card', { name, internalId, domId });
+                domId = 'node-' + internalId;
+            } else {
+                // Stage 2: DOM lookup (resilient to drawflow data
+                // being out of sync with what's visible on canvas).
+                // Walk all .drawflow-node wrappers, find the one
+                // whose inner .vf-node has data-step-name === name.
+                console.log('[vf] deleteStepByName: drawflow data miss, falling back to DOM lookup for', name);
+                const wrappers = document.querySelectorAll('.drawflow-node');
+                for (const w of wrappers) {
+                    const inner = w.querySelector('[data-step-name]');
+                    if (inner && inner.dataset.stepName === name) {
+                        domId = w.id;  // DOM id form, e.g. "node-5"
+                        break;
+                    }
+                }
+                if (domId) {
+                    console.log('[vf] deleteStepByName: DOM lookup resolved', { name, domId });
+                } else {
+                    console.warn('[vf] deleteStepByName: NO card on canvas for', name, '— nothing to remove');
+                }
+            }
+            if (domId) {
+                console.log('[vf] deleteStepByName: removing card', { name, domId });
                 try { _editor.removeNodeId(domId); }
                 catch (e) { console.warn('[vf] removeNodeId threw:', e); /* may already be removed */ }
-            } else {
-                console.warn('[vf] deleteStepByName: could not resolve node for', name, '— nodeRemoved listener is the safety net');
             }
         }
         // Close the side panel + clear selection if it was
