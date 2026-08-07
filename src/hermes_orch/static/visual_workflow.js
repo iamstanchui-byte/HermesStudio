@@ -1157,23 +1157,42 @@
             if (internalId != null) {
                 domId = 'node-' + internalId;
             } else {
-                // Stage 2: DOM lookup (resilient to drawflow data
-                // being out of sync with what's visible on canvas).
-                // Walk all .drawflow-node wrappers, find the one
-                // whose inner .vf-node has data-step-name === name.
-                console.log('[vf] deleteStepByName: drawflow data miss, falling back to DOM lookup for', name);
+                // v3.14.x: deep diagnostic dump. The user's most
+                // recent failure mode is "click worked, both lookups
+                // failed" — which means _stepTemplate has the step
+                // (click found it) but drawflow data + DOM don't.
+                // This is the stale-page signature: page is loaded
+                // with old data attribute, the in-memory _stepTemplate
+                // was modified (e.g. by an Undo) but the DOM/data
+                // weren't re-rendered. Dump the state so the user
+                // can confirm and reload.
+                const dataNodeNames = Object.entries(allNodes).map(([id, n]) => {
+                    return `${id}=${n && n.data && n.data.name ? JSON.stringify(n.data.name) : '<no name>'}`;
+                });
+                const domCardNames = Array.from(
+                    document.querySelectorAll('.drawflow-node [data-step-name]')
+                ).map((el) => JSON.stringify(el.dataset.stepName));
+                console.warn('[vf] deleteStepByName: BOTH lookups failed for', name, {
+                    stepTemplateCount: _stepTemplate.length,
+                    stepTemplateNames: _stepTemplate.map((s) => s.name),
+                    allNodesCount: Object.keys(allNodes).length,
+                    allNodes: dataNodeNames,
+                    domCardCount: domCardNames.length,
+                    domCards: domCardNames,
+                });
+                // Stage 2: DOM lookup
                 const wrappers = document.querySelectorAll('.drawflow-node');
                 for (const w of wrappers) {
                     const inner = w.querySelector('[data-step-name]');
                     if (inner && inner.dataset.stepName === name) {
-                        domId = w.id;  // DOM id form, e.g. "node-5"
+                        domId = w.id;
                         break;
                     }
                 }
                 if (domId) {
                     console.log('[vf] deleteStepByName: DOM lookup resolved', { name, domId });
                 } else {
-                    console.warn('[vf] deleteStepByName: NO card on canvas for', name, '— nothing to remove');
+                    console.warn('[vf] deleteStepByName: NO card on canvas for', name, '— STALE PAGE detected. Hard reload (Ctrl+Shift+R) to sync from server.');
                 }
             }
             if (domId) {
