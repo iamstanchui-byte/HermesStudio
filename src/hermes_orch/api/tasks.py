@@ -324,6 +324,20 @@ async def create_task(body: TaskCreate, request: Request) -> Task:
         task_id=task_id,
         payload={"agent_role": body.agent_role, "action": body.action, "name": body.name},
     )
+    # v1.0.1 §3.2: flip the `first_task_attempted` signal for all
+    # users. Informational only — does NOT collapse the checklist
+    # (a failed first attempt must not show "you're done!"). Per the
+    # single-tenant assumption, all users see this signal flip on
+    # any task creation.
+    try:
+        from hermes_orch.core.onboarding import (
+            SIGNAL_FIRST_TASK_ATTEMPTED,
+            set_signal_for_all_users,
+        )
+        await set_signal_for_all_users(db, SIGNAL_FIRST_TASK_ATTEMPTED, True)
+    except Exception:
+        # Never let the onboarding update fail the task creation.
+        pass
     return _row_to_task(row)
 
 
@@ -611,6 +625,25 @@ async def submit_result(
         "WHERE id = ?",
         (body.status, result_json, body.error, now, now, task_id),
     )
+    # v1.0.1 §3.2: flip the onboarding signal for this terminal
+    # transition. Per spec T1.11, `first_task_completed` is ONLY
+    # true on status=completed — failed tasks do NOT collapse the
+    # checklist. Also flip `first_task_attempted` (informational)
+    # for any terminal status, in case it wasn't flipped on the
+    # create path (e.g. legacy rows from before Phase 2). Per the
+    # single-tenant assumption, both signals flip for all users.
+    try:
+        from hermes_orch.core.onboarding import (
+            SIGNAL_FIRST_TASK_ATTEMPTED,
+            SIGNAL_FIRST_TASK_COMPLETED,
+            set_signal_for_all_users,
+        )
+        await set_signal_for_all_users(db, SIGNAL_FIRST_TASK_ATTEMPTED, True)
+        if body.status == "completed":
+            await set_signal_for_all_users(db, SIGNAL_FIRST_TASK_COMPLETED, True)
+    except Exception:
+        # Never let the onboarding update fail the result submission.
+        pass
     # Free the profile so the dashboard reflects "idle" again
     if task.get("assigned_profile_id"):
         await db.execute(

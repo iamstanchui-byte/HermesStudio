@@ -249,3 +249,102 @@ def backfill_state(
     if has_any_task:
         state = set_signal(state, SIGNAL_FIRST_TASK_ATTEMPTED, True)
     return state
+
+
+# ===== DB-bound helpers =====
+#
+# The functions above are pure (no I/O). These are the DB-bound
+# wrappers used by the signal hooks in auth/cookie.py, api/settings.py,
+# api/tasks.py, and the API endpoints in api/onboarding.py.
+#
+# Single-tenant assumption: when a system-wide event happens (e.g.
+# a task completes), the signal flips for ALL users. This is the
+# correct semantics for the typical one-admin setup. In a future
+# multi-tenant world, the trigger would identify the owning user
+# (e.g. "the user who issued the enrollment token" for agent_connected)
+# and flip only that user. For now, all-flips is acceptable.
+
+
+async def set_user_signal(db, user_id: str, signal: str, value: bool = True) -> dict[str, Any]:
+    """Read the user's current state, flip one signal, write it back.
+
+    Returns the new state. Idempotent: setting a signal that's
+    already set to the requested value is a no-op (no write).
+    """
+    row = await db.fetchone(
+        "SELECT onboarding_state FROM users WHERE id = ?", (user_id,)
+    )
+    if not row:
+        return empty_state()
+    current = parse_state(row["onboarding_state"] or "{}")
+    if current["signals"].get(signal) == bool(value):
+        return current  # no-op
+    new = set_signal(current, signal, value)
+    await db.execute(
+        "UPDATE users SET onboarding_state = ? WHERE id = ?",
+        (serialize_state(new), user_id),
+    )
+    return new
+
+
+async def set_user_skipped(db, user_id: str, skipped: bool = True) -> dict[str, Any]:
+    """Set the user's skipped flag."""
+    row = await db.fetchone(
+        "SELECT onboarding_state FROM users WHERE id = ?", (user_id,)
+    )
+    if not row:
+        return empty_state()
+    current = parse_state(row["onboarding_state"] or "{}")
+    if current.get("skipped") == bool(skipped):
+        return current
+    new = set_skipped(current, skipped)
+    await db.execute(
+        "UPDATE users SET onboarding_state = ? WHERE id = ?",
+        (serialize_state(new), user_id),
+    )
+    return new
+
+
+async def reset_user_state(db, user_id: str) -> dict[str, Any]:
+    """Reset a user's onboarding state to all-false (admin reset / re-demo)."""
+    new = reset_state()
+    await db.execute(
+        "UPDATE users SET onboarding_state = ? WHERE id = ?",
+        (serialize_state(new), user_id),
+    )
+    return new
+
+
+async def set_signal_for_all_users(db, signal: str, value: bool = True) -> int:
+    """Set a signal for every user in the system. Returns # of users flipped.
+
+    Used by system-wide events (task completion, agent enrollment) that
+    flip the signal for every user per the single-tenant assumption.
+    Idempotent: users with the signal already at `value` are skipped.
+    """
+    async with db.conn.execute(
+        "SELECT id, onboarding_state FROM users"
+    ) as cur:
+        users = await cur.fetchall()
+    flipped = 0
+    for u in users:
+        current = parse_state(u["onboarding_state"] or "{}")
+        if current["signals"].get(signal) == bool(value):
+            continue  # no-op
+        new = set_signal(current, signal, value)
+        await db.execute(
+            "UPDATE users SET onboarding_state = ? WHERE id = ?",
+            (serialize_state(new), u["id"]),
+        )
+        flipped += 1
+    return flipped
+
+
+async def get_user_state(db, user_id: str) -> dict[str, Any]:
+    """Read the user's current onboarding state (parsed)."""
+    row = await db.fetchone(
+        "SELECT onboarding_state FROM users WHERE id = ?", (user_id,)
+    )
+    if not row:
+        return empty_state()
+    return parse_state(row["onboarding_state"] or "{}")

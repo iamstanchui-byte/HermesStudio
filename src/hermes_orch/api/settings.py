@@ -94,6 +94,25 @@ async def post_llm(body: LLMConfigIn, request: Request) -> LLMConfigOut:
     cfg = request.app.state.config
     request.app.state.planner.__init__(cfg)
     request.app.state.notifier.__init__(cfg)
+    # v1.0.1 §3.2: flip the llm_configured signal for the current user.
+    # Per spec T1.2, mock-mode is a first-class path — any save to
+    # llm config counts as "LLM configured" (mock is still a valid
+    # configured state, just one that doesn't need a key).
+    try:
+        from hermes_orch.auth.cookie import current_user
+        from hermes_orch.core.onboarding import (
+            SIGNAL_LLM_CONFIGURED,
+            set_user_signal,
+        )
+        user = await current_user(request)
+        if user:
+            await set_user_signal(
+                request.app.state.db, user["id"],
+                SIGNAL_LLM_CONFIGURED, True,
+            )
+    except Exception:
+        # Never let the onboarding update fail the LLM save.
+        pass
     return _llm_view(cfg)
 
 

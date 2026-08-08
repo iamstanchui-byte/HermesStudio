@@ -303,11 +303,31 @@ async def get_user_by_username(db, username: str) -> dict[str, Any] | None:
 
 
 async def set_user_password(db, user_id: str, new_password: str) -> None:
-    """Set / replace the user's password hash."""
+    """Set / replace the user's password hash.
+
+    v1.0.1 §3.2: also flips the `password_set` signal in the user's
+    onboarding_state. This is the moment the bootstrap admin's
+    password gets set (via /setup-password), and the "Change password"
+    step on the new-user checklist is satisfied.
+    """
     await db.execute(
         "UPDATE users SET password_hash = ? WHERE id = ?",
         (hash_password(new_password), user_id),
     )
+    # Flip the password_set onboarding signal. Lazy import to avoid
+    # a circular dep (auth/cookie.py is imported by db.py via
+    # bootstrap admin auto-create).
+    try:
+        from hermes_orch.core.onboarding import (
+            SIGNAL_PASSWORD_SET,
+            set_user_signal,
+        )
+        await set_user_signal(db, user_id, SIGNAL_PASSWORD_SET, True)
+    except Exception:
+        # Never let the onboarding update fail the password change.
+        # Worst case: the user has to refresh the page to see the
+        # checklist collapse.
+        pass
 
 
 async def touch_last_login(db, user_id: str) -> None:
