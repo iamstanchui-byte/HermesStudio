@@ -94,3 +94,83 @@ async def test_settings_page_contains_network_card(client):
     body = r.text
     assert 'id="network"' in body
     assert "Network access" in body
+
+
+# ===== Agents page: single-button (v1.0.1 §3.3 cleanup) =====
+#
+# The legacy "Register agent" button + modal was removed in
+# v1.0.1 (commit fac1bce-followup) because the new "Add agent
+# host" (enrollment token flow) covers the same use case with
+# strictly less friction (no pre-declared agent_id, the agent
+# host self-declares). Two near-duplicate buttons on the same
+# page was confusing for new users.
+#
+# These tests guard against accidentally re-adding the old
+# button or modal. The legacy POST /api/agents endpoint is
+# still available for API consumers.
+
+@pytest.mark.asyncio
+async def test_agents_page_has_only_one_add_button(client):
+    """The agents page header has exactly one "Add" button — the
+    new v1.0.1 §3.3 enrollment-token flow. The legacy
+    "+ Register agent" button must NOT be present."""
+    ac, _ = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await ac.get("/agents")
+    body = r.text
+    # The new button IS there
+    assert "Add agent host" in body
+    assert "showEnrollModal" in body
+    # The legacy button is NOT
+    assert "+ Register agent" not in body, (
+        "Legacy 'Register agent' button must not be rendered "
+        "— use 'Add agent host' (enrollment token flow) instead."
+    )
+    assert "showRegisterModal" not in body
+
+
+@pytest.mark.asyncio
+async def test_agents_page_does_not_have_register_modal(client):
+    """The legacy #register-modal div must not be in the page
+    (its elements were removed entirely; showEnrollModal +
+    #enroll-modal is the new path)."""
+    ac, _ = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await ac.get("/agents")
+    body = r.text
+    assert 'id="register-modal"' not in body
+    assert 'id="reg-agent-id"' not in body
+    assert 'id="reg-success-secret"' not in body
+    # The new modal IS there
+    assert 'id="enroll-modal"' in body
+
+
+@pytest.mark.asyncio
+async def test_agents_page_legacy_handlers_removed(client):
+    """Defensive: the legacy showRegisterModal handler must
+    not be in the page script (it would error at runtime if
+    anyone clicked a leftover trigger)."""
+    ac, _ = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await ac.get("/agents")
+    body = r.text
+    assert "function showRegisterModal" not in body
+    assert "function closeRegisterModal" not in body
+    assert "function submitRegisterAgent" not in body
+    assert "function copySetupSecret" not in body
+
+
+@pytest.mark.asyncio
+async def test_agents_enroll_modal_still_renders(client):
+    """Sanity: the new enrollment-token modal (the one we want
+    to keep) IS rendered. Guards against accidentally removing
+    the wrong modal during the cleanup."""
+    ac, _ = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await ac.get("/agents")
+    body = r.text
+    assert 'id="enroll-modal"' in body
+    assert "enroll-label" in body
+    assert "enroll-hint-name" in body
+    assert "showEnrollModal" in body
+    assert "submitEnrollToken" in body

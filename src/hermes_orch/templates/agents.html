@@ -24,133 +24,26 @@
         <h1 class="text-2xl font-bold text-gray-800">Agents</h1>
         <p class="text-sm text-gray-500 mt-0.5">Discover, manage, and monitor your agent fleet.</p>
     </div>
-    <button onclick="showRegisterModal()"
-            class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700">
-        + Register agent
-    </button>
     {# v1.0.1 §3.3: enrollment-token-based add-host flow. The
-       secondary button next to the legacy "Register agent" entry
-       point — same goal, simpler UX (no pre-declared agent_id). #}
+       only way to add a new agent host from the UI — the agent
+       self-declares its name on enrollment (per spec §3.3.2)
+       and we get a one-time hmac_secret back. The legacy
+       "Register agent" flow (POST /api/agents) is preserved as
+       a server endpoint for API consumers, but no longer
+       exposed in the dashboard (it was redundant + confusing
+       alongside this one). #}
     <button onclick="showEnrollModal()"
-            class="px-3 py-1.5 bg-white border border-blue-600 text-blue-600 rounded text-sm font-medium hover:bg-blue-50">
+            class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700">
         + Add agent host
     </button>
 </div>
 
-{# v3.1.1: Register agent modal. Two states: (1) form with agent_id /
-   hostname / ip / os_type / description, (2) success state showing the
-   one-time setup_secret + setup_instructions for the user to copy to
-   the agent host. Backdrop click or Cancel closes; on success the
-   Close button reloads the page so the new agent shows in the list.
-   The modal reuses the .card border / shadow style so it fits the
-   dashboard. #}
-<div id="register-modal" class="modal-overlay" style="display: none;"
-     onclick="if(event.target===this) closeRegisterModal()">
-    <div class="modal-card" style="width: 480px; max-width: 90vw;">
-        <div class="flex items-center justify-between mb-3">
-            <h2 class="text-lg font-semibold text-gray-800">Register agent</h2>
-            <button onclick="closeRegisterModal()" class="text-gray-400 hover:text-gray-700 text-xl leading-none">&times;</button>
-        </div>
-
-        {# Form state #}
-        <div id="register-modal-form">
-            <p class="text-xs text-gray-500 mb-3">
-                Creates a new agent and returns a one-time setup secret. Copy
-                the secret to the agent host's
-                <code>~/.hermes-orchestrator/.secret-&lt;agent_id&gt;</code> file
-                and start the wrapper. The secret is shown ONCE — make sure
-                you have a way to get it onto the agent host.
-            </p>
-            <form onsubmit="submitRegisterAgent(event)" class="space-y-2">
-                <div>
-                    <label class="block text-xs font-medium text-gray-700 mb-1">
-                        Agent ID <span class="text-red-600">*</span>
-                    </label>
-                    <input id="reg-agent-id" type="text" required pattern="[a-zA-Z0-9._-]+"
-                           placeholder="e.g. win-hostname-01, linux-a-01"
-                           class="w-full border rounded px-2 py-1 text-sm font-mono">
-                    <div class="text-xs text-gray-500 mt-1">
-                        Used as <code>agent_id</code> in heartbeat. Must be unique. Use a stable
-                        host-bound name (e.g. hostname) so it survives restarts.
-                    </div>
-                </div>
-                <div>
-                    <label class="block text-xs font-medium text-gray-700 mb-1">Hostname (optional)</label>
-                    <input id="reg-hostname" type="text" placeholder="e.g. stanley-desktop"
-                           class="w-full border rounded px-2 py-1 text-sm font-mono">
-                </div>
-                <div>
-                    <label class="block text-xs font-medium text-gray-700 mb-1">IP (optional)</label>
-                    <input id="reg-ip" type="text" placeholder="e.g. 192.168.1.50"
-                           class="w-full border rounded px-2 py-1 text-sm font-mono">
-                </div>
-                <div>
-                    <label class="block text-xs font-medium text-gray-700 mb-1">OS type</label>
-                    <select id="reg-os" class="w-full border rounded px-2 py-1 text-sm">
-                        <option value="">(unknown)</option>
-                        <option value="windows">windows</option>
-                        <option value="linux">linux</option>
-                    </select>
-                </div>
-                <div>
-                    <label class="block text-xs font-medium text-gray-700 mb-1">Description (optional)</label>
-                    <input id="reg-desc" type="text" placeholder="e.g. Standalone Windows 11 host"
-                           class="w-full border rounded px-2 py-1 text-sm">
-                </div>
-                <div id="register-modal-error" class="text-xs text-red-600" style="display: none;"></div>
-                <div class="flex items-center gap-2 pt-2">
-                    <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
-                        Register
-                    </button>
-                    <button type="button" onclick="closeRegisterModal()"
-                            class="px-3 py-2 bg-white border text-gray-600 rounded text-sm hover:bg-gray-50">
-                        Cancel
-                    </button>
-                    <span id="register-modal-status" class="text-xs text-gray-500"></span>
-                </div>
-            </form>
-        </div>
-
-        {# Success state — shown after POST returns 201 #}
-        <div id="register-modal-success" style="display: none;">
-            <div class="bg-green-50 border border-green-200 rounded p-3 mb-3">
-                <div class="text-sm font-semibold text-green-800 mb-1">Agent registered</div>
-                <div class="text-xs text-green-700">
-                    Save the secret below — it's shown <strong>once</strong> and cannot be
-                    recovered later. If you lose it, use the
-                    <code>Rotate secret</code> endpoint to issue a new one.
-                </div>
-            </div>
-            <div class="text-xs text-gray-500 mb-1">Setup secret for <strong id="reg-success-agent-id"></strong>:</div>
-            <div class="flex items-center gap-2 mb-3">
-                <input id="reg-success-secret" type="text" readonly
-                       class="flex-1 border rounded px-2 py-1 text-xs font-mono bg-gray-50">
-                <button onclick="copySetupSecret()"
-                        class="text-xs px-2 py-1 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded">
-                    Copy
-                </button>
-            </div>
-            <div class="text-xs text-gray-500 mb-1">Run on the agent host:</div>
-            <pre id="reg-success-cmd"
-                 class="text-xs font-mono bg-gray-900 text-gray-100 p-2 rounded overflow-x-auto mb-3"></pre>
-            <div class="flex items-center gap-2">
-                <button onclick="closeRegisterModal(true)"
-                        class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
-                    Done (reload)
-                </button>
-            </div>
-        </div>
-    </div>
-</div>
-
 {# v1.0.1 (new-user-activation §3.3): enrollment token flow.
-   Unlike the "Register agent" modal above (which requires the
-   operator to pre-declare the agent_id and copy a one-time
-   secret to the agent host), this flow has the AGENT HOST
-   self-declare its name. The operator just generates a token
-   from the dashboard and pastes the install command on the
-   agent host. Simpler + the agent name lives where it
-   belongs (with the host, not the dashboard).
+   Generates a one-time 15-min token, shows the install command
+   (which includes `pip install` for a fresh host), and lets
+   the agent host self-declare its name. The operator doesn't
+   have to pre-declare an agent_id or copy a secret — the
+   agent host does it all in one shot.
 #}
 <div id="enroll-modal" class="modal-overlay" style="display: none;"
      onclick="if(event.target===this) closeEnrollModal()">
@@ -1503,32 +1396,6 @@ function toggleAnalytics() {
     chev.textContent = isOpen ? '▶' : '▼';
 }
 
-// ===== v3.1.1: Register agent modal =====
-// Two-state modal: form -> success (with one-time setup_secret).
-// The success state shows the secret + a copy-paste command for the
-// agent host. The user MUST copy the secret before clicking "Done"
-// (which reloads the page so the new agent appears in the list).
-// Backdrop click or Cancel closes the form (no state saved).
-function showRegisterModal() {
-    // Reset form state
-    document.getElementById('reg-agent-id').value = '';
-    document.getElementById('reg-hostname').value = '';
-    document.getElementById('reg-ip').value = '';
-    document.getElementById('reg-os').value = '';
-    document.getElementById('reg-desc').value = '';
-    document.getElementById('register-modal-form').style.display = 'block';
-    document.getElementById('register-modal-success').style.display = 'none';
-    document.getElementById('register-modal-error').style.display = 'none';
-    document.getElementById('register-modal-status').textContent = '';
-    document.getElementById('register-modal').style.display = 'flex';
-    setTimeout(() => document.getElementById('reg-agent-id').focus(), 50);
-}
-
-function closeRegisterModal(reloadAfter) {
-    document.getElementById('register-modal').style.display = 'none';
-    if (reloadAfter) location.reload();
-}
-
 // v1.0.1 §3.3: enrollment-token flow. The dashboard generates a
 // one-time token + install command; the user pastes the install
 // command on the agent host. `agent_cli enroll` consumes the
@@ -1616,70 +1483,9 @@ async function refreshEnrollPendingCount() {
     }
 }
 
-async function submitRegisterAgent(ev) {
-    ev.preventDefault();
-    const errEl = document.getElementById('register-modal-error');
-    const status = document.getElementById('register-modal-status');
-    errEl.style.display = 'none';
-    const agentId = document.getElementById('reg-agent-id').value.trim();
-    if (!agentId) {
-        errEl.textContent = 'Agent ID is required.';
-        errEl.style.display = 'block';
-        return;
-    }
-    const body = {
-        agent_id: agentId,
-        hostname: document.getElementById('reg-hostname').value.trim() || null,
-        ip: document.getElementById('reg-ip').value.trim() || null,
-        os_type: document.getElementById('reg-os').value || null,
-        description: document.getElementById('reg-desc').value.trim() || null,
-    };
-    status.textContent = 'Registering...';
-    try {
-        const r = await fetch('/api/agents', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(body),
-        });
-        const data = await r.json();
-        if (r.status === 201 && data.setup_secret) {
-            // Success state: show the one-time secret + setup instructions
-            document.getElementById('reg-success-agent-id').textContent = agentId;
-            document.getElementById('reg-success-secret').value = data.setup_secret;
-            document.getElementById('reg-success-cmd').textContent = data.setup_instructions || '';
-            document.getElementById('register-modal-form').style.display = 'none';
-            document.getElementById('register-modal-success').style.display = 'block';
-            status.textContent = '';
-        } else if (r.status === 409) {
-            errEl.textContent = `Agent ID "${agentId}" already exists. Pick a different ID.`;
-            errEl.style.display = 'block';
-            status.textContent = '';
-        } else {
-            errEl.textContent = 'Failed: ' + (data.detail || r.status);
-            errEl.style.display = 'block';
-            status.textContent = '';
-        }
-    } catch (err) {
-        errEl.textContent = 'Network error: ' + err.message;
-        errEl.style.display = 'block';
-        status.textContent = '';
-    }
-}
-
-function copySetupSecret() {
-    const input = document.getElementById('reg-success-secret');
-    input.select();
-    input.setSelectionRange(0, 999);  // for mobile
-    try {
-        document.execCommand('copy');
-        const btn = event.target;
-        const orig = btn.textContent;
-        btn.textContent = 'Copied!';
-        setTimeout(() => { btn.textContent = orig; }, 1200);
-    } catch (err) {
-        // Modern browsers + clipboard API: fall back to plain select
-    }
-}
+// v1.0.1 (2026-08-08): removed submitRegisterAgent() — the legacy
+// Register agent modal is gone. The enrollment-token modal has
+// its own submitEnrollToken() above.
 
 // ===== v3.1.1: Add / Delete profile =====
 // Uses the existing POST /api/agents/{id}/profiles and
