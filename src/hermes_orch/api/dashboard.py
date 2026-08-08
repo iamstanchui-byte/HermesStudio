@@ -492,7 +492,6 @@ async def root(request: Request) -> HTMLResponse:
     """
     from hermes_orch.core.onboarding import (
         is_checklist_complete,
-        parse_state,
         should_show_checklist,
     )
     from hermes_orch.auth.cookie import current_user
@@ -1906,6 +1905,7 @@ async def project_visual_page(
 async def settings_page(request: Request) -> HTMLResponse:
     """Settings page (LLM + Telegram + Project Storage + Cleanup + HTTPS)."""
     from hermes_orch.api.settings import _https_view
+    from hermes_orch.auth.cookie import current_user
     from hermes_orch.config import LLM_PROVIDERS
     cfg = request.app.state.config or {}
     llm = cfg.get("llm") or {}
