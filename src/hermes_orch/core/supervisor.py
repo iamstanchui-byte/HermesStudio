@@ -2043,12 +2043,46 @@ class Supervisor:
         is_single = bool(task.get("is_single_task"))
         # Re-read to avoid races
         cur = await self.db.fetchone(
-            "SELECT id, status, project_id, agent_role, required_capability "
+            "SELECT id, status, project_id, agent_role, required_capability, action "
             "FROM tasks WHERE id = ?",
             (tid,),
         )
         if not cur or cur["status"] != "pending":
             return False
+        # v1.0.1 §3.5: server-side healthcheck magic action. The
+        # system-health starter has a step with action
+        # `_server_healthcheck`; the supervisor handles it in-process
+        # (no agent dispatch, no LLM call) so the smoke test works
+        # in mock mode on a fresh install. We short-circuit BEFORE
+        # any profile selection so the task never enters the
+        # dispatch queue.
+        if cur.get("action") == "_server_healthcheck":
+            try:
+                from hermes_orch.core.healthcheck import run_and_record_healthcheck
+                result = await run_and_record_healthcheck(self.db, tid)
+                await audit_log(
+                    self.db, "task.healthcheck",
+                    actor="supervisor",
+                    project_id=cur["project_id"],
+                    task_id=tid,
+                    payload={
+                        "status": result["status"],
+                        "summary": result["summary"],
+                        "agent_count": result["details"].get("agent_count", 0),
+                    },
+                )
+            except Exception as e:
+                # Healthcheck failed at the server level (not a
+                # failed health result — an exception). Mark the
+                # task failed so the supervisor doesn't loop on it.
+                log.error("healthcheck handler crashed for task %s: %s", tid, e)
+                now_iso = _now_iso()
+                await self.db.execute(
+                    "UPDATE tasks SET status = 'failed', error = ?, "
+                    "ended_at = ?, updated_at = ? WHERE id = ?",
+                    (f"healthcheck handler error: {e}", now_iso, now_iso, tid),
+                )
+            return True  # assignment "happened" (in-process handled)
         # Path A (#22): inject the project's procedure.md into the task row
         # at assignment time. The wrapper reads task.procedure_md and
         # prepends it to the agent's prompt as project context (so the
