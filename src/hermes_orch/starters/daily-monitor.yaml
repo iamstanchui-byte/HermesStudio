@@ -1,0 +1,54 @@
+# v1.0.1 (new-user-activation §3.4) starter: daily-monitor
+#
+# Bundled read-only catalog entry. Daily monitoring workflow:
+# fetch a data source, run a simple analysis, and post a summary.
+name: daily-monitor
+version: "0.1.0"
+display:
+  title: "Daily monitor"
+  description: "Scheduled daily check on a data source with summary post"
+  icon: "📊"
+  category: "monitoring"
+  mock_mode_supported: true
+  estimated_minutes: 5
+step_template:
+  - name: fetch-snapshot
+    agent_role: super
+    action: data_fetch
+    depends_on: []
+    params_template:
+      source: "{{source}}"
+      schedule: "daily"
+  - name: analyze
+    agent_role: super
+    action: analyze_data
+    depends_on:
+      - fetch-snapshot
+    params_template:
+      metric: "{{metric}}"
+      threshold: "{{threshold}}"
+      data_ref: "{{fetch-snapshot.output}}"
+  - name: post-summary
+    agent_role: super
+    action: compose_text
+    depends_on:
+      - analyze
+    params_template:
+      style: "alert"
+      analysis: "{{analyze.output}}"
+variables:
+  - name: source
+    type: string
+    required: true
+    description: "Data source URL or identifier"
+  - name: metric
+    type: string
+    required: false
+    default: "value"
+    description: "Metric to monitor"
+  - name: threshold
+    type: number
+    required: false
+    default: 100
+    description: "Alert threshold"
+required_capability: data_fetch

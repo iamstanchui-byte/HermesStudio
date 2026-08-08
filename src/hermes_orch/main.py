@@ -403,6 +403,14 @@ def create_app() -> FastAPI:
     # (POST /api/enrollment-tokens, GET, DELETE, POST /api/agents/enroll)
     from hermes_orch.api.enrollment import router as enrollment_router
     app.include_router(enrollment_router, prefix="/api", tags=["enrollment"])
+    # v1.0.1 §3.4: starter catalog endpoints
+    # (GET /api/starters, GET /api/starters/{name}, POST clone)
+    from hermes_orch.api.starters import router as starters_router
+    app.include_router(starters_router, prefix="/api", tags=["starters"])
+    # Load the bundled starter catalog into app.state.starters
+    # (in-process, no DB writes — read-only YAMLs).
+    from hermes_orch.core.starters import load_catalog
+    app.state.starters = load_catalog()
     # v3.5.0: admin user CRUD (list, create, reset password, disable/enable)
     app.include_router(users_router, prefix="/api/users", tags=["users"])
     # v3.9.0 (Phase 2 UX): per-user UI prefs + plan-presets lookup.

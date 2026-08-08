@@ -1,0 +1,37 @@
+# v1.0.1 (new-user-activation §3.4) starter: research-brief
+#
+# Bundled read-only catalog entry. Clone via
+# POST /api/starters/research-brief/clone to create a user-owned
+# workflow_packages row. The catalog YAML is never mutated; the
+# clone gets a snapshot (per spec §3.4 versioning rule).
+name: research-brief
+version: "0.1.0"
+display:
+  title: "Research brief"
+  description: "2-3 paragraph summary of any topic with sources"
+  icon: "📚"
+  category: "research"
+  mock_mode_supported: true
+  estimated_minutes: 5
+step_template:
+  - name: search-sources
+    agent_role: super
+    action: web_search
+    depends_on: []
+    params_template:
+      query: "{{topic}}"
+      max_results: 10
+  - name: write-summary
+    agent_role: super
+    action: compose_text
+    depends_on:
+      - search-sources
+    params_template:
+      style: "executive_brief"
+      sources: "{{search-sources.output}}"
+variables:
+  - name: topic
+    type: string
+    required: true
+    description: "Topic to research"
+required_capability: web_search

@@ -1,0 +1,31 @@
+# v1.0.1 (new-user-activation §3.4 + §3.5) starter: system-health
+#
+# SPECIAL starter: the step's action is `_server_healthcheck`,
+# a server-side magic action the supervisor handles WITHOUT
+# dispatching to an agent. It pings registered agents in-process
+# and reports the server→agent→result plumbing is healthy. Runs
+# in mock mode with no LLM key (the smoke test must work on a
+# fresh install per spec §3.5).
+#
+# Per §3.5.1:
+#   - 0 agents:  status=failed, summary="No agent connected yet"
+#   - 1 agent:   status=completed if heartbeat < 60s, failed otherwise
+#   - 2+ agents: status=completed if ANY agent has heartbeat < 60s,
+#                failed otherwise. Summary lists each agent.
+name: system-health
+version: "0.1.0"
+display:
+  title: "System health check"
+  description: "Verify the server can reach your agent host end-to-end (no LLM needed)"
+  icon: "🩺"
+  category: "diagnostics"
+  mock_mode_supported: true
+  estimated_minutes: 1
+step_template:
+  - name: ping-agent
+    agent_role: super
+    action: _server_healthcheck
+    depends_on: []
+    params_template: {}
+variables: []
+required_capability: null

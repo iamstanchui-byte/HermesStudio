@@ -1,0 +1,50 @@
+# v1.0.1 (new-user-activation §3.4) starter: backtest-stater
+#
+# Bundled read-only catalog entry. Backtest starter for trading
+# strategies — demonstrates a longer multi-step pipeline. The
+# action names are placeholders for the orchestrator's existing
+# task vocabulary; the actual backtest runner is a wrapper concern.
+name: backtest-stater
+version: "0.1.0"
+display:
+  title: "Backtest starter"
+  description: "Run a sample backtest on historical data with a configurable strategy"
+  icon: "📈"
+  category: "finance"
+  mock_mode_supported: true
+  estimated_minutes: 15
+step_template:
+  - name: fetch-data
+    agent_role: super
+    action: data_fetch
+    depends_on: []
+    params_template:
+      symbol: "{{symbol}}"
+      period: "1y"
+  - name: run-backtest
+    agent_role: super
+    action: backtest_run
+    depends_on:
+      - fetch-data
+    params_template:
+      strategy: "{{strategy}}"
+      data_ref: "{{fetch-data.output}}"
+  - name: report-results
+    agent_role: super
+    action: compose_text
+    depends_on:
+      - run-backtest
+    params_template:
+      style: "backtest_report"
+      results: "{{run-backtest.output}}"
+variables:
+  - name: symbol
+    type: string
+    required: true
+    description: "Ticker symbol to backtest (e.g. AAPL, 0700.HK)"
+  - name: strategy
+    type: string
+    required: false
+    default: "sma_crossover"
+    description: "Strategy name (default: sma_crossover)"
+required_capability: data_fetch
