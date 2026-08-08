@@ -1,0 +1,200 @@
+{# v1.0.1 (new-user-activation) §3.2: 4-step onboarding checklist.
+
+Renders for a fresh user (or one with partial progress) on `GET /`.
+Each step has:
+  - a checkbox (checked if signal is true)
+  - a primary action button (e.g. "Set password", "Configure LLM")
+  - a "?" tooltip with a short description and link to the full docs
+
+The single "Skip for now" affordance lives at the bottom. Admin
+"Reset onboarding state" is at /settings#onboarding (separate page).
+
+The template receives:
+  - onboarding_state: parsed state dict (signals + skipped + completed_at)
+  - is_complete: bool — all 4 success signals true
+  - current_user_ctx / standard base context
+#}
+{% extends "base.html" %}
+{% block title %}Welcome — Hermes Orchestrator{% endblock %}
+
+{% block head %}
+<style>
+/* Onboarding-specific styling. Inherits Tailwind from base.html. */
+.onb-step {
+    display: flex; gap: 1rem; align-items: flex-start;
+    padding: 1rem; border: 1px solid #e5e7eb; border-radius: 0.5rem;
+    background: white; transition: all 0.15s;
+}
+.onb-step.done {
+    background: #f0fdf4; border-color: #86efac;
+}
+.onb-step.current {
+    border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+.onb-step-num {
+    flex-shrink: 0; width: 2rem; height: 2rem;
+    border-radius: 9999px; background: #e5e7eb; color: #4b5563;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 600; font-size: 0.875rem;
+}
+.onb-step.done .onb-step-num {
+    background: #22c55e; color: white;
+}
+.onb-step.current .onb-step-num {
+    background: #3b82f6; color: white;
+}
+.onb-step-title { font-weight: 600; font-size: 1.125rem; color: #111827; }
+.onb-step-desc { font-size: 0.875rem; color: #6b7280; margin-top: 0.25rem; }
+.onb-step-action { margin-top: 0.75rem; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto px-4 py-8">
+    <h1 class="text-2xl font-bold text-gray-900 mb-2">Welcome to Hermes Orchestrator</h1>
+    <p class="text-gray-600 mb-6">
+        Four quick steps and you'll have a working agent system. You can skip
+        this and come back to it later via <a href="/settings#onboarding" class="text-blue-600 hover:underline">Settings → Onboarding</a>.
+    </p>
+
+    <div class="space-y-3" id="onboarding-steps">
+        {% set signals = onboarding_state.signals %}
+        {% set ns = namespace(current_found=false) %}
+
+        {# Step 1: password_set #}
+        {% set step1_done = signals.password_set %}
+        {% set step1_class = "onb-step" + (" done" if step1_done else (" current" if not ns.current_found and not step1_done else "")) %}
+        {% if not step1_done and not ns.current_found %}{% set ns.current_found = true %}{% endif %}
+        <div class="{{ step1_class }}" id="step-password">
+            <div class="onb-step-num">{% if step1_done %}✓{% else %}1{% endif %}</div>
+            <div class="flex-1">
+                <div class="onb-step-title">Set your password</div>
+                <div class="onb-step-desc">
+                    The bootstrap admin (you) needs a password before you can
+                    log in securely. <a href="/settings#onboarding" class="text-blue-600 hover:underline">More info</a>
+                </div>
+                <div class="onb-step-action">
+                    {% if step1_done %}
+                        <span class="text-sm text-green-700">Done</span>
+                    {% else %}
+                        <a href="/settings#onboarding" class="inline-block px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                            Set password
+                        </a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        {# Step 2: llm_configured #}
+        {% set step2_done = signals.llm_configured %}
+        {% set step2_class = "onb-step" + (" done" if step2_done else (" current" if not ns.current_found and not step2_done else "")) %}
+        {% if not step2_done and not ns.current_found %}{% set ns.current_found = true %}{% endif %}
+        <div class="{{ step2_class }}" id="step-llm">
+            <div class="onb-step-num">{% if step2_done %}✓{% else %}2{% endif %}</div>
+            <div class="flex-1">
+                <div class="onb-step-title">Configure the LLM</div>
+                <div class="onb-step-desc">
+                    Tell the orchestrator which LLM to use. Mock mode works
+                    for trying things out without burning API credits.
+                </div>
+                <div class="onb-step-action">
+                    {% if step2_done %}
+                        <span class="text-sm text-green-700">Done</span>
+                    {% else %}
+                        <a href="/settings#llm" class="inline-block px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                            Configure LLM
+                        </a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        {# Step 3: agent_connected #}
+        {% set step3_done = signals.agent_connected %}
+        {% set step3_class = "onb-step" + (" done" if step3_done else (" current" if not ns.current_found and not step3_done else "")) %}
+        {% if not step3_done and not ns.current_found %}{% set ns.current_found = true %}{% endif %}
+        <div class="{{ step3_class }}" id="step-agent">
+            <div class="onb-step-num">{% if step3_done %}✓{% else %}3{% endif %}</div>
+            <div class="flex-1">
+                <div class="onb-step-title">Connect an agent host</div>
+                <div class="onb-step-desc">
+                    Install the wrapper on a host machine and enroll it. The
+                    wrapper reports heartbeats so the orchestrator knows
+                    which agents are online.
+                </div>
+                <div class="onb-step-action">
+                    {% if step3_done %}
+                        <span class="text-sm text-green-700">Done</span>
+                    {% else %}
+                        <a href="/agents" class="inline-block px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                            Add agent host
+                        </a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        {# Step 4: first_task_completed #}
+        {% set step4_done = signals.first_task_completed %}
+        {% set step4_class = "onb-step" + (" done" if step4_done else (" current" if not ns.current_found and not step4_done else "")) %}
+        {% if not step4_done and not ns.current_found %}{% set ns.current_found = true %}{% endif %}
+        <div class="{{ step4_class }}" id="step-task">
+            <div class="onb-step-num">{% if step4_done %}✓{% else %}4{% endif %}</div>
+            <div class="flex-1">
+                <div class="onb-step-title">Run your first task</div>
+                <div class="onb-step-desc">
+                    Create a project, add a task, and watch an agent run it
+                    end-to-end. Try a starter from the gallery to skip the
+                    setup.
+                </div>
+                <div class="onb-step-action">
+                    {% if step4_done %}
+                        <span class="text-sm text-green-700">Done</span>
+                    {% else %}
+                        <a href="/projects" class="inline-block px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                            Open projects
+                        </a>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    {% if not is_complete %}
+    <div class="mt-6 flex items-center justify-between text-sm">
+        <span class="text-gray-500">
+            {% if signals.first_task_attempted and not signals.first_task_completed %}
+                You've tried a task. A failed first attempt doesn't count —
+                run a successful one to finish this step.
+            {% endif %}
+        </span>
+        <button id="skip-btn" onclick="skipOnboarding()"
+            class="text-gray-500 hover:text-gray-700 underline">
+            Skip for now
+        </button>
+    </div>
+    {% endif %}
+</div>
+
+<script>
+async function skipOnboarding() {
+    if (!confirm('Skip the onboarding checklist? You can re-open it later via Settings → Onboarding.')) {
+        return;
+    }
+    try {
+        const r = await fetch('/api/me/onboarding/skip', {
+            method: 'POST',
+            credentials: 'same-origin',
+        });
+        if (r.ok) {
+            // Redirect to /agents — they'll get the normal dashboard now
+            window.location.href = '/agents';
+        } else {
+            alert('Failed to skip: ' + r.status);
+        }
+    } catch (e) {
+        alert('Network error: ' + e.message);
+    }
+}
+</script>
+{% endblock %}

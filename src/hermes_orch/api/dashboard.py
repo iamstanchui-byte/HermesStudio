@@ -474,10 +474,66 @@ async def _load_tasks(db: Any) -> list[dict[str, Any]]:
 # ===== Routes =====
 
 
-@router.get("/", response_class=RedirectResponse)
-async def root() -> RedirectResponse:
-    """Redirect to /agents."""
-    return RedirectResponse(url="/agents")
+@router.get("/", response_class=HTMLResponse)
+async def root(request: Request) -> HTMLResponse:
+    """Landing page.
+
+    v1.0.1 (§3.2): if the current user's onboarding is incomplete
+    (and not skipped), render the 4-step checklist
+    (`templates/onboarding.html`) instead of redirecting to /agents.
+    This is the new-user activation path: someone who just installed
+    the server lands on a single page that walks them through the
+    4 steps (password → LLM → agent → first task) rather than an
+    empty /agents page with no idea what to do next.
+
+    Unauthenticated users get redirected to /login (the existing
+    auth middleware handles that — the request just continues here
+    with current_user_ctx=None).
+    """
+    from hermes_orch.core.onboarding import (
+        is_checklist_complete,
+        parse_state,
+        should_show_checklist,
+    )
+    from hermes_orch.auth.cookie import current_user
+    from fastapi.responses import RedirectResponse as _Redirect
+
+    user = await current_user(request)
+    if not user:
+        return _Redirect(url="/login", status_code=302)
+
+    # Read the user's onboarding state. Default to `{}` for a fresh
+    # user who somehow has no state row (shouldn't happen — the
+    # column has a NOT NULL DEFAULT '{}' constraint).
+    state = await _get_user_onboarding_state(request, user["id"])
+    if should_show_checklist(state):
+        return templates.TemplateResponse(
+            request=request,
+            name="onboarding.html",
+            context={
+                **(await _base_context(request, "onboarding")),
+                "onboarding_state": state,
+                "is_complete": is_checklist_complete(state),
+            },
+        )
+    return _Redirect(url="/agents", status_code=302)
+
+
+async def _get_user_onboarding_state(request: Request, user_id: str) -> dict[str, Any]:
+    """Read + parse the user's onboarding_state column.
+
+    Helper used by `GET /` and the settings page banner. The parse is
+    defensive: malformed JSON or a missing row both yield the empty
+    state (which `should_show_checklist` treats as a fresh user — the
+    correct response to "we don't know what this user's state is").
+    """
+    from hermes_orch.core.onboarding import empty_state, parse_state
+    row = await request.app.state.db.fetchone(
+        "SELECT onboarding_state FROM users WHERE id = ?", (user_id,)
+    )
+    if not row:
+        return empty_state()
+    return parse_state(row["onboarding_state"] or "{}")
 
 
 async def _load_agents_overview(db: Any) -> dict[str, Any]:
@@ -1870,6 +1926,18 @@ async def settings_page(request: Request) -> HTMLResponse:
         cleanup_last_result = job.last_run_result
     # v3.12.0: HTTPS view (drives the toggle / cert path / expiry badge)
     https = _https_view(cfg)
+    # v1.0.1 (§3.2 / §6.5): Onboarding state for the settings page banner.
+    # Read directly from the user's row — `parse_state` handles the
+    # default `{}` + malformed JSON cases.
+    onboarding_state: dict[str, Any] = {}
+    ctx_user = await current_user(request)
+    if ctx_user:
+        from hermes_orch.core.onboarding import parse_state
+        row = await request.app.state.db.fetchone(
+            "SELECT onboarding_state FROM users WHERE id = ?", (ctx_user["id"],)
+        )
+        if row:
+            onboarding_state = parse_state(row["onboarding_state"] or "{}")
     return templates.TemplateResponse(
         request=request,
         name="settings.html",
@@ -1896,6 +1964,10 @@ async def settings_page(request: Request) -> HTMLResponse:
             "https_expires_in": https.cert_expires_in_days,
             "https_cert_cn": https.cert_subject_cn,
             "https_sans": https.cert_sans,
+            # v1.0.1: onboarding state for the settings page banner
+            # (§6.5). Empty dict if user is unauthenticated; the
+            # template renders "false" for all signals in that case.
+            "onboarding_state": onboarding_state,
         },
     )
 

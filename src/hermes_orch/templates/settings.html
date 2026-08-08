@@ -463,6 +463,72 @@
     </form>
 </div>
 
+<!-- v1.0.1 (new-user-activation §3.2 / §6.5): Onboarding card.
+     Shows the current onboarding state for the logged-in user
+     (signals + skipped flag), with an admin-only "Reset onboarding
+     state" button. The reset clears all signals back to false,
+     so the user sees the 4-step checklist on next /. Used for
+     re-demoing the onboarding flow without doing a fresh install.
+     For non-admins the section is rendered read-only (no reset
+     button) — matches the spec's "admin-only" guard. -->
+<div id="onboarding" class="bg-white border rounded-lg p-6 shadow-sm mb-4 scroll-mt-20">
+    <h2 class="text-lg font-semibold text-gray-800 mb-3">Onboarding</h2>
+    <p class="text-sm text-gray-600 mb-4">
+        New users see a 4-step checklist on the landing page. Your
+        current state is shown below. Skip = "I know I have to do
+        these things, don't bug me." Reset = "show me the checklist
+        again" (useful for re-demoing).
+    </p>
+    <div class="space-y-1 text-sm" id="onboarding-state-display">
+        <div><span class="font-mono">password_set</span>: <span id="ob-password">{{ "true" if onboarding_state and onboarding_state.signals and onboarding_state.signals.password_set else "false" }}</span></div>
+        <div><span class="font-mono">llm_configured</span>: <span id="ob-llm">{{ "true" if onboarding_state and onboarding_state.signals and onboarding_state.signals.llm_configured else "false" }}</span></div>
+        <div><span class="font-mono">agent_connected</span>: <span id="ob-agent">{{ "true" if onboarding_state and onboarding_state.signals and onboarding_state.signals.agent_connected else "false" }}</span></div>
+        <div><span class="font-mono">first_task_completed</span>: <span id="ob-task">{{ "true" if onboarding_state and onboarding_state.signals and onboarding_state.signals.first_task_completed else "false" }}</span></div>
+        <div><span class="font-mono">first_task_attempted</span>: <span id="ob-attempted">{{ "true" if onboarding_state and onboarding_state.signals and onboarding_state.signals.first_task_attempted else "false" }}</span> <span class="text-gray-500">(informational — does not collapse the checklist)</span></div>
+        <div><span class="font-mono">skipped</span>: <span id="ob-skipped">{{ "true" if onboarding_state and onboarding_state.skipped else "false" }}</span></div>
+    </div>
+    <div class="mt-4 flex items-center gap-3">
+        <a href="/" class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 inline-block">
+            Go to landing
+        </a>
+        {% if current_user_ctx and current_user_ctx.role == 'admin' %}
+        <button type="button" id="onboarding-reset-btn" onclick="resetOnboarding()"
+            class="px-3 py-1.5 bg-gray-700 text-white rounded text-sm hover:bg-gray-800">
+            Reset onboarding state
+        </button>
+        <span id="onboarding-reset-status" class="text-sm text-gray-500"></span>
+        {% else %}
+        <span class="text-sm text-gray-500">Reset is admin-only</span>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+async function resetOnboarding() {
+    if (!confirm('Reset your onboarding state? All 4 signals will be cleared and the 4-step checklist will re-appear on the landing page. This is for re-demoing the onboarding flow.')) {
+        return;
+    }
+    const status = document.getElementById('onboarding-reset-status');
+    status.textContent = 'Resetting...';
+    try {
+        const r = await fetch('/api/me/onboarding/reset', {
+            method: 'POST',
+            credentials: 'same-origin',
+        });
+        if (r.ok) {
+            status.textContent = 'Reset. Go to landing to see the checklist.';
+            // Refresh after a moment so the user can copy the message
+            setTimeout(() => location.reload(), 800);
+        } else {
+            const data = await r.json().catch(() => ({}));
+            status.textContent = 'Failed: ' + (data.detail || r.status);
+        }
+    } catch (e) {
+        status.textContent = 'Network error: ' + e.message;
+    }
+}
+</script>
+
 <!-- v3.14.x: removed Evaluations / Guardrails / Integrations placeholder
      cards (2026-08-08). They linked to sidebar sub-items that have also
      been removed. When the features actually ship, add the card back
