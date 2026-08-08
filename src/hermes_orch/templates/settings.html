@@ -924,7 +924,8 @@ async function loadNetworkStatus() {
         document.getElementById('network-desired').textContent = data.desired;
         document.getElementById('network-lan-enabled').checked = data.lan_enabled;
         document.getElementById('network-lan-status').textContent = data.lan_enabled
-            ? ('enabled (' + data.active + ')') : 'disabled (loopback only)';
+            ? ('enabled (' + (data.lan_url ? new URL(data.lan_url).hostname : 'IP not detected') + ')')
+            : 'disabled (loopback only)';
         const lanUrlEl = document.getElementById('network-lan-url');
         if (data.lan_enabled && data.lan_url) {
             lanUrlEl.textContent = data.lan_url;

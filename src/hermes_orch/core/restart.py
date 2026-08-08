@@ -25,6 +25,7 @@ embedded), the user gets 501 and a copy-pasteable command.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,6 +107,51 @@ PROCESS_MODE_DIRECT = "direct"
 PROCESS_MODE_UNDETECTABLE = "undetectable"
 
 
+# Names of launchers that do NOT auto-respawn their child process.
+# When the orchestrator is started by one of these, an in-place `os.execv`
+# on the worker is unsafe: the launcher exits when the worker exits, and
+# the operator is left with a dead server. We must return
+# `undetectable` so the API can return 501 with a manual-restart
+# instruction.
+_NON_RESPAWNING_LAUNCHERS = frozenset({
+    "hermes-orch.exe",
+    "hermes-orch",
+})
+
+
+def _parent_process_name() -> str | None:
+    """Return the name of the parent process on Windows, or None on error.
+
+    Uses `tasklist` (always present on Windows) rather than psutil, so
+    the restart path has zero pip dependencies. The function is called
+    only on restart, so the ~50ms tasklist cost is acceptable.
+
+    Returns the bare image name (e.g. "hermes-orch.exe", "python.exe",
+    "powershell.exe"). Returns None if the lookup fails for any reason
+    (non-Windows, tasklist missing, parent already dead, etc.).
+    """
+    if sys.platform != "win32":
+        return None
+    ppid = os.getppid()
+    if ppid <= 0:
+        return None
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH", "/FI", f"PID eq {ppid}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    first_line = result.stdout.strip().splitlines()[0]
+    # CSV format: "Image Name","PID","Session Name","Session#","Mem Usage"
+    first_col = first_line.split(",", 1)[0].strip()
+    return first_col.strip('"') or None
+
+
 def detect_process_mode() -> str:
     """Detect how the orchestrator process was started.
 
@@ -114,26 +160,33 @@ def detect_process_mode() -> str:
                           will restart us on sys.exit(0))
       - "direct"         (no env var, but a normal Python process; safe to
                           os.execv in-place to re-exec ourselves)
-      - "undetectable"   (frozen / embedded / no reliable argv; we cannot
-                          safely restart ourselves; tell the operator to
-                          restart manually)
+      - "undetectable"   (frozen / embedded / parent launcher doesn't
+                          respawn / no reliable argv; we cannot safely
+                          restart ourselves; tell the operator to restart
+                          manually)
 
-    The supervised env var is the canonical signal. Without it we fall
-    back to a heuristic check: if `sys.executable` looks like a real
-    Python interpreter and `sys.argv[0]` is a Python script (not a
-    frozen exe), assume `direct`. Otherwise `undetectable`.
-
-    The heuristic is intentionally conservative — a false `direct` on a
-    frozen binary would cause an in-place exec that breaks the process.
-    Better to 501 with manual instructions than to crash a frozen
-    deployment.
+    Detection order (first match wins):
+      1. HERMES_SUPERVISED env var → supervised
+      2. Parent process is a known non-respawning launcher (e.g.
+         hermes-orch.exe PyInstaller wrapper) → undetectable
+      3. Looks like a normal Python process (sys.executable + sys.argv[0]
+         looks like a script, not a frozen binary) → direct
+      4. Otherwise → undetectable (frozen / embedded / weird)
     """
     # 1. Supervised mode: explicit env var (set by install scripts)
     supervised = os.environ.get("HERMES_SUPERVISED", "").strip().lower()
     if supervised in ("systemd", "nssm", "supervised", "true", "1", "yes"):
         return PROCESS_MODE_SUPERVISED
 
-    # 2. Direct / dev mode: normal Python process we can re-exec
+    # 2. Non-respawning parent launcher (hermes-orch.exe PyInstaller
+    #    wrapper). The launcher starts python as a child, but does not
+    #    respawn it on exit. An in-place os.execv on the worker would
+    #    leave the operator with a dead server. Force undetectable.
+    parent = _parent_process_name()
+    if parent and parent.lower() in _NON_RESPAWNING_LAUNCHERS:
+        return PROCESS_MODE_UNDETECTABLE
+
+    # 3. Direct / dev mode: normal Python process we can re-exec
     exe = sys.executable or ""
     argv0 = sys.argv[0] if sys.argv else ""
     # A frozen binary (PyInstaller) has exe ending in .exe AND argv0 == exe
@@ -145,7 +198,7 @@ def detect_process_mode() -> str:
     if not is_frozen and exe and argv0:
         return PROCESS_MODE_DIRECT
 
-    # 3. Undetectable: no env var, looks frozen / embedded
+    # 4. Undetectable: no env var, looks frozen / embedded / weird
     return PROCESS_MODE_UNDETECTABLE
 
 
@@ -168,5 +221,20 @@ def perform_restart() -> tuple[str, str]:
         os.execv(sys.executable, [sys.executable] + sys.argv)
         # execv does not return on success.
         raise RuntimeError("os.execv returned unexpectedly")
-    # Undetectable: caller maps to 501.
-    return mode, "Please restart the server manually (Ctrl+C and re-run `hermes-orch serve`)."
+    # Undetectable: caller maps to 501. Try to give the operator a
+    # specific, copy-pasteable command. If the parent is the
+    # hermes-orch.exe launcher, point them at the restart script
+    # (the standard way to bounce the server in this setup).
+    parent = _parent_process_name()
+    if parent and parent.lower() in _NON_RESPAWNING_LAUNCHERS:
+        message = (
+            f"Server is running under the {parent} launcher, which does not "
+            f"auto-respawn its child. Please run `restart-server.ps1` "
+            f"(in the project root) to apply the new bind_host."
+        )
+    else:
+        message = (
+            "Cannot restart automatically in this environment. "
+            "Please restart the server manually (Ctrl+C and re-run `hermes-orch serve`)."
+        )
+    return mode, message

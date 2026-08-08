@@ -22,6 +22,8 @@ from hermes_orch.auth.cookie import ROLE_ADMIN, current_user
 from hermes_orch.core.restart import (
     PROCESS_MODE_DIRECT,
     PROCESS_MODE_UNDETECTABLE,
+    _parent_process_name,
+    _NON_RESPAWNING_LAUNCHERS,
     detect_process_mode,
     is_restart_required,
     perform_restart,
@@ -72,19 +74,38 @@ async def restart_server(request: Request, response: Response) -> RestartOut:
     mode = detect_process_mode()
 
     if mode == PROCESS_MODE_UNDETECTABLE:
-        # Cannot safely restart ourselves. Tell the operator how.
-        response.status_code = 501
-        return RestartOut(
-            mode="manual",
-            message=(
+        # Cannot safely restart ourselves. Tell the operator how. The
+        # specific command depends on the parent launcher (if any).
+        parent = _parent_process_name()
+        if parent and parent.lower() in _NON_RESPAWNING_LAUNCHERS:
+            # hermes-orch.exe PyInstaller wrapper — use the restart script
+            message = (
+                f"Server is running under the {parent} launcher, which "
+                f"does not auto-respawn its child. Please run "
+                f"`restart-server.ps1` (in the project root) to apply "
+                f"the new bind_host."
+            )
+            restart_command = (
+                "cd <project root>\n"
+                ".\\scripts\\restart-server.ps1\n\n"
+                "The new bind_host will be applied on next start."
+            )
+        else:
+            # Generic / dev mode
+            message = (
                 "Cannot restart automatically in this environment. "
                 "Please restart the server manually."
-            ),
-            restart_command=(
+            )
+            restart_command = (
                 "Ctrl+C and re-run `hermes-orch serve` (or your service "
                 "manager's restart command). The new bind_host will be "
                 "applied on next start."
-            ),
+            )
+        response.status_code = 501
+        return RestartOut(
+            mode="manual",
+            message=message,
+            restart_command=restart_command,
         )
 
     # For supervised + direct, we respond BEFORE perform_restart()

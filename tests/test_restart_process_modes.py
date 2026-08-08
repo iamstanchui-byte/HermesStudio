@@ -4,7 +4,8 @@
 `detect_process_mode()` returns one of:
   - "supervised"     (HERMES_SUPERVISED=systemd|nssm env var; supervisor restarts us)
   - "direct"         (normal Python process; safe to os.execv in-place)
-  - "undetectable"   (frozen / embedded; cannot safely restart)
+  - "undetectable"   (frozen / embedded / parent launcher doesn't respawn;
+                      cannot safely restart)
 
 `perform_restart()` is harder to test in-process because supervised +
 direct both terminate the test runner. We test the classifier and
@@ -21,6 +22,7 @@ import pytest
 from hermes_orch.core.restart import (
     PROCESS_MODE_DIRECT,
     PROCESS_MODE_UNDETECTABLE,
+    _parent_process_name,
     detect_process_mode,
     perform_restart,
 )
@@ -95,3 +97,112 @@ def test_perform_restart_returns_undetectable_without_exiting(monkeypatch):
     mode, message = perform_restart()
     assert mode == "undetectable"
     assert "manually" in message.lower() or "restart" in message.lower()
+
+
+# ===== Parent-launcher detection (v1.0.1) =====
+#
+# The PyInstaller `hermes-orch.exe` launcher starts python as a child
+# but does NOT respawn it on exit. An in-place `os.execv` on the worker
+# in that scenario leaves the operator with a dead server. We must
+# return `undetectable` so the API returns 501 with a clear
+# `restart-server.ps1` instruction.
+
+
+def test_detect_undetectable_when_parent_is_hermes_orch_launcher(monkeypatch):
+    """Parent process is hermes-orch.exe -> undetectable, even if exe/argv
+    look like normal Python.
+
+    This is the exact scenario from the user setup:
+    `hermes-orch.exe serve --reload` launches `python.exe -m
+    hermes_orch.cli serve --reload`. The python child looks like a
+    "direct" process by the exe/argv heuristic, but the parent launcher
+    doesn't respawn it. The parent-launcher check fires first.
+    """
+    monkeypatch.delenv("HERMES_SUPERVISED", raising=False)
+    # Simulate the python child: looks like a normal Python process
+    monkeypatch.setattr(sys, "executable", "C:/path/to/python.exe")
+    monkeypatch.setattr(sys, "argv", ["-m", "hermes_orch.cli", "serve", "--reload"])
+    # But the parent is the launcher
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: "hermes-orch.exe",
+    )
+    assert detect_process_mode() == "undetectable"
+
+
+def test_detect_undetectable_when_parent_is_hermes_orch_no_ext(monkeypatch):
+    """Parent process is `hermes-orch` (no .exe, Linux/macOS) -> undetectable."""
+    monkeypatch.delenv("HERMES_SUPERVISED", raising=False)
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(sys, "argv", ["-m", "hermes_orch.cli", "serve"])
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: "hermes-orch",
+    )
+    assert detect_process_mode() == "undetectable"
+
+
+def test_detect_direct_when_parent_is_normal_python_parent(monkeypatch):
+    """Parent is `python.exe` (e.g. pytest -> python -m pytest) -> direct.
+
+    The parent-launcher check is a whitelist; a normal python parent
+    (e.g. the pytest runner, a test harness, a wrapper script) does
+    not block the direct-mode heuristic.
+    """
+    monkeypatch.delenv("HERMES_SUPERVISED", raising=False)
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: "python.exe",
+    )
+    # The "direct" path requires exe + argv0 to NOT look frozen. Mock
+    # sys.executable + sys.argv to look like a normal Python process.
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(sys, "argv", ["/usr/bin/python3", "some_script.py"])
+    assert detect_process_mode() == "direct"
+
+
+def test_parent_process_name_handles_missing_parent(monkeypatch):
+    """_parent_process_name returns None on any error (defensive).
+
+    We test the failure path: if `os.getppid()` returns 0 (no parent
+    on Windows for Session 0 service? no, even then), the function
+    returns None and the rest of the detection continues.
+    """
+    monkeypatch.setattr(os, "getppid", lambda: 0)
+    assert _parent_process_name() is None
+
+
+def test_parent_process_name_handles_tasklist_failure(monkeypatch):
+    """tasklist returns non-zero (parent already dead) -> None."""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        class R:
+            returncode = 1
+            stdout = ""
+        return R()
+
+    monkeypatch.setattr(os, "getppid", lambda: 12345)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _parent_process_name() is None
+
+
+def test_perform_restart_under_launcher_suggests_restart_script(monkeypatch):
+    """perform_restart() under the hermes-orch.exe launcher mentions
+    `restart-server.ps1` in its message (not the generic "manually").
+    """
+    monkeypatch.delenv("HERMES_SUPERVISED", raising=False)
+    monkeypatch.setattr(sys, "executable", "/path/to/python.exe")
+    monkeypatch.setattr(sys, "argv", ["-m", "hermes_orch.cli", "serve"])
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: "hermes-orch.exe",
+    )
+    mode, message = perform_restart()
+    assert mode == "undetectable"
+    assert "restart-server.ps1" in message, (
+        f"expected 'restart-server.ps1' in message, got: {message!r}"
+    )
+    assert "hermes-orch.exe" in message, (
+        f"expected launcher name in message, got: {message!r}"
+    )
