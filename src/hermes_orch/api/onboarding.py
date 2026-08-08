@@ -57,11 +57,20 @@ class ResetOut(BaseModel):
 
 @router.get("/me/onboarding", response_model=OnboardingOut)
 async def get_my_onboarding(request: Request) -> OnboardingOut:
-    """Return the current user's onboarding state + display hint."""
+    """Return the current user's onboarding state + display hint.
+
+    v1.0.1 hotfix (2026-08-09): returns the EFFECTIVE state (stored
+    JSON merged with truth-from-live-DB) so the UI never shows a
+    stale "still need to do X" line for a user who has already
+    done X. See `core/onboarding.py::get_effective_user_state`
+    for the merge rules.
+    """
     user = await current_user(request)
     if not user:
         raise HTTPException(401, "Not authenticated")
-    state = await onboarding_mod.get_user_state(request.app.state.db, user["id"])
+    state = await onboarding_mod.get_effective_user_state(
+        request.app.state.db, user["id"]
+    )
     return OnboardingOut(
         should_show_checklist=onboarding_mod.should_show_checklist(state),
         is_complete=onboarding_mod.is_checklist_complete(state),

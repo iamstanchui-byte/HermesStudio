@@ -348,3 +348,129 @@ async def get_user_state(db, user_id: str) -> dict[str, Any]:
     if not row:
         return empty_state()
     return parse_state(row["onboarding_state"] or "{}")
+
+
+# ===== Truth-based override (v1.0.1 hotfix 2026-08-09) =====
+#
+# The stored `onboarding_state` JSON column is a CACHE of what the
+# user has done. It can get stale:
+#   - Legacy user whose password pre-dates the onboarding column
+#     (auto-backfill at startup fills the column for `{}` defaults,
+#     but a user who set their password AFTER the backfill ran
+#     without the password_set signal hook being installed is stale)
+#   - Admin "Reset onboarding state" button (intentionally clears
+#     all signals so the user can re-demo the flow)
+#   - User did LLM/agent/first-task BEFORE the v1.0.1 signal hooks
+#     were added
+#
+# In all of these cases, the user's actual state (password_hash IS
+# NOT NULL, config.yaml has LLM, agents table has a fresh heartbeat,
+# tasks table has a completed row) is "more done" than the stored
+# signal says. We don't want to show a user a checklist saying
+# "you still need to do X" when X is already done.
+#
+# `get_effective_user_state` reads the stored state AND computes
+# truth from live data, then merges: a signal is `true` if EITHER
+# the stored value OR the truth says it's true. The merged state
+# is what the user sees (landing page, settings page, /api/me/onboarding).
+#
+# We do NOT write the merged state back to the DB. The stored
+# signal is allowed to lag the truth — the regular signal hooks
+# (auth/cookie.py::set_user_password, api/settings.py::LLM save,
+# api/enrollment.py::consume, core/healthcheck.py::record_healthcheck)
+# will catch up the next time the user does an action that flips
+# a signal.
+
+# Signal names that can be re-derived from live DB state. Keep this
+# list in sync with `backfill_state()` above.
+_TRUTH_OVERRIDABLE_SIGNALS = (
+    SIGNAL_PASSWORD_SET,
+    SIGNAL_LLM_CONFIGURED,
+    SIGNAL_AGENT_CONNECTED,
+    SIGNAL_FIRST_TASK_COMPLETED,
+    SIGNAL_FIRST_TASK_ATTEMPTED,
+)
+
+
+async def _truth_inputs(db) -> dict[str, bool]:
+    """Gather the 5 boolean inputs to `backfill_state` from live DB
+    state. Used by `get_effective_user_state` to compute the truth
+    state for a user.
+
+    Each call hits the DB / disk a few times. The 3 helpers on the
+    Database class (`_has_llm_configured`, `_task_completion_stats`,
+    `_has_recent_agent_heartbeat`) are the same ones the startup
+    backfill uses. We access them via duck-typing so this module
+    stays independent of `db.py`'s exact class hierarchy (the
+    production Database class has them, the test stub may not —
+    we fall back to all-false in that case).
+    """
+    # Default to "no live state" if the db doesn't expose the
+    # truth helpers. This keeps the function safe to call from
+    # test contexts that use a minimal Database stub.
+    has_llm = False
+    has_completed = False
+    has_any = False
+    has_agent = False
+    try:
+        # The 3 methods are underscore-prefixed on the Database
+        # class. They're "private" to db.py but we re-use them
+        # here to avoid duplicating the SQL / file-read logic.
+        has_llm = bool(await db._has_llm_configured())
+    except Exception:
+        pass
+    try:
+        has_completed, has_any = await db._task_completion_stats()
+    except Exception:
+        pass
+    try:
+        has_agent = bool(await db._has_recent_agent_heartbeat())
+    except Exception:
+        pass
+    return {
+        "has_llm_config": has_llm,
+        "has_completed_task": has_completed,
+        "has_any_task": has_any,
+        "has_connected_agent": has_agent,
+    }
+
+
+async def get_effective_user_state(db, user_id: str) -> dict[str, Any]:
+    """Read the user's onboarding state and merge in truth from live
+    DB state. A signal is `true` if EITHER the stored value OR the
+    truth says it's true.
+
+    The merged state is what the user sees in the UI. The stored
+    column is NOT updated by this function — the regular signal
+    hooks (auth/cookie.py, api/settings.py, api/enrollment.py,
+    core/healthcheck.py) catch the stored state up the next time
+    the user does an action that flips a signal.
+
+    Cost: 3 SQL queries + 1 config.yaml read per call. Acceptable
+    for the user-initiated landing/settings/API endpoints.
+    """
+    stored = await get_user_state(db, user_id)
+    # Read password_hash for the user (truth input #1).
+    user_row = await db.fetchone(
+        "SELECT password_hash FROM users WHERE id = ?", (user_id,)
+    )
+    has_password = bool(user_row and user_row.get("password_hash"))
+    truth = await _truth_inputs(db)
+    truth_state = backfill_state(
+        has_password=has_password,
+        has_llm_config=truth["has_llm_config"],
+        has_connected_agent=truth["has_connected_agent"],
+        has_completed_task=truth["has_completed_task"],
+        has_any_task=truth["has_any_task"],
+    )
+    # Merge: stored OR truth, per signal. Build a fresh state
+    # dict so we don't mutate the caller's data.
+    merged_signals = dict(stored.get("signals") or {})
+    for sig in _TRUTH_OVERRIDABLE_SIGNALS:
+        if truth_state.get("signals", {}).get(sig) is True:
+            merged_signals[sig] = True
+    # Preserve `skipped` and `completed_at` from the stored state
+    # (the user explicitly opted out / completion timestamp).
+    merged = dict(stored)
+    merged["signals"] = merged_signals
+    return merged

@@ -497,6 +497,7 @@ async def root(request: Request) -> HTMLResponse:
     auth middleware handles that — the request just continues here
     with current_user_ctx=None).
     """
+    from hermes_orch.core import onboarding as onboarding_mod
     from hermes_orch.core.onboarding import (
         is_checklist_complete,
         should_show_checklist,
@@ -508,31 +509,16 @@ async def root(request: Request) -> HTMLResponse:
     if not user:
         return _Redirect(url="/login", status_code=302)
 
-    # Read the user's onboarding state. Default to `{}` for a fresh
-    # user who somehow has no state row (shouldn't happen — the
-    # column has a NOT NULL DEFAULT '{}' constraint).
-    state = await _get_user_onboarding_state(request, user["id"])
-
-    # v1.0.1 hotfix (2026-08-09): override the stored `password_set`
-    # signal with truth. Legacy users whose password pre-dates the
-    # onboarding JSON column may have `password_set=false` in storage
-    # despite having a real password_hash — this is a stale state,
-    # not a real "needs to set password" state. The effective state
-    # is what's shown to the user + what's used for the collapse
-    # check. We don't write this back to the DB (the regular signal
-    # hooks will catch up next time the user changes their
-    # password or any other signal flips).
-    has_password = bool(user.get("password_hash"))
-    if has_password and state.get("signals", {}).get("password_set") is not True:
-        # Build a shallow copy so we don't mutate the parsed dict
-        # in place (caller may reuse it).
-        from hermes_orch.core.onboarding import empty_state
-        effective_state = dict(state)
-        effective_signals = dict(state.get("signals") or {})
-        effective_signals["password_set"] = True
-        effective_state["signals"] = effective_signals
-    else:
-        effective_state = state
+    # Read the user's effective onboarding state. The helper merges
+    # the stored JSON column with truth-from-live-DB (see
+    # core/onboarding.py::get_effective_user_state for the rationale).
+    # This handles the stale-state cases (admin reset, legacy user
+    # with password pre-dating the column, etc.) — a user who has
+    # actually done a step sees it as "Done" regardless of what the
+    # stored signal says.
+    effective_state = await onboarding_mod.get_effective_user_state(
+        request.app.state.db, user["id"]
+    )
 
     if should_show_checklist(effective_state):
         return templates.TemplateResponse(
@@ -1956,17 +1942,17 @@ async def settings_page(request: Request) -> HTMLResponse:
     # v3.12.0: HTTPS view (drives the toggle / cert path / expiry badge)
     https = _https_view(cfg)
     # v1.0.1 (§3.2 / §6.5): Onboarding state for the settings page banner.
-    # Read directly from the user's row — `parse_state` handles the
-    # default `{}` + malformed JSON cases.
+    # Read the effective onboarding state (merged with truth-from-DB
+    # so the Onboarding card on the settings page never shows a stale
+    # "still need to do X" line for a user who has already done X).
+    # Same helper as the landing page uses.
     onboarding_state: dict[str, Any] = {}
     ctx_user = await current_user(request)
     if ctx_user:
-        from hermes_orch.core.onboarding import parse_state
-        row = await request.app.state.db.fetchone(
-            "SELECT onboarding_state FROM users WHERE id = ?", (ctx_user["id"],)
+        from hermes_orch.core import onboarding as onboarding_mod
+        onboarding_state = await onboarding_mod.get_effective_user_state(
+            request.app.state.db, ctx_user["id"]
         )
-        if row:
-            onboarding_state = parse_state(row["onboarding_state"] or "{}")
     return templates.TemplateResponse(
         request=request,
         name="settings.html",

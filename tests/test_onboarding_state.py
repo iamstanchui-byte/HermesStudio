@@ -320,3 +320,125 @@ def test_success_signals_count_is_4():
 def test_attempted_is_not_a_success_signal():
     """Defensive: the informational signal must never be in SUCCESS_SIGNALS."""
     assert SIGNAL_FIRST_TASK_ATTEMPTED not in SUCCESS_SIGNALS
+
+
+# ===== get_effective_user_state (v1.0.1 hotfix 2026-08-09) =====
+#
+# Truth-merge: stored state OR live DB state, per signal. Tested
+# via a minimal mock db that implements only the methods
+# `get_effective_user_state` actually calls.
+
+import pytest
+
+from hermes_orch.core import onboarding as onboarding_mod
+
+
+class _MockDb:
+    """Minimal stub for the 3 truth methods + the user fetch.
+
+    The real `db.py::Database` class has these as private async
+    methods (`_has_llm_configured`, `_task_completion_stats`,
+    `_has_recent_agent_heartbeat`). We expose them here as
+    public async methods to keep the test independent of how
+    `_truth_inputs` calls them.
+    """
+    def __init__(self, *, llm: bool, completed: bool, any_task: bool, agent: bool):
+        self._llm = llm
+        self._completed = completed
+        self._any_task = any_task
+        self._agent = agent
+
+    async def _has_llm_configured(self) -> bool:
+        return self._llm
+
+    async def _task_completion_stats(self) -> tuple[bool, bool]:
+        return (self._completed, self._any_task)
+
+    async def _has_recent_agent_heartbeat(self) -> bool:
+        return self._agent
+
+    async def fetchone(self, sql: str, params: tuple = ()):
+        # The only fetchone we use is "SELECT password_hash FROM users WHERE id = ?"
+        # for the password truth check. We hardcode the user's id to "u1" and
+        # return a dict with a non-None password_hash so the truth is "has password".
+        if "password_hash" in sql:
+            return {"id": "u1", "password_hash": "hashed:fake"}
+        return None
+
+
+@pytest.mark.asyncio
+async def test_effective_state_all_truth_overrides_stored_false():
+    """All 4 success signals are true in live DB but stored false
+    (e.g. after admin reset). Effective state merges truth: ALL
+    signals flip to true → checklist collapses."""
+    db = _MockDb(llm=True, completed=True, any_task=True, agent=True)
+    eff = await onboarding_mod.get_effective_user_state(db, "u1")
+    assert eff["signals"][SIGNAL_PASSWORD_SET] is True
+    assert eff["signals"][SIGNAL_LLM_CONFIGURED] is True
+    assert eff["signals"][SIGNAL_AGENT_CONNECTED] is True
+    assert eff["signals"][SIGNAL_FIRST_TASK_COMPLETED] is True
+    # All 4 success signals true → checklist complete
+    assert onboarding_mod.is_checklist_complete(eff) is True
+
+
+@pytest.mark.asyncio
+async def test_effective_state_no_truth_keeps_stored_false():
+    """No live data: stored all-false + no truth → effective is all-false
+    for non-password signals. (Password comes from the fetchone in
+    the mock — we test that the truth path doesn't add signals that
+    aren't really there.)"""
+    db = _MockDb(llm=False, completed=False, any_task=False, agent=False)
+    eff = await onboarding_mod.get_effective_user_state(db, "u1")
+    # Mock returns a non-None password_hash, so password is True
+    assert eff["signals"][SIGNAL_PASSWORD_SET] is True
+    # But the other 3 remain false (no live data, no stored data)
+    assert eff["signals"][SIGNAL_LLM_CONFIGURED] is False
+    assert eff["signals"][SIGNAL_AGENT_CONNECTED] is False
+    assert eff["signals"][SIGNAL_FIRST_TASK_COMPLETED] is False
+
+
+@pytest.mark.asyncio
+async def test_effective_state_partial_truth_merges():
+    """User has LLM + agent + completed task, but no password.
+    Effective state: password_set=False (from truth: no password
+    OR stored says so), llm/agent/completed all True (from truth)."""
+    class _NoPasswordDb(_MockDb):
+        async def fetchone(self, sql: str, params: tuple = ()):
+            if "password_hash" in sql:
+                return {"id": "u1", "password_hash": None}
+            return None
+    db = _NoPasswordDb(llm=True, completed=True, any_task=True, agent=True)
+    eff = await onboarding_mod.get_effective_user_state(db, "u1")
+    assert eff["signals"][SIGNAL_PASSWORD_SET] is False
+    assert eff["signals"][SIGNAL_LLM_CONFIGURED] is True
+    assert eff["signals"][SIGNAL_AGENT_CONNECTED] is True
+    assert eff["signals"][SIGNAL_FIRST_TASK_COMPLETED] is True
+    # Checklist NOT complete (password is the missing one)
+    assert onboarding_mod.is_checklist_complete(eff) is False
+
+
+@pytest.mark.asyncio
+async def test_effective_state_preserves_skipped():
+    """If the user opted out via Skip, the merged state must still
+    have `skipped=true` even if all live signals are true. Skip
+    is explicit user intent; the truth-merge should not un-skip."""
+    db = _MockDb(llm=True, completed=True, any_task=True, agent=True)
+    stored = set_skipped(empty_state(), True)
+    # Mock the get_user_state path by injecting the stored state
+    # via the helper's internal call. We do that by monkey-patching
+    # `get_user_state` for this test.
+    original = onboarding_mod.get_user_state
+
+    async def _fake_get_user_state(_db, _uid):
+        return stored
+    onboarding_mod.get_user_state = _fake_get_user_state
+    try:
+        eff = await onboarding_mod.get_effective_user_state(db, "u1")
+    finally:
+        onboarding_mod.get_user_state = original
+    # Signals all true from truth
+    assert eff["signals"][SIGNAL_LLM_CONFIGURED] is True
+    # Skipped preserved
+    assert eff.get("skipped") is True
+    # should_show_checklist returns False for skipped users
+    assert onboarding_mod.should_show_checklist(eff) is False
