@@ -331,3 +331,104 @@ def test_has_non_respawning_launcher_ancestor_handles_empty_chain(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     from hermes_orch.core.restart import _has_non_respawning_launcher_ancestor
     assert _has_non_respawning_launcher_ancestor() is False
+
+
+# ===== _find_non_respawning_launcher_name (v1.0.1 Phase 1.4) =====
+#
+# Single helper used by BOTH `perform_restart()` and the API endpoint
+# to decide which 501 message to show. Checks the immediate parent
+# first (fast path), then walks the ancestor chain.
+
+
+def test_find_launcher_name_via_immediate_parent(monkeypatch):
+    """Immediate parent IS the launcher -> return that name (fast path)."""
+    from hermes_orch.core.restart import _find_non_respawning_launcher_name
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: "hermes-orch.exe",
+    )
+    # _get_process_ancestry should NOT be called when immediate parent matches
+    def fail_if_called():
+        raise AssertionError("should not call _get_process_ancestry when immediate parent matches")
+
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._get_process_ancestry",
+        fail_if_called,
+    )
+    assert _find_non_respawning_launcher_name() == "hermes-orch.exe"
+
+
+def test_find_launcher_name_via_ancestor_chain(monkeypatch):
+    """Immediate parent is uvicorn (not launcher); ancestor chain has it."""
+    from hermes_orch.core.restart import _find_non_respawning_launcher_name
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: "python.exe",
+    )
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._get_process_ancestry",
+        lambda: [
+            (4408, "python.exe"),
+            (16280, "python.exe"),
+            (2152, "hermes-orch.exe"),
+        ],
+    )
+    assert _find_non_respawning_launcher_name() == "hermes-orch.exe"
+
+
+def test_find_launcher_name_returns_none_when_no_launcher(monkeypatch):
+    """No launcher anywhere -> None (caller shows generic message)."""
+    from hermes_orch.core.restart import _find_non_respawning_launcher_name
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: "python.exe",
+    )
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._get_process_ancestry",
+        lambda: [(1234, "python.exe"), (5678, "python.exe")],
+    )
+    assert _find_non_respawning_launcher_name() is None
+
+
+def test_find_launcher_name_handles_missing_parent(monkeypatch):
+    """parent lookup returns None, no ancestry -> None (defensive)."""
+    from hermes_orch.core.restart import _find_non_respawning_launcher_name
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._get_process_ancestry",
+        lambda: [],
+    )
+    assert _find_non_respawning_launcher_name() is None
+
+
+def test_perform_restart_under_launcher_ancestor_uses_specific_message(monkeypatch):
+    """Launcher is in the ANCESTOR chain (not immediate parent) -> specific message.
+
+    This is the user's actual setup: hermes-orch.exe is 4 levels up
+    via uvicorn. The previous `perform_restart` only checked the
+    immediate parent so it fell through to the generic message.
+    """
+    monkeypatch.delenv("HERMES_SUPERVISED", raising=False)
+    monkeypatch.setattr(sys, "executable", "/path/to/python.exe")
+    monkeypatch.setattr(sys, "argv", ["-m", "hermes_orch.cli", "serve"])
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: "python.exe",  # uvicorn
+    )
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._get_process_ancestry",
+        lambda: [
+            (4408, "python.exe"),
+            (16280, "python.exe"),
+            (2152, "hermes-orch.exe"),
+        ],
+    )
+    mode, message = perform_restart()
+    assert mode == "undetectable"
+    assert "hermes-orch.exe" in message, f"expected launcher name, got: {message!r}"
+    assert "restart-server.ps1" in message, f"expected script hint, got: {message!r}"
+    # Must NOT be the generic message
+    assert "Ctrl+C" not in message, f"got generic message, expected specific: {message!r}"

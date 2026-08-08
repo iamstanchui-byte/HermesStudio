@@ -22,8 +22,7 @@ from hermes_orch.auth.cookie import ROLE_ADMIN, current_user
 from hermes_orch.core.restart import (
     PROCESS_MODE_DIRECT,
     PROCESS_MODE_UNDETECTABLE,
-    _parent_process_name,
-    _NON_RESPAWNING_LAUNCHERS,
+    _find_non_respawning_launcher_name,
     detect_process_mode,
     is_restart_required,
     perform_restart,
@@ -75,13 +74,17 @@ async def restart_server(request: Request, response: Response) -> RestartOut:
 
     if mode == PROCESS_MODE_UNDETECTABLE:
         # Cannot safely restart ourselves. Tell the operator how. The
-        # specific command depends on the parent launcher (if any).
-        parent = _parent_process_name()
-        if parent and parent.lower() in _NON_RESPAWNING_LAUNCHERS:
-            # hermes-orch.exe PyInstaller wrapper — use the restart script
+        # specific command depends on whether we're under a known
+        # non-respawning launcher (e.g. hermes-orch.exe) — checked via
+        # the immediate parent AND the ancestor chain, since the
+        # worker process typically has uvicorn (python.exe) as its
+        # immediate parent with hermes-orch.exe several levels up.
+        launcher_name = _find_non_respawning_launcher_name()
+        if launcher_name:
+            # hermes-orch.exe / hermes-orch launcher — use the restart script
             message = (
-                f"Server is running under the {parent} launcher, which "
-                f"does not auto-respawn its child. Please run "
+                f"Server is running under the {launcher_name} launcher, "
+                f"which does not auto-respawn its child. Please run "
                 f"`restart-server.ps1` (in the project root) to apply "
                 f"the new bind_host."
             )
@@ -91,7 +94,7 @@ async def restart_server(request: Request, response: Response) -> RestartOut:
                 "The new bind_host will be applied on next start."
             )
         else:
-            # Generic / dev mode
+            # Generic / dev mode (frozen binary, embedded, etc.)
             message = (
                 "Cannot restart automatically in this environment. "
                 "Please restart the server manually."

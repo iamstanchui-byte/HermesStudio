@@ -308,6 +308,28 @@ def detect_process_mode() -> str:
     return PROCESS_MODE_UNDETECTABLE
 
 
+def _find_non_respawning_launcher_name() -> str | None:
+    """Return the name of a non-respawning launcher in our process tree.
+
+    Walks both the immediate parent and the ancestor chain (up to 6
+    levels). Returns the first matching name found, or None if no
+    non-respawning launcher is in the tree.
+
+    Used by both `perform_restart()` and the API endpoint to decide
+    which restart instruction to give the operator. The worker process
+    typically has uvicorn (python.exe) as its immediate parent, with
+    hermes-orch.exe several levels up — so the immediate-parent check
+    alone misses the common case.
+    """
+    immediate = _parent_process_name()
+    if immediate and immediate.lower() in _NON_RESPAWNING_LAUNCHERS:
+        return immediate
+    for _pid, name in _get_process_ancestry():
+        if name.lower() in _NON_RESPAWNING_LAUNCHERS:
+            return name
+    return None
+
+
 def perform_restart() -> tuple[str, str]:
     """Actually restart the process. Returns (mode, message).
 
@@ -328,13 +350,12 @@ def perform_restart() -> tuple[str, str]:
         # execv does not return on success.
         raise RuntimeError("os.execv returned unexpectedly")
     # Undetectable: caller maps to 501. Try to give the operator a
-    # specific, copy-pasteable command. If the parent is the
-    # hermes-orch.exe launcher, point them at the restart script
-    # (the standard way to bounce the server in this setup).
-    parent = _parent_process_name()
-    if parent and parent.lower() in _NON_RESPAWNING_LAUNCHERS:
+    # specific, copy-pasteable command. If we're under a non-respawning
+    # launcher (e.g. hermes-orch.exe), point them at the restart script.
+    launcher = _find_non_respawning_launcher_name()
+    if launcher:
         message = (
-            f"Server is running under the {parent} launcher, which does not "
+            f"Server is running under the {launcher} launcher, which does not "
             f"auto-respawn its child. Please run `restart-server.ps1` "
             f"(in the project root) to apply the new bind_host."
         )
