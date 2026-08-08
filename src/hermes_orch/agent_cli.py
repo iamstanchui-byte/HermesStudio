@@ -1731,6 +1731,135 @@ def register(
     click.echo(f"    hermes-orch-agent apply-configs --config {cfg_path}")
 
 
+# v1.0.1 (new-user-activation §3.3): enrollment-token-based agent
+# setup. The operator issues a token from the dashboard, then runs
+# this command on the agent host. The token (single-use, 15-min TTL)
+# is consumed server-side and an hmac_secret is returned.
+@cli.command()
+@click.option("--server", required=True, help="Orchestrator URL (e.g. http://192.168.1.10:8765)")
+@click.option("--token", required=True, help="Enrollment token (starts with etok-; 15-min expiry)")
+@click.option("--agent-name", required=True, help="Name for this agent (e.g. win-01, linux-a-01). Per spec §3.3.2, this ALWAYS wins over the operator's requested_agent_name hint.")
+@click.option("--hostname", default=None, help="Reported hostname (default: socket.gethostname())")
+@click.option("--os-type", default=None, type=click.Choice(["windows", "linux"]), help="OS type (default: auto-detect)")
+@click.option("--config-file", default=None, help="Where to write wrapper-config.json (default: ~/.hermes-orchestrator/wrapper-config.json)")
+@click.option("--hmac-secret-file", default=None, help="Where to write the hmac_secret (default: ~/.hermes-orchestrator/.hmac-<agent_id>)")
+def enroll(
+    server: str,
+    token: str,
+    agent_name: str,
+    hostname: str | None,
+    os_type: str | None,
+    config_file: str | None,
+    hmac_secret_file: str | None,
+) -> None:
+    """Enroll this agent with the orchestrator using a one-time token.
+
+    v1.0.1 §3.3: simpler than `register` — no need to pre-declare an
+    agent_id. The server creates the agent row from the token +
+    agent-name + hostname + os_type. The returned hmac_secret is
+    stored locally and used for all subsequent HMAC-authenticated
+    heartbeats / task submissions.
+    """
+    import json as _json
+    import urllib.request
+    import urllib.error
+
+    # Auto-detect hostname + os_type if not provided
+    if not hostname:
+        import socket
+        hostname = socket.gethostname()
+    if not os_type:
+        import platform
+        os_type = "windows" if platform.system().lower().startswith("win") else "linux"
+
+    click.echo(f"Enrolling agent '{agent_name}' (host={hostname}, os={os_type}) ...")
+    click.echo(f"  Server: {server}")
+
+    # POST /api/agents/enroll — no auth, the token IS the credential
+    url = server.rstrip("/") + "/api/agents/enroll"
+    body = _json.dumps({
+        "token": token,
+        "agent_name": agent_name,
+        "hostname": hostname,
+        "os_type": os_type,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+    except urllib.error.HTTPError as e:
+        # The 410/404/500 cases: parse the JSON detail and surface
+        # a clean error message (no secret leakage, even if the
+        # server accidentally included one).
+        try:
+            err_body = _json.loads(e.read().decode("utf-8"))
+            detail = err_body.get("detail") or err_body.get("error") or str(e)
+        except Exception:
+            detail = str(e)
+        click.echo(f"  ERROR: {detail}", err=True)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        click.echo(f"  ERROR: cannot reach orchestrator at {server}: {e.reason}", err=True)
+        sys.exit(1)
+
+    data = _json.loads(resp.read().decode("utf-8"))
+    agent_id = data.get("agent_id") or ""
+    hmac_secret = data.get("hmac_secret") or ""
+    if not agent_id or not hmac_secret:
+        click.echo(f"  ERROR: server returned no agent_id / hmac_secret", err=True)
+        sys.exit(1)
+
+    click.echo(f"  OK. agent_id={agent_id}")
+
+    # Write hmac_secret to a chmod-0600 file
+    secret_path = Path(hmac_secret_file).expanduser() if hmac_secret_file else (
+        Path.home() / ".hermes-orchestrator" / f".hmac-{agent_id}"
+    )
+    secret_path.parent.mkdir(parents=True, exist_ok=True)
+    secret_path.write_text(hmac_secret, encoding="utf-8")
+    try:
+        os.chmod(secret_path, 0o600)
+    except Exception:
+        pass  # chmod may fail on Windows; the file is still user-only by default
+
+    click.echo(f"  HMAC secret written to {secret_path} (mode 0600)")
+
+    # Write (or merge into) wrapper-config.json so the user can
+    # immediately `hermes-orch-agent start` without re-typing
+    # --orchestrator / --agent-id / --hmac-secret-file.
+    cfg_path = Path(config_file).expanduser() if config_file else (
+        Path.home() / ".hermes-orchestrator" / "wrapper-config.json"
+    )
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {}
+    if cfg_path.exists():
+        try:
+            existing = _json.loads(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            existing = {}
+    existing.setdefault("orchestrator_url", server)
+    existing.setdefault("agent_id", agent_id)
+    existing["hmac_secret_file"] = str(secret_path)
+    cfg_path.write_text(
+        _json.dumps(existing, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    click.echo(f"  wrapper-config.json written to {cfg_path}")
+
+    if data.get("requested_name_used"):
+        click.echo(
+            "  Note: agent enrolled with the operator's requested_agent_name "
+            "(the agent's --agent-name matched the dashboard hint)."
+        )
+
+    click.echo("")
+    click.echo("  Next steps:")
+    click.echo("    1. (optional) edit wrapper-config.json to fix profile root paths")
+    click.echo("    2. start the daemon:  hermes-orch-agent start")
+
+
 @cli.command()
 @click.option(
     "--config",

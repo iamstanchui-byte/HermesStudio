@@ -28,6 +28,13 @@
             class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700">
         + Register agent
     </button>
+    {# v1.0.1 §3.3: enrollment-token-based add-host flow. The
+       secondary button next to the legacy "Register agent" entry
+       point — same goal, simpler UX (no pre-declared agent_id). #}
+    <button onclick="showEnrollModal()"
+            class="px-3 py-1.5 bg-white border border-blue-600 text-blue-600 rounded text-sm font-medium hover:bg-blue-50">
+        + Add agent host
+    </button>
 </div>
 
 {# v3.1.1: Register agent modal. Two states: (1) form with agent_id /
@@ -131,6 +138,92 @@
                         class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
                     Done (reload)
                 </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{# v1.0.1 (new-user-activation §3.3): enrollment token flow.
+   Unlike the "Register agent" modal above (which requires the
+   operator to pre-declare the agent_id and copy a one-time
+   secret to the agent host), this flow has the AGENT HOST
+   self-declare its name. The operator just generates a token
+   from the dashboard and pastes the install command on the
+   agent host. Simpler + the agent name lives where it
+   belongs (with the host, not the dashboard).
+#}
+<div id="enroll-modal" class="modal-overlay" style="display: none;"
+     onclick="if(event.target===this) closeEnrollModal()">
+    <div class="modal-card" style="width: 560px; max-width: 90vw;">
+        <div class="flex items-center justify-between mb-3">
+            <h2 class="text-lg font-semibold text-gray-800">Add agent host (v1.0.1)</h2>
+            <button onclick="closeEnrollModal()" class="text-gray-400 hover:text-gray-700 text-xl leading-none">&times;</button>
+        </div>
+
+        {# Form state — operator enters a label + optional name hint #}
+        <div id="enroll-modal-form">
+            <p class="text-xs text-gray-500 mb-3">
+                Generates a 15-minute, single-use enrollment token. The
+                <strong>install command</strong> below contains the token
+                inline (visible via <code>ps aux</code> briefly) — avoid
+                running on a shared host if that's a concern. The agent
+                host self-declares its own name (the name on the
+                agent-side overrides any hint you set here).
+            </p>
+            <form onsubmit="submitEnrollToken(event)" class="space-y-2">
+                <div>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">
+                        Label (optional, shown in dashboard only)
+                    </label>
+                    <input id="enroll-label" type="text" maxlength="200"
+                           placeholder="e.g. Home laptop, Office desktop"
+                           class="w-full border rounded px-2 py-1 text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-gray-700 mb-1">
+                        Hint name (optional, overridden by agent)
+                    </label>
+                    <input id="enroll-hint-name" type="text" maxlength="100"
+                           placeholder="e.g. win-01"
+                           class="w-full border rounded px-2 py-1 text-sm font-mono">
+                    <div class="text-xs text-gray-500 mt-1">
+                        The agent's own <code>--agent-name</code> flag wins
+                        on enrollment (per spec §3.3.2). This is a
+                        pre-fill hint only.
+                    </div>
+                </div>
+                <div class="flex items-center gap-2 pt-1">
+                    <button type="submit"
+                            class="px-4 py-2 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700">
+                        Generate install command
+                    </button>
+                    <span id="enroll-status" class="text-xs text-gray-500"></span>
+                </div>
+            </form>
+        </div>
+
+        {# Success state — show plaintext + copyable install command.
+           Token is shown ONCE here; if the user closes the modal they
+           have to generate a new token. #}
+        <div id="enroll-modal-success" style="display: none;">
+            <div class="text-xs text-gray-500 mb-1">
+                <strong>Token shown once.</strong> Expires in 15 min. Run this on the agent host:
+            </div>
+            <pre id="enroll-cmd"
+                 class="text-xs font-mono bg-gray-900 text-gray-100 p-3 rounded overflow-x-auto mb-3"></pre>
+            <div class="flex items-center gap-2">
+                <button type="button" onclick="copyEnrollCommand()"
+                        class="px-3 py-1.5 bg-gray-700 text-white rounded text-sm hover:bg-gray-800">
+                    Copy command
+                </button>
+                <button type="button" onclick="closeEnrollModal(true)"
+                        class="px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                    Done
+                </button>
+                <span id="enroll-copied" class="text-xs text-green-700" style="display: none;">Copied</span>
+            </div>
+            <div class="mt-3 text-xs text-gray-500">
+                Pending tokens: <span id="enroll-pending-count">…</span>
             </div>
         </div>
     </div>
@@ -1434,6 +1527,93 @@ function showRegisterModal() {
 function closeRegisterModal(reloadAfter) {
     document.getElementById('register-modal').style.display = 'none';
     if (reloadAfter) location.reload();
+}
+
+// v1.0.1 §3.3: enrollment-token flow. The dashboard generates a
+// one-time token + install command; the user pastes the install
+// command on the agent host. `agent_cli enroll` consumes the
+// token + creates the agent row from the agent's self-declared
+// `--agent-name` (per spec §3.3.2, the agent's name wins over
+// the operator's hint here).
+function showEnrollModal() {
+    document.getElementById('enroll-label').value = '';
+    document.getElementById('enroll-hint-name').value = '';
+    document.getElementById('enroll-modal-form').style.display = 'block';
+    document.getElementById('enroll-modal-success').style.display = 'none';
+    document.getElementById('enroll-status').textContent = '';
+    document.getElementById('enroll-copied').style.display = 'none';
+    document.getElementById('enroll-modal').style.display = 'flex';
+    setTimeout(() => document.getElementById('enroll-label').focus(), 50);
+}
+
+function closeEnrollModal(reloadAfter) {
+    document.getElementById('enroll-modal').style.display = 'none';
+    if (reloadAfter) location.reload();
+}
+
+async function submitEnrollToken(ev) {
+    ev.preventDefault();
+    const status = document.getElementById('enroll-status');
+    status.textContent = 'Generating...';
+    status.className = 'text-xs text-gray-500';
+    const label = document.getElementById('enroll-label').value.trim();
+    const hint = document.getElementById('enroll-hint-name').value.trim();
+    try {
+        const r = await fetch('/api/enrollment-tokens', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                label: label,
+                requested_agent_name: hint,
+            }),
+        });
+        if (!r.ok) {
+            const data = await r.json().catch(() => ({}));
+            status.textContent = 'Failed: ' + (data.detail || r.status);
+            status.className = 'text-xs text-red-600';
+            return;
+        }
+        const data = await r.json();
+        // Show the success state with the install command
+        document.getElementById('enroll-modal-form').style.display = 'none';
+        document.getElementById('enroll-modal-success').style.display = 'block';
+        document.getElementById('enroll-cmd').textContent = data.install_command;
+        // Refresh the pending-tokens count
+        refreshEnrollPendingCount();
+    } catch (e) {
+        status.textContent = 'Network error: ' + e.message;
+        status.className = 'text-xs text-red-600';
+    }
+}
+
+function copyEnrollCommand() {
+    const cmd = document.getElementById('enroll-cmd').textContent;
+    navigator.clipboard.writeText(cmd).then(() => {
+        const el = document.getElementById('enroll-copied');
+        el.style.display = 'inline';
+        setTimeout(() => el.style.display = 'none', 1500);
+    }).catch(() => {
+        // Fallback: select the text in the <pre> so the user can
+        // copy with Ctrl+C
+        const range = document.createRange();
+        range.selectNodeContents(document.getElementById('enroll-cmd'));
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+    });
+}
+
+async function refreshEnrollPendingCount() {
+    try {
+        const r = await fetch('/api/enrollment-tokens', {credentials: 'same-origin'});
+        if (!r.ok) return;
+        const items = await r.json();
+        const pending = items.filter(t => !t.is_used && !t.is_expired).length;
+        document.getElementById('enroll-pending-count').textContent = pending;
+    } catch (e) {
+        // Non-fatal — the count is just informational
+    }
 }
 
 async function submitRegisterAgent(ev) {
