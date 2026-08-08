@@ -79,13 +79,19 @@ class IssueTokenOut(BaseModel):
 
     `token` is the PLAINTEXT — shown to the operator ONCE in the UI
     and never stored. The DB row stores only `token_hash`.
+
+    `install_command` is the FULL one-liner the user pastes on the
+    agent host — it includes the `pip install` step (so a brand-new
+    host with no hermes-orchestrator package can run the command
+    directly), then the `hermes-orch-agent enroll` invocation. Per
+    spec §3.3, the one-liner is the contract: paste, run, done.
     """
     id: str
     token: str
     expires_at: str
     label: str
     requested_agent_name: str
-    install_command: str  # the one-liner the user pastes on the agent host
+    install_command: str  # the full one-liner (install + enroll)
 
 
 class TokenListItem(BaseModel):
@@ -162,7 +168,24 @@ async def post_enrollment_token(
     port = request.url.port or (443 if scheme == "https" else 80)
     # Default to bare host:port for non-standard ports; else just host
     server_url = f"{scheme}://{host}:{port}" if port not in (80, 443) else f"{scheme}://{host}"
+    # The install_command is the FULL one-liner: install the package
+    # (from GitHub — the package exposes both `hermes-orch` server
+    # and `hermes-orch-agent` wrapper CLIs via [project.scripts]),
+    # then run enroll. Per spec §3.3, this is the contract: paste
+    # the one line on a brand-new host, get an enrolled agent.
+    #
+    # We use `pip install` (system or active-venv, whichever the
+    # user has) and `git+https://...` for the install source. For
+    # most production setups the user will adapt this to their
+    # own pip / venv / pipx — but this is the safest default.
+    #
+    # On PowerShell the user needs `;` instead of `&&` between
+    # commands, but `hermes-orch-agent enroll ...` doesn't depend
+    # on the install success in a way the user would want to
+    # skip past, so `&&` is fine on bash/zsh and they're expected
+    # to translate for PowerShell.
     install_command = (
+        f'pip install "hermes-orchestrator @ git+https://github.com/iamstanchui-byte/HermesStudio.git" && '
         f"hermes-orch-agent enroll "
         f"--server {server_url} "
         f"--token {issued.plaintext} "

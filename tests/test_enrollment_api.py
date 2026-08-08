@@ -121,6 +121,37 @@ async def test_issue_token_admin_returns_plaintext_once(client):
 
 
 @pytest.mark.asyncio
+async def test_issue_token_install_command_includes_pip_install_step(client):
+    """v1.0.1 §3.3 contract: install_command is a full one-liner that
+    works on a brand-new host with no hermes-orch-agent installed.
+
+    The command must include BOTH:
+      1. The pip install step (so a fresh host gets the CLI)
+      2. The enroll step (consumes the token)
+    """
+    ac, _ = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await ac.post(
+        "/api/enrollment-tokens",
+        json={"label": "x", "requested_agent_name": "agent-1"},
+    )
+    cmd = r.json()["install_command"]
+    # The install step — pulls the package (server + agent CLI) from
+    # GitHub. Without this, the host has no `hermes-orch-agent` to run.
+    assert "pip install" in cmd, f"missing pip install: {cmd!r}"
+    assert "hermes-orchestrator" in cmd, f"missing package: {cmd!r}"
+    # The enroll step — consumes the token, creates the agent row.
+    assert "hermes-orch-agent enroll" in cmd
+    # The token is inline (per spec §3.3.1 the brief ps-leak is
+    # an accepted v1.0.1 limitation; we surface this in the UI
+    # tooltip, not in the command itself).
+    assert r.json()["token"] in cmd
+    # The two steps are chained so the enroll can't run before
+    # the install completes.
+    assert "&&" in cmd, f"install + enroll must be chained: {cmd!r}"
+
+
+@pytest.mark.asyncio
 async def test_issue_token_does_not_leak_plaintext_in_list(client):
     """The list endpoint must never include the plaintext."""
     ac, _ = client
