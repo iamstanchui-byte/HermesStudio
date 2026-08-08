@@ -63,6 +63,19 @@
                 host self-declares its own name (the name on the
                 agent-side overrides any hint you set here).
             </p>
+            {# v1.0.1 P3.3 polish: explicit prerequisites. The
+               install_command runs `pip install git+https://...`
+               which needs pip + git on PATH. Python 3.10+ is also
+               required (matches the project's requires-python).
+               Without these, the one-liner fails with
+               "command not found" or "git: command not found". #}
+            <div class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mb-3">
+                <strong>Prerequisites</strong> on the agent host:
+                <code>python 3.10+</code>, <code>pip</code>, <code>git</code>.
+                Linux/Mac: usually pre-installed. Windows: install Python
+                from python.org with "Add to PATH" checked, then run
+                <code>pip install git</code> if git isn't already on PATH.
+            </div>
             <form onsubmit="submitEnrollToken(event)" class="space-y-2">
                 <div>
                     <label class="block text-xs font-medium text-gray-700 mb-1">

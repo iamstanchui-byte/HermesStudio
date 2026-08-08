@@ -40,11 +40,75 @@ HEARTBEAT_FRESH_SECONDS = 60
 # idempotent set (no-op if already true).
 
 
-def _isoformat(ts: float | int | None) -> str | None:
-    """ISO 8601 UTC for a unix timestamp (or None)."""
-    if ts is None or ts == 0:
+def _isoformat(ts: float | int | str | None) -> str | None:
+    """Normalize a heartbeat timestamp to ISO 8601 UTC.
+
+    Handles both storage formats:
+      - Unix timestamp (int/float, possibly fractional)
+      - ISO 8601 string (the current DB default — `last_heartbeat_at`
+        is stored as a TIMESTAMP column, which aiosqlite surfaces
+        as ISO string)
+
+    The supervisor's healthcheck branch must handle both because
+    the agents table was created long before v1.0.1 and may have
+    legacy rows in either format (pre/post v3.x schema evolution).
+    """
+    if ts is None or ts == "" or ts == 0:
         return None
-    return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    if isinstance(ts, str):
+        # Already ISO — but we want to ensure it's a clean string,
+        # not a SQLite-style "YYYY-MM-DD HH:MM:SS.SSSSSS" with a
+        # space. Normalize by re-parsing + re-formatting.
+        try:
+            # SQLite returns "2026-08-08 23:56:05.720143" (space,
+            # no timezone) for TIMESTAMP columns. Replace space → T
+            # so datetime.fromisoformat can parse it.
+            s = ts.strip()
+            if " " in s and "T" not in s:
+                s = s.replace(" ", "T", 1)
+            # Handle "Z" suffix
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            return datetime.fromisoformat(s).isoformat()
+        except (ValueError, TypeError):
+            return ts  # best effort: return as-is
+    # int / float — treat as unix timestamp
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def _to_unix(ts: float | int | str | None) -> float | None:
+    """Convert a heartbeat timestamp to a unix float for comparison.
+
+    Returns None if unparseable. Used to decide whether the
+    heartbeat is "fresh" (within HEARTBEAT_FRESH_SECONDS).
+    """
+    if ts is None or ts == "" or ts == 0:
+        return None
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if isinstance(ts, str):
+        s = ts.strip()
+        if " " in s and "T" not in s:
+            s = s.replace(" ", "T", 1)
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+            # SQLite TIMESTAMP without explicit tz → assume UTC.
+            # The codebase convention is to store heartbeats as
+            # UTC (the wrapper's `datetime.utcnow().isoformat()`
+            # at write time). aiosqlite surfaces this as a string
+            # WITHOUT tz, which `fromisoformat` parses as naive
+            # — we treat naive as UTC.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 async def run_healthcheck(db) -> dict[str, Any]:
@@ -83,11 +147,15 @@ async def run_healthcheck(db) -> dict[str, Any]:
     fresh_count = 0
     for r in rows:
         hb_ts = r.get("last_heartbeat_at")
-        hb_iso = _isoformat(hb_ts) if hb_ts else None
-        # "fresh" = heartbeat within the last 60s AND status verified
-        # (or any non-pending status — the heartbeat is the canonical
-        # liveness signal, the status field is secondary)
-        is_fresh = bool(hb_ts and hb_ts > fresh_after)
+        hb_unix = _to_unix(hb_ts)
+        hb_iso = _isoformat(hb_ts)
+        # "fresh" = heartbeat within the last 60s. The agent's
+        # status field is secondary — a heartbeat IS the liveness
+        # signal. (We don't gate on `status = 'verified'` here
+        # because a freshly-enrolled agent has status='verifying'
+        # for a few seconds before its first auth'd heartbeat;
+        # we don't want the smoke test to fail on that race.)
+        is_fresh = bool(hb_unix and hb_unix > fresh_after)
         if is_fresh:
             fresh_count += 1
         per_agent.append({

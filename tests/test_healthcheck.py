@@ -233,3 +233,86 @@ async def test_record_healthcheck_completed_flips_completed_signal(fresh_db):
     state = parse_state(state_row["onboarding_state"])
     assert state["signals"][SIGNAL_FIRST_TASK_ATTEMPTED] is True
     assert state["signals"][SIGNAL_FIRST_TASK_COMPLETED] is True
+
+
+# ===== Heartbeat format compatibility (regression for live bug) =====
+#
+# The agents.last_heartbeat_at column is a TIMESTAMP — aiosqlite
+# surfaces it as an ISO 8601 string (sometimes with a space
+# separator instead of 'T', sometimes with a 'Z' suffix). The
+# healthcheck handler used to assume unix-timestamp int/float
+# and crashed on real-world data. The fix: _isoformat / _to_unix
+# helpers accept both formats. This test guards against the
+# crash coming back if someone "simplifies" the type hint.
+#
+# Caught during live end-to-end verify on 2026-08-08: the live
+# DB had heartbeats as "2026-08-08T23:56:05.720143+08:00" and
+# the healthcheck handler raised ValueError. The unit tests
+# passed because they used unix timestamps. This is the
+# "regression only caught at the boundary" lesson.
+
+@pytest.mark.asyncio
+async def test_healthcheck_handles_iso_string_heartbeats(fresh_db):
+    """Real-world heartbeats are ISO strings, not unix ints.
+
+    Per spec §3.5.1 the healthcheck must handle whatever format
+    the agents table gives us. Insert agents with ISO-format
+    heartbeats (matching what aiosqlite surfaces for TIMESTAMP
+    columns) and verify the healthcheck still works.
+    """
+    db = fresh_db
+    import time as _time
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    # ISO 8601 with explicit +00:00 offset (what the DB stores)
+    iso_utc = now.isoformat()  # e.g. "2026-08-08T15:58:02.170373+00:00"
+    iso_local = now.astimezone().isoformat()  # with local tz
+    iso_z = iso_utc.replace("+00:00", "Z")  # Z-suffix variant
+    # SQLite-style "YYYY-MM-DD HH:MM:SS" (no T, no tz) — what
+    # aiosqlite actually surfaces for TIMESTAMP columns
+    iso_space = iso_utc.replace("T", " ").replace("+00:00", "")
+    # Fresh = within HEARTBEAT_FRESH_SECONDS of now
+    await _insert_agent(db, "agent-utc", iso_utc)
+    await _insert_agent(db, "agent-local", iso_local)
+    await _insert_agent(db, "agent-z", iso_z)
+    await _insert_agent(db, "agent-space", iso_space)
+    # Stale = 2 minutes ago (way past HEARTBEAT_FRESH_SECONDS=60)
+    stale_ts = int(_time.time()) - 120
+    await _insert_agent(db, "agent-stale-int", stale_ts)
+
+    result = await run_healthcheck(db)
+    # 5 agents total
+    assert result["details"]["agent_count"] == 5
+    # 4 fresh (all the ISO variants), 1 stale
+    assert result["details"]["fresh_count"] == 4
+    # Each ISO-variant agent is_fresh=True
+    by_id = {a["agent_id"]: a for a in result["details"]["registered_agents"]}
+    for agent_id in ("agent-utc", "agent-local", "agent-z", "agent-space"):
+        assert by_id[agent_id]["is_fresh"] is True, (
+            f"{agent_id} should be fresh but was marked stale: {by_id[agent_id]}"
+        )
+    # The unix-int stale agent is_fresh=False
+    assert by_id["agent-stale-int"]["is_fresh"] is False
+    # All ISO timestamps in the response are normalized (no space)
+    for a in result["details"]["registered_agents"]:
+        assert " " not in a["last_heartbeat_at"], (
+            f"heartbeat should be normalized ISO, got: {a['last_heartbeat_at']!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_healthcheck_handles_null_and_empty_heartbeats(fresh_db):
+    """Defensive: NULL or empty heartbeats (newly-enrolled agents
+    that haven't sent their first heartbeat yet) must NOT crash
+    the handler and must be marked stale."""
+    db = fresh_db
+    await _insert_agent(db, "agent-null", None)
+    await _insert_agent(db, "agent-empty", 0)  # 0 is "never heartbeat-ed" in some stores
+    result = await run_healthcheck(db)
+    assert result["details"]["agent_count"] == 2
+    assert result["details"]["fresh_count"] == 0
+    by_id = {a["agent_id"]: a for a in result["details"]["registered_agents"]}
+    for agent_id in ("agent-null", "agent-empty"):
+        assert by_id[agent_id]["is_fresh"] is False
+        # NULL → last_heartbeat_at is None in the response
+        assert by_id[agent_id]["last_heartbeat_at"] is None

@@ -152,6 +152,58 @@ async def test_issue_token_install_command_includes_pip_install_step(client):
 
 
 @pytest.mark.asyncio
+async def test_issue_token_install_command_is_tag_pinned(client):
+    """v1.0.1 (P3.3 polish): the install URL is tag-pinned to v0.10.0
+    (matches pyproject.toml). New users get the v0.10.0 source, not
+    whatever happens to be on `main` today.
+
+    Perplexity review (2026-08-08): the repo URL
+    `github.com/iamstanchui-byte/HermesStudio` is correct (the project
+    is named `hermes-orchestrator` but lives inside the user's
+    umbrella repo). The tag pin is the safety belt: if the user
+    hasn't pushed the `v0.10.0` tag, this exact command will fail
+    with a clear pip error (NOT silently install a different version).
+    """
+    ac, _ = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await ac.post(
+        "/api/enrollment-tokens",
+        json={"label": "x", "requested_agent_name": "agent-1"},
+    )
+    cmd = r.json()["install_command"]
+    # The exact form: pip install "<name> @ git+<url>@<tag>"
+    assert "@v0.10.0" in cmd, f"install URL must be tag-pinned to v0.10.0: {cmd!r}"
+    # The @ pinning must come AFTER the .git suffix (not just
+    # somewhere in the URL).
+    assert ".git@v0.10.0" in cmd, (
+        f"tag pin must be after .git (PEP 508 git ref syntax): {cmd!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_issue_token_install_command_url_is_canonical(client):
+    """The repo URL is `iamstanchui-byte/HermesStudio` — the user's
+    umbrella repo. The project itself is named `hermes-orchestrator`
+    in pyproject.toml. This test guards against accidental URL drift
+    (e.g. pointing to a fork or wrong repo) — the URL must stay on
+    the canonical `HermesStudio` repo.
+    """
+    ac, _ = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await ac.post(
+        "/api/enrollment-tokens",
+        json={"label": "x", "requested_agent_name": "agent-1"},
+    )
+    cmd = r.json()["install_command"]
+    # Canonical URL — DO NOT change without coordinating with
+    # the user. Perplexity flagged this as a P0 verification
+    # point on 2026-08-08.
+    assert "iamstanchui-byte/HermesStudio" in cmd, (
+        f"URL must point to canonical repo HermesStudio: {cmd!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_issue_token_does_not_leak_plaintext_in_list(client):
     """The list endpoint must never include the plaintext."""
     ac, _ = client

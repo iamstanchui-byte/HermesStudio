@@ -174,3 +174,43 @@ async def test_agents_enroll_modal_still_renders(client):
     assert "enroll-hint-name" in body
     assert "showEnrollModal" in body
     assert "submitEnrollToken" in body
+
+
+# ===== Settings sidebar cleanup (v1.0.1 P4 polish) =====
+#
+# The "Models" sidebar sub-item was dead (pointed to
+# /settings#models but the corresponding card was removed
+# in v3.14.x). Re-adding it would confuse the operator (click
+# a sidebar item, jump to a non-existent section). Removed in
+# commit bb7d285. This test guards against re-adding.
+
+@pytest.mark.asyncio
+async def test_settings_sidebar_does_not_have_dead_models_item(client):
+    ac, _ = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await ac.get("/settings")
+    body = r.text
+    # The dead "Models" item must not be in the sidebar
+    assert 'href="/settings#models"' not in body, (
+        "Dead 'Models' sidebar sub-item must not be re-added "
+        "(the corresponding card was removed in v3.14.x)"
+    )
+    # The remaining items ARE there
+    assert 'href="/settings#network"' in body
+    assert 'href="/settings#onboarding"' in body
+
+
+@pytest.mark.asyncio
+async def test_enroll_modal_shows_prerequisites_hint(client):
+    """v1.0.1 (P3.3 polish): the enroll modal shows a prerequisite
+    hint (python 3.10+, pip, git) so the user doesn't hit
+    'command not found' on a minimal host."""
+    ac, _ = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await ac.get("/agents")
+    body = r.text
+    # The prerequisites box is visible
+    assert "Prerequisites" in body
+    assert "python 3.10" in body.lower() or "python 3.10+" in body
+    assert "git" in body.lower()
+    assert "pip" in body.lower()

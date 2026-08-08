@@ -185,7 +185,7 @@ async def post_enrollment_token(
     # skip past, so `&&` is fine on bash/zsh and they're expected
     # to translate for PowerShell.
     install_command = (
-        f'pip install "hermes-orchestrator @ git+https://github.com/iamstanchui-byte/HermesStudio.git" && '
+        f'pip install "hermes-orchestrator @ git+https://github.com/iamstanchui-byte/HermesStudio.git@v0.10.0" && '
         f"hermes-orch-agent enroll "
         f"--server {server_url} "
         f"--token {issued.plaintext} "

@@ -265,11 +265,15 @@ async function useStarter(name) {
         if (r.ok) {
             const data = await r.json();
             if (status) status.textContent = 'Cloned!';
-            // Redirect to the cloned workflow so the user can run it.
-            // (The workflow detail page handles "Run" for a project.)
-            setTimeout(() => {
-                window.location.href = `/workflows/${data.workflow_id}`;
-            }, 600);
+            // v1.0.1 §3.4 polish: redirect immediately with the
+            // starter name as a query param. The workflow detail
+            // page reads `?cloned_from=<name>` and shows a one-time
+            // banner ("Cloned from starter: Research brief"). This
+            // replaces the previous setTimeout(..., 600) hack which
+            // had a race condition (user might miss the "Cloned!"
+            // message depending on browser/render timing).
+            window.location.href =
+                `/workflows/${data.workflow_id}?cloned_from=${encodeURIComponent(name)}`;
         } else {
             const err = await r.json().catch(() => ({}));
             if (status) status.textContent = 'Failed: ' + (err.detail || r.status);
