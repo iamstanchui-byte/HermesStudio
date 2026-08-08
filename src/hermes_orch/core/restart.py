@@ -152,6 +152,82 @@ def _parent_process_name() -> str | None:
     return first_col.strip('"') or None
 
 
+def _get_process_ancestry(max_depth: int = 6) -> list[tuple[int, str]]:
+    """Return the parent-process chain for the current process, root first omitted.
+
+    One wmic call to read the full process table, then walk up from
+    `os.getppid()`. Each tuple is `(pid, name)`. The first element is
+    the immediate parent; the last is the highest ancestor found
+    (typically a system process or the original shell).
+
+    The chain is bounded by `max_depth` (default 6) to avoid runaway
+    walks if the process table is malformed. A `set` of seen PIDs also
+    breaks the chain on cycles.
+
+    Returns [] on any error (non-Windows, wmic missing, timeout, etc.)
+    so the caller can fall through to the next detection rule.
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        result = subprocess.run(
+            ["wmic", "process", "get", "Name,ProcessId,ParentProcessId", "/FORMAT:CSV"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    # CSV columns (in order): Node,Name,ParentProcessId,ProcessId
+    # Build a pid -> (name, parent_pid) table.
+    table: dict[int, tuple[str, int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(",")
+        if len(parts) < 4:
+            continue
+        try:
+            name = parts[1]
+            parent_pid = int(parts[2]) if parts[2] and parts[2].isdigit() else 0
+            pid = int(parts[3])
+        except (ValueError, IndexError):
+            continue
+        table[pid] = (name, parent_pid)
+
+    chain: list[tuple[int, str]] = []
+    current = os.getppid()
+    seen: set[int] = set()
+    for _ in range(max_depth):
+        if current <= 0 or current in seen:
+            break
+        seen.add(current)
+        info = table.get(current)
+        if info is None:
+            break
+        name, parent = info
+        chain.append((current, name))
+        current = parent
+    return chain
+
+
+def _has_non_respawning_launcher_ancestor() -> bool:
+    """True if any ancestor (up to 6 levels up) is a non-respawning launcher.
+
+    Used as a follow-up to `_parent_process_name()` because under the
+    hermes-orch.exe launcher the actual worker process has python.exe
+    (uvicorn) as its immediate parent, with hermes-orch.exe several
+    levels up. The immediate-parent check alone misses the launcher;
+    walking the chain catches it.
+    """
+    if sys.platform != "win32":
+        return False
+    for _pid, name in _get_process_ancestry():
+        if name.lower() in _NON_RESPAWNING_LAUNCHERS:
+            return True
+    return False
+
+
 def detect_process_mode() -> str:
     """Detect how the orchestrator process was started.
 
@@ -182,8 +258,16 @@ def detect_process_mode() -> str:
     #    wrapper). The launcher starts python as a child, but does not
     #    respawn it on exit. An in-place os.execv on the worker would
     #    leave the operator with a dead server. Force undetectable.
+    #
+    #    Two checks:
+    #    a. immediate parent — catches the case where the worker is
+    #       launched directly by hermes-orch.exe
+    #    b. any ancestor up the chain — catches the common production
+    #       case where uvicorn sits between the worker and the launcher
     parent = _parent_process_name()
     if parent and parent.lower() in _NON_RESPAWNING_LAUNCHERS:
+        return PROCESS_MODE_UNDETECTABLE
+    if _has_non_respawning_launcher_ancestor():
         return PROCESS_MODE_UNDETECTABLE
 
     # 3. Direct / dev mode: normal Python process we can re-exec

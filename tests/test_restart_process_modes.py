@@ -206,3 +206,91 @@ def test_perform_restart_under_launcher_suggests_restart_script(monkeypatch):
     assert "hermes-orch.exe" in message, (
         f"expected launcher name in message, got: {message!r}"
     )
+
+
+# ===== Ancestor chain detection (v1.0.1 Phase 1.2) =====
+#
+# In the production setup (`restart-server.ps1` -> `hermes-orch.exe` ->
+# python -> uvicorn -> worker), the worker's IMMEDIATE parent is
+# python.exe (uvicorn), not hermes-orch.exe. The launcher is several
+# levels up. The ancestor-chain check catches that case.
+
+
+def test_detect_undetectable_when_grandparent_is_launcher(monkeypatch):
+    """uvicorn is the immediate parent, hermes-orch.exe is the grandparent.
+
+    This is the actual user setup after `restart-server.ps1`:
+        worker (request handler) -> python (uvicorn master) -> python
+        (uvicorn wrapper) -> hermes-orch.exe (PyInstaller launcher)
+    The immediate parent is python.exe so the simple check misses it;
+    the ancestor walk must find hermes-orch.exe.
+    """
+    monkeypatch.delenv("HERMES_SUPERVISED", raising=False)
+    monkeypatch.setattr(sys, "executable", "/path/to/python.exe")
+    monkeypatch.setattr(sys, "argv", ["-m", "hermes_orch.cli", "serve"])
+    # Immediate parent is uvicorn, NOT the launcher
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: "python.exe",
+    )
+    # But the ancestor chain (up to 6 levels) has hermes-orch.exe
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._get_process_ancestry",
+        lambda: [
+            (4408, "python.exe"),       # uvicorn master
+            (16280, "python.exe"),      # uvicorn wrapper
+            (2152, "hermes-orch.exe"),  # PyInstaller launcher
+            (10836, "powershell.exe"),  # the script that started it all
+        ],
+    )
+    assert detect_process_mode() == "undetectable"
+
+
+def test_detect_direct_when_ancestor_chain_is_clean_python(monkeypatch):
+    """No launcher anywhere in the chain -> direct still works.
+
+    A pure-python dev setup (pytest, test harness, plain
+    `python -m hermes_orch.cli serve`) has python.exe (or pytest) all
+    the way up. Must NOT be misclassified as undetectable.
+    """
+    monkeypatch.delenv("HERMES_SUPERVISED", raising=False)
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(sys, "argv", ["/usr/bin/python3", "run.py"])
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._parent_process_name",
+        lambda: "python.exe",
+    )
+    monkeypatch.setattr(
+        "hermes_orch.core.restart._get_process_ancestry",
+        lambda: [
+            (1234, "python.exe"),
+            (5678, "python.exe"),
+        ],
+    )
+    assert detect_process_mode() == "direct"
+
+
+def test_get_process_ancestry_returns_empty_on_non_windows(monkeypatch):
+    """Non-Windows platforms return an empty chain (we only have Windows wmic)."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    from hermes_orch.core.restart import _get_process_ancestry
+    assert _get_process_ancestry() == []
+
+
+def test_get_process_ancestry_handles_wmic_failure(monkeypatch):
+    """wmic missing / failure -> empty chain -> falls through to next rule."""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        raise OSError("wmic not found")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    from hermes_orch.core.restart import _get_process_ancestry
+    assert _get_process_ancestry() == []
+
+
+def test_has_non_respawning_launcher_ancestor_handles_empty_chain(monkeypatch):
+    """Empty ancestry (e.g. wmic failed) -> no launcher found -> False."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    from hermes_orch.core.restart import _has_non_respawning_launcher_ancestor
+    assert _has_non_respawning_launcher_ancestor() is False
