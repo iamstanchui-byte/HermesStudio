@@ -30,6 +30,12 @@ CREATE TABLE IF NOT EXISTS agents (
     status TEXT NOT NULL DEFAULT 'verifying',
     last_heartbeat_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- v1.0.1 (new-user-activation §3.3): human-friendly name set at
+    -- enrollment time by the agent host (per §3.3.2, the agent's
+    -- self-declared `--agent-name` always wins over the operator's
+    -- `requested_agent_name` hint). Default '' for legacy agents
+    -- that enrolled before this column existed.
+    name TEXT NOT NULL DEFAULT '',
     -- Real HMAC shared secret (v1.6, 2026-07-29). Plaintext; needed
     -- server-side to recompute the signature for each request. NULL
     -- for agents that haven't been bootstrapped yet (legacy mode).
@@ -40,6 +46,27 @@ CREATE TABLE IF NOT EXISTS agents (
     -- See src/hermes_orch/auth/hmac.py for the verification scheme.
     hmac_secret TEXT
 );
+
+-- v1.0.1 (new-user-activation §3.3): Enrollment token table.
+-- Issued by the dashboard, consumed by `agent_cli enroll`. Plaintext
+-- tokens are NEVER stored — only the SHA-256 hash. Single-use, 15-min
+-- expiry by default. Atomic consume via a single UPDATE with WHERE
+-- `expires_at > now AND used_at IS NULL`.
+CREATE TABLE IF NOT EXISTS enrollment_tokens (
+    id                  TEXT PRIMARY KEY,
+    token_hash          TEXT NOT NULL UNIQUE,  -- SHA-256 of plaintext
+    created_by          TEXT NOT NULL,         -- user_id (operator who issued)
+    created_at          TEXT NOT NULL,         -- ISO 8601
+    expires_at          TEXT NOT NULL,         -- created_at + 15 min
+    used_at             TEXT,                  -- null until consumed
+    used_by_agent_id    TEXT,                  -- FK agents.id (set on consume)
+    requested_agent_name TEXT,                 -- UI pre-fill hint only (§3.3.2)
+    label               TEXT                   -- free-text label for UI
+);
+CREATE INDEX IF NOT EXISTS idx_enrollment_tokens_hash
+    ON enrollment_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_enrollment_tokens_expires
+    ON enrollment_tokens(expires_at);
 
 CREATE TABLE IF NOT EXISTS agent_profiles (
     id TEXT PRIMARY KEY,
@@ -561,6 +588,9 @@ MIGRATIONS = [
     # for each user. JSON object — see core/onboarding.py for the schema.
     # Idempotent: ALTER TABLE ADD COLUMN fails silently on re-run.
     "ALTER TABLE users ADD COLUMN onboarding_state TEXT NOT NULL DEFAULT '{}'",
+    # v1.0.1 §3.3: agents.name column (idempotent for pre-Phase-3
+    # installs that have the agents table without this column).
+    "ALTER TABLE agents ADD COLUMN name TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE agent_profiles ADD COLUMN llm_model_base_url TEXT",
     "ALTER TABLE agent_profiles ADD COLUMN llm_model_provider TEXT",
     # Per-profile MCP server list (wrapper-reported via heartbeat). Stored

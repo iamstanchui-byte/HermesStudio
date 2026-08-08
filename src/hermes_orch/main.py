@@ -399,6 +399,10 @@ def create_app() -> FastAPI:
     # landing page to decide between onboarding.html and /agents.
     from hermes_orch.api.onboarding import router as onboarding_router
     app.include_router(onboarding_router, prefix="/api", tags=["onboarding"])
+    # v1.0.1 §3.3: enrollment token endpoints
+    # (POST /api/enrollment-tokens, GET, DELETE, POST /api/agents/enroll)
+    from hermes_orch.api.enrollment import router as enrollment_router
+    app.include_router(enrollment_router, prefix="/api", tags=["enrollment"])
     # v3.5.0: admin user CRUD (list, create, reset password, disable/enable)
     app.include_router(users_router, prefix="/api/users", tags=["users"])
     # v3.9.0 (Phase 2 UX): per-user UI prefs + plan-presets lookup.
