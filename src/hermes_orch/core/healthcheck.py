@@ -111,6 +111,15 @@ def _to_unix(ts: float | int | str | None) -> float | None:
     return None
 
 
+# Public alias of `_to_unix` for callers outside this module
+# (notably `db.py::_has_recent_agent_heartbeat` which needs the
+# same "anything-to-unix" coercion to compare against a 5-min
+# window). Avoids the awkward "import private function" pattern.
+def to_unix_timestamp(ts: float | int | str | None) -> float | None:
+    """Public version of `_to_unix`. Same semantics."""
+    return _to_unix(ts)
+
+
 async def run_healthcheck(db) -> dict[str, Any]:
     """Run the server-side healthcheck. Returns the result dict.
 

@@ -1135,27 +1135,52 @@ class Database:
         Conservative — if the agent is offline at boot, we don't
         claim the user is "connected". The Phase 3 enrollment flow
         will set this signal properly going forward.
+
+        v1.0.1 hotfix (2026-08-09, two bugs in one method):
+          1. The previous SQL queried the WRONG TABLE
+             (`agent_profiles`) for the WRONG COLUMN
+             (`last_heartbeat`). The actual column is on
+             `agents` and is named `last_heartbeat_at`. The
+             `pragma_table_info` check returned 0 rows → method
+             always returned False. Result: users with active
+             agents had `agent_connected` stuck at `false` for
+             months. Nobody noticed because the stored signal
+             `signals.agent_connected` was being flipped correctly
+             by Phase 3's consume flow — the truth-merge path
+             (which uses THIS method) was never exercised.
+          2. Even after fixing the table+column, the SQL-side
+             comparison `WHERE last_heartbeat_at >= ?` would
+             break for ISO 8601 strings (aiosqlite surfaces
+             TIMESTAMP as ISO string; SQLite's coercion fails).
+             Fix: read all values, parse each in Python via the
+             same helpers `core/healthcheck.py` uses, check
+             the 5-min window. Cost: O(agents) per call — small
+             for any realistic fleet.
         """
         try:
-            # agent_profiles has a last_heartbeat column. If we don't
-            # have that column (pre-Phase 3 schema), just return False
-            # — the signal will be set correctly by Phase 3.
+            # v1.0.1 hotfix: column is on `agents`, not
+            # `agent_profiles`. Column name is `last_heartbeat_at`
+            # (with the `_at` suffix — matches the agents schema).
             async with self._conn.execute(
-                "SELECT name FROM pragma_table_info('agent_profiles') "
-                "WHERE name = 'last_heartbeat'"
+                "SELECT name FROM pragma_table_info('agents') "
+                "WHERE name = 'last_heartbeat_at'"
             ) as cur:
                 col = await cur.fetchone()
             if not col:
                 return False
-            import time as _time
-            five_min_ago = int(_time.time()) - 300
+            from hermes_orch.core.healthcheck import to_unix_timestamp
             async with self._conn.execute(
-                "SELECT COUNT(*) AS n FROM agent_profiles "
-                "WHERE last_heartbeat >= ?",
-                (five_min_ago,),
+                "SELECT last_heartbeat_at FROM agents"
             ) as cur:
-                row = await cur.fetchone()
-            return bool((row["n"] if row else 0) or 0)
+                rows = await cur.fetchall()
+            import time as _time
+            cutoff = _time.time() - 300
+            for r in rows:
+                hb = r["last_heartbeat_at"]
+                ts = to_unix_timestamp(hb)
+                if ts is not None and ts >= cutoff:
+                    return True
+            return False
         except Exception:
             return False
 

@@ -316,3 +316,99 @@ async def test_healthcheck_handles_null_and_empty_heartbeats(fresh_db):
         assert by_id[agent_id]["is_fresh"] is False
         # NULL → last_heartbeat_at is None in the response
         assert by_id[agent_id]["last_heartbeat_at"] is None
+
+
+# ===== _has_recent_agent_heartbeat (used by onboarding truth-merge) =====
+#
+# v1.0.1 hotfix (2026-08-09): the previous method queried the
+# WRONG TABLE (agent_profiles) for the WRONG COLUMN (last_heartbeat)
+# — the actual column is on `agents` and named `last_heartbeat_at`.
+# Net effect: the method always returned False, and any user with
+# active agents had `agent_connected` stuck at `false` regardless
+# of live data. The bug was only caught when truth-merge was
+# added (commit 8c6b2c9) and a real user with live agents tested
+# the page.
+
+@pytest.mark.asyncio
+async def test_has_recent_agent_heartbeat_fresh_iso_string(fresh_db):
+    """Regression: agent_connected truth-merge must return True
+    when an agent has a fresh heartbeat stored as ISO 8601 string
+    (the aiosqlite default for TIMESTAMP columns).
+
+    Two bugs in the previous implementation:
+    1. Queried `agent_profiles` for column `last_heartbeat` —
+       both wrong. The actual column is `agents.last_heartbeat_at`.
+    2. SQL comparison `last_heartbeat >= ?` would fail for ISO
+       strings (SQLite can't coerce "2026-08-09T..." to int).
+    """
+    db = fresh_db
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await _insert_agent(db, "agent-1", now_iso)
+    # Method under test
+    assert await db._has_recent_agent_heartbeat() is True, (
+        "Fresh ISO-string heartbeat should be detected as recent"
+    )
+
+
+@pytest.mark.asyncio
+async def test_has_recent_agent_heartbeat_fresh_unix_int(fresh_db):
+    """Counterpart: a fresh heartbeat stored as unix int (legacy
+    or programmatic insert) must also be detected."""
+    db = fresh_db
+    now_int = int(time.time())
+    await _insert_agent(db, "agent-1", now_int)
+    assert await db._has_recent_agent_heartbeat() is True
+
+
+@pytest.mark.asyncio
+async def test_has_recent_agent_heartbeat_stale_is_false(fresh_db):
+    """Stale heartbeat (older than 5 min) → False."""
+    db = fresh_db
+    from datetime import datetime, timezone, timedelta
+    stale_iso = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    await _insert_agent(db, "agent-1", stale_iso)
+    assert await db._has_recent_agent_heartbeat() is False
+
+
+@pytest.mark.asyncio
+async def test_has_recent_agent_heartbeat_null_is_false(fresh_db):
+    """No heartbeat (NULL) → False (conservative: we don't claim
+    the user is "connected" until an agent actually checks in)."""
+    db = fresh_db
+    await _insert_agent(db, "agent-1", None)
+    assert await db._has_recent_agent_heartbeat() is False
+
+
+@pytest.mark.asyncio
+async def test_has_recent_agent_heartbeat_no_agents_is_false(fresh_db):
+    """No agents at all → False (the conservative default)."""
+    db = fresh_db
+    assert await db._has_recent_agent_heartbeat() is False
+
+
+@pytest.mark.asyncio
+async def test_has_recent_agent_heartbeat_queries_agents_table_not_profiles(fresh_db):
+    """Defensive regression: the method must read from `agents`
+    (the table that has the heartbeat column), not `agent_profiles`.
+    Insert an agent_profiles row only (the agents table is empty
+    of non-NULL heartbeats); the method must still return False
+    because it doesn't read from agent_profiles at all."""
+    db = fresh_db
+    import secrets
+    # Need a stub agent row first (FK constraint).
+    await _insert_agent(db, "stub-agent", None)  # last_heartbeat_at=NULL
+    profile_id = "prof-" + secrets.token_hex(4)
+    await db.execute(
+        "INSERT INTO agent_profiles (id, agent_id, name, status) "
+        "VALUES (?, ?, 'p1', 'idle')",
+        (profile_id, "stub-agent"),
+    )
+    # agents table has the stub row with NULL heartbeat → method
+    # returns False regardless of what agent_profiles has. This
+    # proves the method doesn't accidentally read from
+    # agent_profiles.
+    assert await db._has_recent_agent_heartbeat() is False, (
+        "Method must query `agents` (not `agent_profiles`) — "
+        "the profile table doesn't have a last_heartbeat column"
+    )
