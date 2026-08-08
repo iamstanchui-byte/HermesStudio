@@ -722,8 +722,10 @@
     </script>
     {# v3.0: left sidebar (replaces the v2.x top nav). 5 top-level items
        matching the Perplexity-approved mockup, with Settings as an
-       expandable group containing secondary entries (Models, Evaluations,
-       Guardrails, Integrations, Token Usage, Schedules, History).
+       expandable group containing secondary entries (Models, Token Usage,
+       Schedules, History). 2026-08-08: removed Evaluations, Guardrails,
+       Integrations sub-items (placeholder "Planned for v3.2+" cards
+       removed from settings.html — no real implementation yet).
        Sidebar collapses to 64px icon-only mode via the chevron button;
        state persists in localStorage. #}
     <aside class="sidebar">
@@ -778,9 +780,12 @@
                 <a href="/schedules" class="sidebar-subitem {% if active_page == 'schedules' %}active{% endif %}">Schedules</a>
                 <a href="/history" class="sidebar-subitem {% if active_page == 'history' %}active{% endif %}">History</a>
                 <a href="/settings#models" class="sidebar-subitem">Models</a>
-                <a href="/settings#evaluations" class="sidebar-subitem">Evaluations</a>
-                <a href="/settings#guardrails" class="sidebar-subitem">Guardrails</a>
-                <a href="/settings#integrations" class="sidebar-subitem">Integrations</a>
+                <a href="/settings#network" class="sidebar-subitem">Network</a>
+                {# v3.14.x: removed Evaluations / Guardrails / Integrations
+                   sub-items (2026-08-08). The corresponding "Planned for
+                   v3.2+" placeholder cards were also removed from
+                   settings.html — no real implementation yet. Re-add
+                   here + a real card when the feature ships. #}
                 {# v3.5.1: Users sub-item moved out of a separate Admin
                    section and inlined under Settings. Only rendered for
                    admin users (the /admin/users route is also server-gated

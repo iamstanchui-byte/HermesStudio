@@ -21,6 +21,7 @@ import httpx
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
+from hermes_orch.auth.cookie import ROLE_ADMIN, current_user
 from hermes_orch.config import LLM_PROVIDERS, load_config, save_config_section
 
 router = APIRouter()
@@ -676,3 +677,156 @@ async def post_https_upload(
     from hermes_orch.config import load_config
     request.app.state.config = load_config()
     return _https_view(request.app.state.config)
+
+
+# ===== Network bind host (v1.0.1 new-user-activation §3.1) =====
+
+
+class BindHostIn(BaseModel):
+    """Body for POST /api/settings/bind-host.
+
+    `lan_enabled=true`  -> server will rebind to 0.0.0.0 after restart
+                            (LAN + loopback, exposes dashboard to LAN)
+    `lan_enabled=false` -> server will rebind to 127.0.0.1 after restart
+                            (loopback only, secure default)
+
+    The bind change requires a server restart (a live socket listener
+    cannot rebind without one). The endpoint sets the `restart-required`
+    flag on every write, regardless of whether the new value differs
+    from the old one. Operator then triggers restart via
+    POST /api/server/restart.
+    """
+
+    lan_enabled: bool
+
+
+class BindHostOut(BaseModel):
+    """Response for GET /api/settings/bind-host.
+
+    `active` is what the running server is currently bound to (read from
+    the in-memory config that was loaded at startup — only changes on
+    restart). `desired` is what the operator has asked for; if it
+    differs from `active`, the operator needs to restart to apply.
+
+    `restart_required` is true when the desired and active binds
+    differ. `restart_reason` is a human-readable string explaining
+    why a restart is needed (e.g. "bind_host: 127.0.0.1 -> 0.0.0.0").
+
+    `lan_enabled` is a convenience derived from `active == "0.0.0.0"`.
+    """
+
+    active: str
+    desired: str
+    lan_enabled: bool
+    restart_required: bool
+    restart_reason: str = ""
+    lan_url: str = ""  # auto-detected LAN IP for agent host enrollment; empty if loopback
+
+
+def _detect_lan_url(bind_host: str, port: int, scheme: str = "http") -> str:
+    """Return a LAN URL the operator can give to agent hosts.
+
+    Empty if `bind_host` is not 0.0.0.0 (LAN access is disabled).
+    Otherwise resolve the local IP via the routing table (UDP socket
+    to a public IP, read the local endpoint, never sends a packet).
+    Returns "" if the lookup fails (e.g. no network).
+    """
+    if bind_host != "0.0.0.0":
+        return ""
+    try:
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+        return f"{scheme}://{lan_ip}:{port}"
+    except OSError:
+        return ""
+
+
+@router.get("/bind-host", response_model=BindHostOut)
+async def get_bind_host(request: Request) -> BindHostOut:
+    """Read the current + desired bind host + restart-required flag.
+
+    The `active` field is the live bind (read from in-memory cfg). The
+    `desired` field is the operator's pending choice (read from disk
+    if it differs from active, or equals active otherwise).
+
+    The "desired differs from active" case only happens after a write
+    that hasn't been applied yet. Until the operator restarts, both
+    fields are returned so the UI can show "Active: X, Pending: Y,
+    Restart to apply."
+    """
+    from hermes_orch.config import find_config_path
+    from hermes_orch.core.restart import is_restart_required
+
+    # Active bind: read from in-memory config (loaded at startup)
+    cfg = request.app.state.config
+    active = cfg["orchestrator"].get("bind_host") or "127.0.0.1"
+
+    # Desired bind: read from disk config (operator's latest write)
+    desired = active
+    cfg_path = find_config_path()
+    if cfg_path and cfg_path.exists():
+        try:
+            import yaml
+
+            with open(cfg_path, encoding="utf-8") as f:
+                file_cfg = yaml.safe_load(f) or {}
+            desired = file_cfg.get("orchestrator", {}).get("bind_host") or active
+        except OSError:
+            desired = active
+
+    restart = is_restart_required()
+    port = cfg["orchestrator"].get("port") or 8765
+    scheme = "https" if (cfg.get("https") or {}).get("enabled") else "http"
+
+    return BindHostOut(
+        active=active,
+        desired=desired,
+        lan_enabled=(active == "0.0.0.0"),
+        restart_required=restart.required,
+        restart_reason=restart.reason,
+        lan_url=_detect_lan_url(active, port, scheme),
+    )
+
+
+@router.post("/bind-host", response_model=BindHostOut)
+async def post_bind_host(body: BindHostIn, request: Request) -> BindHostOut:
+    """Set the desired bind host. Always requires a server restart.
+
+    The write does NOT take effect immediately (the live socket cannot
+    rebind). The endpoint sets the `restart-required` flag and returns
+    the same shape as GET so the UI can show the "Restart required"
+    banner. The operator triggers restart via /api/server/restart.
+
+    Admin-only: changing the bind host exposes the dashboard to the
+    LAN (or removes it). This is a security-sensitive operation
+    (matches the /api/server/restart policy: only admins can affect
+    server lifecycle + LAN exposure).
+    """
+    user = await current_user(request)
+    if not user or user.get("role") != ROLE_ADMIN:
+        raise HTTPException(403, "Admin-only endpoint")
+
+    from hermes_orch.core.restart import write_restart_required
+
+    desired_bind = "0.0.0.0" if body.lan_enabled else "127.0.0.1"
+    current_active = request.app.state.config["orchestrator"].get("bind_host") or "127.0.0.1"
+
+    # Persist the desired bind to disk. This is the value the NEXT
+    # server start will read via `load_config()`.
+    save_config_section("orchestrator", {"bind_host": desired_bind})
+
+    # Always set the restart-required flag — even if desired == active,
+    # the operator may want a restart for unrelated reasons (e.g.
+    # they edited the config file by hand). Idempotent.
+    write_restart_required(
+        f"bind_host: {current_active} -> {desired_bind} "
+        f"(lan_enabled={body.lan_enabled}); restart to apply"
+    )
+
+    # Return the new desired state. The active field is unchanged
+    # (we don't know what the live bind will be after the next start
+    # until the operator actually triggers the restart).
+    return await get_bind_host(request)

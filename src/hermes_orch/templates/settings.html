@@ -398,49 +398,75 @@
     </form>
 </div>
 
-<!-- v3.1.0: Placeholder cards for sidebar sub-items /settings#evaluations,
-     /settings#guardrails, /settings#integrations. Each gets its own
-     `id` so the browser scrolls to the right place when the user
-     clicks the sub-item. The actual feature bodies are planned for
-     v3.2+ (post-launch). Keeping a real (small) card instead of a
-     blank anchor means the user lands on something visible —
-     "Coming in v3.2" with the planned scope. `scroll-mt-20` leaves
-     80px of breathing room above the card after the jump. -->
-<div id="evaluations" class="bg-white border rounded-lg p-6 shadow-sm mb-4 scroll-mt-20">
-    <h2 class="text-lg font-semibold text-gray-800 mb-2">Evaluations</h2>
-    <p class="text-sm text-gray-500 mb-3">Planned for v3.2+.</p>
-    <p class="text-sm text-gray-500">
-        Run a curated set of golden projects against your current LLM
-        config to compare cost/quality across models. Each eval
-        produces a scorecard (pass rate, cost per project, P95 latency,
-        quality rubric) and is saved to history so you can spot
-        regressions before flipping a model into production.
+<!-- v1.0.1 (new-user-activation §3.1): Network bind host card.
+     The dashboard can be bound to loopback only (default, secure) or
+     0.0.0.0 (LAN). A change requires a server restart (a live socket
+     listener cannot rebind). The UI presents the toggle, the
+     "Apply changes" button (persists + sets the restart-required
+     flag), and the "Restart server" button (triggers /api/server/restart
+     which handles the supervised / direct / undetectable modes
+     per spec §3.1.2). Before restart, the UI shows a warning if
+     any tasks are currently running, per spec §3.7. -->
+<div id="network" class="bg-white border rounded-lg p-6 shadow-sm mb-4 scroll-mt-20">
+    <h2 class="text-lg font-semibold text-gray-800 mb-3">Network access</h2>
+    <p class="text-sm text-gray-500 mb-4">
+        Default is loopback-only (127.0.0.1) — the dashboard is reachable
+        from this host but not from the network. Enable LAN access to allow
+        agent hosts on other machines to reach the orchestrator. <strong>Changing
+        this requires a server restart.</strong>
     </p>
+
+    <div id="network-status-banner" class="hidden p-3 mb-4 rounded text-sm border"></div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2 text-sm mb-4">
+        <div>
+            <span class="text-gray-500">Active bind:</span>
+            <span class="font-mono font-semibold" id="network-active">loading...</span>
+        </div>
+        <div>
+            <span class="text-gray-500">Desired bind:</span>
+            <span class="font-mono font-semibold" id="network-desired">loading...</span>
+        </div>
+        <div>
+            <span class="text-gray-500">LAN status:</span>
+            <span class="font-mono" id="network-lan-status">loading...</span>
+        </div>
+        <div>
+            <span class="text-gray-500">Agent-host URL:</span>
+            <span class="font-mono text-xs" id="network-lan-url">loading...</span>
+        </div>
+    </div>
+
+    <form id="network-form" class="space-y-3">
+        <label class="flex items-center gap-2 cursor-pointer">
+            <input id="network-lan-enabled" type="checkbox" class="rounded">
+            <span class="text-sm">Allow LAN access (bind to 0.0.0.0)</span>
+        </label>
+
+        <div class="flex items-center gap-2 pt-2 flex-wrap">
+            <button type="button" id="network-apply-btn" onclick="applyNetwork()"
+                class="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                Apply changes
+            </button>
+            <button type="button" id="network-restart-btn" onclick="restartServer()" disabled
+                class="px-4 py-2 bg-gray-700 text-white rounded text-sm hover:bg-gray-800 disabled:opacity-40 disabled:cursor-not-allowed"
+                title="Available once Apply changes sets the restart-required flag">
+                Restart server
+            </button>
+            <span id="network-status" class="text-sm text-gray-500"></span>
+        </div>
+
+        <div id="network-restart-warning" class="hidden p-3 rounded border border-yellow-300 bg-yellow-50 text-yellow-900 text-sm">
+            <strong>Heads up:</strong>
+            <span id="network-restart-warning-text">N task(s) are currently running. Restarting now will interrupt them.</span>
+        </div>
+    </form>
 </div>
 
-<div id="guardrails" class="bg-white border rounded-lg p-6 shadow-sm mb-4 scroll-mt-20">
-    <h2 class="text-lg font-semibold text-gray-800 mb-2">Guardrails</h2>
-    <p class="text-sm text-gray-500 mb-3">Planned for v3.2+.</p>
-    <p class="text-sm text-gray-500">
-        Per-profile policy hooks that run before/after each task
-        dispatch: max tokens per call, deny-list of tool names, output
-        redaction (e.g. mask API keys before persisting to disk),
-        budget cap per day. Block + audit when a guardrail trips so
-        you can investigate later.
-    </p>
-</div>
-
-<div id="integrations" class="bg-white border rounded-lg p-6 shadow-sm mb-4 scroll-mt-20">
-    <h2 class="text-lg font-semibold text-gray-800 mb-2">Integrations</h2>
-    <p class="text-sm text-gray-500 mb-3">Planned for v3.2+.</p>
-    <p class="text-sm text-gray-500">
-        Connect external systems: Slack / Discord for notifications
-        beyond Telegram, GitHub / GitLab for auto-PR from workflow
-        output, S3 / GCS / SMB for share-folder alternatives. Each
-        integration stores its credentials the same way the Telegram
-        bot does (encrypted at rest, last-4 shown in the UI).
-    </p>
-</div>
+<!-- v3.14.x: removed Evaluations / Guardrails / Integrations placeholder
+     cards (2026-08-08). They linked to sidebar sub-items that have also
+     been removed. When the features actually ship, add the card back
+     here + the corresponding sub-item in base.html. -->
 
 <script>
 const PROVIDERS = {{ providers | tojson }};
@@ -883,6 +909,147 @@ async function uploadHttpsCert() {
     });
     certInput.click();
 }
+
+// ===== Network bind host (v1.0.1 new-user-activation §3.1) =====
+
+async function loadNetworkStatus() {
+    try {
+        const r = await fetch('/api/settings/bind-host', { credentials: 'same-origin' });
+        const data = await r.json();
+        if (!r.ok) {
+            document.getElementById('network-status').textContent = 'Failed to load: ' + (data.detail || r.status);
+            return;
+        }
+        document.getElementById('network-active').textContent = data.active + ':' + (location.port || '8765');
+        document.getElementById('network-desired').textContent = data.desired;
+        document.getElementById('network-lan-enabled').checked = data.lan_enabled;
+        document.getElementById('network-lan-status').textContent = data.lan_enabled
+            ? ('enabled (' + data.active + ')') : 'disabled (loopback only)';
+        const lanUrlEl = document.getElementById('network-lan-url');
+        if (data.lan_enabled && data.lan_url) {
+            lanUrlEl.textContent = data.lan_url;
+            lanUrlEl.title = 'Use this URL when running hermes-orch-agent enroll on an agent host';
+        } else {
+            lanUrlEl.textContent = '(LAN disabled)';
+        }
+        // Show pending-restart banner if active != desired
+        const banner = document.getElementById('network-status-banner');
+        const restartBtn = document.getElementById('network-restart-btn');
+        if (data.restart_required) {
+            banner.className = 'p-3 mb-4 rounded text-sm border border-amber-300 bg-amber-50 text-amber-900';
+            banner.textContent = 'Restart required to apply network-access changes. ' +
+                (data.restart_reason ? '(' + data.restart_reason + ')' : '');
+            banner.classList.remove('hidden');
+            restartBtn.disabled = false;
+            // Pre-check running tasks per spec §3.7
+            checkRunningTasksBeforeRestart();
+        } else {
+            banner.classList.add('hidden');
+            restartBtn.disabled = true;
+            document.getElementById('network-restart-warning').classList.add('hidden');
+        }
+    } catch (err) {
+        document.getElementById('network-status').textContent = 'Network error: ' + err.message;
+    }
+}
+
+async function checkRunningTasksBeforeRestart() {
+    // Per spec §3.7: show "N task(s) are currently running" warning if any.
+    try {
+        const r = await fetch('/api/tasks/?status=running', { credentials: 'same-origin' });
+        const data = await r.json();
+        // data may be {tasks: [...]} or just a list — be defensive
+        const tasks = Array.isArray(data) ? data : (data.tasks || data.items || []);
+        const n = tasks.length;
+        const warn = document.getElementById('network-restart-warning');
+        if (n > 0) {
+            document.getElementById('network-restart-warning-text').textContent =
+                n + ' task(s) are currently running. Restarting now will interrupt them.';
+            warn.classList.remove('hidden');
+        } else {
+            warn.classList.add('hidden');
+        }
+    } catch (err) {
+        // Best-effort. Don't block the restart if the count check fails.
+    }
+}
+
+async function applyNetwork() {
+    const status = document.getElementById('network-status');
+    const lanEnabled = document.getElementById('network-lan-enabled').checked;
+    status.textContent = 'Saving...';
+    status.className = 'text-sm text-gray-500';
+    try {
+        const r = await fetch('/api/settings/bind-host', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            credentials: 'same-origin',
+            body: JSON.stringify({ lan_enabled: lanEnabled }),
+        });
+        const data = await r.json();
+        if (r.ok) {
+            status.textContent = 'Saved. Click "Restart server" to apply.';
+            status.className = 'text-sm text-green-600';
+            await loadNetworkStatus();
+        } else {
+            status.textContent = 'Failed: ' + (data.detail || r.status);
+            status.className = 'text-sm text-red-600';
+        }
+    } catch (err) {
+        status.textContent = 'Network error: ' + err.message;
+        status.className = 'text-sm text-red-600';
+    }
+}
+
+async function restartServer() {
+    // Confirm if the running-task warning is visible
+    const warn = document.getElementById('network-restart-warning');
+    if (!warn.classList.contains('hidden')) {
+        if (!confirm('Some tasks are currently running. Restarting now will interrupt them. Continue?')) {
+            return;
+        }
+    }
+    const status = document.getElementById('network-status');
+    status.textContent = 'Restarting...';
+    status.className = 'text-sm text-gray-500';
+    try {
+        const r = await fetch('/api/server/restart', {
+            method: 'POST',
+            credentials: 'same-origin',
+        });
+        const data = await r.json();
+        if (r.status === 202) {
+            status.textContent = data.message + ' Reloading in 3s...';
+            status.className = 'text-sm text-blue-600';
+            // Give the new process a moment to bind, then reload.
+            setTimeout(() => location.reload(), 3000);
+        } else if (r.status === 501) {
+            status.textContent = data.message;
+            status.className = 'text-sm text-amber-600';
+            // Surface the restart command (manual mode)
+            if (data.restart_command) {
+                const ta = document.createElement('textarea');
+                ta.value = data.restart_command;
+                ta.readOnly = true;
+                ta.rows = 3;
+                ta.className = 'block w-full border rounded px-2 py-1 text-xs font-mono mt-2';
+                status.parentElement.appendChild(ta);
+            }
+        } else {
+            status.textContent = 'Failed: ' + (data.detail || r.status);
+            status.className = 'text-sm text-red-600';
+        }
+    } catch (err) {
+        // A failed fetch is EXPECTED on supervised/direct mode because
+        // the process is dying. Show "restarting" and reload.
+        status.textContent = 'Server is restarting. Reloading in 3s...';
+        status.className = 'text-sm text-blue-600';
+        setTimeout(() => location.reload(), 3000);
+    }
+}
+
+// Load network status on page open
+loadNetworkStatus();
 </script>
 
 {% endblock %}

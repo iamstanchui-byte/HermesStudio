@@ -389,6 +389,10 @@ def create_app() -> FastAPI:
     app.include_router(projects_router, prefix="/api/projects", tags=["projects"])
     app.include_router(schedules_router, prefix="/api/schedules", tags=["schedules"])
     app.include_router(settings_router, prefix="/api/settings", tags=["settings"])
+    # v1.0.1 (new-user-activation): server lifecycle endpoints
+    # (POST /api/server/restart with process-mode-aware handling).
+    from hermes_orch.api.server import router as server_router
+    app.include_router(server_router, prefix="/api/server", tags=["server"])
     app.include_router(tasks_router, prefix="/api/tasks", tags=["tasks"])
     # v3.5.0: admin user CRUD (list, create, reset password, disable/enable)
     app.include_router(users_router, prefix="/api/users", tags=["users"])

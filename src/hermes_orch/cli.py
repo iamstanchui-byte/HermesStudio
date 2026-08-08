@@ -215,6 +215,35 @@ def serve(host: str | None, port: int | None, reload: bool) -> None:
         except OSError:
             lan_url = "(could not detect LAN IP — set bind_host to a specific interface if needed)"
 
+    # v1.0.1: check the restart-required flag from a prior run. If
+    # the operator previously changed bind_host (or any other restart-
+    # gated setting) and the previous run successfully applied it, we
+    # are now binding to the NEW value. Clear the flag so the dashboard
+    # doesn't keep nagging. If the flag is still set, it means the
+    # operator changed a setting and the previous restart attempt
+    # didn't take effect — surface this in the startup banner.
+    from hermes_orch.core.restart import (
+        clear_restart_required,
+        is_restart_required,
+    )
+    was_restart_pending = is_restart_required()
+    if was_restart_pending.required:
+        # The previous run completed with the flag set, meaning the
+        # operator requested a change but the live bind never updated.
+        # This is informational; we keep the flag so the dashboard
+        # still offers a restart button. We do NOT clear it here.
+        click.echo(
+            click.style("WARN: ", fg="yellow", bold=True)
+            + f"restart-required flag was set on previous run "
+            f"({was_restart_pending.reason!r}). The new bind is "
+            f"in effect, but the operator may have requested additional "
+            f"changes that did not apply. If you don't need a fresh "
+            f"restart, clear the flag at "
+            f"~/.hermes-orchestrator/restart-required.flag"
+        )
+    else:
+        clear_restart_required()
+
     click.echo(f"Starting Hermes Orchestrator on {scheme}://{bind_host}:{bind_port}")
     click.echo(f"  Dashboard:     {scheme}://localhost:{bind_port}/")
     if lan_enabled and lan_url:
