@@ -271,18 +271,55 @@ def test_detect_direct_when_ancestor_chain_is_clean_python(monkeypatch):
 
 
 def test_get_process_ancestry_returns_empty_on_non_windows(monkeypatch):
-    """Non-Windows platforms return an empty chain (we only have Windows wmic)."""
+    """Non-Windows platforms return an empty chain (we only have Windows PowerShell)."""
     monkeypatch.setattr(sys, "platform", "linux")
     from hermes_orch.core.restart import _get_process_ancestry
     assert _get_process_ancestry() == []
 
 
-def test_get_process_ancestry_handles_wmic_failure(monkeypatch):
-    """wmic missing / failure -> empty chain -> falls through to next rule."""
+def test_get_process_ancestry_handles_powershell_failure(monkeypatch):
+    """PowerShell missing / failure -> empty chain -> falls through to next rule.
+
+    We use PowerShell's `Get-CimInstance Win32_Process` (not `wmic`,
+    which was removed in Windows 11 24H2) to read the process table.
+    If the subprocess fails for any reason, we MUST return [] so the
+    caller can fall through to the next detection rule.
+    """
     import subprocess
 
     def fake_run(*args, **kwargs):
-        raise OSError("wmic not found")
+        raise OSError("powershell not found")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    from hermes_orch.core.restart import _get_process_ancestry
+    assert _get_process_ancestry() == []
+
+
+def test_get_process_ancestry_handles_powershell_nonzero_exit(monkeypatch):
+    """PowerShell returns non-zero -> empty chain (no exception, just no data)."""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = "fake error"
+        return R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    from hermes_orch.core.restart import _get_process_ancestry
+    assert _get_process_ancestry() == []
+
+
+def test_get_process_ancestry_handles_malformed_json(monkeypatch):
+    """PowerShell returns non-JSON -> empty chain (defensive parse)."""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        class R:
+            returncode = 0
+            stdout = "not json at all"
+        return R()
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     from hermes_orch.core.restart import _get_process_ancestry

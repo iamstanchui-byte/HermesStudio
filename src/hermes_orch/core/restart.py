@@ -155,45 +155,67 @@ def _parent_process_name() -> str | None:
 def _get_process_ancestry(max_depth: int = 6) -> list[tuple[int, str]]:
     """Return the parent-process chain for the current process, root first omitted.
 
-    One wmic call to read the full process table, then walk up from
-    `os.getppid()`. Each tuple is `(pid, name)`. The first element is
-    the immediate parent; the last is the highest ancestor found
-    (typically a system process or the original shell).
+    Uses PowerShell's `Get-CimInstance Win32_Process` to read the full
+    process table, then walks up from `os.getppid()`. We use PowerShell
+    (not `wmic`) because `wmic` was removed in Windows 11 24H2 and
+    later. PowerShell ships with every supported Windows install.
+
+    Each tuple is `(pid, name)`. The first element is the immediate
+    parent; the last is the highest ancestor found (typically a system
+    process or the original shell).
 
     The chain is bounded by `max_depth` (default 6) to avoid runaway
     walks if the process table is malformed. A `set` of seen PIDs also
     breaks the chain on cycles.
 
-    Returns [] on any error (non-Windows, wmic missing, timeout, etc.)
-    so the caller can fall through to the next detection rule.
+    Returns [] on any error (non-Windows, PowerShell missing, timeout,
+    etc.) so the caller can fall through to the next detection rule.
+    The function is only called on restart, so the ~500ms PowerShell
+    startup cost is acceptable.
     """
     if sys.platform != "win32":
         return []
+    # One PowerShell call: output JSON array of {ProcessId, ParentProcessId, Name}.
+    # -NoProfile to skip loading the user profile (faster + more deterministic).
+    # -Compressed JSON keeps output small for parsing.
+    ps_cmd = (
+        "Get-CimInstance Win32_Process | "
+        "Select-Object ProcessId, ParentProcessId, Name | "
+        "ConvertTo-Json -Compress"
+    )
     try:
         result = subprocess.run(
-            ["wmic", "process", "get", "Name,ProcessId,ParentProcessId", "/FORMAT:CSV"],
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
     if result.returncode != 0 or not result.stdout.strip():
         return []
-    # CSV columns (in order): Node,Name,ParentProcessId,ProcessId
-    # Build a pid -> (name, parent_pid) table.
+    import json
+
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return []
+    # PowerShell may return a single object (not wrapped in array) when
+    # there's only one process. Normalize to a list.
+    if isinstance(data, dict):
+        data = [data]
+
     table: dict[int, tuple[str, int]] = {}
-    for line in result.stdout.splitlines():
-        parts = line.split(",")
-        if len(parts) < 4:
-            continue
+    for entry in data:
         try:
-            name = parts[1]
-            parent_pid = int(parts[2]) if parts[2] and parts[2].isdigit() else 0
-            pid = int(parts[3])
-        except (ValueError, IndexError):
+            pid = int(entry.get("ProcessId") or 0)
+            parent = int(entry.get("ParentProcessId") or 0)
+            name = str(entry.get("Name") or "")
+        except (TypeError, ValueError):
             continue
-        table[pid] = (name, parent_pid)
+        if pid <= 0 or not name:
+            continue
+        table[pid] = (name, parent)
 
     chain: list[tuple[int, str]] = []
     current = os.getppid()
