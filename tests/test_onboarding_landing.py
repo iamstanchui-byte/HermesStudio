@@ -263,3 +263,123 @@ async def test_onboarding_page_loads_starters_via_api(client):
     names = {item["name"] for item in items}
     # The smoke-test starter is the one we wire into the onboarding step 4
     assert "system-health" in names
+
+
+# ===== v1.0.1 hotfix (2026-08-09): password_set signal =====
+#
+# Legacy users whose password pre-dates the v1.0.1 onboarding JSON
+# column may have `password_set=false` in storage despite having a
+# real password_hash. The hotfix overrides the stored signal with
+# truth at render time so the checklist never shows a "Set your
+# password" step (or a broken /setup-password button) for a user
+# who already has a password.
+
+@pytest.mark.asyncio
+async def test_onboarding_step1_done_when_user_has_password_but_stale_signal(client):
+    """Regression: a user with password_hash IS NOT NULL but
+    `signals.password_set=false` (stale) should see step 1 as "Done"
+    (no "Set password" button, no /setup-password link)."""
+    from hermes_orch.core.onboarding import reset_state, serialize_state
+    ac, app = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+
+    # Force a stale state: password IS set (via the fixture's
+    # bootstrap), but explicitly reset the signal back to false.
+    # This is the post-backfill state for a legacy user.
+    row = await app.state.db.fetchone(
+        "SELECT id, password_hash FROM users WHERE username = ?",
+        (ADMIN_USERNAME,),
+    )
+    assert row["password_hash"], "fixture should have set the password"
+
+    # Leave llm/agent/first_task signals as False (so the
+    # checklist still shows for the OTHER 3 steps).
+    stale = reset_state()
+    stale["signals"]["password_set"] = False  # stale!
+    await app.state.db.execute(
+        "UPDATE users SET onboarding_state = ? WHERE id = ?",
+        (serialize_state(stale), row["id"]),
+    )
+
+    r = await ac.get("/", follow_redirects=False)
+    assert r.status_code == 200
+    body = r.text
+    # Step 1 title is always rendered
+    assert "Set your password" in body
+    # But the button must NOT be rendered (effective signal is True)
+    # The button text is "Set password" inside the step-password div.
+    # Search within the step div to be robust to other "Done" texts.
+    import re
+    step1 = re.search(
+        r'<div[^>]*id="step-password"[^>]*>.*?</div>\s*</div>', body, re.S
+    )
+    assert step1, "step-password div not found"
+    step1_html = step1.group(0)
+    # No "Set password" link (button label) inside the step —
+    # substring match (the template puts whitespace around the
+    # text node, so a `>Set password<` strict check would fail
+    # on the surrounding whitespace).
+    assert "Set password" not in step1_html, (
+        "Set password button must not appear when user has a password "
+        "(stale password_set signal must be overridden at render time)"
+    )
+    # No /setup-password link inside the step
+    assert "/setup-password" not in step1_html, (
+        "/setup-password link must not appear for a user with a password"
+    )
+    # "Done" is rendered for step 1
+    assert "Done" in step1_html, (
+        "Step 1 should show as 'Done' when user has a password"
+    )
+
+
+@pytest.mark.asyncio
+async def test_onboarding_step1_button_when_user_has_no_password(client):
+    """Counterpart: a user with password_hash IS NULL but with a
+    stored `password_set=true` (e.g. from a buggy prior flip) should
+    STILL see step 1 as needing action. Wait, that's not a realistic
+    scenario — the more useful counter-test is: a user with no
+    password at all sees the "Set password" button."""
+    # The fixture's _bootstrap_admin sets the password, so to test
+    # the no-password case we create a brand-new user that has no
+    # password_hash. We do this by direct DB write (bypassing
+    # create_user which requires a password) so the user has a
+    # login session but no password_hash (e.g. a half-migrated
+    # legacy user, or the bootstrap admin pre-setup).
+    ac, app = client
+    # We can simulate this by directly clearing the admin's
+    # password_hash after login (won't affect the session cookie
+    # which is still valid).
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    row = await app.state.db.fetchone(
+        "SELECT id FROM users WHERE username = ?", (ADMIN_USERNAME,)
+    )
+    await app.state.db.execute(
+        "UPDATE users SET password_hash = NULL WHERE id = ?", (row["id"],)
+    )
+    from hermes_orch.core.onboarding import reset_state, serialize_state
+    await app.state.db.execute(
+        "UPDATE users SET onboarding_state = ? WHERE id = ?",
+        (serialize_state(reset_state()), row["id"]),
+    )
+    r = await ac.get("/", follow_redirects=False)
+    assert r.status_code == 200
+    body = r.text
+    # The "Set password" button must be rendered
+    assert 'href="/setup-password"' in body, (
+        "User with no password must see the 'Set password' button "
+        "linking to /setup-password"
+    )
+    # No "Done" for step 1
+    import re
+    step1 = re.search(
+        r'<div[^>]*id="step-password"[^>]*>.*?</div>\s*</div>', body, re.S
+    )
+    assert step1, "step-password div not found"
+    step1_html = step1.group(0)
+    # The button label "Set password" must appear (substring — the
+    # template puts whitespace + newlines around the text node)
+    assert "Set password" in step1_html
+    # Defensive: the button must link to /setup-password, not the
+    # legacy /settings#onboarding self-link
+    assert 'href="/setup-password"' in step1_html

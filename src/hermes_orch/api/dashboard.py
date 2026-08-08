@@ -108,6 +108,13 @@ async def _base_context(request: Request, active_page: str) -> dict[str, Any]:
         "active_page": active_page,
         "llm_configured": _llm_configured(getattr(request.app.state, "config", None)),
         "current_user_ctx": cached,
+        # v1.0.1 hotfix (2026-08-09): surface whether the current
+        # user has a password set, so the onboarding template can
+        # override the stored `password_set` signal (which may be
+        # stale for legacy users whose password pre-dates the
+        # onboarding JSON column). We don't expose the password_hash
+        # itself to the template — only a boolean.
+        "current_user_has_password": bool(cached.get("password_hash")) if cached else False,
     }
 
 
@@ -505,14 +512,36 @@ async def root(request: Request) -> HTMLResponse:
     # user who somehow has no state row (shouldn't happen — the
     # column has a NOT NULL DEFAULT '{}' constraint).
     state = await _get_user_onboarding_state(request, user["id"])
-    if should_show_checklist(state):
+
+    # v1.0.1 hotfix (2026-08-09): override the stored `password_set`
+    # signal with truth. Legacy users whose password pre-dates the
+    # onboarding JSON column may have `password_set=false` in storage
+    # despite having a real password_hash — this is a stale state,
+    # not a real "needs to set password" state. The effective state
+    # is what's shown to the user + what's used for the collapse
+    # check. We don't write this back to the DB (the regular signal
+    # hooks will catch up next time the user changes their
+    # password or any other signal flips).
+    has_password = bool(user.get("password_hash"))
+    if has_password and state.get("signals", {}).get("password_set") is not True:
+        # Build a shallow copy so we don't mutate the parsed dict
+        # in place (caller may reuse it).
+        from hermes_orch.core.onboarding import empty_state
+        effective_state = dict(state)
+        effective_signals = dict(state.get("signals") or {})
+        effective_signals["password_set"] = True
+        effective_state["signals"] = effective_signals
+    else:
+        effective_state = state
+
+    if should_show_checklist(effective_state):
         return templates.TemplateResponse(
             request=request,
             name="onboarding.html",
             context={
                 **(await _base_context(request, "onboarding")),
-                "onboarding_state": state,
-                "is_complete": is_checklist_complete(state),
+                "onboarding_state": effective_state,
+                "is_complete": is_checklist_complete(effective_state),
             },
         )
     return _Redirect(url="/agents", status_code=302)

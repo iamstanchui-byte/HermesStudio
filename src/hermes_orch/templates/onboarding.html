@@ -77,7 +77,17 @@ The template receives:
                     {% if step1_done %}
                         <span class="text-sm text-green-700">Done</span>
                     {% else %}
-                        <a href="/settings#onboarding" class="inline-block px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                        {# v1.0.1 hotfix (2026-08-09): "Set password" used
+                           to link to /settings#onboarding (self-link —
+                           the user was already on the onboarding page,
+                           so clicking did nothing). The right destination
+                           is the bootstrap setup-password page, which
+                           `core/auth.py::setup_password_page` serves at
+                           GET /setup-password. That's the page designed
+                           for the bootstrap admin's first password set.
+                           For non-admin users the same page works (it's
+                           the user-facing password-set form). #}
+                        <a href="/setup-password" class="inline-block px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
                             Set password
                         </a>
                     {% endif %}
@@ -101,7 +111,16 @@ The template receives:
                     {% if step2_done %}
                         <span class="text-sm text-green-700">Done</span>
                     {% else %}
-                        <a href="/settings#llm" class="inline-block px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
+                        {# v1.0.1 hotfix (2026-08-09): "Configure LLM"
+                           used to link to /settings#llm but no element
+                           on settings.html has id="llm" — the LLM
+                           Provider card has id="models" (legacy name
+                           from when the sidebar had a "Models" sub-item).
+                           Linking to /settings#models scrolls to the
+                           actual LLM card. The id name "models" is
+                           unfortunate but kept stable to avoid touching
+                           the deleted sidebar reference. #}
+                        <a href="/settings#models" class="inline-block px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
                             Configure LLM
                         </a>
                     {% endif %}
