@@ -224,3 +224,42 @@ async def test_skip_then_get_root_redirects_to_agents(client):
     r2 = await ac.get("/", follow_redirects=False)
     assert r2.status_code == 302
     assert r2.headers["location"] == "/agents"
+
+
+# ===== Starter gallery on landing page (v1.0.1 §3.4) =====
+
+@pytest.mark.asyncio
+async def test_onboarding_page_contains_starter_gallery_placeholder(client):
+    """The onboarding page has the #starter-gallery div that JS
+    fills in. The cards are rendered client-side via fetch()."""
+    from hermes_orch.core.onboarding import reset_state, serialize_state
+    ac, app = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    # Reset to fresh state
+    row = await app.state.db.fetchone(
+        "SELECT id FROM users WHERE username = ?", (ADMIN_USERNAME,)
+    )
+    await app.state.db.execute(
+        "UPDATE users SET onboarding_state = ? WHERE id = ?",
+        (serialize_state(reset_state()), row["id"]),
+    )
+    r = await ac.get("/", follow_redirects=False)
+    assert r.status_code == 200
+    body = r.text
+    assert 'id="starter-gallery"' in body
+
+
+@pytest.mark.asyncio
+async def test_onboarding_page_loads_starters_via_api(client):
+    """The JS on the page calls /api/starters. Verify the endpoint
+    is reachable from an authenticated browser session."""
+    ac, _ = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r = await ac.get("/api/starters")
+    assert r.status_code == 200
+    items = r.json()
+    # T1.8: ≥3 starters
+    assert len(items) >= 3
+    names = {item["name"] for item in items}
+    # The smoke-test starter is the one we wire into the onboarding step 4
+    assert "system-health" in names
