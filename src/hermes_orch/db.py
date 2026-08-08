@@ -207,7 +207,12 @@ CREATE TABLE IF NOT EXISTS users (
     is_bootstrap_admin INTEGER NOT NULL DEFAULT 0,  -- 1 only for the first admin row
     disabled INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
-    last_login_at INTEGER
+    last_login_at INTEGER,
+    -- v1.0.1 new-user-activation §3.2: 4-step onboarding checklist
+    -- state. JSON object with the 4 signal booleans + skip flag.
+    -- Empty `{}` = "no signals computed yet" (fresh user). See
+    -- core/onboarding.py for the schema and semantics.
+    onboarding_state TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username COLLATE NOCASE);
 
@@ -552,6 +557,10 @@ MIGRATIONS = [
     # means "wrapper hasn't reported yet" — dashboard shows a grey
     # fallback badge with a tooltip.
     "ALTER TABLE agent_profiles ADD COLUMN llm_model_default TEXT",
+    # v1.0.1 new-user-activation §3.2: 4-step onboarding checklist state
+    # for each user. JSON object — see core/onboarding.py for the schema.
+    # Idempotent: ALTER TABLE ADD COLUMN fails silently on re-run.
+    "ALTER TABLE users ADD COLUMN onboarding_state TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE agent_profiles ADD COLUMN llm_model_base_url TEXT",
     "ALTER TABLE agent_profiles ADD COLUMN llm_model_provider TEXT",
     # Per-profile MCP server list (wrapper-reported via heartbeat). Stored
@@ -941,10 +950,184 @@ class Database:
                 _bootstrap_exc,
             )
 
+        # === v1.0.1: one-time onboarding state backfill (§3.2.1) ===
+        #
+        # When a user upgrades from a pre-v1.0.1 install, their
+        # `onboarding_state` is the SQL default `{}` — which we treat
+        # as "fresh user, show the 4-step checklist". For a user
+        # who's been running for months, that would be a regression:
+        # they'd suddenly see a "Welcome, do these 4 things!" page
+        # when they already did all 4. So we compute the real state
+        # from their existing data and overwrite the default.
+        #
+        # IDEMPOTENT: a user with non-default state (e.g. they've
+        # already started the checklist) is SKIPPED — we never
+        # overwrite in-progress onboarding. Only `{}` (the SQL
+        # default) is eligible for backfill.
+        try:
+            await self._run_onboarding_backfill()
+        except Exception as _backfill_exc:
+            # Never let the backfill fail the boot. Worst case the
+            # user sees a fresh checklist once; they can skip it.
+            import logging as _logging
+            _logging.getLogger("hermes_orch.db").warning(
+                "Onboarding backfill failed: %s. Users may see the "
+                "checklist once after upgrade; they can skip it.",
+                _backfill_exc,
+            )
+
     async def close(self) -> None:
         if self._conn:
             await self._conn.close()
             self._conn = None
+
+    # ===== v1.0.1 onboarding backfill =====
+    #
+    # Runs once at startup. For every user with `onboarding_state = '{}'`
+    # (the SQL default for newly-upgraded installs), compute the real
+    # state from their existing data and overwrite the column.
+    #
+    # Users with non-default state are SKIPPED — we never overwrite
+    # in-progress onboarding. This is the "backfill, not reset"
+    # contract from spec §3.2.1.
+    #
+    # Idempotent: a second boot finds nothing to do (everyone's
+    # state is no longer `{}`).
+
+    async def _run_onboarding_backfill(self) -> int:
+        """Backfill `onboarding_state` for users with the SQL default.
+
+        Returns the number of users whose state was rewritten.
+        """
+        # Find users with the SQL default state. We use the literal
+        # string '{}' rather than `json_each` etc. — the default is
+        # always that exact string.
+        async with self._conn.execute(
+            "SELECT id, password_hash FROM users WHERE onboarding_state = '{}'"
+        ) as cur:
+            users = await cur.fetchall()
+        if not users:
+            return 0
+
+        # Snapshot the existing data ONCE so we don't keep re-counting
+        # the same tables per user. Counts are stable enough for the
+        # 5-min boot window.
+        llm_configured = await self._has_llm_configured()
+        has_completed_task, has_any_task = await self._task_completion_stats()
+        agent_connected = await self._has_recent_agent_heartbeat()
+
+        from hermes_orch.core.onboarding import (
+            backfill_state,
+            serialize_state,
+        )
+
+        rewritten = 0
+        for u in users:
+            new_state = backfill_state(
+                has_password=bool(u["password_hash"]),
+                has_llm_config=llm_configured,
+                has_connected_agent=agent_connected,
+                has_completed_task=has_completed_task,
+                has_any_task=has_any_task,
+            )
+            await self._conn.execute(
+                "UPDATE users SET onboarding_state = ? WHERE id = ?",
+                (serialize_state(new_state), u["id"]),
+            )
+            rewritten += 1
+        await self._conn.commit()
+        if rewritten:
+            import logging as _logging
+            _logging.getLogger("hermes_orch.db").info(
+                "Onboarding backfill: rewrote state for %d user(s) "
+                "(password_set=%s, llm_configured=%s, agent_connected=%s, "
+                "has_completed_task=%s, has_any_task=%s)",
+                rewritten, bool(any(u["password_hash"] for u in users)),
+                llm_configured, agent_connected,
+                has_completed_task, has_any_task,
+            )
+        return rewritten
+
+    async def _has_llm_configured(self) -> bool:
+        """True iff config.yaml has an `llm` section with any meaningful
+        override (api_key set, or non-default model/base_url/provider).
+
+        We can't import the live config here without circular deps
+        (db.py is imported by config.py). The simple heuristic: if
+        `config.yaml` exists and contains an `llm:` key with any
+        non-default value, treat as configured. Default `mock: true`
+        with no api_key is also "configured" (per spec T1.2: mock
+        is a first-class path).
+        """
+        try:
+            from pathlib import Path
+            from hermes_orch.config import find_config_path
+            cfg_path = find_config_path()
+            if not cfg_path or not cfg_path.exists():
+                return False
+            import yaml
+            with open(cfg_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            llm = data.get("llm")
+            if not isinstance(llm, dict):
+                return False
+            # The default config (hermes_orch init) has an llm section
+            # with `mock: true` and no api_key. That's still a valid
+            # configured state — the user has made an explicit choice
+            # to use mock. So presence of the llm section is enough.
+            return True
+        except Exception:
+            return False
+
+    async def _task_completion_stats(self) -> tuple[bool, bool]:
+        """Return (has_any_completed_task, has_any_task_at_all).
+
+        Both are computed from the `tasks` table in two cheap COUNTs.
+        """
+        try:
+            async with self._conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE status = 'completed'"
+            ) as cur:
+                row = await cur.fetchone()
+            has_completed = bool((row["n"] if row else 0) or 0)
+            async with self._conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks"
+            ) as cur:
+                row = await cur.fetchone()
+            has_any = bool((row["n"] if row else 0) or 0)
+            return has_completed, has_any
+        except Exception:
+            return False, False
+
+    async def _has_recent_agent_heartbeat(self) -> bool:
+        """True iff any agent row has a heartbeat within the last 5 min.
+
+        Conservative — if the agent is offline at boot, we don't
+        claim the user is "connected". The Phase 3 enrollment flow
+        will set this signal properly going forward.
+        """
+        try:
+            # agent_profiles has a last_heartbeat column. If we don't
+            # have that column (pre-Phase 3 schema), just return False
+            # — the signal will be set correctly by Phase 3.
+            async with self._conn.execute(
+                "SELECT name FROM pragma_table_info('agent_profiles') "
+                "WHERE name = 'last_heartbeat'"
+            ) as cur:
+                col = await cur.fetchone()
+            if not col:
+                return False
+            import time as _time
+            five_min_ago = int(_time.time()) - 300
+            async with self._conn.execute(
+                "SELECT COUNT(*) AS n FROM agent_profiles "
+                "WHERE last_heartbeat >= ?",
+                (five_min_ago,),
+            ) as cur:
+                row = await cur.fetchone()
+            return bool((row["n"] if row else 0) or 0)
+        except Exception:
+            return False
 
     @property
     def conn(self) -> aiosqlite.Connection:
