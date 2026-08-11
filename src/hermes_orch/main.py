@@ -165,6 +165,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cfg = load_config(config_path=config_path)
     app.state.config = cfg
 
+    # Security hotfix 2026-08-11 (B12, R13): validate the canonical
+    # public origin BEFORE any further startup work. If invalid,
+    # refuse to bind. This is fail-closed: the server cannot start
+    # without a correct public_origin (CSRF allowlist source).
+    # See auth/origin_validation.py for the contract.
+    from hermes_orch.auth.origin_validation import validate_public_origin
+    public_origin_cfg = (
+        (cfg.get("server") or {}).get("public_origin", "")
+    )
+    try:
+        canonical_origin = validate_public_origin(public_origin_cfg)
+    except ValueError as e:
+        # Re-raise as a clear startup error. uvicorn will surface the
+        # traceback to the operator; the server never binds to a port.
+        raise SystemExit(
+            f"\n[FATAL] server.public_origin / HERMES_ORCH_PUBLIC_ORIGIN "
+            f"is invalid:\n  {e}\n"
+            f"Fix this in config.yaml under 'server.public_origin' or "
+            f"via the env var HERMES_ORCH_PUBLIC_ORIGIN, then restart.\n"
+        ) from e
+    app.state.public_origin = canonical_origin
+    logger.info(
+        "CSRF public_origin configured: %s", canonical_origin
+    )
+
     if config_path is not None:
         db_path = config_path.parent / "hermes-orch.db"
     else:
