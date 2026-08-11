@@ -449,8 +449,8 @@ async def _agent_with_profiles(db: Any, agent_id: str) -> Agent:
 async def register_agent(
     body: AgentRegister,
     request: Request,
-    _csrf: None = Depends(require_same_origin),
     user: dict = Depends(require_admin),
+    _csrf: None = Depends(require_same_origin),
 ) -> AgentRegistrationResponse:
     """Register a new agent. Returns one-time setup secret.
 
@@ -661,8 +661,8 @@ async def update_agent(
     agent_id: str,
     body: AgentUpdate,
     request: Request,
-    _csrf: None = Depends(require_same_origin),
     user: dict = Depends(require_admin),
+    _csrf: None = Depends(require_same_origin),
 ) -> Agent:
     """Update agent metadata (ip, os_type, max_concurrent_tasks).
 
@@ -977,8 +977,8 @@ async def heartbeat(
 async def delete_agent(
     agent_id: str,
     request: Request,
-    _csrf: None = Depends(require_same_origin),
     user: dict = Depends(require_admin),
+    _csrf: None = Depends(require_same_origin),
 ) -> Response:
     """Delete an agent.
 
@@ -1025,8 +1025,8 @@ async def delete_agent(
 async def rotate_key(
     agent_id: str,
     request: Request,
-    _csrf: None = Depends(require_same_origin),
     user: dict = Depends(require_admin),
+    _csrf: None = Depends(require_same_origin),
 ) -> dict:
     """Rotate agent's secret. Old key valid for grace period (default 7 days).
 
@@ -1084,8 +1084,8 @@ async def add_profile(
     agent_id: str,
     body: AgentProfileCreate,
     request: Request,
-    _csrf: None = Depends(require_same_origin),
     user: dict = Depends(require_admin),
+    _csrf: None = Depends(require_same_origin),
 ) -> AgentProfile:
     """Add a new profile to an existing agent.
 
@@ -1166,8 +1166,8 @@ async def remove_profile(
     agent_id: str,
     profile_name: str,
     request: Request,
-    _csrf: None = Depends(require_same_origin),
     user: dict = Depends(require_admin),
+    _csrf: None = Depends(require_same_origin),
 ) -> Response:
     """Remove a profile (fails if profile has in-flight task).
 
@@ -1209,8 +1209,8 @@ async def update_profile(
     profile_name: str,
     body: AgentProfileUpdate,
     request: Request,
-    _csrf: None = Depends(require_same_origin),
     user: dict = Depends(require_admin),
+    _csrf: None = Depends(require_same_origin),
 ) -> AgentProfile:
     """Update a profile (description).
 

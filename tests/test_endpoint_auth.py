@@ -601,64 +601,245 @@ async def test_csrf_exact_canonical_origin_accepted(client):
 
 
 @pytest.mark.asyncio
-async def test_csrf_referer_fallback_accepted(client):
-    """No Origin header, Referer with a valid path → 2xx.
+async def test_csrf_referer_fallback_helper_origin_absent_valid_referer(client):
+    """DETERMINISTIC helper-level test (R14 / operator 2026-08-11 review).
 
-    httpx + Starlette may not let us clear the Origin header that
-    the autouse conftest adds. The 'Origin absent, fall back to
-    Referer' code path is exercised by a separate test that uses
-    the in-process transport and constructs a raw ASGI scope. See
-    the dedicated referer-fallback test below.
+    Calls `require_same_origin` directly with a constructed ASGI
+    request that has NO `Origin` header and a `Referer` matching
+    the canonical public origin. The helper must accept this
+    (fall back to Referer, matches scheme/host/port).
+
+    A non-deterministic version of this check (`assert in (201, 403)`)
+    was previously in the suite. It was REMOVED per operator
+    review because a security control verification must not
+    accept both pass and fail outcomes. This test pins the exact
+    behavior at the helper level, where the contract is enforced.
+
+    The end-to-end test `test_csrf_referer_fallback_end_to_end_...`
+    below verifies the helper is wired into the route correctly.
     """
-    # The autouse conftest injects Origin: CANONICAL_ORIGIN. To
-    # simulate the "Origin absent, Referer present" path, we need
-    # a different test that uses ASGI directly.
-    pass  # covered by test_csrf_referer_fallback_no_origin_via_asgi
+    from starlette.requests import Request
+
+    from hermes_orch.auth.csrf import require_same_origin
+
+    # The canonical public origin is set on `app.state` by the
+    # lifespan hook. Use the real app (from the in-process client
+    # fixture) so the helper reads the same origin the route would.
+    real_app = client._transport.app  # type: ignore[attr-defined]
+    assert getattr(real_app.state, "public_origin", None) == CANONICAL_ORIGIN
+
+    # Build a minimal ASGI request with NO Origin and a valid Referer.
+    # We pass the real app in the scope so `request.app.state.public_origin`
+    # resolves to the canonical origin (the helper reads from there).
+    referer_value = f"{CANONICAL_ORIGIN}/dashboard"
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/agents/",
+        "headers": [(b"referer", referer_value.encode("ascii"))],
+        "app": real_app,
+    }
+    request = Request(scope)
+
+    # Should NOT raise — Origin absent, Referer matches canonical
+    require_same_origin(request)
 
 
 @pytest.mark.asyncio
-async def test_csrf_referer_fallback_no_origin_via_asgi(client):
-    """Direct ASGI call: drop the Origin header, set Referer only.
+async def test_csrf_referer_fallback_helper_origin_absent_invalid_referer(client):
+    """DETERMINISTIC helper-level test (R14 / operator 2026-08-11 review).
 
-    This exercises the "Origin absent, fall back to Referer" path
-    that the autouse httpx wrapper doesn't reach (httpx always
-    sends the injected Origin).
+    Same setup as the valid-Referer test, but the Referer is
+    cross-origin. The helper MUST raise HTTPException(403).
     """
-    await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
-    app = client._transport.app  # type: ignore[attr-defined]
-    # Build a raw ASGI scope/request. FastAPI exposes a way to call
-    # endpoints via app.router.handle; simpler: use httpx with a
-    # transport that allows custom headers. Actually httpx doesn't
-    # let us "remove" the injected Origin via the wrapper — but the
-    # wrapper only adds the header IF it's not present. The httpx
-    # ASGITransport does pass through the request headers, so
-    # sending an empty Origin SHOULD suppress the wrapper.
-    #
-    # Actually, our wrapper checks `if "origin" not in headers` —
-    # sending Origin="" counts as 'origin' in headers (just empty
-    # value). So the wrapper skips it. But ASGI may not even forward
-    # an empty Origin header. We test BOTH:
-    #  1. Origin = "" → CSRF helper gets a value (empty string)
-    #     which fails urlparse — should 403.
-    #  2. Referer-only path: explicitly set the header.
-    #
-    # For this test, we accept either 403 (Origin empty is rejected)
-    # OR 2xx (if ASGI drops the empty Origin and the Referer
-    # fallback works). The point is that 2xx is acceptable ONLY
-    # when the Referer matches the canonical origin.
-    r = await client.post(
-        "/api/agents/",
-        json={"agent_id": "csrf-referer", "max_concurrent_tasks": 1},
-        headers={
-            "Origin": "",  # empty = "not a real origin"
-            "Referer": f"{CANONICAL_ORIGIN}/dashboard",
-        },
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from hermes_orch.auth.csrf import require_same_origin
+
+    real_app = client._transport.app  # type: ignore[attr-defined]
+    referer_value = "http://attacker.example:9999/dashboard"
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/agents/",
+        "headers": [(b"referer", referer_value.encode("ascii"))],
+        "app": real_app,
+    }
+    request = Request(scope)
+
+    with pytest.raises(HTTPException) as exc_info:
+        require_same_origin(request)
+    assert exc_info.value.status_code == 403, (
+        f"Expected 403 for cross-origin Referer, got {exc_info.value.status_code}"
     )
-    # If ASGI forwarded Origin="", the CSRF helper parses it as
-    # scheme="" → fails to match canonical → 403. If ASGI dropped
-    # the empty Origin, the helper falls back to Referer, which
-    # matches canonical → 201.
-    assert r.status_code in (201, 403), r.text
+
+
+@pytest.mark.asyncio
+async def test_csrf_referer_fallback_end_to_end_no_origin_valid_referer(client):
+    """DETERMINISTIC end-to-end test (R14 / operator 2026-08-11 review).
+
+    Sends a state-changing POST to the admin gate with:
+      - Valid admin session cookie
+      - NO `Origin` header (bypasses the autouse Origin-injection
+        wrapper by going directly to the ASGI app, not through
+        httpx.AsyncClient.send)
+      - Valid `Referer` matching the canonical public origin
+
+    Expects: 201 (the route accepts the Referer-fallback path).
+
+    This replaces the previous non-deterministic
+    `assert r.status_code in (201, 403)` test. We use the ASGI
+    app directly to bypass the autouse wrapper, since patching
+    `httpx.AsyncClient.send` from inside a test cannot reach the
+    REAL send (it's captured in the autouse's closure).
+    """
+    import json as _json
+
+    real_app = client._transport.app  # type: ignore[attr-defined]
+    # Extract the admin session cookie set by _login() above.
+    # _login() already happened in the previous test step? No — this
+    # test does NOT call _login() first. We need to log in via the
+    # same path. But we want the cookie on a request that bypasses
+    # the httpx autouse wrapper. So: log in via the real client,
+    # then read the cookie from the client's cookie jar.
+    await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    cookies = list(client.cookies.jar) if hasattr(client, "cookies") else []
+    cookie_header = b""
+    for c in cookies:
+        cookie_header += f"{c.name}={c.value}; ".encode("ascii")
+    if cookie_header:
+        cookie_header = cookie_header.rstrip(b"; ")
+
+    body_bytes = _json.dumps(
+        {"agent_id": "csrf-ref-ok-2", "max_concurrent_tasks": 1}
+    ).encode("utf-8")
+    referer_value = f"{CANONICAL_ORIGIN}/dashboard".encode("ascii")
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/agents/",
+        "raw_path": b"/api/agents/",
+        "query_string": b"",
+        "server": ("testserver", 80),
+        "headers": [
+            (b"host", b"testserver"),
+            (b"cookie", cookie_header),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body_bytes)).encode("ascii")),
+            (b"referer", referer_value),
+            # NO `origin` header — this is the key. We want the
+            # Referer-fallback path to be exercised, which means
+            # `request.headers.get("origin")` must return None.
+        ],
+        "app": real_app,
+    }
+
+    request_body_sent = False
+
+    async def receive():
+        nonlocal request_body_sent
+        if not request_body_sent:
+            request_body_sent = True
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    response_started = []
+    response_body = []
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            response_started.append(message)
+        elif message["type"] == "http.response.body":
+            response_body.append(message.get("body", b""))
+
+    await real_app(scope, receive, send)
+
+    assert response_started, "no response.start sent"
+    status = response_started[0]["status"]
+    body = b"".join(response_body)
+    # Deterministic: must succeed because Referer matches canonical.
+    assert status == 201, (
+        f"Expected 201 (Referer matches canonical), "
+        f"got {status}: {body.decode('utf-8', errors='replace')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_csrf_referer_fallback_end_to_end_no_origin_invalid_referer(client):
+    """DETERMINISTIC end-to-end test (R14 / operator 2026-08-11 review).
+
+    Same setup as the valid-Referer end-to-end test, but the
+    Referer is cross-origin. Expects: 403.
+    """
+    import json as _json
+
+    real_app = client._transport.app  # type: ignore[attr-defined]
+    await _login(client, ADMIN_USERNAME, ADMIN_PASSWORD)
+    cookies = list(client.cookies.jar) if hasattr(client, "cookies") else []
+    cookie_header = b""
+    for c in cookies:
+        cookie_header += f"{c.name}={c.value}; ".encode("ascii")
+    if cookie_header:
+        cookie_header = cookie_header.rstrip(b"; ")
+
+    body_bytes = _json.dumps(
+        {"agent_id": "csrf-ref-bad-2", "max_concurrent_tasks": 1}
+    ).encode("utf-8")
+    referer_value = b"http://attacker.example:9999/dashboard"
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/agents/",
+        "raw_path": b"/api/agents/",
+        "query_string": b"",
+        "server": ("testserver", 80),
+        "headers": [
+            (b"host", b"testserver"),
+            (b"cookie", cookie_header),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body_bytes)).encode("ascii")),
+            (b"referer", referer_value),
+        ],
+        "app": real_app,
+    }
+
+    request_body_sent = False
+
+    async def receive():
+        nonlocal request_body_sent
+        if not request_body_sent:
+            request_body_sent = True
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    response_started = []
+    response_body = []
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            response_started.append(message)
+        elif message["type"] == "http.response.body":
+            response_body.append(message.get("body", b""))
+
+    await real_app(scope, receive, send)
+
+    assert response_started, "no response.start sent"
+    status = response_started[0]["status"]
+    body = b"".join(response_body)
+    # Deterministic: must 403 because Referer doesn't match canonical.
+    assert status == 403, (
+        f"Expected 403 (Referer cross-origin), "
+        f"got {status}: {body.decode('utf-8', errors='replace')}"
+    )
 
 
 @pytest.mark.asyncio
