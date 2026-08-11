@@ -40,9 +40,19 @@
 .NOTES
     Windows PowerShell 5.1 compatible. No `&&`, no `bash` heredocs.
     Per MEMORY.md, PowerShell here-strings with embedded quotes parse
-    unreliably â€” so the Python probes are built via string concatenation
+    unreliably -- so the Python probes are built via string concatenation
     and written to a temp file via [System.IO.File]::WriteAllText with
     UTF-8 (no BOM).
+
+    Path contract (locked, do NOT change without operator sign-off):
+      $ProductionConfigPath = C:\ProgramData\HermesOrchestrator\config\config.yaml
+      $ProductionDbPath     = C:\ProgramData\HermesOrchestrator\config\hermes-orch.db
+    These are the production contract paths used by the NSSM service
+    (HERMES_ORCH_CONFIG env var points to the config; the DB lives
+    next to it per the v1.0.2 find_config_path() derivation). The
+    script's DEFAULT must match these -- otherwise it would silently
+    read the dev's user-profile config and produce a false PASS.
+    The -ConfigPath parameter is an override for testing in dev only.
 #>
 [CmdletBinding()]
 param(
@@ -55,9 +65,20 @@ $ErrorActionPreference = 'Stop'
 # ===== Constants (locked, NOT configurable) =====
 $InstallDir = 'C:\Program Files\HermesOrchestrator'
 $VenvPythonExe = Join-Path $InstallDir 'venv\Scripts\python.exe'
-$DefaultConfigPath = Join-Path $env:USERPROFILE '.hermes-orchestrator\config.yaml'
+
+# Production contract: the NSSM service runs with
+# HERMES_ORCH_CONFIG=C:\ProgramData\HermesOrchestrator\config\config.yaml
+# and the SQLite DB lives next to the config (per v1.0.2
+# find_config_path() derivation: db_path = config_path.parent / "hermes-orch.db").
+# The script MUST default to these paths -- the previous version
+# defaulted to the dev's user-profile config, which would silently
+# read a different (non-production) config and produce false PASS.
+$ProductionConfigDir = 'C:\ProgramData\HermesOrchestrator\config'
+$ProductionConfigPath = Join-Path $ProductionConfigDir 'config.yaml'
+$ProductionDbPath = Join-Path $ProductionConfigDir 'hermes-orch.db'
+
 if ($ConfigPath -eq "") {
-    $ConfigPath = $DefaultConfigPath
+    $ConfigPath = $ProductionConfigPath
 }
 
 $results = New-Object System.Collections.Generic.List[object]
@@ -110,6 +131,11 @@ Write-Host ""
 # ====================================================================
 Write-Host "[Item 1] Production agents: hmac_secret is non-NULL" -ForegroundColor Yellow
 
+# DB path resolution. The v1.0.2 main.py derives the DB path from
+# the config path: `db_path = config_path.parent / "hermes-orch.db"`.
+# So if the config is at the production location, the DB is next
+# to it. Default to the production contract; fall back to the
+# user-profile location only as a dev override.
 $dbPath = $null
 if (Test-Path -LiteralPath $ConfigPath) {
     $configDir = Split-Path -LiteralPath $ConfigPath -ErrorAction SilentlyContinue
@@ -118,6 +144,11 @@ if (Test-Path -LiteralPath $ConfigPath) {
     }
 }
 if ($null -eq $dbPath -or -not (Test-Path -LiteralPath $dbPath)) {
+    # Production contract: ProgramData\HermesOrchestrator\config\hermes-orch.db
+    $dbPath = $ProductionDbPath
+}
+if (-not (Test-Path -LiteralPath $dbPath)) {
+    # Dev override: ~/.hermes-orchestrator/hermes-orch.db
     $dbPath = Join-Path $env:USERPROFILE '.hermes-orchestrator\hermes-orch.db'
 }
 
@@ -233,8 +264,19 @@ $pyDbPath = Py-Path -Path $dbPath
 # a Python DOUBLE-quoted string so the inner single quotes don't
 # terminate the Python string literal. Column is `token_hash`
 # (enrollment tokens store SHA-256, never plaintext), `used_at`
-# NULL = not yet consumed, `expires_at > now` = not yet expired.
-$sql1 = "SELECT id, used_at, expires_at FROM enrollment_tokens WHERE used_at IS NULL AND expires_at > datetime('now')"
+# NULL = not yet consumed.
+#
+# CRITICAL: use `julianday()` for the date comparison, NOT a direct
+# string compare. The `expires_at` column is stored as
+# `2026-08-11T05:59:26.172863+00:00` (ISO-8601 with T separator
+# and +00:00 timezone), while `datetime('now')` returns
+# `2026-08-11 13:43:29` (space separator, no timezone). A direct
+# string compare would match because `T` (0x54) > ` ` (0x20), so
+# EXPIRED tokens would be wrongly classified as outstanding. The
+# `julianday()` function normalizes both to a numeric day count
+# and compares correctly. Without this fix, Item 3 produces a
+# false WARN on any production DB that has expired-unused tokens.
+$sql1 = "SELECT id, used_at, expires_at FROM enrollment_tokens WHERE used_at IS NULL AND julianday(expires_at) > julianday('now')"
 $scriptLines = @(
     'import sqlite3, sys',
     ('conn = sqlite3.connect(' + $pyDbPath + ')'),
@@ -356,7 +398,11 @@ if (-not $chosenOrigin) {
         "        errors.append('no hostname')",
         "    if parsed.port is None:",
         "        errors.append('no port')",
-        "    if parsed.path not in ('', '/'):",
+        "    # Bare-origin contract: path MUST be exactly empty string.",
+        "    # urlparse normalizes 'http://host:8765/' to path='/', which",
+        "    # must be rejected (a single trailing slash IS a path of",
+        "    # '/' and violates the bare-origin contract).",
+        "    if parsed.path != '':",
         "        errors.append('has path=' + str(parsed.path))",
         "    if parsed.query:",
         "        errors.append('has query=' + str(parsed.query))",
