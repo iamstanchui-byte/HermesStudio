@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 
-from hermes_orch.config import load_config
+from hermes_orch.config import find_config_path, load_config
 from hermes_orch.core.cleanup import CleanupJob
 from hermes_orch.core.notifier import Notifier
 from hermes_orch.core.planner import Planner
@@ -124,7 +124,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cfg = load_config()
     app.state.config = cfg
 
-    db_path = Path.home() / ".hermes-orchestrator" / "hermes-orch.db"
+    # R7-C (2026-08-10): DB-path contract — derive the production
+    # SQLite path from the SAME config path that load_config() just
+    # used, so the service connects to the production DB whether it
+    # runs interactively (dev) or as LocalSystem (production).
+    #
+    # Before this, the hardcoded
+    #   `Path.home() / ".hermes-orchestrator" / "hermes-orch.db"`
+    # ignored HERMES_ORCH_CONFIG entirely and opened a wrong DB
+    # when the service ran as LocalSystem (whose $HOME is
+    # `C:\Windows\System32\config\systemprofile`). That created an
+    # empty DB there and returned 401 "Unknown agent" for every
+    # heartbeat, because the server was reading from a DB that had
+    # no agent rows.
+    #
+    # Now: cfg_path.parent / "hermes-orch.db" matches the config
+    # dir, so the production service (NSSM AppEnvironmentExtra sets
+    # HERMES_ORCH_CONFIG to
+    # `C:\ProgramData\HermesOrchestrator\config\config.yaml`)
+    # opens `C:\ProgramData\HermesOrchestrator\config\hermes-orch.db`
+    # — the production DB.
+    #
+    # Fallback: when no config path resolves, fall back to the
+    # historical user-profile path so the operator gets a readable
+    # error (Database.connect will fail) instead of silently
+    # writing to systemprofile. This path is unit-tested and is
+    # the ONLY legacy-mode db_path; it is NEVER used in production
+    # because the NSSM service always sets HERMES_ORCH_CONFIG.
+    _cfg_path = find_config_path()
+    if _cfg_path is not None:
+        db_path = _cfg_path.parent / "hermes-orch.db"
+    else:
+        # No config found anywhere — fall back to the historical
+        # user-profile path so the operator gets a readable error
+        # (Database.connect will fail) instead of silently writing
+        # to systemprofile.
+        db_path = Path.home() / ".hermes-orchestrator" / "hermes-orch.db"
     # v3.13.0: enforce minimum SQLite version for production DB.
     # The `root_path` migration uses ADD COLUMN (no IF NOT EXISTS in
     # SQLite, so we rely on the existing try/except in the migration
