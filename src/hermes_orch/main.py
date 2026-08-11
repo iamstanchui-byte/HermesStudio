@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 
-from hermes_orch.config import find_config_path, load_config
+from hermes_orch.config import load_config
 from hermes_orch.core.cleanup import CleanupJob
 from hermes_orch.core.notifier import Notifier
 from hermes_orch.core.planner import Planner
