@@ -492,6 +492,8 @@ if ($failCount -gt 0) {
     Write-Host "PASSED with warnings -- review the WARN items before deploying." -ForegroundColor Yellow
     exit 0
 } else {
-    Write-Host "PASSED -- safe to deploy the B12 hotfix." -ForegroundColor Green
+    Write-Host "PASSED -- pre-deploy compatibility passed." -ForegroundColor Green
+    Write-Host "PR review and explicit operator deployment approval are still required." -ForegroundColor Yellow
+    Write-Host "This script does NOT authorize deployment; the operator decides." -ForegroundColor Yellow
     exit 0
 }
