@@ -151,25 +151,57 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def find_config_path() -> Path | None:
-    """Find config file. Order: $HERMES_ORCH_CONFIG > ~/.hermes-orchestrator/config.yaml > ./config.yaml."""
+    """Find config file. Order: $HERMES_ORCH_CONFIG > ~/.hermes-orchestrator/config.yaml > ./config.yaml.
+
+    R7-C contract (2026-08-11 review): the returned path is ALWAYS
+    absolute. This makes the downstream DB-path derivation
+    (`config_path.parent / "hermes-orch.db"`) deterministic
+    regardless of the process cwd at the moment aiosqlite opens the
+    DB. Without `.resolve()` on the local branch, a local config
+    yields a relative `Path("./config.yaml")` whose `.parent` is
+    `Path(".")` and whose DB suffix lands as the bare
+    `Path("hermes-orch.db")` -- which aiosqlite would then open
+    relative to whatever cwd the worker thread is in. The
+    lifespan's `Path.cwd()` is the natural anchor; we use it
+    explicitly so a chdir between resolution and DB connect
+    cannot drift the DB location.
+    """
     env_path = os.environ.get("HERMES_ORCH_CONFIG")
     if env_path:
-        return Path(env_path)
+        p = Path(env_path)
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve()
+        else:
+            p = p.resolve()
+        return p
     home_path = Path.home() / ".hermes-orchestrator" / "config.yaml"
     if home_path.exists():
-        return home_path
-    local_path = Path("./config.yaml")
+        return home_path.resolve()
+    local_path = Path("config.yaml")
     if local_path.exists():
-        return local_path
+        return (Path.cwd() / local_path).resolve()
     return None
 
 
-def load_config() -> dict[str, Any]:
-    """Load config with env var overrides."""
+def load_config(config_path: Path | None = None) -> dict[str, Any]:
+    """Load config with env var overrides.
+
+    R7-C contract (2026-08-11 review): callers that derive downstream
+    paths from the same config (e.g. the lifespan, which derives the
+    DB path from the config's parent dir) should pass an already-
+    resolved `config_path` so `load_config()` and the downstream
+    derivation use the SAME object. If `config_path` is None, the
+    config path is resolved via `find_config_path()` -- which means
+    a caller that also calls `find_config_path()` independently may
+    end up with two different paths. The lifespan passes its
+    resolved path explicitly; all other callers (tests, scripts)
+    leave it as None to preserve the historical "auto-resolve" behavior.
+    """
     cfg: dict[str, Any] = {k: dict(v) for k, v in DEFAULT_CONFIG.items()}
 
     # Load from file
-    config_path = find_config_path()
+    if config_path is None:
+        config_path = find_config_path()
     if config_path and config_path.exists():
         with open(config_path) as f:
             file_cfg = yaml.safe_load(f) or {}

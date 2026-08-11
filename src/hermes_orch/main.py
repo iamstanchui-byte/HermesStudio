@@ -121,16 +121,16 @@ _HMAC_PATH_PATTERNS: list[re.Pattern[str]] = [
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """App lifespan: load config, connect DB, start supervisor on startup; stop on shutdown."""
-    cfg = load_config()
-    app.state.config = cfg
-
-    # R7-C (2026-08-10): DB-path contract — derive the production
-    # SQLite path from the SAME config path that load_config() just
-    # used, so the service connects to the production DB whether it
-    # runs interactively (dev) or as LocalSystem (production).
+    # R7-C (2026-08-10): DB-path contract — resolve the config path
+    # EXACTLY ONCE and pass the same resolved path to BOTH
+    # `load_config()` AND the DB-path derivation. The DB always
+    # lives next to the config file (`config_path.parent /
+    # "hermes-orch.db"`), so the service connects to the same DB
+    # whether it runs interactively (dev) or as LocalSystem
+    # (production).
     #
     # Before this, the hardcoded
-    #   `Path.home() / ".hermes-orchestrator" / "hermes-orch.db"`
+    # `Path.home() / ".hermes-orchestrator" / "hermes-orch.db"`
     # ignored HERMES_ORCH_CONFIG entirely and opened a wrong DB
     # when the service ran as LocalSystem (whose $HOME is
     # `C:\Windows\System32\config\systemprofile`). That created an
@@ -138,22 +138,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # heartbeat, because the server was reading from a DB that had
     # no agent rows.
     #
-    # Now: cfg_path.parent / "hermes-orch.db" matches the config
-    # dir, so the production service (NSSM AppEnvironmentExtra sets
+    # Now: production service (NSSM AppEnvironmentExtra sets
     # HERMES_ORCH_CONFIG to
     # `C:\ProgramData\HermesOrchestrator\config\config.yaml`)
     # opens `C:\ProgramData\HermesOrchestrator\config\hermes-orch.db`
     # — the production DB.
     #
-    # Fallback: when no config path resolves, fall back to the
-    # historical user-profile path so the operator gets a readable
-    # error (Database.connect will fail) instead of silently
-    # writing to systemprofile. This path is unit-tested and is
-    # the ONLY legacy-mode db_path; it is NEVER used in production
-    # because the NSSM service always sets HERMES_ORCH_CONFIG.
-    _cfg_path = find_config_path()
-    if _cfg_path is not None:
-        db_path = _cfg_path.parent / "hermes-orch.db"
+    # Fallback: when no config path resolves (env unset, no home
+    # config, no local config), fall back to the historical user-
+    # profile path so the operator gets a readable error
+    # (Database.connect will fail) instead of silently writing to
+    # systemprofile. This path is unit-tested and is the ONLY
+    # legacy-mode db_path; it is NEVER used in production because
+    # the NSSM service always sets HERMES_ORCH_CONFIG.
+    #
+    # 2026-08-11 review fix: previous version called
+    # `find_config_path()` twice (once inside `load_config()`,
+    # once for DB derivation). If env / cwd / file existence
+    # changed between the two calls, the loaded config and the
+    # DB path could disagree. Now we resolve once and pass the
+    # same object to both. `load_config()` accepts an optional
+    # `config_path` param; if it's None, load_config() falls back
+    # to its own find_config_path() call (preserving the
+    # auto-resolve behavior for non-lifespan callers).
+    config_path = find_config_path()
+    cfg = load_config(config_path=config_path)
+    app.state.config = cfg
+
+    if config_path is not None:
+        db_path = config_path.parent / "hermes-orch.db"
     else:
         # No config found anywhere — fall back to the historical
         # user-profile path so the operator gets a readable error
