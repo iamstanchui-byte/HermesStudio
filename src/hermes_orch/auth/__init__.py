@@ -31,6 +31,9 @@ from hermes_orch.auth.cookie import (
     touch_last_login,
     verify_password,
 )
+from hermes_orch.auth.admin_guard import require_admin
+from hermes_orch.auth.csrf import require_same_origin
+from hermes_orch.auth.origin_validation import validate_public_origin
 
 __all__ = [
     # hmac (v1.6)
@@ -62,4 +65,10 @@ __all__ = [
     "set_user_password",
     "touch_last_login",
     "verify_password",
+    # admin guard (security hotfix 2026-08-11, B12)
+    "require_admin",
+    # CSRF (security hotfix 2026-08-11, B12 §6.1)
+    "require_same_origin",
+    # origin validation (security hotfix 2026-08-11, B12 §6.1 R13)
+    "validate_public_origin",
 ]

@@ -147,6 +147,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ssl_cert_path": "",   # absolute path to PEM-encoded cert (or chain)
         "ssl_key_path": "",    # absolute path to PEM-encoded private key
     },
+    "server": {
+        # Security hotfix 2026-08-11 (B12): canonical public origin
+        # used by the CSRF helper in `auth.csrf.require_same_origin`.
+        # MUST be set in config.yaml or via env var
+        # HERMES_ORCH_PUBLIC_ORIGIN. Format: bare absolute URL
+        # `scheme://hostname:port` (no path, no query, no fragment,
+        # no userinfo, no trailing slash).
+        #
+        # The server refuses to start at `lifespan()` if this is
+        # missing or invalid (see `auth.origin_validation.validate_public_origin`).
+        # This is fail-closed: a misconfigured server cannot start.
+        "public_origin": "",
+    },
 }
 
 
@@ -203,6 +216,21 @@ def load_config() -> dict[str, Any]:
 
     # Apply env var overrides (HERMES_ORCH_<SECTION>_<KEY>)
     _apply_env_overrides(cfg)
+
+    # Security hotfix 2026-08-11 (B12): explicit mapping for the
+    # canonical public origin. We need a single env var with a flat
+    # name (`HERMES_ORCH_PUBLIC_ORIGIN`) but the underscore-splitting
+    # in `_apply_env_overrides` would put it at `cfg["public"]["origin"]`,
+    # not the desired `cfg["server"]["public_origin"]`. So we map it
+    # explicitly here. This runs AFTER `_apply_env_overrides` so a
+    # `server.public_origin` value in config.yaml can still be the
+    # authoritative source — the env var only overrides if the YAML
+    # didn't already set it (or the env var is explicitly set).
+    _env_public_origin = os.environ.get("HERMES_ORCH_PUBLIC_ORIGIN", "").strip()
+    if _env_public_origin:
+        # env var wins over file when both are set
+        cfg.setdefault("server", {})["public_origin"] = _env_public_origin
+
     return cfg
 
 

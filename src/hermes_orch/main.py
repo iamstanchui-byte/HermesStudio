@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 
-from hermes_orch.config import load_config
+from hermes_orch.config import find_config_path, load_config
 from hermes_orch.core.cleanup import CleanupJob
 from hermes_orch.core.notifier import Notifier
 from hermes_orch.core.planner import Planner
@@ -124,7 +124,47 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cfg = load_config()
     app.state.config = cfg
 
-    db_path = Path.home() / ".hermes-orchestrator" / "hermes-orch.db"
+    # Security hotfix 2026-08-11 (B12, R13): validate the canonical
+    # public origin BEFORE any further startup work. If invalid,
+    # refuse to bind. This is fail-closed: the server cannot start
+    # without a correct public_origin (CSRF allowlist source).
+    # See auth/origin_validation.py for the contract.
+    from hermes_orch.auth.origin_validation import validate_public_origin
+    public_origin_cfg = (
+        (cfg.get("server") or {}).get("public_origin", "")
+    )
+    try:
+        canonical_origin = validate_public_origin(public_origin_cfg)
+    except ValueError as e:
+        # Re-raise as a clear startup error. uvicorn will surface the
+        # traceback to the operator; the server never binds to a port.
+        raise SystemExit(
+            f"\n[FATAL] server.public_origin / HERMES_ORCH_PUBLIC_ORIGIN "
+            f"is invalid:\n  {e}\n"
+            f"Fix this in config.yaml under 'server.public_origin' or "
+            f"via the env var HERMES_ORCH_PUBLIC_ORIGIN, then restart.\n"
+        ) from e
+    app.state.public_origin = canonical_origin
+    logger.info(
+        "CSRF public_origin configured: %s", canonical_origin
+    )
+
+    # v1.0.2 (user 2026-08-10): derive DB path from the SAME config path
+    # that load_config() just used. The previous hardcoded `Path.home() / ...
+    # .hermes-orchestrator/hermes-orch.db` ignored HERMES_ORCH_CONFIG entirely
+    # and opened a wrong DB when the service ran as LocalSystem (whose
+    # $HOME is C:\Windows\System32\config\systemprofile, creating an empty
+    # DB there and returning 401 "Unknown agent" for every heartbeat).
+    # Now: cfg_path.parent / "hermes-orch.db" matches the config dir.
+    _cfg_path = find_config_path()
+    if _cfg_path is not None:
+        db_path = _cfg_path.parent / "hermes-orch.db"
+    else:
+        # No config found anywhere — fall back to the historical
+        # user-profile path so the operator gets a readable error
+        # (Database.connect will fail) instead of silently writing
+        # to systemprofile.
+        db_path = Path.home() / ".hermes-orchestrator" / "hermes-orch.db"
     # v3.13.0: enforce minimum SQLite version for production DB.
     # The `root_path` migration uses ADD COLUMN (no IF NOT EXISTS in
     # SQLite, so we rely on the existing try/except in the migration

@@ -45,15 +45,16 @@ from hermes_orch.auth import require_hmac_auth
 
 from hermes_orch.core.audit import audit_log
 from hermes_orch.utils import now_iso as _now_iso
-# v3.9.0 (Phase 3): reset-live-SOUL is admin-only. The
-# `require_admin` dep lives in api/users.py to keep the
-# admin guard co-located with the other admin-only endpoints.
-# We import lazily inside the function (see reset_live_soul)
-# to avoid the import-time cycle: api/agents.py is mounted
-# at app startup before api/users.py. The Depends() call
-# resolves the function at request time, not at import
-# time, so the lazy import inside the function works.
-from hermes_orch.api.users import require_admin  # noqa: E402
+# Security hotfix 2026-08-11 (B12, B10): import the canonical
+# admin guard + CSRF helper. These are wired into the 7
+# admin-mutation routes (§4 of the design doc) and the
+# non-admin `/secret` route is replaced with a 410 stub
+# (§5). The legacy `from hermes_orch.api.users import
+# require_admin` was used only by reset_live_soul; we keep
+# that import lazy INSIDE that function to avoid the
+# import-time cycle (api/users.py imports from us).
+from hermes_orch.auth.admin_guard import require_admin
+from hermes_orch.auth.csrf import require_same_origin
 
 router = APIRouter()
 
@@ -445,11 +446,20 @@ async def _agent_with_profiles(db: Any, agent_id: str) -> Agent:
 
 
 @router.post("/", response_model=AgentRegistrationResponse, status_code=201)
-async def register_agent(body: AgentRegister, request: Request) -> AgentRegistrationResponse:
+async def register_agent(
+    body: AgentRegister,
+    request: Request,
+    _csrf: None = Depends(require_same_origin),
+    user: dict = Depends(require_admin),
+) -> AgentRegistrationResponse:
     """Register a new agent. Returns one-time setup secret.
 
     One-time secret shown in response — user copies to agent OS.
     Stored as SHA-256 hash in DB.
+
+    Security (B12 hotfix 2026-08-11): admin-gated. Unauthenticated
+    → 401, non-admin → 403, cross-origin POST → 403. Admin
+    identity is recorded in the audit log.
     """
     db = request.app.state.db
 
@@ -491,7 +501,7 @@ async def register_agent(body: AgentRegister, request: Request) -> AgentRegistra
     )
     await audit_log(
         db, "agent.registered",
-        actor="operator",
+        actor=f"admin:{user['username']}",
         agent_id=body.agent_id,
         payload={
             "ip": body.ip,
@@ -501,6 +511,10 @@ async def register_agent(body: AgentRegister, request: Request) -> AgentRegistra
             # the starting configuration. Subsequent changes are
             # captured by `agent.max_concurrent_tasks_changed`.
             "max_concurrent_tasks": body.max_concurrent_tasks,
+            # B12: caller identity + route. `remote_addr` is best-effort
+            # (None when no client — e.g. unit tests via ASGI in-process).
+            "remote_addr": request.client.host if request.client else None,
+            "route": "POST /api/agents/",
         },
     )
     return AgentRegistrationResponse(
@@ -568,78 +582,34 @@ async def get_max_history_config(
     }
 
 
-@router.post("/{agent_id}/secret")
+@router.post("/{agent_id}/secret", status_code=410)
 async def set_agent_secret(
-    agent_id: str, body: AgentSecretSetBody, request: Request
+    agent_id: str,
+    request: Request,
 ) -> dict:
-    """One-shot HMAC secret bootstrap (v1.6, 2026-07-29).
+    """B10 disposition (security hotfix 2026-08-11).
 
-    Pushes the wrapper's shared secret into the DB so the server
-    can verify HMAC signatures on subsequent requests. This
-    endpoint is the ONLY one that doesn't itself require HMAC —
-    it's the bootstrap call.
+    Anonymous legacy secret-bootstrap removed. New-flow agents (post
+    2026-08-11, via /api/agents/enroll) have their hmac_secret written
+    atomically in the enroll transaction; this endpoint is unnecessary
+    for normal flow. Legacy agents (pre-enroll) that lost their
+    hmac_secret should be handled via the admin-authenticated recovery
+    flow tracked under security/agent-secret-at-rest (B11).
 
-    Behavior:
-      - 404 if agent doesn't exist
-      - 201 {"status": "set"} if hmac_secret was NULL (first call)
-      - 200 {"status": "already_set", "match": true} if hmac_secret
-        was already set AND matches the provided secret (idempotent
-        retry; safe for the wrapper to call on every start)
-      - 409 {"status": "conflict"} if hmac_secret was set AND
-        doesn't match (someone else has a different secret; the
-        wrapper's local secret is out of sync; operator must fix)
+    The endpoint returns 410 Gone for ALL callers (unauth, non-admin,
+    admin). It is intentionally NOT gated by `require_admin` because
+    the 410 contract is unconditional — the route is permanently
+    disabled, not "admin-only".
 
-    This endpoint is intentionally unauthenticated for the local
-    network threat model: any caller on the network can claim to
-    be agent X and push a secret. The protection is the one-shot
-    nature — the first valid call wins, subsequent calls are
-    rejected unless the secret matches. Audit log records the
-    caller's IP and any X-Agent-Id header.
+    IMPLEMENTATION TRAP: do NOT add `Depends(require_admin)` here. If
+    the implementer accidentally does so, an admin caller would get
+    200/201 instead of 410, breaking the B10 contract.
     """
-    db = request.app.state.db
-    row = await db.fetchone(
-        "SELECT id, hmac_secret FROM agents WHERE id = ?", (agent_id,)
-    )
-    if not row:
-        raise HTTPException(404, f"Agent not found: {agent_id}")
-
-    existing = row.get("hmac_secret")
-    now = _now_iso()
-    caller_agent_id = request.headers.get("X-Agent-Id", "")
-
-    if existing is None:
-        await db.execute(
-            "UPDATE agents SET hmac_secret = ? WHERE id = ?",
-            (body.secret, agent_id),
-        )
-        await audit_log(
-            db, "agent.hmac_secret_set",
-            actor=f"bootstrap:{caller_agent_id or 'unknown'}",
-            agent_id=agent_id,
-            payload={"first_set": True, "remote_addr": request.client.host if request.client else None},
-        )
-        return {"status": "set", "agent_id": agent_id}
-
-    if existing == body.secret:
-        await audit_log(
-            db, "agent.hmac_secret_reverify",
-            actor=f"bootstrap:{caller_agent_id or 'unknown'}",
-            agent_id=agent_id,
-            payload={"match": True, "remote_addr": request.client.host if request.client else None},
-        )
-        return {"status": "already_set", "match": True, "agent_id": agent_id}
-
-    # Conflict: someone else has a different secret.
-    await audit_log(
-        db, "agent.hmac_secret_conflict",
-        actor=f"bootstrap:{caller_agent_id or 'unknown'}",
-        agent_id=agent_id,
-        payload={"remote_addr": request.client.host if request.client else None},
-    )
     raise HTTPException(
-        409,
-        f"Agent {agent_id} already has a different hmac_secret. "
-        "Use POST /api/agents/{id}/rotate-key to change it (v1.6.1+).",
+        410,
+        "POST /api/agents/{id}/secret is deprecated. New-flow agents "
+        "have their HMAC secret set at enroll time. For legacy recovery, "
+        "use the admin-authenticated recovery flow (tracked in B11).",
     )
 
 
@@ -687,8 +657,17 @@ async def get_agent(
 
 
 @router.put("/{agent_id}", response_model=Agent)
-async def update_agent(agent_id: str, body: AgentUpdate, request: Request) -> Agent:
-    """Update agent metadata (ip, os_type, max_concurrent_tasks)."""
+async def update_agent(
+    agent_id: str,
+    body: AgentUpdate,
+    request: Request,
+    _csrf: None = Depends(require_same_origin),
+    user: dict = Depends(require_admin),
+) -> Agent:
+    """Update agent metadata (ip, os_type, max_concurrent_tasks).
+
+    Security (B12 hotfix 2026-08-11): admin-gated.
+    """
     db = request.app.state.db
     agent = await db.fetchone(
         "SELECT id, max_concurrent_tasks FROM agents WHERE id = ?", (agent_id,)
@@ -729,12 +708,15 @@ async def update_agent(agent_id: str, body: AgentUpdate, request: Request) -> Ag
         if new_cap != old_cap:
             await audit_log(
                 db, "agent.max_concurrent_tasks_changed",
-                actor="operator",
+                actor=f"admin:{user['username']}",
                 agent_id=agent_id,
                 payload={
                     "old": old_cap,
                     "new": new_cap,
                     "source": "PUT /api/agents/{id}",
+                    # B12: caller identity + route
+                    "remote_addr": request.client.host if request.client else None,
+                    "route": "PUT /api/agents/{id}",
                 },
             )
     return await _agent_with_profiles(db, agent_id)
@@ -992,12 +974,22 @@ async def heartbeat(
 
 
 @router.delete("/{agent_id}", status_code=204)
-async def delete_agent(agent_id: str, request: Request) -> Response:
+async def delete_agent(
+    agent_id: str,
+    request: Request,
+    _csrf: None = Depends(require_same_origin),
+    user: dict = Depends(require_admin),
+) -> Response:
     """Delete an agent.
 
     - Marks in-flight tasks (assigned/running) as failed (with reason 'agent deleted')
     - CASCADE deletes agent_profiles
     - CASCADE deletes any DB rows referencing agent (heartbeat, etc.)
+
+    Security (B12 hotfix 2026-08-11): admin-gated. This is the
+    B12 highest-priority route (any caller on the LAN could previously
+    DELETE any agent without auth). Admin identity is recorded in the
+    audit log.
     """
     db = request.app.state.db
     agent = await db.fetchone("SELECT id FROM agents WHERE id = ?", (agent_id,))
@@ -1015,8 +1007,13 @@ async def delete_agent(agent_id: str, request: Request) -> Response:
     # Audit log (before delete, in case of cascade issues)
     await audit_log(
         db, "agent.deleted",
-        actor="operator",
+        actor=f"admin:{user['username']}",
         agent_id=agent_id,
+        payload={
+            # B12: caller identity + route
+            "remote_addr": request.client.host if request.client else None,
+            "route": "DELETE /api/agents/{id}",
+        },
     )
 
     # Delete (CASCADE removes profiles via FK)
@@ -1025,10 +1022,19 @@ async def delete_agent(agent_id: str, request: Request) -> Response:
 
 
 @router.post("/{agent_id}/rotate-key")
-async def rotate_key(agent_id: str, request: Request) -> dict:
+async def rotate_key(
+    agent_id: str,
+    request: Request,
+    _csrf: None = Depends(require_same_origin),
+    user: dict = Depends(require_admin),
+) -> dict:
     """Rotate agent's secret. Old key valid for grace period (default 7 days).
 
     Returns: new_secret + old_secret_expires_at
+
+    Security (B12 hotfix 2026-08-11): admin-gated. Previously any caller
+    could rotate any agent's key and receive the new secret in the
+    response, which is a permanent identity-takeover vector.
     """
     db = request.app.state.db
     agent = await db.fetchone("SELECT * FROM agents WHERE id = ?", (agent_id,))
@@ -1047,9 +1053,14 @@ async def rotate_key(agent_id: str, request: Request) -> dict:
     )
     await audit_log(
         db, "agent.key_rotated",
-        actor="operator",
+        actor=f"admin:{user['username']}",
         agent_id=agent_id,
-        payload={"old_expires_at": expires},
+        payload={
+            "old_expires_at": expires,
+            # B12: caller identity + route
+            "remote_addr": request.client.host if request.client else None,
+            "route": "POST /api/agents/{id}/rotate-key",
+        },
     )
 
     return {
@@ -1070,9 +1081,16 @@ async def rotate_key(agent_id: str, request: Request) -> dict:
 
 @router.post("/{agent_id}/profiles", response_model=AgentProfile, status_code=201)
 async def add_profile(
-    agent_id: str, body: AgentProfileCreate, request: Request
+    agent_id: str,
+    body: AgentProfileCreate,
+    request: Request,
+    _csrf: None = Depends(require_same_origin),
+    user: dict = Depends(require_admin),
 ) -> AgentProfile:
-    """Add a new profile to an existing agent."""
+    """Add a new profile to an existing agent.
+
+    Security (B12 hotfix 2026-08-11): admin-gated.
+    """
     db = request.app.state.db
     agent = await db.fetchone("SELECT id FROM agents WHERE id = ?", (agent_id,))
     if not agent:
@@ -1127,7 +1145,7 @@ async def add_profile(
     row = await db.fetchone("SELECT * FROM agent_profiles WHERE id = ?", (profile_id,))
     await audit_log(
         db, "agent.profile_added",
-        actor="operator",
+        actor=f"admin:{user['username']}",
         agent_id=agent_id,
         payload={
             "profile_name": body.name,
@@ -1135,14 +1153,26 @@ async def add_profile(
             "capabilities": body.capabilities or {},
             "skills": cleaned_skills,
             "root_path": cleaned_root_path,
+            # B12: caller identity + route
+            "remote_addr": request.client.host if request.client else None,
+            "route": "POST /api/agents/{id}/profiles",
         },
     )
     return _row_to_profile(row)
 
 
 @router.delete("/{agent_id}/profiles/{profile_name}", status_code=204)
-async def remove_profile(agent_id: str, profile_name: str, request: Request) -> Response:
-    """Remove a profile (fails if profile has in-flight task)."""
+async def remove_profile(
+    agent_id: str,
+    profile_name: str,
+    request: Request,
+    _csrf: None = Depends(require_same_origin),
+    user: dict = Depends(require_admin),
+) -> Response:
+    """Remove a profile (fails if profile has in-flight task).
+
+    Security (B12 hotfix 2026-08-11): admin-gated.
+    """
     db = request.app.state.db
     profile = await db.fetchone(
         "SELECT * FROM agent_profiles WHERE agent_id = ? AND name = ?",
@@ -1161,9 +1191,14 @@ async def remove_profile(agent_id: str, profile_name: str, request: Request) -> 
     await db.execute("DELETE FROM agent_profiles WHERE id = ?", (profile["id"],))
     await audit_log(
         db, "agent.profile_removed",
-        actor="operator",
+        actor=f"admin:{user['username']}",
         agent_id=agent_id,
-        payload={"profile_name": profile_name},
+        payload={
+            "profile_name": profile_name,
+            # B12: caller identity + route
+            "remote_addr": request.client.host if request.client else None,
+            "route": "DELETE /api/agents/{id}/profiles/{name}",
+        },
     )
     return Response(status_code=204)
 
@@ -1174,8 +1209,13 @@ async def update_profile(
     profile_name: str,
     body: AgentProfileUpdate,
     request: Request,
+    _csrf: None = Depends(require_same_origin),
+    user: dict = Depends(require_admin),
 ) -> AgentProfile:
-    """Update a profile (description)."""
+    """Update a profile (description).
+
+    Security (B12 hotfix 2026-08-11): admin-gated.
+    """
     db = request.app.state.db
     profile = await db.fetchone(
         "SELECT * FROM agent_profiles WHERE agent_id = ? AND name = ?",
@@ -1283,7 +1323,7 @@ async def update_profile(
                 })
     await audit_log(
         db, "agent.profile_updated",
-        actor="operator",
+        actor=f"admin:{user['username']}",
         agent_id=agent_id,
         payload={
             "profile_name": profile_name,
@@ -1293,6 +1333,9 @@ async def update_profile(
             # v3.9.0 (SOUL routing): surface the new skills field too
             # so the audit log captures what the operator changed.
             "skills": body.skills,
+            # B12: caller identity + route
+            "remote_addr": request.client.host if request.client else None,
+            "route": "PATCH /api/agents/{id}/profiles/{name}",
         },
     )
     return _row_to_profile(row)
