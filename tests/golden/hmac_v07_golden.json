@@ -1,0 +1,12 @@
+{
+  "_comment": "Locked expected output of sign_v07_request for v0.7 §1.4 with the fixed inputs documented in tests/test_hmac_v07_golden.py. Update ONLY when the v0.7 §1.4 canonical format itself changes (5-field, method\\npath\\nbody_sha256\\ntimestamp\\nnonce, base64 HMAC-SHA256). Cross-validated against installer/bootstrapper/install-orch-client.ps1::Wait-ForEnrollment (PowerShell) on 2026-08-13 — both implementations produce byte-identical 7 headers with these inputs.",
+  "expected_headers": {
+    "X-Hermes-Method": "GET",
+    "X-Hermes-Path": "/api/agents/test-agent/status",
+    "X-Hermes-Body-SHA256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "X-Hermes-Key-Id": "key-test",
+    "X-Hermes-Timestamp": "1700000000",
+    "X-Hermes-Nonce": "0123456789abcdef0123456789abcdef",
+    "X-Hermes-Signature": "wZRxHeuFbqyQoYlI0dtzPLoUi/sJkuYEizu9E93kcQs="
+  }
+}
