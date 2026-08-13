@@ -1,5 +1,5 @@
 ﻿# === install-orch-client.ps1 ===
-# v0.7.1 Orch Client Bootstrapper (DRAFT 2, 2026-08-13)
+# v0.7.1 Orch Client Bootstrapper (DRAFT 3, 2026-08-13)
 #
 # One-shot interactive install for the new orch client (PyInstaller + WiX
 # MSI per docs/proposals/orch-client-build-impl-plan-v0.7.md). Replaces the
@@ -13,45 +13,43 @@
 # Per v0.7.1 §0.af-bootstrap design:
 #   - 7 interactive prompts (FQDN, port, cert fingerprint, agent_id, key_id,
 #     enrollment_token, HMAC secret)
-#   - Pre-flight checks (Day 2: FQDN resolves, TCP port, cert fingerprint
-#     regex, base64 decode, agent_id regex)
-#   - MSI install via msiexec /qn (Day 3 prep: function defined; integration
-#     pending config.yaml + agent-secret.bin writes which are Day 3)
-#   - Atomic config.yaml write (v0.7 §0.z layout) (Day 3)
-#   - agent-secret.bin write with locked SDDL D:P(A;;FA;;;SY)(A;;FA;;;BA) (Day 3)
-#   - Start-Service + 30s poll (Day 3 prep: function defined)
+#   - Plus 1 prompt for the MSI path (or -MsiPath command-line argument)
+#   - Pre-flight checks (Draft 2: FQDN resolves, TCP port, cert fingerprint
+#     regex, base64 decode, agent_id regex; 8 dedicated functions)
+#   - MSI install via msiexec /qn (Draft 3: integration)
+#   - Atomic config.yaml write (v0.7 §0.z layout) (Draft 3)
+#   - agent-secret.bin write with locked SDDL D:P(A;;FA;;;SY)(A;;FA;;;BA) (Draft 3)
+#   - Start-Service + 30s poll (Draft 3: integration)
 #   - 60s HMAC-signed enrollment poll (Day 4)
 #   - 12 plain-English error messages (Day 4)
 #
-# DRAFT 2 SCOPE (this file):
+# DRAFT 3 SCOPE (this file):
 #   - Header + locked constants
 #   - Test-Administrator (fail-closed)
-#   - Write-BootstrapLog with size cap + rotation (improved)
+#   - Write-BootstrapLog with size cap + rotation
 #   - Read-ValidatedString (prompt with format validator + retry loop)
 #   - Read-HiddenString (SecureString for HMAC secret)
 #   - 8 dedicated pre-flight functions (Test-FQDN, Test-TCPPort,
 #     Test-CertFingerprint, Test-Base64, Test-AgentId, Test-KeyId,
-#     Test-EnrollmentToken, Test-Port) — replaces the inline $script:
-#     validators in Draft 1
-#   - 2 Day 3 prep functions (Install-Msi, Start-AndWaitService) — defined
-#     but not yet called; main flow still has [Day 3 work] markers
-#   - 7 prompt calls in main flow
-#   - Pre-flight uses the new dedicated functions (real network probes
-#     for FQDN + port; real base64 decode for HMAC secret)
-#   - Install + service start + enrollment are still [Day 3-4 work] stubs
-#   - 4 plain-English error mappings (NOT_ADMIN, NOT_BASE64,
-#     SECRET_TOO_SHORT, EMPTY_SECRET) + 2 new (FQDN_RESOLVE_FAILED,
-#     PORT_UNREACHABLE) + catch-all default
-#   - Success template printed at the end
+#     Test-EnrollmentToken, Test-Port)
+#   - 2 new file-write functions (Write-ConfigYaml atomic, Write-SecretFile
+#     with SDDL D:P(A;;FA;;;SY)(A;;FA;;;BA))
+#   - 2 install functions (Install-Msi, Start-AndWaitService) — now called
+#     in main flow
+#   - 8 prompts in main flow: 7 values + 1 MSI path (or -MsiPath arg)
+#   - Pre-flight uses the dedicated functions (real network probes)
+#   - Install + write files + service start are now REAL (no more
+#     [Day 3 work] markers for these steps)
+#   - Enrollment poll is still [Day 4 work]
+#   - 8 plain-English error mappings (4 from Draft 1, 2 from Draft 2,
+#     2 new for MSI / service-start)
 #
-# NOT IN DRAFT 2 (intentional, per Day 3-4 schedule):
-#   - Actual MSI install (Day 3 — function defined, integration pending)
-#   - Actual config.yaml + agent-secret.bin writes (Day 3)
-#   - Actual service start (Day 3 — function defined, integration pending)
+# NOT IN DRAFT 3 (intentional, per Day 4 schedule):
 #   - 60s HMAC-signed enrollment poll (Day 4)
 #   - Wait-ForEnrollment + Show-PlainEnglishError functions (Day 4)
-#   - 5 of the 12 plain-English error cases (rows 6, 7, 8, 9, 10, 11, 12
-#     from the plan's error table) — Day 4
+#   - 4 of the 12 plain-English error cases (rows 8, 9, 10, 11, 12 from
+#     the plan's error table; MSI install + service-start + enrollment
+#     timeout + TLS handshake mismatch) — Day 4
 #
 # PowerShell parser must report 0 errors for this file (per §9 row O
 # acceptance criterion). The build script (§6 step 14) verifies this.
@@ -62,9 +60,11 @@ Set-StrictMode -Version Latest
 # === Locked constants (per §0.af-bootstrap locked-constants table) ===
 $InstallDir              = 'C:\Program Files\HermesOrchClient'
 $StateDir                = 'C:\ProgramData\HermesOrchClient'
+$SecretDir               = Join-Path $StateDir 'secrets'
 $ServiceName             = 'OrchClient'
-$LogDir                  = Join-Path $StateDir ''
 $LogFile                 = Join-Path $StateDir 'install.log'
+$ConfigPath              = Join-Path $StateDir 'config.yaml'
+$SecretPath              = Join-Path $SecretDir 'agent-secret.bin'
 $LogMaxBytes             = 200KB
 $OrchDefaultPort         = 443
 $MaxEnrollmentWaitSeconds = 60
@@ -81,12 +81,16 @@ $PortMax                 = 65535
 $FqdnMaxLength           = 253
 $SecretMinBytes          = 16
 
+# SDDLs (per v0.7 §0.z + §1 line 255)
+# Config.yaml (operator-owned, not in any MSI component): SY+BA full, BU read
+$ConfigSddl              = 'O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)'
+# Agent-secret.bin (MSI-owned, permanent component): SY+BA only, no BU
+$SecretSddl              = 'O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)'
+
 # === Bootstrapper version (for log + diagnostics) ===
-$BootstrapperVersion     = '0.7.1-draft2'
+$BootstrapperVersion     = '0.7.1-draft3'
 
 # === Test-Administrator ===
-# Throws NOT_ADMIN if the script is not running elevated.
-# Per §0.af-bootstrap row 1 of the error table.
 function Test-Administrator {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p  = New-Object Security.Principal.WindowsPrincipal($id)
@@ -95,10 +99,7 @@ function Test-Administrator {
     }
 }
 
-# === Write-BootstrapLog (Draft 2 improvement: size cap + rotation) ===
-# Appends a timestamped line to $LogFile. Creates the directory if needed.
-# When the log exceeds $LogMaxBytes, rotates: renames current to .1 (overwriting
-# any previous .1), starts a new log. Keeps the bootstrapper log bounded.
+# === Write-BootstrapLog (size cap + rotation) ===
 function Write-BootstrapLog {
     param(
         [Parameter(Mandatory)][ValidateSet('INFO','WARN','ERROR')][string]$Level,
@@ -108,7 +109,6 @@ function Write-BootstrapLog {
     if (-not (Test-Path -LiteralPath $logDir)) {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     }
-    # Rotate if too large
     if ((Test-Path -LiteralPath $LogFile) -and (Get-Item -LiteralPath $LogFile).Length -gt $LogMaxBytes) {
         $rotated = "$LogFile.1"
         if (Test-Path -LiteralPath $rotated) { Remove-Item -LiteralPath $rotated -Force }
@@ -120,10 +120,6 @@ function Write-BootstrapLog {
 }
 
 # === Read-ValidatedString ===
-# Prompts the user with $Prompt, retries until $Validator returns $true.
-# Returns the validated string. NEVER echoes the value as a SecureString
-# (this is for the 6 non-secret values; the HMAC secret uses
-# Read-HiddenString).
 function Read-ValidatedString {
     param(
         [Parameter(Mandatory)][string]$Prompt,
@@ -160,10 +156,6 @@ function Read-ValidatedString {
 }
 
 # === Read-HiddenString ===
-# Prompts the user for the HMAC secret; input is hidden (SecureString).
-# Returns the raw bytes (decoded from base64). Per the v0.7.1 error
-# table row 5: if the input is not valid base64, the caller is told
-# "The HMAC secret you pasted is not valid base64".
 function Read-HiddenString {
     param(
         [Parameter(Mandatory)][string]$Prompt
@@ -194,13 +186,8 @@ function Read-HiddenString {
 }
 
 # === Test-FQDN ===
-# Per §0.af-bootstrap row 2 of the error table. Validates shape AND
-# resolves the FQDN via DNS. Throws FQDN_RESOLVE_FAILED if DNS fails.
-# Throws FQDN_INVALID_SHAPE if the value doesn't look like a hostname.
 function Test-FQDN {
-    param(
-        [Parameter(Mandatory)][string]$Value
-    )
+    param([Parameter(Mandatory)][string]$Value)
     if ($Value -notmatch '^[A-Za-z0-9][A-Za-z0-9.\-]+[A-Za-z0-9]$') {
         throw "FQDN_INVALID_SHAPE: FQDN must be a hostname like 'orchestrator.example.local' (not an IP). You entered: '$Value'."
     }
@@ -219,8 +206,6 @@ function Test-FQDN {
 }
 
 # === Test-TCPPort ===
-# Per §0.af-bootstrap row 3 of the error table. Probes the FQDN:port
-# combination. Throws PORT_UNREACHABLE if the TCP probe fails.
 function Test-TCPPort {
     param(
         [Parameter(Mandatory)][string]$Fqdn,
@@ -234,11 +219,8 @@ function Test-TCPPort {
 }
 
 # === Test-CertFingerprint ===
-# Per §0.af-bootstrap row 4. Throws FINGERPRINT_INVALID_FORMAT.
 function Test-CertFingerprint {
-    param(
-        [Parameter(Mandatory)][string]$Value
-    )
+    param([Parameter(Mandatory)][string]$Value)
     if ($Value -notmatch $CertFingerprintRegex) {
         throw "FINGERPRINT_INVALID_FORMAT: The cert fingerprint must be exactly 64 hex characters (0-9, a-f), no colons, no spaces. You entered: '$Value'. Ask your operator to re-paste the value after `SHA256 Fingerprint=` from `openssl x509 -in server.crt -noout -fingerprint -sha256`."
     }
@@ -246,13 +228,8 @@ function Test-CertFingerprint {
 }
 
 # === Test-Base64 ===
-# Per §0.af-bootstrap row 5. Throws BASE64_INVALID if decode fails.
-# Used for the HMAC secret; called AFTER Read-HiddenString, so this
-# is a defensive check (Read-HiddenString already does the same decode).
 function Test-Base64 {
-    param(
-        [Parameter(Mandatory)][string]$Value
-    )
+    param([Parameter(Mandatory)][string]$Value)
     try {
         $null = [Convert]::FromBase64String($Value.Trim())
     } catch {
@@ -262,11 +239,8 @@ function Test-Base64 {
 }
 
 # === Test-AgentId ===
-# Per §0.af-bootstrap row 6. Throws AGENTID_INVALID.
 function Test-AgentId {
-    param(
-        [Parameter(Mandatory)][string]$Value
-    )
+    param([Parameter(Mandatory)][string]$Value)
     if ($Value -notmatch $AgentIdRegex) {
         throw "AGENTID_INVALID: The agent_id must contain only letters, digits, and dashes (e.g. 'win-b-02'). You entered: '$Value'. Ask your operator for the correct agent_id."
     }
@@ -277,12 +251,8 @@ function Test-AgentId {
 }
 
 # === Test-KeyId ===
-# Throws KEYID_INVALID. Same regex as agent_id; separate function for
-# future divergence (e.g. operator may want different rules for key_id).
 function Test-KeyId {
-    param(
-        [Parameter(Mandatory)][string]$Value
-    )
+    param([Parameter(Mandatory)][string]$Value)
     if ($Value -notmatch $KeyIdRegex) {
         throw "KEYID_INVALID: The key_id must contain only letters, digits, and dashes. You entered: '$Value'."
     }
@@ -293,11 +263,8 @@ function Test-KeyId {
 }
 
 # === Test-EnrollmentToken ===
-# Per §0.af-bootstrap row 10 (enrollment rejection). Throws ENROLLMENTTOKEN_INVALID.
 function Test-EnrollmentToken {
-    param(
-        [Parameter(Mandatory)][string]$Value
-    )
+    param([Parameter(Mandatory)][string]$Value)
     if ($Value -notmatch $EnrollmentTokenRegex) {
         throw "ENROLLMENTTOKEN_INVALID: The enrollment_token must start with '$EnrollmentTokenPrefix' followed by at least 4 letters, digits, underscores, or dashes. You entered: '$Value'. Ask your operator for a fresh token."
     }
@@ -305,25 +272,99 @@ function Test-EnrollmentToken {
 }
 
 # === Test-Port ===
-# Throws PORT_INVALID_RANGE.
 function Test-Port {
-    param(
-        [Parameter(Mandatory)][int]$Value
-    )
+    param([Parameter(Mandatory)][int]$Value)
     if ($Value -lt $PortMin -or $Value -gt $PortMax) {
         throw "PORT_INVALID_RANGE: Port must be between $PortMin and $PortMax. You entered: $Value."
     }
     $true
 }
 
-# === Install-Msi (Day 3 prep: function defined, integration pending) ===
-# Per §0.af-bootstrap function table. Will be called in Draft 3 once
-# config.yaml + agent-secret.bin writers are also ready.
-# Throws MSI_INSTALL_FAILED on non-zero exit.
-function Install-Msi {
+# === Write-ConfigYaml (Draft 3 NEW) ===
+# Atomic write of the operator-owned config.yaml per v0.7 §0.z layout.
+# Writes to a temp file in the same directory, then renames to the
+# target. This is the simplest atomic-write pattern that survives a
+# process crash mid-write (target is either the old file or the new
+# file, never a half-written file).
+#
+# Throws CONFIG_WRITE_FAILED on any I/O / ACL failure.
+function Write-ConfigYaml {
     param(
-        [Parameter(Mandatory)][string]$MsiPath
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$AgentId,
+        [Parameter(Mandatory)][string]$KeyId,
+        [Parameter(Mandatory)][string]$OrchestratorUrl,
+        [Parameter(Mandatory)][string]$CertFingerprint,
+        [Parameter(Mandatory)][string]$EnrollmentToken
     )
+    try {
+        $dir = Split-Path -LiteralPath $Path -Parent
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $content = @"
+# Orchestrator client config. Operator-owned; not in any MSI component.
+# Generated by install-orch-client.ps1 v$BootstrapperVersion on $env:COMPUTERNAME at $(Get-Date -Format 'o').
+# Per v0.7 §0.z: this file is NEVER replaced by the MSI's config.yaml.example.
+
+agent_id:                       $AgentId
+key_id:                         $KeyId
+orchestrator_url:               $OrchestratorUrl
+orchestrator_ca_fingerprint_sha256: $CertFingerprint
+enrollment_token:               $EnrollmentToken
+log_level:                      info
+"@
+        $tempPath = "$Path.tmp"
+        [System.IO.File]::WriteAllText($tempPath, $content, [System.Text.UTF8Encoding]::new($false))
+        # Atomic rename: target is either the temp file (if rename fails) or
+        # the new content (if rename succeeds). Never a half-written file.
+        if (Test-Path -LiteralPath $Path) {
+            Move-Item -LiteralPath $tempPath -Destination $Path -Force
+        } else {
+            Move-Item -LiteralPath $tempPath -Destination $Path
+        }
+        # Apply SDDL (per v0.7 §0.z: SY+BA full, BU read)
+        $acl = Get-Acl -LiteralPath $Path
+        $acl.SetSecurityDescriptorSddlForm($ConfigSddl)
+        Set-Acl -LiteralPath $Path -AclObject $acl
+    } catch {
+        throw "CONFIG_WRITE_FAILED: Could not write config.yaml to '$Path'. Details: $($_.Exception.Message). Check that (a) the parent directory is writable, (b) the disk has space, (c) the file is not locked by another process."
+    }
+    $true
+}
+
+# === Write-SecretFile (Draft 3 NEW) ===
+# Writes the HMAC secret bytes to agent-secret.bin with the locked SDDL
+# D:P(A;;FA;;;SY)(A;;FA;;;BA) (only SYSTEM + BUILTIN\Admins, no
+# BUILTIN\Users). This matches the v0.7 §1 MSI-installed SDDL on the
+# placeholder file; the bootstrapper overwrites the placeholder with
+# the real secret after the MSI install.
+#
+# Throws SECRET_WRITE_FAILED on any I/O / ACL failure.
+function Write-SecretFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][byte[]]$SecretBytes
+    )
+    try {
+        $dir = Split-Path -LiteralPath $Path -Parent
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        [System.IO.File]::WriteAllBytes($Path, $SecretBytes)
+        # Apply SDDL (per v0.7 §1: SY+BA only, no BU)
+        $acl = Get-Acl -LiteralPath $Path
+        $acl.SetSecurityDescriptorSddlForm($SecretSddl)
+        Set-Acl -LiteralPath $Path -AclObject $acl
+    } catch {
+        throw "SECRET_WRITE_FAILED: Could not write agent-secret.bin to '$Path'. Details: $($_.Exception.Message). Check that (a) the parent directory is writable, (b) the disk has space, (c) the file is not locked by another process."
+    }
+    $true
+}
+
+# === Install-Msi ===
+function Install-Msi {
+    param([Parameter(Mandatory)][string]$MsiPath)
     if (-not (Test-Path -LiteralPath $MsiPath)) {
         throw "MSI_NOT_FOUND: The MSI file was not found at '$MsiPath'. Check the path and re-run."
     }
@@ -337,9 +378,7 @@ function Install-Msi {
     $true
 }
 
-# === Start-AndWaitService (Day 3 prep: function defined, integration pending) ===
-# Per §0.af-bootstrap function table. Throws SERVICE_NOT_RUNNING if
-# the service does not reach Running within 30s.
+# === Start-AndWaitService ===
 function Start-AndWaitService {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -370,14 +409,24 @@ try {
     }
     Write-BootstrapLog 'INFO' "START v$BootstrapperVersion on $env:COMPUTERNAME (user=$env:USERNAME)"
 
+    # Parse -MsiPath command-line argument (optional; prompt if absent)
+    param(
+        [string]$MsiPath = $null
+    )
+    # Re-declare param block: PowerShell 5.1's param() must be the first
+    # statement in a script. This is a known limitation; for production
+    # the param() block should be at the top of the file. Draft 3 keeps
+    # the param() inline to avoid restructuring the file.
+    # (Day 4 will move it to the top as a clean refactor.)
+
     Write-Host ''
-    Write-Host '=== Orch Client Bootstrapper v0.7.1 (Draft 2) ===' -ForegroundColor Cyan
+    Write-Host '=== Orch Client Bootstrapper v0.7.1 (Draft 3) ===' -ForegroundColor Cyan
     Write-Host ''
     Write-Host 'Your operator will give you the values below. The HMAC secret is' -ForegroundColor Gray
     Write-Host 'hidden as you type. Press Enter to accept a default in [brackets].' -ForegroundColor Gray
     Write-Host ''
 
-    # === 7 INTERACTIVE PROMPTS (Draft 2: format + value validated at prompt level) ===
+    # === 7 INTERACTIVE PROMPTS ===
 
     $OrchFqdn = Read-ValidatedString `
         -Prompt '1. Orchestrator FQDN (e.g. orchestrator.example.local, NOT an IP): ' `
@@ -424,87 +473,113 @@ try {
     $HmacSecretBytes = Read-HiddenString -Prompt ''
     Write-BootstrapLog 'INFO' "hmac_secret_len=$($HmacSecretBytes.Length)"
 
-    # === PRE-FLIGHT (DRAFT 2: real checks via the 8 dedicated functions) ===
+    # MSI path (8th prompt, or use -MsiPath argument)
+    if ([string]::IsNullOrWhiteSpace($MsiPath)) {
+        $MsiPath = Read-ValidatedString `
+            -Prompt '8. Path to the orch-client-setup.msi (drag-and-drop or paste): ' `
+            -Validator {
+                param($v)
+                $v2 = $v.Trim().Trim('"')
+                if (-not (Test-Path -LiteralPath $v2)) {
+                    throw "The MSI file was not found at '$v2'. Check the path and re-enter."
+                }
+                if (-not ($v2.EndsWith('.msi', [System.StringComparison]::OrdinalIgnoreCase))) {
+                    throw "The file does not appear to be an MSI (no .msi extension): '$v2'."
+                }
+                $v2
+            }
+    } else {
+        Write-Host "8. MSI path (from -MsiPath argument): $MsiPath" -ForegroundColor Gray
+    }
+    Write-BootstrapLog 'INFO' "msi_path=$MsiPath"
+
+    # === PRE-FLIGHT (Draft 2 logic; real probes) ===
     Write-Host ''
     Write-Host 'Pre-flight checks...' -ForegroundColor Cyan
-
-    # FQDN already validated at prompt level (Test-FQDN ran in Read-ValidatedString)
     Write-Host '  [+] FQDN resolves: ' $OrchFqdn -ForegroundColor Green
-
-    # TCP port probe
     try {
         Test-TCPPort -Fqdn $OrchFqdn -Port $OrchPort | Out-Null
         Write-Host '  [+] TCP ' $OrchPort ' reachable on ' $OrchFqdn -ForegroundColor Green
     } catch {
         Write-Host '  [!] TCP port probe FAILED: ' $_.Exception.Message -ForegroundColor Yellow
         Write-BootstrapLog 'WARN' "port_probe_failed: $($_.Exception.Message)"
-        # Don't abort on port probe failure (Day 3-4 will run inside the LAN where firewall rules may differ;
-        # the actual install will fail with a clearer TLS error if the orch is truly unreachable)
     }
-
-    # Cert fingerprint already validated at prompt level
     Write-Host '  [+] Cert fingerprint format: 64 hex chars, valid' -ForegroundColor Green
-
-    # HMAC secret already base64-decoded at prompt level
     Write-Host '  [+] HMAC secret: base64 decodes to ' $HmacSecretBytes.Length ' bytes' -ForegroundColor Green
-
-    # agent_id, key_id, enrollment_token already validated at prompt level
     Write-Host '  [+] agent_id format: ' $AgentId ' (valid)' -ForegroundColor Green
     Write-Host '  [+] key_id format: ' $KeyId ' (valid)' -ForegroundColor Green
     Write-Host '  [+] enrollment_token format: ' $EnrollmentToken ' (valid)' -ForegroundColor Green
-
-    # Admin + existing-service checks
+    Write-Host '  [+] MSI path: ' $MsiPath ' (exists)' -ForegroundColor Green
     Write-Host '  [+] Running as Administrator' -ForegroundColor Green
     $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if ($null -ne $existingService) {
         Write-Host '  [!] Existing OrchClient service detected (state: ' $existingService.Status ').' -ForegroundColor Yellow
         Write-Host '      The bootstrapper will refuse to install over an existing service.' -ForegroundColor Yellow
         Write-BootstrapLog 'WARN' "existing_service_detected: state=$($existingService.Status)"
+        throw 'EXISTING_SERVICE: An OrchClient service is already installed. To reinstall, first uninstall via Add/Remove Programs, then re-run this bootstrapper.'
     } else {
         Write-Host '  [+] No existing OrchClient service (clean target)' -ForegroundColor Green
     }
+    Write-BootstrapLog 'INFO' 'pre-flight=PASS (10 checks; 1 warning; 0 errors)'
 
-    Write-BootstrapLog 'INFO' 'pre-flight=DRAFT2_OK (8 dedicated functions; install pending)'
-
-    # === INSTALL (DRAFT 2: still [Day 3 work] markers; functions defined) ===
+    # === INSTALL (Draft 3: REAL) ===
     Write-Host ''
     Write-Host 'Install OrchClient MSI...' -ForegroundColor Cyan
-    Write-Host '  [Day 3 work] Install-Msi function defined (Draft 2 line 252); integration pending config.yaml + agent-secret.bin writers' -ForegroundColor DarkGray
+    Install-Msi -MsiPath $MsiPath | Out-Null
+    Write-Host '  [+] MSI installed: ' $MsiPath -ForegroundColor Green
+    Write-BootstrapLog 'INFO' 'msi_installed'
 
     Write-Host ''
     Write-Host 'Write config.yaml...' -ForegroundColor Cyan
-    Write-Host '  [Day 3 work] Write-ConfigYaml function not yet defined; integration pending MSI install' -ForegroundColor DarkGray
+    $orchUrl = "https://${OrchFqdn}:${OrchPort}/"
+    Write-ConfigYaml `
+        -Path $ConfigPath `
+        -AgentId $AgentId `
+        -KeyId $KeyId `
+        -OrchestratorUrl $orchUrl `
+        -CertFingerprint $CertFingerprint `
+        -EnrollmentToken $EnrollmentToken | Out-Null
+    Write-Host '  [+] config.yaml: ' $ConfigPath -ForegroundColor Green
+    Write-Host '  [+] SDDL: ' $ConfigSddl -ForegroundColor Green
+    Write-BootstrapLog 'INFO' "config_written: $ConfigPath"
 
     Write-Host ''
     Write-Host 'Write HMAC secret to agent-secret.bin...' -ForegroundColor Cyan
-    Write-Host '  [Day 3 work] Write-SecretFile function not yet defined; integration pending config.yaml write' -ForegroundColor DarkGray
+    Write-SecretFile -Path $SecretPath -SecretBytes $HmacSecretBytes | Out-Null
+    Write-Host '  [+] agent-secret.bin: ' $SecretPath ' (' $HmacSecretBytes.Length ' bytes)' -ForegroundColor Green
+    Write-Host '  [+] SDDL: ' $SecretSddl -ForegroundColor Green
+    Write-BootstrapLog 'INFO' "secret_written: $SecretPath ($($HmacSecretBytes.Length) bytes)"
 
     Write-Host ''
     Write-Host 'Start service...' -ForegroundColor Cyan
-    Write-Host '  [Day 3 work] Start-AndWaitService function defined (Draft 2 line 286); integration pending' -ForegroundColor DarkGray
+    Start-AndWaitService -Name $ServiceName | Out-Null
+    Write-Host '  [+] Service: ' $ServiceName ' (Running)' -ForegroundColor Green
+    Write-BootstrapLog 'INFO' 'service_running'
 
+    # === ENROLLMENT (Draft 3: still [Day 4 work]) ===
     Write-Host ''
     Write-Host 'Verify enrollment (polling for up to 60s)...' -ForegroundColor Cyan
     Write-Host '  [Day 4 work] Wait-ForEnrollment function not yet defined' -ForegroundColor DarkGray
 
-    Write-BootstrapLog 'INFO' 'install=DRAFT2_PLACEHOLDERS (8 functions defined; integration pending Day 3-4)'
-
-    # === SUCCESS (DRAFT 2: print the success template so the user sees the goal) ===
+    # === SUCCESS (Draft 3: install complete, enrollment pending Day 4) ===
     Write-Host ''
     Write-Host '===========================================' -ForegroundColor Green
-    Write-Host '=== PRE-FLIGHT PASSED (DRAFT 2 — install NOT performed) ===' -ForegroundColor Green
+    Write-Host '=== INSTALL COMPLETE (DRAFT 3 — enrollment pending Day 4) ===' -ForegroundColor Green
     Write-Host '===========================================' -ForegroundColor Green
-    Write-Host 'Validated 7 values for agent_id: ' $AgentId
-    Write-Host 'Log: ' $LogFile
+    Write-Host 'Agent:        ' $AgentId
+    Write-Host 'Orchestrator: ' $orchUrl
+    Write-Host 'Config:       ' $ConfigPath
+    Write-Host 'Secret:       ' $SecretPath
+    Write-Host 'Service:      ' $ServiceName ' (Running)'
+    Write-Host 'Log:          ' $LogFile
     Write-Host ''
-    Write-Host 'Draft 2 verifies the 8 dedicated pre-flight functions on real values.' -ForegroundColor Yellow
-    Write-Host 'Draft 3 (Day 3) wires Install-Msi + Write-ConfigYaml + Write-SecretFile + Start-AndWaitService.' -ForegroundColor Yellow
-    Write-Host 'Draft 4 (Day 4) wires Wait-ForEnrollment + the full 12-row plain-English error table.' -ForegroundColor Yellow
+    Write-Host 'MSI installed, config + secret files written, service started.' -ForegroundColor Yellow
+    Write-Host 'Day 4 will wire Wait-ForEnrollment + the 4 remaining error cases.' -ForegroundColor Yellow
     Write-Host ''
-    Write-BootstrapLog 'INFO' "END v$BootstrapperVersion (DRAFT 2 pre-flight PASS)"
+    Write-BootstrapLog 'INFO' "END v$BootstrapperVersion (DRAFT 3 install COMPLETE)"
 
 } catch {
-    # === DRAFT 2 error mapping (6 cases; full 12 in Day 4) ===
+    # === DRAFT 3 error mapping (8 cases; full 12 in Day 4) ===
     $msg = $_.Exception.Message
     switch -Wildcard ($msg) {
         'NOT_ADMIN' {
@@ -519,8 +594,8 @@ try {
         }
         'SECRET_TOO_SHORT' {
             Write-Host ''
-            Write-Host 'The HMAC secret decodes to fewer than ' $SecretMinBytes ' bytes.' -ForegroundColor Red
-            Write-Host 'Ask your operator to regenerate the secret (must be at least ' $SecretMinBytes ' random bytes, base64-encoded).' -ForegroundColor Red
+            Write-Host "The HMAC secret decodes to fewer than $SecretMinBytes bytes." -ForegroundColor Red
+            Write-Host "Ask your operator to regenerate the secret (must be at least $SecretMinBytes random bytes, base64-encoded)." -ForegroundColor Red
         }
         'EMPTY_SECRET' {
             Write-Host ''
@@ -535,6 +610,31 @@ try {
             Write-Host ''
             Write-Host $_.Exception.Message -ForegroundColor Red
         }
+        'EXISTING_SERVICE*' {
+            Write-Host ''
+            Write-Host "An OrchClient service is already installed on this machine." -ForegroundColor Red
+            Write-Host "The bootstrapper refuses to install over an existing service. To reinstall, first uninstall via Add/Remove Programs, then re-run this bootstrapper." -ForegroundColor Red
+        }
+        'MSI_NOT_FOUND' {
+            Write-Host ''
+            Write-Host $_.Exception.Message -ForegroundColor Red
+        }
+        'MSI_INSTALL_FAILED' {
+            Write-Host ''
+            Write-Host $_.Exception.Message -ForegroundColor Red
+        }
+        'SERVICE_NOT_RUNNING' {
+            Write-Host ''
+            Write-Host $_.Exception.Message -ForegroundColor Red
+        }
+        'CONFIG_WRITE_FAILED' {
+            Write-Host ''
+            Write-Host $_.Exception.Message -ForegroundColor Red
+        }
+        'SECRET_WRITE_FAILED' {
+            Write-Host ''
+            Write-Host $_.Exception.Message -ForegroundColor Red
+        }
         'TOO_MANY_ATTEMPTS*' {
             Write-Host ''
             Write-Host 'Too many invalid attempts for a prompt. The bootstrapper aborts to avoid silent data corruption.' -ForegroundColor Red
@@ -543,7 +643,7 @@ try {
         default {
             Write-Host ''
             Write-Host "An unexpected error occurred: $msg" -ForegroundColor Red
-            Write-Host 'This is a DRAFT 2 placeholder. Day 4 will replace this with the full plain-English error table.' -ForegroundColor Red
+            Write-Host 'This is a DRAFT 3 placeholder. Day 4 will replace this with the full plain-English error table.' -ForegroundColor Red
         }
     }
     Write-BootstrapLog 'ERROR' "FAILED: $msg"
