@@ -1,7 +1,8 @@
 # Orch Client Install & Register Runbook (Windows target)
 
-> **v0.2** — aligned with `docs/proposals/orch-client-build-impl-plan-v0.7.md`
-> (`9dcb082` on branch `proposal/orch-client-build-impl-plan-v0.1`).
+> **v0.3** — aligned with `docs/proposals/orch-client-build-impl-plan-v0.7.md`
+> (`9dcb082` on branch `proposal/orch-client-build-impl-plan-v0.1`) +
+> v0.7 cert-pinning patch (see §0.bis of the plan).
 >
 > **For a new operator.** Assumes the orchestrator is already running on
 > another machine (the "orchestrator host"). This runbook is executed on
@@ -36,6 +37,22 @@
 All v0.1 sections preserved where not directly affected. Section
 numbering kept stable. New section `0` added for the changelog.
 
+### 0.1 v0.2 → v0.3 cert-pinning patch (2026-08-13)
+
+| # | v0.2 said | v0.3 says | Reason |
+|---|---|---|---|
+| 9 | "Before you start" checklist did not list the orch server's TLS cert; `orchestrator_url` was the only HTTPS-related item | Checklist adds **Orchestrator cert SHA-256 fingerprint** (lower-case hex, no colons, 64 hex chars; operator runs `openssl x509 -in server.crt -noout -fingerprint -sha256` on the orch host and pastes the value after `SHA256 Fingerprint=`) | v0.7 §1.6 + §0.bis: the new client (this MSI) uses cert fingerprint pinning, not OS trust store. Without the fingerprint, the service fails closed (placeholder / missing / comment-only value) |
+| 10 | `config.yaml` example did not include the cert fingerprint field | Step 5a adds `orchestrator_ca_fingerprint_sha256: <PASTE_FINGERPRINT_HERE>` field with a comment pointing to v0.7 §1.6 | The pinned value is per-deployment, not in `MANIFEST.json`; each agent's `config.yaml` carries its own pinned value. Operator pastes once at install time |
+| 11 | Troubleshooting table had no row for "TLS handshake fails" / "certificate verify failed" | New row: "TLS handshake fails" → "`orchestrator_ca_fingerprint_sha256` in `config.yaml` does not match the orch server's current cert. Re-fetch the fingerprint from the operator (orch server may have re-gen'd cert since first install); paste the new value; restart the service. Do NOT switch to `verify=False` or trust-store fallback — pinning is the only trust model" | Pinning is the only trust model in v0.7 §1.6. The troubleshooting row makes the rotation-flow explicit |
+| 12 | "What to report back" did not include the cert fingerprint | Adds "the cert fingerprint you used (so the operator can confirm it matches the orch server's current cert at audit time)" | Audit trail: the operator can verify at any time that every agent's pinned fingerprint matches the orch server's current cert |
+
+**Forbidden (per v0.7 §1.6):** shipping a real fingerprint in the MSI
+template, hard-coding a fingerprint in `config.yaml.example`, shipping
+the cert file inside the MSI, adding the cert to the OS trust store,
+or setting `INSECURE_SKIP_TLS_VERIFY=1`. The fingerprint is always
+operator-input at deployment time; the cert never leaves the orch
+host.
+
 ---
 
 ## Before you start (checklist)
@@ -58,6 +75,13 @@ You need:
 - [ ] **HMAC secret** (32+ random bytes; your operator generates and
       pastes to you out-of-band; you will write it into
       `agent-secret.bin`, not into `config.yaml`; v0.7 §0.4)
+- [ ] **Orchestrator cert SHA-256 fingerprint** (the orch server's
+      self-signed cert, lower-case hex, **no colons, 64 hex chars**;
+      your operator runs `openssl x509 -in server.crt -noout
+      -fingerprint -sha256` on the orch host and pastes you the value
+      after `SHA256 Fingerprint=`; v0.7 §1.6 + §0.bis). **Do NOT**
+      substitute `Get-FileHash` on the cert file — that gives the
+      file's SHA-256, not the cert's
 - [ ] **Orch client installer file** (.msi) + the matching SHA-256 hash
       + the signing-cert fingerprint (your operator provides these —
       DO NOT download from anywhere else)
@@ -224,6 +248,7 @@ Fill in these fields. **No secret in this file.**
 agent_id:        <AGENT_ID>          # e.g. win-b-02
 key_id:          <KEY_ID>            # operator-assigned; used for HMAC key rotation
 orchestrator_url: https://<ORCHESTRATOR_FQDN>:<HTTPS_PORT>/
+orchestrator_ca_fingerprint_sha256: <PASTE_FINGERPRINT_HERE>  # 64 hex chars, no colons; v0.7 §1.6
 enrollment_token: <ENROLLMENT_TOKEN> # one-time; consumed on first enroll
 log_level:       info
 ```
@@ -422,6 +447,8 @@ agent without first deleting the agent record on the orchestrator.**
 | Auth / 401 / 403 errors after enroll | HMAC key bytes don't match, or query string on signed endpoint | Re-paste secret from operator into `agent-secret.bin`; do not edit by hand. Per v0.7 §1.4, signed endpoints forbid query strings — do not add `?...` to a signed URL |
 | Service crashes repeatedly | `agent-secret.bin` is missing / empty / unreadable (SDDL stripped, or wrong owner) | Re-create the secret file with the correct SDDL; restart the service. The service fails closed on a missing or wrong-DACL secret |
 | Uninstall removes the 3 data files | v0.7 PermanentFeature was not applied (wrong MSI / wrong build) | This is a build bug, not an operator error. **STOP**, restore from your stash backup (above), and ask the operator to rebuild and re-test on a clean VM |
+| TLS handshake fails / "certificate verify failed" | `orchestrator_ca_fingerprint_sha256` in `config.yaml` does not match the orch server's current cert (orch server may have re-gen'd cert since first install) | Re-fetch the fingerprint from the operator (`openssl x509 -in server.crt -noout -fingerprint -sha256` on the orch host), paste the new value into `config.yaml`, restart the service. Do **NOT** switch to `verify=False`, do **NOT** fall back to the OS trust store, do **NOT** set `INSECURE_SKIP_TLS_VERIFY=1` — pinning is the only trust model in v0.7 §1.6 |
+| `CERTIFICATE_VERIFY_FAILED` with "Hostname mismatch" | The cert's CN/SAN does not include the FQDN you used in `orchestrator_url` (default cert SANs are `hostname, localhost, 127.0.0.1` only) | Either: (a) use the orch host's hostname (not its IP) in `orchestrator_url` and ensure DNS / `hosts` file resolves it, OR (b) ask the operator to re-gen the cert with the FQDN (or IP) in SANs. Per v0.7 §1.6, direct-IP is out of scope for first release |
 
 ---
 
@@ -480,6 +507,8 @@ After you finish, tell the operator:
 - The **target hostname** (so they can identify the machine)
 - The **installer filename + SHA-256** you used
 - The **orchestrator FQDN + HTTPS port** you targeted
+- The **cert fingerprint** you used (so the operator can confirm it
+  matches the orch server's current cert at audit time; v0.7 §1.6)
 - The **service status** (Running / Stopped / etc.)
 - The **last 20 lines of `orch-client.log`** if there were any errors
 - (If available) the **status** the operator sees in the orchestrator
@@ -491,6 +520,10 @@ The operator will confirm "verified" or troubleshoot.
 ## Cross-references
 
 - `docs/proposals/orch-client-build-impl-plan-v0.7.md` — build plan this
-  runbook is aligned with. See §0.z, §0.4, §0.4-bis, §0.y, §1, §1.4,
-  §1.5, §7 (operator-binding dependencies), §8 (forbidden actions),
-  §12 (next steps).
+  runbook is aligned with. See §0.bis (v0.7 cert-pinning patch), §0.z,
+  §0.4, §0.4-bis, §0.y, §1, §1.4, §1.5, §1.6 (cert fingerprint
+  pinning — the design behind Step 5a's
+  `orchestrator_ca_fingerprint_sha256` field and the Before-you-start
+  checklist's cert-fingerprint line), §7 (operator-binding
+  dependencies, including the new #14 cert fingerprint), §8 (forbidden
+  actions), §12 (next steps).
