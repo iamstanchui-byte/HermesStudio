@@ -1,0 +1,376 @@
+# Orch Server HMAC v0.7 Alignment Spec
+
+**Date:** 2026-08-13
+**Author:** Mavis (operator-approved direction: design server-side follow-up to v0.7 §1.4 client format)
+**Status:** PROPOSAL for review
+**Scope:** Align the orch server's HMAC verification with the v0.7 §1.4
+bound-metadata model so the v0.7.1 bootstrapper (Draft 4) can enroll
+and verify. Affects `/src/hermes_orch/auth/hmac.py` and a new
+`/api/agents/{id}/status` endpoint.
+
+---
+
+## 0. Why this spec exists
+
+The v0.7.1 bootstrapper (`installer/bootstrapper/install-orch-client.ps1`
+Draft 4, commit `8cc85d7`) uses the v0.7 §1.4 bound-metadata HMAC
+format to call `/api/agents/{id}/status` and verify enrollment. The
+**orch server currently uses the v1.6 HMAC format** (per
+`src/hermes_orch/auth/hmac.py` line 1-49, "v1.6, 2026-07-29") for the
+2 agent-self routes (`POST /{id}/heartbeat` and `GET /{id}`). The v1.6
+format and the v0.7 §1.4 format are **incompatible** — different
+header names, different signature inputs, different encodings, different
+authorization rules.
+
+Without this alignment, the v0.7.1 bootstrapper cannot complete
+enrollment. The orch server must be updated to:
+1. Accept the v0.7 §1.4 format on the new `/api/agents/{id}/status`
+   endpoint
+2. (Optional) accept the v0.7 §1.4 format on the existing 2
+   agent-self routes, replacing v1.6
+
+This spec proposes the server-side changes. It does NOT implement them.
+
+---
+
+## 1. Authoritative specification: v0.7 §1.4
+
+Per `docs/proposals/orch-client-build-impl-plan-v0.7.md` §1.4:
+
+### 1.1 Request headers (7 headers)
+
+| Header | Value |
+|---|---|
+| `X-Hermes-Method` | Uppercase HTTP method (`GET`, `POST`, ...) |
+| `X-Hermes-Path` | Canonical path, **no query string** (per v0.7 §1.4 "no query strings on signed endpoints") |
+| `X-Hermes-Body-SHA256` | Lower-case hex SHA-256 of the raw request body bytes; `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` for GET (empty body) |
+| `X-Hermes-Key-Id` | Operator-assigned HMAC key id (e.g. `key-2026-08-13-win-b-02`); server uses this to look up the agent |
+| `X-Hermes-Timestamp` | Unix epoch seconds, decimal string |
+| `X-Hermes-Nonce` | Per-request UUID hex (32 chars, `N` format); prevents replay |
+| `X-Hermes-Signature` | Base64 of HMAC-SHA256 (NOT hex) |
+
+### 1.2 Canonical string-to-sign
+
+```
+<METHOD>\n<PATH>\n<BODY_SHA256_HEX>\n<TIMESTAMP>\n<NONCE>
+```
+
+5 fields joined by `\n` (newline). PATH has no query string.
+
+### 1.3 Signature
+
+```
+signature_b64 = base64( HMAC-SHA256(key=agent.hmac_secret, msg=canonical_input_bytes) )
+```
+
+The server recomputes this and compares with `X-Hermes-Signature` via
+`hmac.compare_digest` (constant-time).
+
+### 1.4 Server verification steps
+
+1. All 7 headers present (else 401 with `MISSING_AUTH_HEADERS`)
+2. `X-Hermes-Timestamp` parses as int, `|now - ts| <= HMAC_WINDOW_SEC`
+   (default 300s, same as v1.6; else 401 with `TIMESTAMP_OUT_OF_WINDOW`)
+3. Look up agent by `X-Hermes-Key-Id` (NOT by URL `agent_id`); if not
+   found, 401 with `UNKNOWN_KEY_ID`
+4. Reject if URL `agent_id` does not match the agent bound to this
+   `key_id` (per v0.7 §1.4 key-id-to-agent rule; else 403 with
+   `KEY_AGENT_MISMATCH`)
+5. Read the raw request body BEFORE Pydantic parses it; compute its
+   SHA-256; reject if not equal to `X-Hermes-Body-SHA256` (else 401
+   with `BODY_HASH_MISMATCH`)
+6. Recompute the canonical input + signature; constant-time compare
+   with `X-Hermes-Signature` (else 401 with `INVALID_SIGNATURE`)
+7. Check the nonce has not been seen recently (in-memory LRU with TTL
+   matching the timestamp window; else 401 with `NONCE_REPLAY`)
+8. On success, return the `agent_id` (from the DB row, not the URL)
+
+### 1.5 New endpoint: `GET /api/agents/{id}/status`
+
+Per the v0.7.1 bootstrapper's `Wait-ForEnrollment`, the server needs a
+new HMAC-authed endpoint that returns the agent's enrollment state:
+
+```json
+{ "status": "verified" | "pending" | "rejected" | "expired" }
+```
+
+The bootstrapper polls this every 5s for up to 60s. The HMAC
+verification on this endpoint follows §1.1-1.4 above.
+
+### 1.6 Key-id-to-agent authorization rule (v0.7 §1.4 specific)
+
+The v1.6 server looks up agents by `X-Agent-Id` directly. v0.7 §1.4
+changes this: the server looks up by `X-Hermes-Key-Id` (the key
+points to the agent), then validates that the URL `agent_id` matches
+the agent bound to that key. This prevents a compromised or
+mis-provisioned key from impersonating a different agent.
+
+The data model needs a new column on the `agents` table (or a
+separate `agent_keys` table) that maps `key_id` → `agent_id`. For
+first release, this can be a single optional column
+`agents.hmac_key_id` (UNIQUE constraint). Multiple keys per agent
+can be added later if rotation is needed.
+
+---
+
+## 2. Current v1.6 implementation (what changes)
+
+`src/hermes_orch/auth/hmac.py` lines 1-265 implement the v1.6 format:
+
+| Aspect | v1.6 (current) | v0.7 §1.4 (target) | Change scope |
+|---|---|---|---|
+| Header count | 3 (X-Agent-Id, X-Timestamp, X-Signature) | 7 (X-Hermes-*) | new headers added |
+| Agent lookup | by `X-Agent-Id` | by `X-Hermes-Key-Id` + URL match | new data model column |
+| Signature input fields | 4 (method, path, body_hash, timestamp) | 5 (method, path, body_hash, timestamp, nonce) | +nonce field |
+| Signature encoding | hex | base64 | encoding change |
+| Path | includes query string | NO query string | path normalization |
+| Nonce | none (timestamp window only) | required, replay-protected | new LRU + TTL store |
+| Body hash verification | implicit (server signs with the raw body) | explicit (`X-Hermes-Body-SHA256` header checked) | new check |
+| `hmac_secret` storage | plaintext in DB (per `hmac.py:42-48` "Threat model: plaintext in DB") | unchanged (out of scope for this spec) | no change here |
+| Legacy mode | `HERMES_HMAC_REQUIRED=false` allows no-signature auth | TBD; could be removed or repurposed | needs operator decision |
+
+### 2.1 What does NOT change
+
+- `hmac_secret` storage format (plaintext in DB) — out of scope; tracked
+  in `security/agent-secret-at-rest` (B11) as a separate design track
+- 7 admin-gated routes (B12 hotfix; not affected by HMAC refactor)
+- The 410 Gone for B10 (`rotate-key`)
+- HMAC window default (300s)
+- The enrollment endpoint (`/api/enrollment`) which is anonymous
+  and does not use HMAC
+
+---
+
+## 3. Migration options
+
+The operator (per the red lines) MUST decide between 3 options. This
+spec recommends **Option B** (dual-format with version detection) for
+the v1.6 → v0.7 transition, then cutover to v0.7-only after a
+deprecation window.
+
+| Option | Behavior | Pros | Cons | Recommendation |
+|---|---|---|---|---|
+| **A. Hard cutover** | Server accepts v0.7 only; v1.6 requests get 401 | Simple code; one path | Breaks any existing agent using v1.6; requires re-bootstrapping all agents | NO — too disruptive for the 2 known agents (`win-local-1`, `linux-a-01`) |
+| **B. Dual-format (version detection)** | Server detects v0.7 by presence of `X-Hermes-Method` header; v1.6 requests (no `X-Hermes-*` headers) still work; v0.7 requests on the new endpoint work | Both formats work side-by-side; the 2 existing agents stay alive; new agents use the bootstrapper; clean cutover at a later date | Slightly more code; v0.7 must be reachable on the new endpoint; v1.6 stays on the old 2 routes | **YES** — preserves production |
+| **C. Format negotiation** | Client sends `Accept-Signature: v0.7` header; server picks the right verifier | Future-proof; supports incremental rollout of v0.8 etc. | Overkill for 2 known clients; the v1.6 → v0.7 transition is small enough that dual-format suffices | NO — over-engineered for the current scale |
+
+**Recommended migration (Option B)**:
+1. Server implements v0.7 verification alongside v1.6
+2. The new `/api/agents/{id}/status` endpoint is **v0.7 only**
+3. The 2 existing routes (`heartbeat`, `GET /{id}`) accept BOTH
+   v1.6 and v0.7 (per the dual-format path)
+4. Operator can deprecate v1.6 later by setting a flag
+   `HERMES_HMAC_REQUIRE_V07=true`; v1.6 requests then get 401
+5. After a deprecation window (e.g. 30 days of stable v0.7), remove
+   v1.6 support entirely (one PR)
+
+The dual-format path is gated by a new env var
+`HERMES_HMAC_ACCEPT_V06` (default `true` during the transition; the
+operator flips to `false` after deprecation).
+
+---
+
+## 4. New HMAC implementation (server-side, high-level)
+
+This section describes what the new `hmac_v07.py` module should
+contain. It mirrors the v0.7.1 bootstrapper's `Wait-ForEnrollment`.
+
+### 4.1 Module: `src/hermes_orch/auth/hmac_v07.py`
+
+```python
+# coding: utf-8
+"""HMAC-SHA256 v0.7 §1.4 agent authentication (bound-metadata model).
+
+Companion to the v1.6 implementation in hmac.py. v0.7 §1.4 specifies:
+  - 7 headers (X-Hermes-Method, X-Hermes-Path, X-Hermes-Body-SHA256,
+    X-Hermes-Key-Id, X-Hermes-Timestamp, X-Hermes-Nonce, X-Hermes-Signature)
+  - canonical input: METHOD\nPATH\nBODY_SHA256_HEX\nTIMESTAMP\nNONCE
+  - signature: base64(HMAC-SHA256(secret, canonical_input))
+  - agent lookup: by X-Hermes-Key-Id + URL agent_id match
+  - path excludes query string (v0.7 §1.4 "no query strings on signed endpoints")
+  - nonce is replay-protected via in-memory LRU with TTL
+"""
+```
+
+Key functions (per the bootstrapper's contract):
+- `string_to_sign_v07(method, path, body_sha256_hex, timestamp, nonce) -> str`
+- `compute_signature_v07(secret, ...) -> str` (base64-encoded)
+- `verify_signature_v07(secret, ..., provided_signature) -> bool`
+- `require_hmac_auth_v07(request) -> str` (FastAPI dependency; returns agent_id)
+- `check_nonce_replay(nonce, ttl_seconds) -> bool` (LRU-backed; default TTL 300s)
+- `lookup_agent_by_key_id(key_id) -> Optional[AgentRow]`
+
+### 4.2 Module: `src/hermes_orch/api/agent_status.py`
+
+The new endpoint:
+```python
+@router.get("/api/agents/{agent_id}/status", dependencies=[Depends(require_hmac_auth_v07)])
+async def get_agent_status(agent_id: str, request: Request) -> dict:
+    """Return the agent's enrollment state for the bootstrapper's
+    Wait-ForEnrollment poll. Returns {"status": "verified"|"pending"|...}.
+    HMAC verification is done by the dependency; this handler just
+    queries the DB."""
+    row = await request.app.state.db.fetchone(
+        "SELECT enrollment_status FROM agents WHERE id = ?", (agent_id,)
+    )
+    if not row:
+        raise HTTPException(404, f"Agent {agent_id} not found")
+    return {"status": row["enrollment_status"]}
+```
+
+### 4.3 Data model change
+
+A new column on the `agents` table:
+```sql
+ALTER TABLE agents ADD COLUMN hmac_key_id TEXT;  -- NULL for v1.6 agents
+CREATE UNIQUE INDEX idx_agents_hmac_key_id ON agents(hmac_key_id);
+```
+
+For backward compat, `hmac_key_id` is NULL for existing agents; the
+dual-format path serves them via v1.6 (`X-Agent-Id` lookup). For new
+agents, the bootstrapper's Wait-ForEnrollment includes a step that
+sends the key_id during enroll (the existing anonymous enroll endpoint
+needs a new v0.7 variant that takes key_id).
+
+### 4.4 Enrollment integration
+
+The existing `/api/enrollment` endpoint is anonymous. The v0.7
+bootstrapper's flow is:
+1. Bootstrapper sends `POST /api/enrollment` with `enrollment_token`
+   + `agent_id` + `key_id` + HMAC signature
+2. Server validates the token, sets `agents.hmac_key_id` to the
+   provided `key_id`, marks the agent as enrolled, returns success
+3. Bootstrapper then polls `GET /api/agents/{id}/status` with HMAC
+   signature to confirm `verified`
+
+The existing enrollment endpoint needs a v0.7 variant that takes
+`key_id` and signs the request. For first release, the simplest is:
+- Add a new endpoint `POST /api/enrollment/v07` that accepts the
+  same fields as the existing one plus `key_id`, with HMAC headers
+- The bootstrapper uses the v0.7 variant; old agents use the v1.6
+  variant
+
+(Alternative: extend the existing enrollment endpoint to optionally
+take HMAC headers; HMAC present → v0.7 path; absent → anonymous v1.6
+path. Simpler for the client; same complexity on the server.)
+
+---
+
+## 5. Error responses
+
+All v0.7 HMAC errors return a 4xx with a JSON body. The bootstrapper
+maps these to plain-English messages (per `installer/bootstrapper/
+install-orch-client.ps1` §3 plain-English error table).
+
+| Status | Body | Bootstrapper plain-English error |
+|---|---|---|
+| 400 | `{"error": "MALFORMED_HEADERS", "detail": "..."}` | (rare; bad header format) |
+| 401 | `{"error": "MISSING_AUTH_HEADERS", "detail": "Missing X-Hermes-* headers"}` | "The orchestrator rejected the request..." |
+| 401 | `{"error": "INVALID_TIMESTAMP", "detail": "..."}` | "The orchestrator rejected the request..." |
+| 401 | `{"error": "TIMESTAMP_OUT_OF_WINDOW", "detail": "..."}` | "..." |
+| 401 | `{"error": "UNKNOWN_KEY_ID", "detail": "..."}` | "The orchestrator rejected the request..." |
+| 401 | `{"error": "BODY_HASH_MISMATCH", "detail": "..."}` | "..." |
+| 401 | `{"error": "INVALID_SIGNATURE", "detail": "..."}` | "..." |
+| 401 | `{"error": "NONCE_REPLAY", "detail": "..."}` | "..." |
+| 403 | `{"error": "KEY_AGENT_MISMATCH", "detail": "URL agent_id does not match the agent bound to this key"}` | "..." |
+| 404 | `{"error": "AGENT_NOT_FOUND", "detail": "..."}` | "..." |
+| 500 | `{"error": "INTERNAL", "detail": "..."}` | "..." |
+
+The bootstrapper doesn't currently distinguish between these 4xx codes
+(per the v0.7.1 §0.af-bootstrap error table, all 4xx map to plain-
+English "orchestrator rejected" or specific user-action messages). For
+first release, this granularity is sufficient.
+
+---
+
+## 6. Test cases (acceptance criteria)
+
+The implementation must pass these on a clean Windows 10/11 target
++ clean Python 3.14 venv + a local orchestrator. Test cases
+per the v0.7.1 §9 row O matrix.
+
+| ID | Scenario | Expected |
+|---|---|---|
+| T1 | Happy path: bootstrapper signs a GET `/api/agents/win-local-1/status` with valid key_id, valid secret, valid timestamp + nonce, valid path | 200 + `{"status": "verified"}` |
+| T2 | Missing `X-Hermes-Method` header | 401 MISSING_AUTH_HEADERS |
+| T3 | Missing `X-Hermes-Signature` header | 401 MISSING_AUTH_HEADERS |
+| T4 | Timestamp 600s in the past | 401 TIMESTAMP_OUT_OF_WINDOW |
+| T5 | Timestamp 600s in the future | 401 TIMESTAMP_OUT_OF_WINDOW |
+| T6 | Unknown `X-Hermes-Key-Id` | 401 UNKNOWN_KEY_ID |
+| T7 | `X-Hermes-Key-Id` exists but URL `agent_id` doesn't match the bound agent | 403 KEY_AGENT_MISMATCH |
+| T8 | Body hash mismatch (sign with one body, send another) | 401 BODY_HASH_MISMATCH |
+| T9 | Signature mismatch (sign with one secret, verify with another) | 401 INVALID_SIGNATURE |
+| T10 | Nonce replay (send same nonce twice within the window) | 401 NONCE_REPLAY on the second request |
+| T11 | Query string on signed endpoint | 400 MALFORMED_HEADERS or rejected (v0.7 §1.4 forbids) |
+| T12 | Path normalization: extra slashes, case differences, URL encoding | server normalizes per the same rule the client uses |
+| T13 | Dual-format: v1.6 request (X-Agent-Id) on `POST /heartbeat` | works (per Option B migration) |
+| T14 | Dual-format: v0.7 request (X-Hermes-*) on `POST /heartbeat` | works (per Option B migration) |
+| T15 | Bootstrapper Wait-ForEnrollment against a real orch | enrollment poll returns `status=verified` within 60s |
+| T16 | Cert mismatch (bootstrapper's TLS pin rejects the orch's cert) | bootstrapper throws CERT_MISMATCH (orch never sees the request) |
+
+---
+
+## 7. Backward compatibility / deprecation timeline
+
+| Day | Action | Backward compat |
+|---|---|---|
+| Day 0 (merge) | Server implements v0.7 (alongside v1.6); `POST /api/agents/{id}/status` is v0.7-only; `heartbeat` and `GET /{id}` accept both | v1.6 still works (default `HERMES_HMAC_ACCEPT_V06=true`) |
+| Day 0-30 | v0.7 in use by the bootstrapper on new agents; v1.6 still in use by the 2 existing agents | both formats work |
+| Day 30 | Operator sets `HERMES_HMAC_ACCEPT_V06=false`; v1.6 requests get 401 with `DEPRECATED_V06` | v1.6 still works for 30 days then stops |
+| Day 60 | v1.6 code path removed from `hmac.py`; `HERMES_HMAC_ACCEPT_V06` env var is a no-op | v0.7 only |
+
+---
+
+## 8. Open questions / out of scope
+
+1. **Body hash verification** — the v0.7 §1.4 spec says the body is
+   included in the signature, but for GETs the body is empty. v0.7
+   also adds the `X-Hermes-Body-SHA256` header for explicit
+   body-hash binding. Does the server reject requests where
+   `X-Hermes-Body-SHA256` ≠ SHA-256(body), or is it informational?
+   **Proposed**: reject (T8 above).
+2. **Nonce store TTL** — the LRU is in-memory; if the server
+   restarts, all nonces are forgotten. An attacker could replay a
+   request whose nonce was seen before the restart, if the timestamp
+   is still within the window. **Proposed**: the LRU is in-memory
+   for first release; the operator can add a Redis-backed store
+   later. The risk is bounded by the 5-minute timestamp window.
+3. **hmac_secret storage** — the v1.6 comment says "plaintext in DB"
+   (line 42-48). B11 (`security/agent-secret-at-rest`) is the
+   separate design track for encrypted-at-rest. **Out of scope here.**
+4. **Path canonicalization** — what does the server do with
+   `/api/agents//win-local-1/status` (double slash), or
+   `/API/AGENTS/WIN-LOCAL-1/STATUS` (uppercase)? The v0.7 spec is
+   silent. **Proposed**: server rejects paths that don't match the
+   exact canonical form the client signed; the client is expected
+   to send the canonical form. (T12 above.)
+5. **Backward compat for `/api/enrollment`** — does the existing
+   anonymous enrollment endpoint stay, or does it become HMAC-only?
+   **Proposed**: keep the anonymous endpoint for v1.6 agents; add a
+   new HMAC-signed v0.7 variant for bootstrapper-enrolled agents.
+   (Section 4.4 above.)
+
+---
+
+## 9. Operator action requested
+
+This spec is a design doc, NOT an implementation. The next step is
+the operator (the same person who approved the v0.7.1 bootstrapper)
+to:
+1. **Review this spec** (focus on §3 migration options, §4 new
+   implementation, §5 error responses, §6 test cases)
+2. **Decide on §3 migration option** (recommended: Option B
+   dual-format, with `HERMES_HMAC_ACCEPT_V06` flag)
+3. **Approve a new branch** (`feature/orch-server-hmac-v07` or
+   similar) for the server-side implementation
+4. **Schedule implementation** per the v0.7 §12 operator-binding
+   prerequisites (build host + signing cert + clean VM test
+   environment + agent_id bound)
+
+The v0.7.1 bootstrapper (Draft 4, commit `8cc85d7`) is **frozen**
+and will not change. The server-side work is a separate branch +
+PR + VM test matrix.
+
+This spec doc does NOT trigger any code changes, branch creation,
+or production state mutations. It is a design artifact for the next
+operator-binding phase.
