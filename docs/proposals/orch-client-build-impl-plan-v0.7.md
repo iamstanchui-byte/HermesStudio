@@ -1,7 +1,7 @@
-# Orch Client Build — Implementation Plan v0.7 (final plan-only iteration) + cert-pinning patch
+# Orch Client Build — Implementation Plan v0.7 (final plan-only iteration) + cert-pinning patch + v0.7.1 bootstrapper
 
 **Date:** 2026-08-13
-**Status:** PROPOSAL for review (Perplexity + operator) — v0.7 + cert-pinning patch
+**Status:** PROPOSAL for review (Perplexity + operator) — v0.7 + cert-pinning patch + v0.7.1 bootstrapper
 **Supersedes:** v0.6 (commit `aa49a71` on branch `proposal/orch-client-build-impl-plan-v0.1`)
 **Scope:** end-to-end build of a Windows MSI installer for the new orch
 client, on the orchestrator host (Windows A). The MSI will be carried
@@ -17,7 +17,13 @@ is a planning aid, not a release gate; further doc-level iterations
 would delay VM testing without adding safety. The **cert-pinning
 patch** (see §0.bis) is the only post-finality amendment: it adds
 the missing TLS cert verification design (§1.6 + §7 #14 + §12 #0)
-without re-opening the 7-row v0.6 → v0.7 review loop.
+without re-opening the 7-row v0.6 → v0.7 review loop. The
+**v0.7.1 bootstrapper patch** (see §0.ter) is the next post-finality
+amendment: it adds a one-shot PowerShell bootstrapper for
+semi-technical users (per user profile, target audience is
+semi-technical, NOT developers), addressing the productization gap
+between the v0.3 runbook (developer-friendly) and the user-facing
+"1-click install" experience.
 
 ---
 
@@ -71,6 +77,45 @@ deployment time.
 stable. The 7-row v0.6 → v0.7 changelog above remains the canonical
 "final iteration" record. This patch is the only post-finality
 amendment.
+
+---
+
+## 0.ter v0.7.1 bootstrapper patch (2026-08-13)
+
+After the cert-pinning patch landed, the operator (target audience for
+the **shipped** product) raised a productization gap: the v0.3 runbook
+is technically correct but assumes PowerShell fluency, YAML syntax
+familiarity, base64 encoding knowledge, and SDDL string literacy.
+For the locked user profile ("target audience is semi-technical, NOT
+developers"), a 8-step PowerShell runbook with a manual base64 secret
+write is a 7-place footgun. v0.7 + cert-pinning patch is preserved as
+the canonical technical design; this v0.7.1 patch adds the
+**operator-facing one-click bootstrapper** that turns the 8 manual
+steps into one interactive script with plain-English error messages.
+
+| Change | Where | Why |
+|---|---|---|
+| New `## 0.af-bootstrap Bootstrapper` | After §0.af SBOM tool binding | Full bootstrapper design: 7 interactive prompts (FQDN, port, cert fingerprint, agent_id, key_id, enrollment_token, HMAC secret) with format validators, pre-flight checks (FQDN resolves, TCP port reachable, cert fingerprint regex, base64 decode), MSI install via `msiexec /qn`, atomic `config.yaml` write (v0.7 §0.z layout), `agent-secret.bin` write with locked SDDL `D:P(A;;FA;;;SY)(A;;FA;;;BA)`, `Start-Service` + 30s poll, 60s enrollment poll, plain-English error mapping for all 12 error cases. ~530 lines PowerShell, 15 helper functions |
+| New step 14 in §6 build script | §6 build script after step 13 | `build.ps1` ships `install-orch-client.ps1` as a build artifact (WiX `<File Source>` from `installer/bootstrapper/`). Bootstrapper is **NOT bundled inside the MSI** — it runs as a separate one-shot script before the MSI install (so the user can dry-run / pre-validate before any system changes) |
+| New `§7 #15` operator-binding dependency | §7 table | "Bootstrapper is shipped in the MSI bundle; operator's per-target briefing sheet is reduced to 7 values (FQDN, port, cert fingerprint, agent_id, key_id, enrollment_token, HMAC secret) instead of the previous 8 manual runbook steps. Operator still generates the cert (per §12 #0) and the agent_id / key_id / enrollment_token (per existing §12 #1-#6)" |
+| New `§9 row O` acceptance criteria | §9 table | "Bootstrapper runs successfully on a clean Windows 10/11 VM with the 7-value briefing; wrong fingerprint produces the plain-English 'cert rotation' error; enrollment succeeds within 60s; bootstrapper log file is human-readable" |
+| New `§11` row for v0.7.1 | §11 changelog | Bootstrapper + Quick-start runbook cross-reference |
+| `§12 #0` updated | §12 prerequisites | Add "operator distributes bootstrapper-friendly briefing sheet" alongside the cert gen step |
+
+**Constraints preserved:** v0.7 + cert-pinning patch design
+constraints (lock ACL on install root, recursive venv tree check,
+PermanentFeature uninstall preservation, cert fingerprint pinning
+with fail-closed mismatch, HMAC + Origin/CSRF, etc.) are **not
+modified** by the bootstrapper. The bootstrapper is a friendlier way
+to feed the same 7 values into the same v0.7 design; the underlying
+MSI, ACL, cert, and HMAC mechanisms are unchanged.
+
+**Runbook v0.3 → v0.4:** the runbook gets a new "Quick start" section
+at the top that says "if your operator gave you the bootstrapper
+script, just run `install-orch-client.ps1` as Administrator. The 8
+manual steps below are for operators / power users only." The
+manual steps are demoted to a "Manual install (advanced)" section at
+the bottom, not deleted.
 
 ---
 
@@ -241,6 +286,117 @@ dedup check.
 ## 0.af SBOM tool binding
 
 (unchanged from v0.6; preflight gate added in §0.x)
+
+---
+
+## 0.af-bootstrap Bootstrapper (v0.7.1 patch)
+
+The `install-orch-client.ps1` bootstrapper replaces the 8 manual
+PowerShell steps in the v0.3 runbook with one interactive script.
+Target user: **semi-technical** (per locked user profile); NOT
+developers. Goal: from "user runs the script" to "user sees
+SUCCESS" in < 2 minutes, with **zero stack traces** and plain-
+English error messages at every failure point.
+
+### User flow
+
+1. User receives from their operator: a download link to
+   `orch-client-setup.msi` + a `install-orch-client.ps1`
+   bootstrapper + a chat/email with the 7 required values
+2. User right-clicks `install-orch-client.ps1` → "Run with
+   PowerShell (Admin)" (or `Start-Process powershell -Verb RunAs
+   -ArgumentList '-File', '<path>'`)
+3. Script prompts for 7 values, one at a time, with format hints
+   (HMAC secret is hidden with `Read-Host -AsSecureString`)
+4. Script runs pre-flight checks (FQDN resolves, TCP port
+   reachable, cert fingerprint regex `^[0-9a-f]{64}$`, HMAC secret
+   base64-decodes, agent_id regex `^[a-zA-Z0-9-]+$`)
+5. If pre-flight OK: install MSI via `msiexec /qn`, write
+   `config.yaml` (v0.7 §0.z layout), write `agent-secret.bin` with
+   locked SDDL `D:P(A;;FA;;;SY)(A;;FA;;;BA)`, start service, poll
+   for 60s for enrollment
+6. Print `=== SUCCESS ===` block, or a plain-English error
+   (no stack trace; the error table in §0.af-bootstrap-errors below
+   is exhaustive)
+
+### Locked constants (top of script)
+
+| Constant | Value | Reason |
+|---|---|---|
+| `$InstallDir` | `C:\Program Files\HermesOrchClient` | matches v0.7 §1 install list |
+| `$StateDir` | `C:\ProgramData\HermesOrchClient` | matches v0.7 §0.z config lifecycle |
+| `$ServiceName` | `OrchClient` | matches v0.7 §5 service name |
+| `$LogFile` | `C:\ProgramData\HermesOrchClient\install.log` | bootstrapper-local log; separate from server.stdout.log / server.stderr.log / watchdog.log |
+| `$MsiPath` | operator-distributed | checked at runtime, not pre-baked into bootstrapper |
+| `$OrchDefaultPort` | `443` | matches v0.7 §1.6 HTTPS port |
+| `$MaxEnrollmentWaitSeconds` | `60` | enrollment poll timeout |
+
+### 7 interactive prompts (with format hints)
+
+| # | Prompt | Validator | Default |
+|---|---|---|---|
+| 1 | Orchestrator FQDN (e.g. `orchestrator.example.local`, NOT an IP) | `[Net.Dns]::Resolve()` | — |
+| 2 | Orchestrator HTTPS port | range 1-65535, advisory TCP probe | `443` |
+| 3 | Orchestrator TLS cert SHA-256 fingerprint (64 hex chars, no colons) | regex `^[0-9a-f]{64}$` | — |
+| 4 | This machine's `agent_id` (e.g. `win-b-02`) | regex `^[a-zA-Z0-9-]+$` | — |
+| 5 | HMAC `key_id` (operator-assigned) | regex `^[a-zA-Z0-9-]+$` | — |
+| 6 | One-time `enrollment_token` (operator-generated) | regex `^enroll-[a-zA-Z0-9_-]+$` (advisory) | — |
+| 7 | HMAC secret (base64 string) | `[Convert]::FromBase64String` succeeds, ≥ 16 bytes | — |
+
+### Helper functions (~15 functions, each ≤ 40 lines, each `[CmdletBinding()]` + try/catch)
+
+| Function | Lines | Purpose |
+|---|---|---|
+| `Test-Administrator` | ~10 | Throw if not elevated; clear "run as Administrator" error |
+| `Read-ValidatedString` | ~30 | `Read-Host` with format validator + retry loop |
+| `Read-HiddenString` | ~20 | `Read-Host -AsSecureString` for HMAC secret; decode at end |
+| `Test-FQDN` | ~15 | `[Net.Dns]::Resolve()`; throw on fail |
+| `Test-TCPPort` | ~15 | `Test-NetConnection -Port`; throw on fail |
+| `Test-CertFingerprint` | ~10 | Regex; throw on fail |
+| `Test-Base64` | ~15 | `[Convert]::FromBase64String` in try/catch; throw on fail |
+| `Test-AgentId` | ~10 | Regex; throw on fail |
+| `Write-BootstrapLog` | ~10 | Append line to `$LogFile` with timestamp |
+| `Install-Msi` | ~30 | `Start-Process msiexec` with `/qn /l*v $LogFile`; throw on non-zero exit |
+| `Write-ConfigYaml` | ~40 | Atomic write (temp + `Move-Item`) of YAML with the 7 values; v0.7 §0.z layout |
+| `Write-SecretFile` | ~30 | `[IO.File]::WriteAllBytes` + `Set-Acl` with locked SDDL |
+| `Start-AndWaitService` | ~30 | `Start-Service` + poll every 2s for 30s; throw if not Running |
+| `Wait-ForEnrollment` | ~40 | Poll HMAC-signed `/api/agents/<agent_id>/status` every 5s for 60s |
+| `Show-PlainEnglishError` | ~30 | Maps internal exceptions to the 12 error messages below |
+
+**Total: ~530 lines** (Draft 1 may be smaller; full Draft 4 reaches 530).
+
+### Plain-English error table (v0.7.1 §0.af-bootstrap-errors)
+
+The bootstrapper NEVER shows a stack trace, .NET HRESULT, raw
+msiexec error code, or raw exception message. Every error produces
+ONE of these 12 messages, each with: (a) what happened, (b) what
+the user does, (c) who to ask.
+
+| # | Failure | Plain-English message |
+|---|---|---|
+| 1 | Not running as Administrator | "This script needs to run as Administrator. Right-click PowerShell and 'Run as Administrator', then re-run this script." |
+| 2 | FQDN does not resolve | "I can't find '<FQDN>' on the network. Check for typos, or ask your operator for the correct FQDN. Do NOT use the orchestrator's IP address — the TLS certificate is generated for the hostname only." |
+| 3 | TCP port not reachable | "I can't connect to <FQDN>:<PORT>. Check that (a) the orchestrator is running, (b) the port is correct, (c) no firewall is blocking. Ask your operator to verify." |
+| 4 | Cert fingerprint wrong format | "The cert fingerprint must be exactly 64 hex characters (0-9, a-f), no colons, no spaces. You entered '<value>'. Ask your operator to re-paste the value after `SHA256 Fingerprint=` from `openssl x509 -in server.crt -noout -fingerprint -sha256`." |
+| 5 | HMAC secret not base64 | "The HMAC secret you pasted is not valid base64. Confirm with your operator that the encoding is base64 (not hex, not raw bytes). Re-paste the secret." |
+| 6 | agent_id has invalid chars | "The agent_id must contain only letters, digits, and dashes (e.g. 'win-b-02'). You entered '<value>'. Ask your operator for the correct agent_id." |
+| 7 | Existing OrchClient service detected | "An OrchClient service is already installed on this machine. The bootstrapper refuses to install over an existing service. To reinstall, first uninstall via Add/Remove Programs, then re-run this bootstrapper." |
+| 8 | MSI install failed | "The MSI install failed with: <msiexec exit code + short reason>. The full log is at C:\ProgramData\HermesOrchClient\install.log. Common causes: (a) the MSI is corrupt (re-download), (b) another install is in progress (wait + retry), (c) a required component is missing. Contact your operator with the install.log." |
+| 9 | Service won't start | "The OrchClient service installed but did not start within 30s. The Windows Event Log (eventvwr.msc -> Windows Logs -> Application, Source = OrchClient) has the details. The full log is at C:\ProgramData\HermesOrchClient\install.log. Common causes: (a) config.yaml is malformed (the bootstrapper validates this; ask operator to verify), (b) the orchestrator is unreachable from this machine, (c) the HMAC secret mismatch." |
+| 10 | Enrollment timeout (60s) | "The orch client installed and started, but the orchestrator did not confirm enrollment within 60 seconds. Common causes: (a) the enrollment_token is already consumed (ask operator for a new one), (b) the agent_id already exists (this machine's agent_id conflicts with another registered machine), (c) the orchestrator is slow. Re-run the bootstrapper; if it still fails, ask your operator to check the orchestrator's agent list." |
+| 11 | TLS handshake failed (cert mismatch) | "The orchestrator at <FQDN> presented a TLS certificate whose fingerprint does not match the fingerprint you entered. Common causes: (a) the operator has rotated the cert since they sent you the fingerprint (ask for the current one), (b) you're connecting to a different orchestrator than you think (verify the FQDN). The agent did NOT enroll; your data files are intact." |
+| 12 | `INSECURE_SKIP_TLS_VERIFY` set in env | "The orchestrator-side hardening rejected the request because the agent's environment has INSECURE_SKIP_TLS_VERIFY set. The v0.7 §1.6 fingerprint-pinning policy forbids this escape hatch. Unset the env var and re-run." |
+
+**Where the bootstrapper lives:** `installer/bootstrapper/install-orch-client.ps1`
+in the repo. The build script (v0.7 §6 step 14) ships it as a
+**separate file in the MSI bundle directory**, NOT bundled inside
+the MSI itself — the bootstrapper runs BEFORE the MSI install
+(so the user can dry-run / pre-validate before any system changes),
+and a bundled bootstrapper could not run after uninstall.
+
+**Runbook reference:** `docs/runbooks/orch-client-install-runbook.md`
+v0.4 (the new "Quick start" section points to the bootstrapper; the
+8 manual steps are demoted to "Manual install (advanced)").
 
 ---
 
@@ -934,6 +1090,61 @@ Write-Host "[+] SBOM: $sbomOut (sha256: $sbomHash)"
 Write-Host "[+] MANIFEST read-back + assert gate: PASS"
 Write-Host "[+] Source commit: $sourceCommit"
 Write-Host "[+] requirements.lock sha256: $lockfileSha"
+
+# ============================================================================
+# 14) Ship bootstrapper (v0.7.1 patch; see §0.ter + §0.af-bootstrap)
+# ============================================================================
+# The bootstrapper is a separate file shipped in the MSI bundle directory,
+# NOT bundled inside the MSI itself. The bootstrapper runs BEFORE the MSI
+# install (so the user can dry-run / pre-validate before any system changes);
+# a bundled bootstrapper could not run after uninstall, and would force the
+# user to commit to install before validation.
+#
+# The bootstrapper lives at installer/bootstrapper/install-orch-client.ps1
+# in the repo. build.ps1 copies it to the MSI bundle directory (alongside
+# the .msi file) so the user receives it in the same download.
+#
+# Verify the bootstrapper source itself: PowerShell parser must report 0
+# errors. This is a structural check; full behavioral validation is in the
+# §9 row O acceptance test on a clean VM.
+$bootstrapperSrc  = Join-Path $RepoRoot 'installer\bootstrapper\install-orch-client.ps1'
+$bootstrapperDest = Join-Path $msiDir 'install-orch-client.ps1'
+if (-not (Test-Path -LiteralPath $bootstrapperSrc)) {
+    throw "Bootstrapper not found at $bootstrapperSrc. The v0.7.1 patch requires installer/bootstrapper/install-orch-client.ps1 to exist."
+}
+$bootstrapperTokens = $null
+$bootstrapperErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+    $bootstrapperSrc,
+    [ref]$bootstrapperTokens,
+    [ref]$bootstrapperErrors) | Out-Null
+if ($bootstrapperErrors.Count -ne 0) {
+    throw "Bootstrapper PowerShell parser reported $($bootstrapperErrors.Count) error(s): $($bootstrapperErrors | ForEach-Object { $_.Message } | Out-String)"
+}
+Copy-Item -LiteralPath $bootstrapperSrc -Destination $bootstrapperDest -Force
+$bootstrapperHash = (Get-FileHash -LiteralPath $bootstrapperDest -Algorithm SHA256).Hash
+Write-Host "[+] Bootstrapper: $bootstrapperDest (sha256: $bootstrapperHash, 0 parse errors)"
+# Add the bootstrapper to MANIFEST.json's payload_inventory (v0.7.1 addition)
+$bootstrapperInventoryEntry = [PSCustomObject]@{
+    path   = (Resolve-Path -LiteralPath $bootstrapperDest -Relative).ToString()
+    sha256 = $bootstrapperHash
+    role   = 'bootstrapper'
+}
+$manifest.payload_inventory = @($manifest.payload_inventory) + @($bootstrapperInventoryEntry)
+# Re-write MANIFEST.json (object) and re-run the read-back + assert gate
+$manifestJson = $manifest | ConvertTo-Json -Depth 8
+[System.IO.File]::WriteAllText(
+    (Join-Path $msiDir 'MANIFEST.json'),
+    $manifestJson,
+    [System.Text.UTF8Encoding]::new($false))
+$manifestReadback = Get-Content -LiteralPath (Join-Path $msiDir 'MANIFEST.json') -Raw |
+    ConvertFrom-Json
+$bootstrapperInManifest = $manifestReadback.payload_inventory |
+    Where-Object { $_.role -eq 'bootstrapper' -and $_.sha256 -eq $bootstrapperHash }
+if (-not $bootstrapperInManifest) {
+    throw "MANIFEST.json payload_inventory missing bootstrapper entry after re-write"
+}
+Write-Host "[+] Bootstrapper added to MANIFEST.json payload_inventory"
 ```
 
 ---
@@ -958,6 +1169,7 @@ Write-Host "[+] requirements.lock sha256: $lockfileSha"
 | 12 | VM test environment (clean Windows 10/11) | operator | required before implementation approval |
 | 13 | Explicit privileged cleanup script (out of scope; follow-up) | operator | for removing `config.yaml` / `agent-secret.bin` on uninstall |
 | 14 | Orchestrator cert SHA-256 fingerprint (per agent, for client-side pinning) | operator | not yet bound — see §1.6. Operator runs `hermes-orch gen-cert` on the orch host, captures the lower-case hex SHA-256 of `server.crt` (via `openssl x509 -fingerprint -sha256`, NOT `Get-FileHash` on the cert file), pastes the value into each agent's `config.yaml::orchestrator_ca_fingerprint_sha256`. The v3.12.0 `gen-cert` does not currently print the fingerprint; a `--print-fingerprint` follow-up is recommended so the operator does not have to remember the openssl incantation |
+| 15 | Bootstrapper script + per-target briefing sheet (v0.7.1) | operator | bootstrapper is shipped in the MSI bundle directory (per §0.af-bootstrap, §6 step 14); operator's per-target briefing sheet is reduced to 7 values (FQDN, port, cert fingerprint, agent_id, key_id, enrollment_token, HMAC secret) instead of the previous 8 manual runbook steps. The bootstrapper validates the values before any system change. The briefing sheet (one paragraph per value + how to obtain) is a separate small deliverable; operator still generates the cert (per #0) and the agent_id / key_id / enrollment_token (per existing #1-#6) |
 
 ---
 
@@ -1002,6 +1214,14 @@ A-M: same as v0.5 (file system layout, ACLs, service registration, doctor binary
 - Read-back + parse + assert gate passes
 - `PermanentFeature` (secret + config) survives uninstall on a clean VM
 
+**O (v0.7.1 added — bootstrapper)**:
+- Bootstrapper `install-orch-client.ps1` ships in `dist/` alongside the MSI; PowerShell parser reports 0 errors
+- Bootstrapper runs successfully end-to-end on a clean Windows 10/11 VM with the 7-value briefing
+- Wrong fingerprint produces the plain-English "cert rotation" error (table row 11 in §0.af-bootstrap-errors); no stack trace in any failure case
+- Enrollment succeeds within 60s on the happy path
+- Bootstrapper log file (`C:\ProgramData\HermesOrchClient\install.log`) is human-readable with timestamps + plain-English messages
+- Bootstrapper is added to `MANIFEST.json::payload_inventory` with `role='bootstrapper'` and the SHA-256 of the shipped file
+
 ---
 
 ## 10. What I will NOT do (without separate approval)
@@ -1032,6 +1252,8 @@ A-M: same as v0.5 (file system layout, ACLs, service registration, doctor binary
 | Preflight gate | (n/a) | All declared tool versions verified before any build step |
 | Dedup | (n/a) | Hash-equality gate (silent skip is forbidden) |
 | Manifest handling | (n/a) | Object throughout, JSON once, read-back + parse + assert gate |
+| Bootstrapper (v0.7.1) | (n/a) | `install-orch-client.ps1` ships in MSI bundle directory; PowerShell parser 0 errors; 7 interactive prompts (FQDN, port, cert fingerprint, agent_id, key_id, enrollment_token, HMAC secret) with format validators; 12 plain-English error cases (zero stack traces); MSI install + config.yaml + agent-secret.bin + SDDL + service start + 60s enrollment poll; success in < 2 min on happy path; bootstrapper is added to MANIFEST.json payload_inventory with role='bootstrapper' and SHA-256 |
+| Runbook v0.4 | (n/a) | Adds "Quick start" section pointing to bootstrapper; demotes 8 manual steps to "Manual install (advanced)" section at the bottom |
 
 ---
 
@@ -1052,7 +1274,14 @@ Operator-binding prerequisites for the implementation phase:
    one-line `hermes-orch gen-cert` + `openssl x509 -fingerprint
    -sha256` step. The v0.7 implementation includes a
    `--print-fingerprint` follow-up on `gen-cert` so operators do
-   not have to remember the openssl incantation
+   not have to remember the openssl incantation. **v0.7.1 addition**:
+   operator also drafts the **per-target briefing sheet** for the
+   bootstrapper (§0.af-bootstrap) — one paragraph per value (FQDN,
+   port, cert fingerprint, agent_id, key_id, enrollment_token, HMAC
+   secret) explaining where the value comes from and what the user
+   does with it. The briefing sheet is a separate small deliverable
+   (a markdown doc or chat message) that ships alongside the MSI +
+   bootstrapper to the new user
 1. Operator picks `agent_id` and `key-id` for the target machine
 2. Operator picks the code-signing cert / Azure Trusted Signing
 3. Operator installs WiX 4 + .NET SDK + Python 3.14.0 + PyInstaller 6.16.0 + Windows SDK 10.0.22621.4031 + .NET SDK 8.0.404 on the build host
