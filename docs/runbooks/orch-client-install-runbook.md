@@ -1,8 +1,9 @@
 # Orch Client Install & Register Runbook (Windows target)
 
-> **v0.3** — aligned with `docs/proposals/orch-client-build-impl-plan-v0.7.md`
-> (`9dcb082` on branch `proposal/orch-client-build-impl-plan-v0.1`) +
-> v0.7 cert-pinning patch (see §0.bis of the plan).
+> **v0.4** — aligned with `docs/proposals/orch-client-build-impl-plan-v0.7.md`
+> (`a09b4ee` on branch `proposal/orch-client-build-impl-plan-v0.1`) +
+> v0.7 cert-pinning patch + v0.7.1 bootstrapper patch. See the plan's
+> §0.ter (bootstrapper patch) and §0.af-bootstrap (bootstrapper design).
 >
 > **For a new operator.** Assumes the orchestrator is already running on
 > another machine (the "orchestrator host"). This runbook is executed on
@@ -13,11 +14,46 @@
 > "verified".
 >
 > **Status:** TEMPLATE. The MSI referenced here does not yet exist; this
-> runbook is finalized in plan-only phase alongside the v0.7 build plan.
-> Implementation begins only after the v0.7 §12 operator-binding phase
-> completes (build host + signing cert + clean VM test matrix + agent_id
-> bound). For the corresponding build plan see
-> `docs/proposals/orch-client-build-impl-plan-v0.7.md`.
+> runbook is finalized in plan-only phase alongside the v0.7 build plan
+> and the v0.7.1 bootstrapper. Implementation begins only after the
+> v0.7 §12 operator-binding phase completes (build host + signing cert
+> + clean VM test matrix + agent_id bound). For the corresponding build
+> plan see `docs/proposals/orch-client-build-impl-plan-v0.7.md`.
+
+---
+
+## Quick start (recommended for semi-technical users)
+
+**If your operator gave you the bootstrapper script `install-orch-client.ps1`,
+just run it as Administrator.** It collects the 7 required values
+interactively, validates them, runs the install, and verifies enrollment.
+Total time: < 2 minutes.
+
+```powershell
+# Right-click PowerShell → "Run as Administrator", then:
+& 'C:\Path\To\install-orch-client.ps1'
+```
+
+The bootstrapper will prompt for:
+
+1. Orchestrator FQDN (e.g. `orchestrator.example.local`, NOT an IP)
+2. Orchestrator HTTPS port (default 443)
+3. Orchestrator TLS cert SHA-256 fingerprint (64 hex chars, no colons)
+4. This machine's `agent_id` (e.g. `win-b-02`)
+5. HMAC `key_id` (operator-assigned)
+6. One-time `enrollment_token` (operator-generated)
+7. HMAC secret (base64 string; **input is hidden**)
+
+If the bootstrapper succeeds, you will see `=== SUCCESS ===` and the
+agent will be `verified` in the orchestrator. If it fails, every error
+message is plain English — no stack traces.
+
+**The 8 manual steps below are for operators and power users only.**
+The bootstrapper internally implements every one of them. If you need
+to understand what the bootstrapper is doing, or if you need to install
+without using the bootstrapper, read on.
+
+---
 
 ---
 
@@ -53,7 +89,48 @@ or setting `INSECURE_SKIP_TLS_VERIFY=1`. The fingerprint is always
 operator-input at deployment time; the cert never leaves the orch
 host.
 
+### 0.2 v0.3 → v0.4 bootstrapper patch (2026-08-13)
+
+| # | v0.3 said | v0.4 says | Reason |
+|---|---|---|---|
+| 13 | No Quick-start section; the runbook jumped straight into 8 manual PowerShell steps | New "Quick start" section at the top: "if your operator gave you `install-orch-client.ps1`, just run it as Administrator. The 8 manual steps below are for operators and power users only." The bootstrapper collects the same 7 values interactively, validates them, runs the install, and verifies enrollment | User profile (locked): target audience is semi-technical, NOT developers. A 8-step PowerShell runbook with a manual base64 secret write is a 7-place footgun. The bootstrapper reduces 8 steps + 7 manual YAML edits + 1 base64 secret write to one interactive script with plain-English error messages at every failure |
+| 14 | Step 1-8 presented as the user-facing path | All 8 steps demoted to a "Manual install (advanced)" section at the bottom, with a note that "every step below corresponds to a section of the bootstrapper source code (`installer/bootstrapper/install-orch-client.ps1`)" | Manual install is still the reference for operators / power users; it is NOT deleted. The Quick start supersedes it as the user-facing path |
+| 15 | Header / `## 0. v0.1 → v0.2 changelog` did not mention bootstrapper | Header bumped to v0.4; changelog gets a `### 0.2` subsection listing the Quick-start + manual-demotion | Change is structural, not a content correction |
+
+**The 8 manual steps (Step 1 through Step 8 + Uninstall + Troubleshooting
++ Quick reference + Report back + Cross-references) are all preserved
+verbatim.** The bootstrapper internally implements every one of them.
+The Quick start adds ONE thing: a pointer to the bootstrapper as the
+recommended path for semi-technical users.
+
+**Forbidden (per v0.7.1 §0.af-bootstrap):** shipping a real fingerprint
+in the MSI template, hard-coding a fingerprint in
+`config.yaml.example`, shipping the cert file inside the MSI, adding
+the cert to the OS trust store, or setting `INSECURE_SKIP_TLS_VERIFY=1`
+(unchanged from v0.3). Plus, NEW: shipping the bootstrapper with a
+statically-baked cert fingerprint or agent_id (the bootstrapper must
+collect all 7 values at runtime).
+
 ---
+
+## Manual install (advanced) — for operators and power users
+
+The 8 steps in this section are what the bootstrapper (Quick start above)
+implements internally. If the bootstrapper is not available, or if you
+need to install without it (e.g. you are running an older MSI build that
+does not ship the bootstrapper), follow these steps by hand. Every step
+below corresponds to a section of the bootstrapper source code (see
+`installer/bootstrapper/install-orch-client.ps1`).
+
+**Prerequisites (same as the bootstrapper's pre-flight):**
+
+- [ ] Admin PowerShell (right-click → "Run as Administrator")
+- [ ] The 7 values from the operator (FQDN, port, cert fingerprint,
+      agent_id, key_id, enrollment_token, HMAC secret)
+- [ ] The MSI file (`orch-client-setup.msi`) on a staging path
+
+---
+
 
 ## Before you start (checklist)
 
