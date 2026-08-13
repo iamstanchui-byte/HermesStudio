@@ -1,7 +1,7 @@
-# Orch Client Build — Implementation Plan v0.7 (final plan-only iteration)
+# Orch Client Build — Implementation Plan v0.7 (final plan-only iteration) + cert-pinning patch
 
 **Date:** 2026-08-13
-**Status:** PROPOSAL for review (Perplexity + operator) — v0.7
+**Status:** PROPOSAL for review (Perplexity + operator) — v0.7 + cert-pinning patch
 **Supersedes:** v0.6 (commit `aa49a71` on branch `proposal/orch-client-build-impl-plan-v0.1`)
 **Scope:** end-to-end build of a Windows MSI installer for the new orch
 client, on the orchestrator host (Windows A). The MSI will be carried
@@ -14,7 +14,10 @@ manually runs the install on the target.
 binding. The acceptance gate is the §3.6 + §3.7 + §0.4 + §0.4-bis
 VM test matrix on a clean Windows 10/11 target. Perplexity's review
 is a planning aid, not a release gate; further doc-level iterations
-would delay VM testing without adding safety.
+would delay VM testing without adding safety. The **cert-pinning
+patch** (see §0.bis) is the only post-finality amendment: it adds
+the missing TLS cert verification design (§1.6 + §7 #14 + §12 #0)
+without re-opening the 7-row v0.6 → v0.7 review loop.
 
 ---
 
@@ -38,6 +41,36 @@ All v0.6 sections preserved where not directly affected. Section
 numbering kept stable. New sections added for the per-file-role
 allowlist, the full preflight gate, the template-source consistency
 note, and the HMAC query-string policy.
+
+---
+
+## 0.bis v0.7 cert-pinning patch (2026-08-13)
+
+After v0.7 was declared the **final plan-only iteration**, an operator
+review surfaced a real gap: the plan mandates HTTPS for the
+orchestrator URL but does not say how the **new** orch client (this
+MSI) verifies the orch server's TLS certificate. v0.7 is preserved
+as the final doc-level iteration; this patch adds the missing
+cert-verification design without re-opening the 7-row review loop.
+
+| Change | Where | Why |
+|---|---|---|
+| New `## 1.6 Server-side TLS cert + client-side cert fingerprint pinning` | After §1.5 | Pins the cert-verification strategy: server uses the existing v3.12.0 `hermes-orch gen-cert` (self-signed RSA-2048, 365-day, SANs = hostname/localhost/127.0.0.1); each new agent's `config.yaml` carries `orchestrator_ca_fingerprint_sha256`; agent TLS client uses `CERT_REQUIRED` + post-handshake SHA-256 compare; mismatch → fail closed (no `verify=False`, no OS trust store, no `INSECURE_SKIP_TLS_VERIFY`) |
+| New `§7 #14` operator-binding dependency | §7 table | Adds "Orchestrator cert SHA-256 fingerprint (per agent, for client-side pinning)" as an operator-bound prerequisite. The v3.12.0 `gen-cert` does not currently print the fingerprint — recommended follow-up: add `--print-fingerprint` so operators do not have to remember the `openssl x509 -fingerprint -sha256` incantation |
+| New `§12 #0` operator-binding step | §12 prerequisites list | Adds "Operator runs `hermes-orch gen-cert` on the orch host, captures the cert fingerprint" as the **first** step in the operator-binding phase (before agent_id / cert / build host) — because every new agent's `config.yaml` needs the fingerprint at deployment time |
+| Defense-in-depth note in §1.6 | §1.6 | TLS (transport) + fingerprint (MITM) + HMAC (request forgery, §1.4) + Origin/CSRF (browser session, B12/R14) — four independent layers |
+| Cross-reference to runbook | §1.6 footer | `docs/runbooks/orch-client-install-runbook.md` Step 5a (config.yaml field) + Before-you-start checklist + Troubleshooting are the operator-facing surfaces for §1.6 |
+
+**Forbidden (per §1.6):** shipping a real fingerprint in the MSI
+template, hard-coding a fingerprint in
+`installer/templates/config/config.yaml.example`, shipping the cert
+file inside the MSI. The fingerprint is always operator-input at
+deployment time.
+
+**No other sections of v0.7 are affected.** Section numbering kept
+stable. The 7-row v0.6 → v0.7 changelog above remains the canonical
+"final iteration" record. This patch is the only post-finality
+amendment.
 
 ---
 
@@ -286,6 +319,58 @@ Every release artifact is accompanied by:
 - Build timestamp (UTC)
 - `MANIFEST.json` (built as `[ordered]@{}` object, JSON conversion once at the end, read-back + parse + assert gate)
 - `SBOM.cyclonedx.json` (real CycloneDX 1.6, validated)
+
+---
+
+## 1.6 Server-side TLS cert + client-side cert fingerprint pinning
+
+(v0.7 patch; applied after operator review of cert verification options)
+
+The orch server (v3.12.0+) ships a `hermes-orch gen-cert` subcommand
+that auto-generates a self-signed RSA-2048 cert with 365-day validity
+and SANs = `<hostname>, localhost, 127.0.0.1`, written to
+`~/.hermes-orchestrator/certs/server.{crt,key}`. The cert is
+**machine-local and per-deployment**; the v0.7 MSI does NOT bundle it.
+
+**Client-side verification (v0.7 choice: fingerprint pinning).** Each
+new orch client agent's `config.yaml` carries an
+`orchestrator_ca_fingerprint_sha256` field — the lower-case hex
+SHA-256 of the orch server's `server.crt` DER bytes (no colons, no
+spaces, 64 hex chars). The agent's TLS client sets
+`ssl.SSLContext.verify_mode = CERT_REQUIRED` and compares the
+server-presented cert's SHA-256 against the pinned value on every
+handshake. **Mismatch → fail closed**: no connection, no fallback to
+the OS trust store, no `verify=False` escape hatch, no warning-and-
+continue.
+
+| Aspect | Policy |
+|---|---|
+| Cert source | Orch server's `~/.hermes-orchestrator/certs/server.crt` (auto-gen at first install via `hermes-orch gen-cert`) |
+| Cert type | Self-signed, RSA 2048, 365-day validity |
+| Cert SANs (default) | `<hostname>`, `localhost`, `127.0.0.1` — operator MUST use the orch host's hostname in `orchestrator_url` so the cert's CN/SAN matches. Direct-IP connection is out of scope for first release (see "IP-direct" row below) |
+| Agent verification | `ssl.SSLContext.verify_mode = CERT_REQUIRED` + post-handshake SHA-256 compare against `config.yaml::orchestrator_ca_fingerprint_sha256` |
+| Fingerprint capture | Operator runs `openssl x509 -in ~/.hermes-orchestrator/certs/server.crt -noout -fingerprint -sha256` on the orch host (PowerShell `Get-FileHash` on the cert file gives the file's SHA-256, NOT the cert's — must use `openssl x509` or equivalent). The value after `SHA256 Fingerprint=` is the agent-side pinned value |
+| Cert rotation | Server re-runs `hermes-orch gen-cert --force`; new fingerprint printed; operator updates every agent's `orchestrator_ca_fingerprint_sha256`; agent restart required. v0.7 does NOT include a server-pushed fingerprint-update flow (out of scope; tracked as a v0.7 follow-up) |
+| IP-direct connection | Out of scope for first release. Operator must use the orch host's hostname and ensure DNS / `/etc/hosts` / Windows hosts file resolves it. Direct-IP would require re-gen with the IP in SANs (a server follow-up; the v3.12.0 `gen-cert` does not expose an `--ip` flag today) |
+| OS trust store | Not used. The pinning model replaces the OS trust store for the orch server relationship; the cert is not added to `LocalMachine\Root` |
+| `INSECURE_SKIP_TLS_VERIFY` | Not honored. The v0.7 service fails closed if pinning is requested but no fingerprint is configured (placeholder, missing, or comment-only value) |
+| Defense in depth | TLS for transport encryption + fingerprint for MITM defense + HMAC (§1.4) for request forgery defense + Origin/CSRF (B12/R14) for browser-session defense — four independent layers |
+
+`orchestrator_ca_fingerprint_sha256` is a **per-deployment** value, not
+a build-time value, so it is NOT recorded in `MANIFEST.json` (which is
+per-MSI-build and identical across every deployment of the same MSI).
+Each agent's `config.yaml` carries its own pinned value; the value is
+per-orchestrator, not per-MSI-release.
+
+**Runbook reference:** `docs/runbooks/orch-client-install-runbook.md`
+Step 5a (config.yaml field) + Before-you-start checklist (where the
+operator gets the fingerprint) + Troubleshooting (rotation
+mismatch).
+
+**Forbidden:** shipping a real fingerprint in the MSI template, hard-
+coding a fingerprint in `installer/templates/config/config.yaml.example`,
+or shipping the cert file inside the MSI. The fingerprint is always
+operator-input at deployment time.
 
 ---
 
@@ -872,6 +957,7 @@ Write-Host "[+] requirements.lock sha256: $lockfileSha"
 | 11 | UpgradeCode GUID + ProductCode rotation | operator | bind at runtime |
 | 12 | VM test environment (clean Windows 10/11) | operator | required before implementation approval |
 | 13 | Explicit privileged cleanup script (out of scope; follow-up) | operator | for removing `config.yaml` / `agent-secret.bin` on uninstall |
+| 14 | Orchestrator cert SHA-256 fingerprint (per agent, for client-side pinning) | operator | not yet bound — see §1.6. Operator runs `hermes-orch gen-cert` on the orch host, captures the lower-case hex SHA-256 of `server.crt` (via `openssl x509 -fingerprint -sha256`, NOT `Get-FileHash` on the cert file), pastes the value into each agent's `config.yaml::orchestrator_ca_fingerprint_sha256`. The v3.12.0 `gen-cert` does not currently print the fingerprint; a `--print-fingerprint` follow-up is recommended so the operator does not have to remember the openssl incantation |
 
 ---
 
@@ -957,6 +1043,16 @@ The acceptance gate is the **VM test matrix on a clean Windows
 
 Operator-binding prerequisites for the implementation phase:
 
+0. Operator runs `hermes-orch gen-cert` on the **orch host** (or
+   confirms an existing cert is in place) and captures the
+   lower-case hex SHA-256 fingerprint (see §1.6). The fingerprint is
+   per-orchestrator-deployment; every new agent's
+   `config.yaml::orchestrator_ca_fingerprint_sha256` is set from
+   this value. If the orch server is a fresh install, this is a
+   one-line `hermes-orch gen-cert` + `openssl x509 -fingerprint
+   -sha256` step. The v0.7 implementation includes a
+   `--print-fingerprint` follow-up on `gen-cert` so operators do
+   not have to remember the openssl incantation
 1. Operator picks `agent_id` and `key-id` for the target machine
 2. Operator picks the code-signing cert / Azure Trusted Signing
 3. Operator installs WiX 4 + .NET SDK + Python 3.14.0 + PyInstaller 6.16.0 + Windows SDK 10.0.22621.4031 + .NET SDK 8.0.404 on the build host
