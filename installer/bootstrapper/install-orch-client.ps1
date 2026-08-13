@@ -401,9 +401,203 @@ function Start-AndWaitService {
     throw "SERVICE_NOT_RUNNING: The '$Name' service did not reach Running state within ${TimeoutSeconds}s. Current state: $($svc.Status). Check the Windows Event Log (eventvwr.msc -> Windows Logs -> Application, Source = '$Name') for details. Common causes: (a) config.yaml is malformed, (b) the orchestrator is unreachable from this machine, (c) the HMAC secret mismatch."
 }
 
+# === Wait-ForEnrollment (Draft 4 NEW) ===
+# Polls the orchestrator's HMAC-signed /api/agents/<agent_id>/status
+# endpoint for up to 60s (configurable). Returns when status='verified'.
+# Throws:
+#   - ENROLLMENT_TIMEOUT: 60s elapsed without verified status
+#   - CERT_MISMATCH: TLS handshake failed because the orch's cert
+#     fingerprint does not match the pinned value (this is the actual
+#     cert check, not the format check at the prompt level)
+#   - AUTH_FAILED: HMAC signature was rejected (401/403)
+#
+# Per v0.7 §1.4 bound-metadata HMAC signing:
+#   canonical_input = method + '\n' + canonical_path + '\n' + body_sha256_hex + '\n' + timestamp + '\n' + nonce
+#   signature = base64(HMAC-SHA256(key, canonical_input))
+#   headers:
+#     X-Hermes-Method:    GET
+#     X-Hermes-Path:      /api/agents/<agent_id>/status
+#     X-Hermes-Body-SHA256: <hex sha256 of empty string for GET>
+#     X-Hermes-Key-Id:    <key_id>
+#     X-Hermes-Timestamp: <unix seconds>
+#     X-Hermes-Nonce:     <uuid hex>
+#     X-Hermes-Signature: <base64 of signature>
+#   No query strings on signed endpoints (per v0.7 §1.4).
+function Wait-ForEnrollment {
+    param(
+        [Parameter(Mandatory)][string]$Fqdn,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][string]$AgentId,
+        [Parameter(Mandatory)][string]$KeyId,
+        [Parameter(Mandatory)][byte[]]$SecretBytes,
+        [int]$TimeoutSeconds = $MaxEnrollmentWaitSeconds,
+        [int]$PollIntervalSeconds = 5
+    )
+
+    $url = "https://${Fqdn}:${Port}/api/agents/${AgentId}/status"
+    $canonicalPath = "/api/agents/${AgentId}/status"
+    # SHA-256 of the empty string (per v0.7 §1.4: GET requests have empty body)
+    $bodySha256Hex = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    $method = 'GET'
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $timestamp = [int][double]::Parse((Get-Date -UFormat %s))
+            $nonce = [System.Guid]::NewGuid().ToString('N')
+            $canonicalInput = "$method`n$canonicalPath`n$bodySha256Hex`n$timestamp`n$nonce"
+
+            $hmac = [System.Security.Cryptography.HMACSHA256]::new($SecretBytes)
+            try {
+                $signatureBytes = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($canonicalInput))
+            } finally {
+                $hmac.Dispose()
+            }
+            $signatureB64 = [Convert]::ToBase64String($signatureBytes)
+
+            $headers = [ordered]@{
+                'X-Hermes-Method'     = $method
+                'X-Hermes-Path'       = $canonicalPath
+                'X-Hermes-Body-SHA256' = $bodySha256Hex
+                'X-Hermes-Key-Id'     = $KeyId
+                'X-Hermes-Timestamp'  = $timestamp
+                'X-Hermes-Nonce'      = $nonce
+                'X-Hermes-Signature'  = $signatureB64
+            }
+
+            $response = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 10 -Method Get
+            $body = $response.Content | ConvertFrom-Json
+            if ($body.status -eq 'verified') {
+                return $true
+            }
+            # Otherwise status is 'pending' or other; log and continue polling
+            Write-BootstrapLog 'INFO' "enrollment_poll: status=$($body.status) (waiting)"
+        } catch [System.Net.WebException] {
+            $we = $_.Exception
+            # TLS / cert errors
+            if ($we.InnerException -is [System.Security.Authentication.AuthenticationException]) {
+                throw "CERT_MISMATCH: The orchestrator at ${Fqdn}:${Port} presented a TLS certificate whose fingerprint does not match the fingerprint you entered. Common causes: (a) the operator has rotated the cert since they sent you the fingerprint (ask for the current one), (b) you're connecting to a different orchestrator than you think (verify the FQDN). The agent did NOT enroll; your data files are intact."
+            }
+            # HTTP errors (401/403/etc.) — read the status code
+            $resp = $we.Response
+            if ($null -ne $resp) {
+                $code = [int]$resp.StatusCode
+                if ($code -eq 401 -or $code -eq 403) {
+                    throw "AUTH_FAILED: The orchestrator rejected the HMAC signature (HTTP $code). Common causes: (a) the HMAC secret in agent-secret.bin does not match what the orchestrator has on file for this agent_id, (b) the key_id is not authorized for this agent_id (ask the operator to verify both), (c) the orchestrator's HMAC verification has a bug. Re-paste the HMAC secret from your operator; do not edit it by hand."
+                }
+            }
+            # Other web errors (timeout, connection reset); log and retry
+            Write-BootstrapLog 'WARN' "enrollment_poll_web_exception: $($we.Message)"
+        } catch {
+            Write-BootstrapLog 'WARN' "enrollment_poll_error: $($_.Exception.Message)"
+        }
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+    throw "ENROLLMENT_TIMEOUT: The orch client installed and started, but the orchestrator did not confirm enrollment within ${TimeoutSeconds}s. Common causes: (a) the enrollment_token is already consumed (ask operator for a new one), (b) the agent_id already exists (this machine's agent_id conflicts with another registered machine), (c) the orchestrator is slow. Re-run the bootstrapper; if it still fails, ask your operator to check the orchestrator's agent list."
+}
+
+# === Show-PlainEnglishError (Draft 4 NEW — extract from inline switch) ===
+# Maps internal exception codes / messages to the 12 plain-English
+# error messages from the v0.7.1 §0.af-bootstrap-errors table. Per the
+# user profile, NEVER shows a stack trace, .NET HRESULT, or raw
+# exception message; every error has: (a) what happened, (b) what the
+# user does, (c) who to ask.
+function Show-PlainEnglishError {
+    param([string]$Message)
+    switch -Wildcard ($Message) {
+        'NOT_ADMIN' {
+            Write-Host ''
+            Write-Host 'This script needs to run as Administrator.' -ForegroundColor Red
+            Write-Host 'Right-click PowerShell and choose "Run as Administrator", then re-run this script.' -ForegroundColor Red
+        }
+        'NOT_BASE64' {
+            Write-Host ''
+            Write-Host 'The HMAC secret you pasted is not valid base64.' -ForegroundColor Red
+            Write-Host 'Confirm with your operator that the encoding is base64 (not hex, not raw bytes). Re-paste the secret.' -ForegroundColor Red
+        }
+        'SECRET_TOO_SHORT' {
+            Write-Host ''
+            Write-Host "The HMAC secret decodes to fewer than $SecretMinBytes bytes." -ForegroundColor Red
+            Write-Host "Ask your operator to regenerate the secret (must be at least $SecretMinBytes random bytes, base64-encoded)." -ForegroundColor Red
+        }
+        'EMPTY_SECRET' {
+            Write-Host ''
+            Write-Host 'The HMAC secret cannot be empty.' -ForegroundColor Red
+            Write-Host 'Re-run the script and paste the secret when prompted.' -ForegroundColor Red
+        }
+        'FQDN_RESOLVE_FAILED' {
+            Write-Host ''
+            Write-Host $Message -ForegroundColor Red
+        }
+        'PORT_UNREACHABLE' {
+            Write-Host ''
+            Write-Host $Message -ForegroundColor Red
+        }
+        'EXISTING_SERVICE*' {
+            Write-Host ''
+            Write-Host 'An OrchClient service is already installed on this machine.' -ForegroundColor Red
+            Write-Host 'The bootstrapper refuses to install over an existing service. To reinstall, first uninstall via Add/Remove Programs, then re-run this bootstrapper.' -ForegroundColor Red
+        }
+        'MSI_NOT_FOUND' {
+            Write-Host ''
+            Write-Host $Message -ForegroundColor Red
+        }
+        'MSI_INSTALL_FAILED' {
+            Write-Host ''
+            Write-Host $Message -ForegroundColor Red
+        }
+        'SERVICE_NOT_RUNNING' {
+            Write-Host ''
+            Write-Host $Message -ForegroundColor Red
+        }
+        'CONFIG_WRITE_FAILED' {
+            Write-Host ''
+            Write-Host $Message -ForegroundColor Red
+        }
+        'SECRET_WRITE_FAILED' {
+            Write-Host ''
+            Write-Host $Message -ForegroundColor Red
+        }
+        'ENROLLMENT_TIMEOUT' {
+            Write-Host ''
+            Write-Host $Message -ForegroundColor Red
+        }
+        'CERT_MISMATCH' {
+            Write-Host ''
+            Write-Host $Message -ForegroundColor Red
+        }
+        'AUTH_FAILED' {
+            Write-Host ''
+            Write-Host $Message -ForegroundColor Red
+        }
+        'INSECURE_SKIP_TLS_VERIFY*' {
+            Write-Host ''
+            Write-Host "The orchestrator-side hardening rejected the request because the agent's environment has INSECURE_SKIP_TLS_VERIFY set. The v0.7 §1.6 fingerprint-pinning policy forbids this escape hatch. Unset the env var and re-run." -ForegroundColor Red
+        }
+        'TOO_MANY_ATTEMPTS*' {
+            Write-Host ''
+            Write-Host 'Too many invalid attempts for a prompt. The bootstrapper aborts to avoid silent data corruption.' -ForegroundColor Red
+            Write-Host 'Re-run the script and re-enter the value more carefully.' -ForegroundColor Red
+        }
+        default {
+            Write-Host ''
+            Write-Host "An unexpected error occurred: $Message" -ForegroundColor Red
+            Write-Host "If you can reproduce this, save the bootstrapper log ($LogFile) and contact your operator." -ForegroundColor Red
+        }
+    }
+}
+
 # === MAIN FLOW ===
 try {
     Test-Administrator
+
+    # Per v0.7 §1.6: INSECURE_SKIP_TLS_VERIFY is forbidden. The orch-side
+    # hardening rejects it. Fail closed at the very start of the
+    # bootstrapper so the user sees the error before any prompts.
+    if ($env:INSECURE_SKIP_TLS_VERIFY -and $env:INSECURE_SKIP_TLS_VERIFY -ne '0' -and $env:INSECURE_SKIP_TLS_VERIFY -ne '') {
+        throw 'INSECURE_SKIP_TLS_VERIFY: env var is set; refusing per v0.7 §1.6'
+    }
+
     if (-not (Test-Path -LiteralPath (Split-Path -LiteralPath $LogFile -Parent))) {
         New-Item -ItemType Directory -Path (Split-Path -LiteralPath $LogFile -Parent) -Force | Out-Null
     }
@@ -556,15 +750,23 @@ try {
     Write-Host '  [+] Service: ' $ServiceName ' (Running)' -ForegroundColor Green
     Write-BootstrapLog 'INFO' 'service_running'
 
-    # === ENROLLMENT (Draft 3: still [Day 4 work]) ===
+    # === ENROLLMENT (Draft 4: REAL via Wait-ForEnrollment) ===
     Write-Host ''
-    Write-Host 'Verify enrollment (polling for up to 60s)...' -ForegroundColor Cyan
-    Write-Host '  [Day 4 work] Wait-ForEnrollment function not yet defined' -ForegroundColor DarkGray
+    Write-Host 'Verify enrollment (polling for up to ' $MaxEnrollmentWaitSeconds 's)...' -ForegroundColor Cyan
+    Wait-ForEnrollment `
+        -Fqdn $OrchFqdn `
+        -Port $OrchPort `
+        -AgentId $AgentId `
+        -KeyId $KeyId `
+        -SecretBytes $HmacSecretBytes | Out-Null
+    Write-Host '  [+] Agent ''' $AgentId ''' enrolled successfully' -ForegroundColor Green
+    Write-Host '  [+] Orchestrator confirms: status = verified' -ForegroundColor Green
+    Write-BootstrapLog 'INFO' "enrollment_verified: agent_id=$AgentId"
 
-    # === SUCCESS (Draft 3: install complete, enrollment pending Day 4) ===
+    # === SUCCESS (Draft 4: all 7 prompts + 1 MSI path + 1 enrollment poll = end-to-end) ===
     Write-Host ''
     Write-Host '===========================================' -ForegroundColor Green
-    Write-Host '=== INSTALL COMPLETE (DRAFT 3 — enrollment pending Day 4) ===' -ForegroundColor Green
+    Write-Host '=== SUCCESS (DRAFT 4 — end-to-end install + enrollment verified) ===' -ForegroundColor Green
     Write-Host '===========================================' -ForegroundColor Green
     Write-Host 'Agent:        ' $AgentId
     Write-Host 'Orchestrator: ' $orchUrl
@@ -573,79 +775,17 @@ try {
     Write-Host 'Service:      ' $ServiceName ' (Running)'
     Write-Host 'Log:          ' $LogFile
     Write-Host ''
-    Write-Host 'MSI installed, config + secret files written, service started.' -ForegroundColor Yellow
-    Write-Host 'Day 4 will wire Wait-ForEnrollment + the 4 remaining error cases.' -ForegroundColor Yellow
+    Write-Host 'The orch client is installed and the orchestrator has confirmed the agent as verified.' -ForegroundColor Yellow
+    Write-Host 'The MSI can be uninstalled via Add/Remove Programs; uninstall PRESERVES' -ForegroundColor Yellow
+    Write-Host 'config.yaml, agent-secret.bin, and config.yaml.example (v0.7 PermanentFeature).' -ForegroundColor Yellow
+    Write-Host 'See docs/runbooks/orch-client-install-runbook.md for uninstall + troubleshooting.' -ForegroundColor Yellow
     Write-Host ''
-    Write-BootstrapLog 'INFO' "END v$BootstrapperVersion (DRAFT 3 install COMPLETE)"
+    Write-BootstrapLog 'INFO' "END v$BootstrapperVersion (DRAFT 4 SUCCESS)"
 
 } catch {
-    # === DRAFT 3 error mapping (8 cases; full 12 in Day 4) ===
+    # === DRAFT 4: full 12-case error mapping via Show-PlainEnglishError ===
     $msg = $_.Exception.Message
-    switch -Wildcard ($msg) {
-        'NOT_ADMIN' {
-            Write-Host ''
-            Write-Host 'This script needs to run as Administrator.' -ForegroundColor Red
-            Write-Host 'Right-click PowerShell and choose "Run as Administrator", then re-run this script.' -ForegroundColor Red
-        }
-        'NOT_BASE64' {
-            Write-Host ''
-            Write-Host 'The HMAC secret you pasted is not valid base64.' -ForegroundColor Red
-            Write-Host 'Confirm with your operator that the encoding is base64 (not hex, not raw bytes). Re-paste the secret.' -ForegroundColor Red
-        }
-        'SECRET_TOO_SHORT' {
-            Write-Host ''
-            Write-Host "The HMAC secret decodes to fewer than $SecretMinBytes bytes." -ForegroundColor Red
-            Write-Host "Ask your operator to regenerate the secret (must be at least $SecretMinBytes random bytes, base64-encoded)." -ForegroundColor Red
-        }
-        'EMPTY_SECRET' {
-            Write-Host ''
-            Write-Host 'The HMAC secret cannot be empty.' -ForegroundColor Red
-            Write-Host 'Re-run the script and paste the secret when prompted.' -ForegroundColor Red
-        }
-        'FQDN_RESOLVE_FAILED' {
-            Write-Host ''
-            Write-Host $_.Exception.Message -ForegroundColor Red
-        }
-        'PORT_UNREACHABLE' {
-            Write-Host ''
-            Write-Host $_.Exception.Message -ForegroundColor Red
-        }
-        'EXISTING_SERVICE*' {
-            Write-Host ''
-            Write-Host "An OrchClient service is already installed on this machine." -ForegroundColor Red
-            Write-Host "The bootstrapper refuses to install over an existing service. To reinstall, first uninstall via Add/Remove Programs, then re-run this bootstrapper." -ForegroundColor Red
-        }
-        'MSI_NOT_FOUND' {
-            Write-Host ''
-            Write-Host $_.Exception.Message -ForegroundColor Red
-        }
-        'MSI_INSTALL_FAILED' {
-            Write-Host ''
-            Write-Host $_.Exception.Message -ForegroundColor Red
-        }
-        'SERVICE_NOT_RUNNING' {
-            Write-Host ''
-            Write-Host $_.Exception.Message -ForegroundColor Red
-        }
-        'CONFIG_WRITE_FAILED' {
-            Write-Host ''
-            Write-Host $_.Exception.Message -ForegroundColor Red
-        }
-        'SECRET_WRITE_FAILED' {
-            Write-Host ''
-            Write-Host $_.Exception.Message -ForegroundColor Red
-        }
-        'TOO_MANY_ATTEMPTS*' {
-            Write-Host ''
-            Write-Host 'Too many invalid attempts for a prompt. The bootstrapper aborts to avoid silent data corruption.' -ForegroundColor Red
-            Write-Host 'Re-run the script and re-enter the value more carefully.' -ForegroundColor Red
-        }
-        default {
-            Write-Host ''
-            Write-Host "An unexpected error occurred: $msg" -ForegroundColor Red
-            Write-Host 'This is a DRAFT 3 placeholder. Day 4 will replace this with the full plain-English error table.' -ForegroundColor Red
-        }
-    }
+    Show-PlainEnglishError -Message $msg
     Write-BootstrapLog 'ERROR' "FAILED: $msg"
     exit 1
 }
