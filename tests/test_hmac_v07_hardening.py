@@ -949,3 +949,81 @@ def test_h12_v07_unaffected_by_v06_flag(
     )
     body = response.json()
     assert body["status"] in ("verifying", "verified", "blocked", "suspended")
+
+
+# === Issue #A: NonceStore protocol + multi-worker backend ===
+
+def test_h13_nonce_store_protocol_isinstance_check():
+    """H13: `InMemoryNonceStore` is a structural `NonceStore`
+    Protocol implementer. The `typing.runtime_checkable`
+    Protocol allows `isinstance(store, NonceStore)` checks
+    in tests and at startup.
+
+    Today (red phase): the `NonceStore` Protocol does not
+    exist yet — `InMemoryNonceStore` is a plain class. The
+    test asserts the Protocol-based isinstance check passes.
+    """
+    from hermes_orch.auth.nonce_store import (
+        InMemoryNonceStore,
+        NonceStore,
+    )
+    store = InMemoryNonceStore(ttl_seconds=300)
+    assert isinstance(store, NonceStore), (
+        f"InMemoryNonceStore should satisfy NonceStore protocol; "
+        f"missing methods? dir: {[m for m in dir(store) if not m.startswith('_')]}"
+    )
+
+
+def test_h14_make_nonce_store_factory():
+    """H14: `make_nonce_store(backend)` factory returns the
+    right implementation based on the backend name.
+    - `memory` -> InMemoryNonceStore
+    - `redis` -> RedisNonceStore (stub)
+    - anything else -> ValueError
+
+    Today (red phase): the factory does not exist. Calling
+    `make_nonce_store` raises NameError.
+    """
+    from hermes_orch.auth.nonce_store import (
+        InMemoryNonceStore,
+        NonceStore,
+        make_nonce_store,
+    )
+    store_memory = make_nonce_store("memory")
+    assert isinstance(store_memory, InMemoryNonceStore)
+    assert isinstance(store_memory, NonceStore)
+
+    store_redis = make_nonce_store("redis")
+    assert isinstance(store_redis, NonceStore)
+    # The Redis stub raises NotImplementedError on operations
+    # (test_h15 covers this)
+
+    with pytest.raises(ValueError) as exc_info:
+        make_nonce_store("unknown-backend")
+    assert "unknown-backend" in str(exc_info.value).lower()
+
+
+def test_h15_redis_nonce_store_stub_raises():
+    """H15: `RedisNonceStore` is a stub that raises
+    `NotImplementedError` on every operation. The error
+    message is explicit about the production deployment
+    requirement so the operator does not accidentally use
+    the stub in production.
+
+    Today (red phase): the class does not exist; the test
+    raises AttributeError on import.
+    """
+    from hermes_orch.auth.nonce_store import RedisNonceStore
+
+    store = RedisNonceStore(redis_url="redis://localhost:6379/0")
+    with pytest.raises(NotImplementedError) as exc_info:
+        store.is_seen("nonce-1")
+    assert "stub" in str(exc_info.value).lower() or "not implemented" in str(
+        exc_info.value
+    ).lower()
+
+    with pytest.raises(NotImplementedError):
+        store.add("nonce-2")
+
+    with pytest.raises(NotImplementedError):
+        store.add_if_absent("nonce-3")

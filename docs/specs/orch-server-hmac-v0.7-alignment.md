@@ -558,6 +558,101 @@ mechanism.
 - The 401 `V0_6_DEPRECATED` error code is documented in
   spec §1.12 and surfaces in the unified error contract.
 
+### 1.14 NonceStore protocol + multi-worker backend (added hardening Phase 7, 2026-08-15)
+
+The `nonce_store` interface is abstracted behind a `NonceStore`
+Protocol so the production backend can be swapped without
+touching the v0.7 verifier (which calls `add_if_absent` on
+the store). Two implementations ship in v0.7:
+
+1. **`InMemoryNonceStore`** (default): per-process, in-memory,
+   `threading.Lock`-protected, atomic via `add_if_absent`. Used
+   for single-process deployments and tests. Does NOT
+   coordinate across multiple uvicorn workers — a nonce
+   accepted in worker A is invisible to worker B, so a
+   replay routed to worker B would pass the nonce check
+   (silent fail-open).
+
+2. **`RedisNonceStore`**: cross-process via `SET nonce TTL NX`
+   (atomic set-if-not-exists with TTL). Used for
+   multi-worker production deployments. **Stub
+   implementation only** in v0.7 (raises
+   `NotImplementedError` on every operation); the actual
+   Redis client integration is deferred to a follow-up
+   PR once the operator confirms the deployment topology
+   and Redis availability.
+
+**Why a Protocol, not a class hierarchy**:
+
+- The `NonceStore` is a structural Protocol (duck-typed).
+  Any class with the right methods (`is_seen`, `add`,
+  `add_if_absent`) is a valid store. The
+  `InMemoryNonceStore` and `RedisNonceStore` don't need
+  to share a base class — they just need to implement
+  the same methods.
+- `typing.runtime_checkable` allows `isinstance(store,
+  NonceStore)` checks in tests and at startup (e.g. the
+  lifespan verifies the configured store implements
+  the protocol before accepting requests).
+
+**Env var**: `HERMES_NONCE_STORE_BACKEND`
+
+| Value | Behavior |
+|---|---|
+| `memory` (default) | `InMemoryNonceStore(ttl_seconds=300)` |
+| `redis` | `RedisNonceStore(...)` stub; logs a warning on startup that the implementation is incomplete |
+
+**Multi-worker warning**:
+
+If `HERMES_NONCE_STORE_BACKEND=memory` AND the server is
+running with more than 1 uvicorn worker (`--workers > 1`),
+the lifespan logs a `WARNING` on startup:
+
+```
+[nonce_store] running with InMemoryNonceStore but
+HERMES_NONCE_WORKERS=4 (or detected from --workers flag);
+replay protection is per-process and CAN BYPASS cross-worker
+replays. Set HERMES_NONCE_STORE_BACKEND=redis for production
+multi-worker deployments.
+```
+
+The warning is informational, not a hard fail. The operator
+can acknowledge (e.g. in a single-worker test setup) and
+proceed. The warning is the only signal: the server does not
+auto-promote to `redis` even if the operator forgot to
+flip the env var.
+
+**Redis stub interface** (deferred to a follow-up PR):
+
+The `RedisNonceStore` class:
+- Constructor takes a Redis client (or connection URL)
+- `add_if_absent(nonce)` calls `SET nonce <expiry> EX <ttl> NX`
+  and returns True if the key was set (first to record)
+- `is_seen(nonce)` calls `EXISTS nonce` and returns the bool
+- `add(nonce)` calls `SET nonce <expiry> EX <ttl>` (no NX;
+  for compatibility with the v0.6-era interface)
+- All methods catch Redis connection errors and re-raise as
+  `NonceStoreUnavailable` so the verifier can surface 503
+  Service Unavailable to the client (fail-closed; never
+  accept a request when the nonce store is unreachable)
+
+The v0.7 stub raises `NotImplementedError("RedisNonceStore
+is a stub; production deployment requires a real Redis
+client. Tracked in <issue link>")` on every operation, with
+a clear message that the operator must NOT use `redis` in
+production without first implementing the client integration.
+
+**Test coverage**:
+
+- `InMemoryNonceStore` implements the `NonceStore` Protocol
+  (runtime_checkable isinstance check)
+- `RedisNonceStore` is instantiable but raises
+  `NotImplementedError` on operations
+- Factory `make_nonce_store(backend)` returns the right
+  implementation; unknown backend raises `ValueError`
+- Lifespan logs the multi-worker warning when applicable
+  (verifiable via caplog)
+
 ---
 
 ## 2. Current v1.6 implementation (what changes)
