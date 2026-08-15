@@ -1,9 +1,11 @@
 # Orch Client Install & Register Runbook (Windows target)
 
-> **v0.4.1** — aligned with `docs/proposals/orch-client-build-impl-plan-v0.7.md`
-> + v0.7 cert-pinning patch + v0.7.1 bootstrapper patch + **v0.7.2 firewall
-> auto-add patch**. See the plan's §0.ter (bootstrapper patch),
-> §0.quart (firewall auto-add patch), and §0.af-bootstrap (bootstrapper design).
+> **v0.4.2** — aligned with `docs/proposals/orch-client-build-impl-plan-v0.7.md`
+> + v0.7 cert-pinning patch + v0.7.1 bootstrapper patch + v0.7.2 firewall
+> auto-add patch + **v0.7.3 real TLS cert fingerprint pinning patch**. See
+> the plan's §0.ter (bootstrapper patch), §0.quart (firewall auto-add
+> patch), §0.quint (cert fingerprint pinning patch), and §0.af-bootstrap
+> (bootstrapper design).
 >
 > **For a new operator.** Assumes the orchestrator is already running on
 > another machine (the "orchestrator host"). This runbook is executed on
@@ -103,6 +105,14 @@ host.
 | 15 | User has to manually add a Windows Firewall outbound allow rule for the orchestrator port (TCP 8765 or whatever port the operator chose) before the agent can reach the orchestrator. The bootstrapper's `PORT_UNREACHABLE` error tells the user to "check firewall" but doesn't fix it | The bootstrapper auto-adds a Windows Firewall outbound allow rule via `netsh advfirewall firewall add rule` as part of the install flow, right after pre-flight and before MSI install. The rule name is `HermesOrchestrator Agent (Outbound) - <fqdn>:<port>` (unique per orch target, so multiple orchs can coexist). The add is idempotent: if the rule already exists, it's a no-op. A new `FIREWALL_RULE_FAILED` plain-English error case handles the rare netsh failure. If a later install step fails after the rule was added, the catch block best-effort removes the rule (rollback) before showing the error | The "user manually edits Windows Firewall" step is the single biggest friction for a regular user — 4-5 dialog clicks, they have to know "Outbound Rules", "Port", "TCP", the right port number. Auto-add removes that step entirely. The user's mental model collapses to: "I ran the script, it asked me 7 questions, it said SUCCESS in 2 minutes." Matches the user-profile principle: "東西都齊, 就是怎樣方便新user 安裝" |
 | 16 | 13 plain-English error cases (12 from v0.7.1 + EXISTING_SERVICE* wildcard) | 14 plain-English error cases (added FIREWALL_RULE_FAILED) | New failure mode needs a new error mapping. The error message includes 3 fallback options so the user can self-recover without operator intervention |
 | 15 | Header / `## 0. v0.1 → v0.2 changelog` did not mention bootstrapper | Header bumped to v0.4; changelog gets a `### 0.2` subsection listing the Quick-start + manual-demotion | Change is structural, not a content correction |
+
+### 0.4 v0.4.1 → v0.4.2 real TLS cert fingerprint pinning patch (2026-08-15)
+
+| # | v0.4.1 said | v0.4.2 says | Reason |
+|---|---|---|---|
+| 17 | The bootstrapper's `Wait-ForEnrollment` uses `Invoke-WebRequest` for the HMAC-signed poll. The pre-flight `Test-CertFingerprint` is a FORMAT check (regex `^[0-9a-f]{64}$` on the user-pasted 64-char hex) only — it does NOT verify the actual TLS cert the orch presents. For a self-signed orch cert, the default cert validation FAILS outright, so the poll loop never actually worked end-to-end against a self-signed orch (the regex was a hopeful check, not a real pin) | `Wait-ForEnrollment` now uses `[System.Net.Http.HttpClient]` with a custom `HttpClientHandler.ServerCertificateCustomValidationCallback` that: (1) computes SHA-256 of `cert.Export([X509ContentType]::Cert)` (the cert's DER bytes), (2) compares lowercase hex to the user-pasted `$CertFingerprint`, (3) returns `$true` only if the hashes match. Force `[Net.ServicePointManager]::SecurityProtocol = Tls12` for the TLS handshake stage (PS 5.1 / .NET Framework 4.x default is SSL3 / TLS 1.0, which the orch's cert rejects). New `-CertFingerprint` parameter passed at the call site. Improved `CERT_MISMATCH` error message to cover both cert mismatch AND TLS handshake failure (e.g. older TLS versions on the orch) | The format check was a hopeful lie. With this patch, the bootstrapper's `Wait-ForEnrollment` actually verifies the orch's cert against the pinned fingerprint at TLS handshake time, before any HMAC header is sent. This makes the cert-pinning contract per v0.7 §1.6 enforceable from the client side. The PS 5.1 .NET bug (Invoke-WebRequest can't do TLS 1.2) was the proximate cause; the deeper cause is the cert-pinning spec was designed but never implemented for self-signed orchs |
+| 18 | PowerShell `Invoke-WebRequest` is used for the HTTPS enrollment poll | PowerShell `[System.Net.Http.HttpClient]` is used (force TLS 1.2 in handler init) | PS 5.1 .NET Framework 4.x has a known SChannel / HttpClient bug that breaks `Invoke-WebRequest` for TLS 1.2+ endpoints. `HttpClient` with explicit `SecurityProtocol = Tls12` is the fix; same pattern documented in the agent's C# / Python / PowerShell HMAC codebases |
+| 19 | `Wait-ForEnrollment` did not explicitly dispose `HttpClient` / `HttpClientHandler` | Explicit `$client.Dispose()` and `$handler.Dispose()` in the deadline-exceeded branch; `HttpRequestMessage` is disposed in `finally` | Bootstrapper runs once per install; not a long-lived leak, but the explicit dispose is correct hygiene and matches the codebase pattern |
 
 **The 8 manual steps (Step 1 through Step 8 + Uninstall + Troubleshooting
 + Quick reference + Report back + Cross-references) are all preserved

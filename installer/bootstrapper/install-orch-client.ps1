@@ -1,5 +1,5 @@
 ﻿# === install-orch-client.ps1 ===
-# v0.7.2 Orch Client Bootstrapper (DRAFT 5, 2026-08-15)
+# v0.7.3 Orch Client Bootstrapper (DRAFT 6, 2026-08-15)
 #
 # One-shot interactive install for the new orch client (PyInstaller + WiX
 # MSI per docs/proposals/orch-client-build-impl-plan-v0.7.md). Replaces the
@@ -466,14 +466,16 @@ function Remove-FirewallRule {
     }
 }
 
-# === Wait-ForEnrollment (Draft 4 NEW) ===
+# === Wait-ForEnrollment (Draft 4 NEW, v0.7.3: real TLS cert fingerprint pinning) ===
 # Polls the orchestrator's HMAC-signed /api/agents/<agent_id>/status
 # endpoint for up to 60s (configurable). Returns when status='verified'.
 # Throws:
 #   - ENROLLMENT_TIMEOUT: 60s elapsed without verified status
 #   - CERT_MISMATCH: TLS handshake failed because the orch's cert
-#     fingerprint does not match the pinned value (this is the actual
-#     cert check, not the format check at the prompt level)
+#     fingerprint does not match the pinned value (real cert check,
+#     not just a format check at the prompt level). v0.7.3: this is
+#     now actually enforced via ServerCertificateCustomValidationCallback
+#     computing SHA-256 of cert DER bytes and comparing to $CertFingerprint.
 #   - AUTH_FAILED: HMAC signature was rejected (401/403)
 #
 # Per v0.7 §1.4 bound-metadata HMAC signing:
@@ -488,6 +490,25 @@ function Remove-FirewallRule {
 #     X-Hermes-Nonce:     <uuid hex>
 #     X-Hermes-Signature: <base64 of signature>
 #   No query strings on signed endpoints (per v0.7 §1.4).
+#
+# Per v0.7 §1.6 client-side cert fingerprint pinning:
+#   - HttpClientHandler.ServerCertificateCustomValidationCallback fires
+#     when default cert validation fails (which is the case for our
+#     self-signed orch cert, since it is not in the OS trust store)
+#   - Callback computes SHA-256 of cert.Export(X509ContentType::Cert)
+#     (DER bytes) and compares lowercase hex to $CertFingerprint
+#   - If match: return $true (allow connection despite default failure)
+#   - If mismatch: return $false (reject; HttpClient raises
+#     AuthenticationException wrapped in HttpRequestException)
+#   - Fail closed: any error in the callback returns $false
+#   - v0.7.3 FIX: PS 5.1's `Invoke-WebRequest` is unusable for HTTPS
+#     testing (TLS 1.2 .NET bug); use [System.Net.Http.HttpClient] with
+#     an explicit HttpClientHandler. This is the FIRST real cert
+#     fingerprint check in the bootstrapper; before v0.7.3, the
+#     `Test-CertFingerprint` pre-flight was FORMAT-only (regex), and
+#     Wait-ForEnrollment trusted whatever cert the OS validation
+#     accepted (which would FAIL outright for self-signed, so the
+#     poll loop was effectively broken for self-signed orchs).
 function Wait-ForEnrollment {
     param(
         [Parameter(Mandatory)][string]$Fqdn,
@@ -495,6 +516,7 @@ function Wait-ForEnrollment {
         [Parameter(Mandatory)][string]$AgentId,
         [Parameter(Mandatory)][string]$KeyId,
         [Parameter(Mandatory)][byte[]]$SecretBytes,
+        [Parameter(Mandatory)][string]$CertFingerprint,
         [int]$TimeoutSeconds = $MaxEnrollmentWaitSeconds,
         [int]$PollIntervalSeconds = 5
     )
@@ -504,6 +526,45 @@ function Wait-ForEnrollment {
     # SHA-256 of the empty string (per v0.7 §1.4: GET requests have empty body)
     $bodySha256Hex = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
     $method = 'GET'
+
+    # v0.7.3: build HttpClientHandler with custom cert validation callback
+    # that pins to the orch's cert SHA-256 fingerprint.
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.ServerCertificateCustomValidationCallback = {
+        param($sender, $cert, $chain, $errors)
+        try {
+            if ($null -eq $cert) { return $false }
+            # Compute SHA-256 of the cert's DER bytes (per v0.7 §1.6).
+            # GetCertHash() returns the cert's signature algorithm hash
+            # (often SHA-1, NOT what we want), so we export DER and hash.
+            $certBytes = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $hash = $sha256.ComputeHash($certBytes)
+            } finally {
+                $sha256.Dispose()
+            }
+            $actualFp = -join ($hash | ForEach-Object { $_.ToString('x2') })
+            if ($actualFp -eq $CertFingerprint) {
+                # Match: accept the cert (overrides default trust failure for self-signed)
+                return $true
+            }
+            # Mismatch: log and reject
+            Write-BootstrapLog 'WARN' "cert_fingerprint_mismatch: expected=$CertFingerprint actual=$actualFp"
+            return $false
+        } catch {
+            # Any error in the callback fails closed
+            Write-BootstrapLog 'WARN' "cert_callback_error: $($_.Exception.Message)"
+            return $false
+        }
+    }
+
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(10)
+    # Force TLS 1.2 (PS 5.1 / .NET Framework 4.x default is SSL3 / TLS 1.0)
+    # This is required for the orch's gen-cert cert to be accepted at the
+    # TLS handshake stage (before the cert validation callback fires).
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
@@ -530,34 +591,53 @@ function Wait-ForEnrollment {
                 'X-Hermes-Signature'  = $signatureB64
             }
 
-            $response = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 10 -Method Get
-            $body = $response.Content | ConvertFrom-Json
-            if ($body.status -eq 'verified') {
-                return $true
-            }
-            # Otherwise status is 'pending' or other; log and continue polling
-            Write-BootstrapLog 'INFO' "enrollment_poll: status=$($body.status) (waiting)"
-        } catch [System.Net.WebException] {
-            $we = $_.Exception
-            # TLS / cert errors
-            if ($we.InnerException -is [System.Security.Authentication.AuthenticationException]) {
-                throw "CERT_MISMATCH: The orchestrator at ${Fqdn}:${Port} presented a TLS certificate whose fingerprint does not match the fingerprint you entered. Common causes: (a) the operator has rotated the cert since they sent you the fingerprint (ask for the current one), (b) you're connecting to a different orchestrator than you think (verify the FQDN). The agent did NOT enroll; your data files are intact."
-            }
-            # HTTP errors (401/403/etc.) — read the status code
-            $resp = $we.Response
-            if ($null -ne $resp) {
-                $code = [int]$resp.StatusCode
-                if ($code -eq 401 -or $code -eq 403) {
-                    throw "AUTH_FAILED: The orchestrator rejected the HMAC signature (HTTP $code). Common causes: (a) the HMAC secret in agent-secret.bin does not match what the orchestrator has on file for this agent_id, (b) the key_id is not authorized for this agent_id (ask the operator to verify both), (c) the orchestrator's HMAC verification has a bug. Re-paste the HMAC secret from your operator; do not edit it by hand."
+            $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $url)
+            try {
+                foreach ($k in $headers.Keys) {
+                    $null = $request.Headers.TryAddWithoutValidation($k, $headers[$k])
                 }
+                $response = $client.SendAsync($request).GetAwaiter().GetResult()
+                $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                $statusCode = [int]$response.StatusCode
+                if ($statusCode -eq 200) {
+                    $body = $responseBody | ConvertFrom-Json
+                    if ($body.status -eq 'verified') {
+                        return $true
+                    }
+                    # Otherwise status is 'pending' or other; log and continue polling
+                    Write-BootstrapLog 'INFO' "enrollment_poll: status=$($body.status) (waiting)"
+                } elseif ($statusCode -eq 401 -or $statusCode -eq 403) {
+                    throw "AUTH_FAILED: The orchestrator rejected the HMAC signature (HTTP $statusCode). Common causes: (a) the HMAC secret in agent-secret.bin does not match what the orchestrator has on file for this agent_id, (b) the key_id is not authorized for this agent_id (ask the operator to verify both), (c) the orchestrator's HMAC verification has a bug. Re-paste the HMAC secret from your operator; do not edit it by hand."
+                } else {
+                    Write-BootstrapLog 'WARN' "enrollment_poll_http_$statusCode`: $responseBody"
+                }
+            } finally {
+                $request.Dispose()
             }
-            # Other web errors (timeout, connection reset); log and retry
-            Write-BootstrapLog 'WARN' "enrollment_poll_web_exception: $($we.Message)"
+        } catch [System.Net.Http.HttpRequestException] {
+            $ex = $_.Exception
+            # v0.7.3: HttpClient wraps TLS errors in HttpRequestException with
+            # InnerException = AuthenticationException. The cert validation
+            # callback returning $false raises this. We can't distinguish
+            # "callback rejected" from "TLS handshake failed for other reasons"
+            # at this layer (both raise the same exception), but the user's
+            # plain-English guidance is the same: re-check the fingerprint and
+            # the FQDN.
+            if ($ex.InnerException -is [System.Security.Authentication.AuthenticationException]) {
+                throw "CERT_MISMATCH: The orchestrator at ${Fqdn}:${Port} presented a TLS certificate whose fingerprint does not match the fingerprint you entered, or the TLS handshake failed. Common causes: (a) the operator has rotated the cert since they sent you the fingerprint (ask for the current one), (b) you're connecting to a different orchestrator than you think (verify the FQDN), (c) the orch is using a TLS version older than 1.2 (ask the operator to upgrade). The agent did NOT enroll; your data files are intact."
+            }
+            # Other HTTP errors (timeout, connection reset); log and retry
+            Write-BootstrapLog 'WARN' "enrollment_poll_http_exception: $($ex.Message)"
+        } catch [System.Security.Authentication.AuthenticationException] {
+            # Some .NET versions may surface this directly; treat same as above
+            throw "CERT_MISMATCH: The orchestrator at ${Fqdn}:${Port} presented a TLS certificate whose fingerprint does not match the fingerprint you entered, or the TLS handshake failed. Common causes: (a) the operator has rotated the cert since they sent you the fingerprint (ask for the current one), (b) you're connecting to a different orchestrator than you think (verify the FQDN). The agent did NOT enroll; your data files are intact."
         } catch {
             Write-BootstrapLog 'WARN' "enrollment_poll_error: $($_.Exception.Message)"
         }
         Start-Sleep -Seconds $PollIntervalSeconds
     }
+    $client.Dispose()
+    $handler.Dispose()
     throw "ENROLLMENT_TIMEOUT: The orch client installed and started, but the orchestrator did not confirm enrollment within ${TimeoutSeconds}s. Common causes: (a) the enrollment_token is already consumed (ask operator for a new one), (b) the agent_id already exists (this machine's agent_id conflicts with another registered machine), (c) the orchestrator is slow. Re-run the bootstrapper; if it still fails, ask your operator to check the orchestrator's agent list."
 }
 
@@ -691,7 +771,7 @@ try {
     # (Day 4 will move it to the top as a clean refactor.)
 
     Write-Host ''
-    Write-Host '=== Orch Client Bootstrapper v0.7.2 (Draft 5) ===' -ForegroundColor Cyan
+    Write-Host '=== Orch Client Bootstrapper v0.7.3 (Draft 6) ===' -ForegroundColor Cyan
     Write-Host ''
     Write-Host 'Your operator will give you the values below. The HMAC secret is' -ForegroundColor Gray
     Write-Host 'hidden as you type. Press Enter to accept a default in [brackets].' -ForegroundColor Gray
@@ -847,7 +927,8 @@ try {
         -Port $OrchPort `
         -AgentId $AgentId `
         -KeyId $KeyId `
-        -SecretBytes $HmacSecretBytes | Out-Null
+        -SecretBytes $HmacSecretBytes `
+        -CertFingerprint $CertFingerprint | Out-Null
     Write-Host '  [+] Agent ''' $AgentId ''' enrolled successfully' -ForegroundColor Green
     Write-Host '  [+] Orchestrator confirms: status = verified' -ForegroundColor Green
     Write-BootstrapLog 'INFO' "enrollment_verified: agent_id=$AgentId"
