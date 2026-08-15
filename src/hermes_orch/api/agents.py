@@ -43,6 +43,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from hermes_orch.auth import require_hmac_auth
+from hermes_orch.auth.dispatch import dispatch_hmac_auth
 from hermes_orch.auth.hmac_v07 import require_hmac_auth_v07
 
 from hermes_orch.core.audit import audit_log
@@ -728,20 +729,30 @@ async def update_agent(
 async def heartbeat(
     agent_id: str,
     request: Request,
-    x_agent_id: str = Depends(require_hmac_auth),
+    auth_agent_id: str = Depends(dispatch_hmac_auth),
 ) -> dict:
-    """Agent heartbeat. HMAC-authed (v1.6).
+    """Agent heartbeat. HMAC-authed (v0.7 §1.4 dual-format, v1.6 fallback).
 
-    Verifies the X-Agent-Id / X-Timestamp / X-Signature headers via
-    require_hmac_auth, and that X-Agent-Id matches the URL path
-    agent_id (so a wrapper can't heartbeat on behalf of another
-    agent even with a valid signature).
+    Per the v0.7 spec §3 Option B (dual-format migration), this route
+    accepts BOTH the v1.6 3-header format (X-Agent-Id / X-Timestamp /
+    X-Signature, hex HMAC) AND the v0.7 §1.4 7-header format
+    (X-Hermes-Method / X-Hermes-Path / X-Hermes-Body-SHA256 /
+    X-Hermes-Key-Id / X-Hermes-Timestamp / X-Hermes-Nonce /
+    X-Hermes-Signature, base64 HMAC). The dispatcher in
+    `auth/dispatch.py` routes to the right verifier based on header
+    presence; this route is unchanged from the operator's POV.
+
+    The returned `auth_agent_id` is the agent_id the verifier
+    looked up (by hmac_key_id for v0.7, by id for v1.6). The
+    `auth_agent_id != agent_id` check below prevents a valid
+    signature for agent A from heartbeating on behalf of agent B
+    (defense in depth).
 
     Returns list of tasks currently assigned to this agent.
     """
-    if x_agent_id != agent_id:
+    if auth_agent_id != agent_id:
         raise HTTPException(
-            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+            401, f"Auth agent_id ({auth_agent_id}) does not match URL ({agent_id})"
         )
 
     db = request.app.state.db

@@ -153,26 +153,61 @@ def test_v07_heartbeat_accepts_v07_format(client):
     (returns 401 MISSING_AUTH_HEADERS). Step 7 (dual-format
     dispatcher) turns this green.
     """
-    # NOTE: T14 doesn't use agent_with_v06 because in the v0.7
-    # world the agent has a different shape (key_id + bytes
-    # secret). For the red phase we just need any 200 response;
-    # the agent lookup is part of the impl that lands in step 4.
+    # T14 (step 7 / dual-format dispatcher): now actually registers
+    # the agent with hmac_key_id + hmac_secret so the v0.7 verifier
+    # can look it up. The agent_with_v06 fixture uses the v0.6
+    # register_test_agent helper which doesn't set hmac_key_id, so
+    # we register inline (mirrors the v0.7 agent_with_key pattern).
+    import hashlib as _h
+    import sqlite3 as _sqlite3
+    import time as _time
+
     agent_id = "win-test-1"
     key_id = "key-win-test-1"
     secret = os.urandom(32)
+    secret_str = secret.hex()  # stored as hex per v0.6 register_test_agent
+    secret_hash = _h.sha256(secret_str.encode("utf-8")).hexdigest()
+    now = _time.strftime("%Y-%m-%dT%H:%M:%S")
 
-    headers = sign_v07_request(
-        "POST", f"/api/agents/{agent_id}/heartbeat",
-        body=b'{"force": 1}',
-        key_id=key_id, secret=secret,
-    )
-    response = client.post(
-        f"/api/agents/{agent_id}/heartbeat",
-        headers=headers,
-        content=b'{"force": 1}',
-    )
-    assert response.status_code == 200, (
-        f"v0.7 request on /heartbeat failed (status={response.status_code}, "
-        f"body={response.text}). The dual-format dispatcher should "
-        f"accept v0.7 requests during the Option B transition."
-    )
+    db_path = client.app.state.db.db_path
+    conn = _sqlite3.connect(str(db_path))
+    try:
+        conn.execute("DELETE FROM agent_profiles WHERE agent_id = ?",
+                       (agent_id,))
+        conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+        conn.execute(
+            "INSERT INTO agents (id, secret_hash, hmac_secret, "
+            "hmac_key_id, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'verified', ?)",
+            (agent_id, secret_hash, secret_str, key_id, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        headers = sign_v07_request(
+            "POST", f"/api/agents/{agent_id}/heartbeat",
+            body=b'{"force": 1}',
+            key_id=key_id, secret=secret,
+        )
+        response = client.post(
+            f"/api/agents/{agent_id}/heartbeat",
+            headers=headers,
+            content=b'{"force": 1}',
+        )
+        assert response.status_code == 200, (
+            f"v0.7 request on /heartbeat failed (status={response.status_code}, "
+            f"body={response.text}). The dual-format dispatcher should "
+            f"accept v0.7 requests during the Option B transition."
+        )
+    finally:
+        # Cleanup
+        conn = _sqlite3.connect(str(db_path))
+        try:
+            conn.execute("DELETE FROM agent_profiles WHERE agent_id = ?",
+                           (agent_id,))
+            conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+            conn.commit()
+        finally:
+            conn.close()
