@@ -392,6 +392,89 @@ cause the bootstrapper to keep polling past 60s and time out
 operator wouldn't know there's a DB bug; the 500 surfaces
 the issue immediately with a structured error code.
 
+### 1.12 Unified error JSON contract (added hardening Phase 5, 2026-08-15)
+
+All 4xx + 5xx responses from the v0.7 endpoints use a unified
+JSON shape:
+
+```json
+{
+  "error": "ERROR_CODE",
+  "message": "human readable message",
+  "request_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+The `X-Request-Id` response header carries the same UUID as
+`request_id` for cross-system log correlation.
+
+**Legacy `detail` field (preserved for backward compat)**:
+
+The pre-Phase-5 format was `{"detail": "ERROR_CODE: human message"}`
+in a single string. The legacy `detail` field is preserved
+with the same content for backward compatibility with
+existing clients (the bootstrapper's `Wait-ForEnrollment`
+and the dashboard's existing error parsing). New code
+should use the `error` + `message` pair; the legacy
+`detail` field is deprecated and may be removed in a
+future major version (>=2.0).
+
+**Why a unified contract**:
+
+- The previous design used `{"detail": "ERROR_CODE: human message"}`
+  and required clients to `detail.split(": ")[0]` to extract
+  the error code. This is fragile: the split breaks if a `:`
+  appears in the human message (e.g. an IPv6 address in the
+  message body), and the `detail` field is overloaded (both
+  the error code and the human message in one string).
+- The new contract separates the code (`error`) from the
+  human message (`message`), adds a `request_id` for
+  cross-system log correlation, and uses the standard
+  FastAPI exception handler pattern.
+- The split-on-`": "` pattern is preserved as a fallback
+  for clients that haven't migrated to the new field yet.
+
+**Wire format by status code**:
+
+| Status | Body shape |
+|---|---|
+| 200 | data fields only (e.g. `{"agent_id": "...", "status": "verified"}`) |
+| 400 / 401 / 403 / 404 / 409 | `{"error": "CODE", "message": "...", "request_id": "uuid"}` + legacy `{"detail": "CODE: ..."}` |
+| 500 | `{"error": "INTERNAL_SERVER_ERROR" or "INVALID_AGENT_STATUS", "message": "...", "request_id": "uuid"}` + legacy `{"detail": "..."}` |
+
+**Error code registry** (single source of truth, all
+HTTPException-raised codes use the `ERROR_CODE: message`
+detail format which the exception handler parses):
+
+| Code | Where raised |
+|---|---|
+| `MISSING_AUTH_HEADERS` | v0.7 verifier step 1 (header missing) |
+| `MALFORMED_HEADERS` | v0.7 verifier steps 1b/3 (method/path/query) |
+| `TIMESTAMP_OUT_OF_WINDOW` | v0.7 verifier step 2 |
+| `UNKNOWN_KEY_ID` | v0.7 verifier step 5 |
+| `INVALID_SIGNATURE` | v0.7 verifier step 6 |
+| `NONCE_REPLAY` | v0.7 verifier step 7 (atomic add_if_absent) |
+| `KEY_AGENT_MISMATCH` | v0.7 status endpoint (defense in depth) |
+| `BODY_HASH_MISMATCH` | v0.7 verifier step 4 |
+| `MIXED_HEADERS` | dispatcher (Phase 1) |
+| `ENROLLMENT_STATE_CONFLICT` | v0.7 enrollment endpoint (Phase 3) |
+| `INVALID_AGENT_STATUS` | v0.7 status endpoint (Phase 6) |
+| `HTTP_ERROR` | generic fallback when detail has no `:` separator |
+
+**Implementation**:
+
+- `hermes_orch.core.error_contract.parse_error_detail(detail)`
+  parses the `"CODE: message"` string into `(code, message)`
+- `hermes_orch.core.error_contract.make_error_response(
+    code, message, request_id, status_code)` builds the
+  JSON response with both new fields and the legacy `detail`
+- `hermes_orch.main.request_id_middleware` generates a UUID4
+  per request, attaches it to `request.state.request_id` and
+  the `X-Request-Id` response header
+- `hermes_orch.main.custom_http_exception_handler` registered
+  via `app.add_exception_handler(HTTPException, ...)` parses
+  the detail string and returns the unified shape
+
 ---
 
 ## 2. Current v1.6 implementation (what changes)

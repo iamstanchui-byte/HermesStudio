@@ -706,3 +706,110 @@ def test_h08b_status_endpoint_rejects_invalid_enum_value(
         f"{response.status_code}: {response.text}"
     )
     assert response.json()["detail"].split(": ")[0] == "INVALID_AGENT_STATUS"
+
+
+# === Issue #6: Unified error JSON contract ===
+
+def test_h09_unified_error_contract_wire_format(client, agent_with_key):
+    """H9: a 4xx response from the v0.7 endpoints uses the unified
+    wire format per spec §1.12:
+        {"error": "CODE", "message": "...", "request_id": "uuid"}
+    The legacy `detail` field is preserved for backward compat.
+
+    Today (red phase for the unified contract): FastAPI's default
+    HTTPException handler returns `{"detail": "..."}` only —
+    no `error`, no `message`, no `request_id`. The test asserts
+    the new fields are present and correct.
+    """
+    import uuid as _uuid
+
+    agent_id, key_id, secret = agent_with_key
+    # Drop a required header to trigger MISSING_AUTH_HEADERS
+    headers = sign_v07_request(
+        "GET", f"/api/agents/{agent_id}/status", b"",
+        key_id=key_id, secret=secret,
+    )
+    del headers["X-Hermes-Method"]
+    response = client.get(
+        f"/api/agents/{agent_id}/status", headers=headers,
+    )
+    assert response.status_code == 401
+    body = response.json()
+    # Primary contract
+    assert "error" in body, f"missing 'error' field: {body!r}"
+    assert "message" in body, f"missing 'message' field: {body!r}"
+    assert "request_id" in body, f"missing 'request_id' field: {body!r}"
+    assert body["error"] == "MISSING_AUTH_HEADERS"
+    assert isinstance(body["message"], str) and body["message"]
+    # request_id must be a valid UUID4
+    _uuid.UUID(body["request_id"], version=4)
+    # Legacy backward compat: detail field is also present
+    assert "detail" in body
+    assert body["detail"] == f"{body['error']}: {body['message']}"
+
+
+def test_h09b_request_id_header_set_on_responses(client, agent_with_key):
+    """H9b: every response (200 + 4xx + 5xx) carries the
+    `X-Request-Id` response header matching the body's
+    `request_id` field. Operators can grep server logs by
+    request_id to correlate with the response.
+    """
+    agent_id, key_id, secret = agent_with_key
+    # 200 path
+    headers = sign_v07_request(
+        "GET", f"/api/agents/{agent_id}/status", b"",
+        key_id=key_id, secret=secret,
+    )
+    response_ok = client.get(
+        f"/api/agents/{agent_id}/status", headers=headers,
+    )
+    assert response_ok.status_code == 200
+    rid_ok = response_ok.headers.get("X-Request-Id")
+    assert rid_ok, f"200 response missing X-Request-Id: {dict(response_ok.headers)}"
+
+    # 401 path
+    headers_bad = sign_v07_request(
+        "GET", f"/api/agents/{agent_id}/status", b"",
+        key_id=key_id, secret=secret,
+    )
+    del headers_bad["X-Hermes-Signature"]
+    response_bad = client.get(
+        f"/api/agents/{agent_id}/status", headers=headers_bad,
+    )
+    assert response_bad.status_code == 401
+    rid_bad = response_bad.headers.get("X-Request-Id")
+    assert rid_bad, f"401 response missing X-Request-Id: {dict(response_bad.headers)}"
+    # Two different requests should have two different request_ids
+    assert rid_ok != rid_bad, (
+        f"request_id should be unique per request, got "
+        f"both={rid_ok!r}"
+    )
+
+
+def test_h09c_honors_inbound_request_id_header(client, agent_with_key):
+    """H9c: if the client sends an `X-Request-Id` request header
+    (e.g. the bootstrapper chains it through to correlate with
+    its own logs), the server honors it and returns the same
+    value in the response header + the unified body. If the
+    header is absent, the server generates a new UUID4.
+
+    Uses the 401 path (drop X-Hermes-Method) so the response
+    body is the unified error shape (which includes
+    request_id). The 200 success path's body is data fields
+    only per spec §1.12; the X-Request-Id header is still
+    present on 200 responses (covered by H9b).
+    """
+    agent_id, key_id, secret = agent_with_key
+    headers = sign_v07_request(
+        "GET", f"/api/agents/{agent_id}/status", b"",
+        key_id=key_id, secret=secret,
+    )
+    del headers["X-Hermes-Method"]  # trigger 401 MISSING_AUTH_HEADERS
+    inbound_rid = "test-correlation-id-12345"
+    headers["X-Request-Id"] = inbound_rid
+    response = client.get(
+        f"/api/agents/{agent_id}/status", headers=headers,
+    )
+    assert response.status_code == 401
+    assert response.headers["X-Request-Id"] == inbound_rid
+    assert response.json()["request_id"] == inbound_rid
