@@ -9,6 +9,7 @@ Endpoints:
 - DELETE /api/agents/{id}                  — delete agent
 - POST   /api/agents/{id}/secret           — set/push the HMAC shared secret (v1.6 bootstrap)
 - POST   /api/agents/{id}/heartbeat        — agent heartbeat (HMAC-authed)
+- GET    /api/agents/{id}/status           — v0.7 agent status (HMAC-authed via v0.7 §1.4)
 - POST   /api/agents/{id}/rotate-key        — rotate secret
 - POST   /api/agents/{id}/profiles         — add new profile
 - DELETE /api/agents/{id}/profiles/{name}  — remove profile
@@ -42,6 +43,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from hermes_orch.auth import require_hmac_auth
+from hermes_orch.auth.dispatch import dispatch_hmac_auth
+from hermes_orch.auth.hmac_v07 import require_hmac_auth_v07
 
 from hermes_orch.core.audit import audit_log
 from hermes_orch.utils import now_iso as _now_iso
@@ -726,20 +729,30 @@ async def update_agent(
 async def heartbeat(
     agent_id: str,
     request: Request,
-    x_agent_id: str = Depends(require_hmac_auth),
+    auth_agent_id: str = Depends(dispatch_hmac_auth),
 ) -> dict:
-    """Agent heartbeat. HMAC-authed (v1.6).
+    """Agent heartbeat. HMAC-authed (v0.7 §1.4 dual-format, v1.6 fallback).
 
-    Verifies the X-Agent-Id / X-Timestamp / X-Signature headers via
-    require_hmac_auth, and that X-Agent-Id matches the URL path
-    agent_id (so a wrapper can't heartbeat on behalf of another
-    agent even with a valid signature).
+    Per the v0.7 spec §3 Option B (dual-format migration), this route
+    accepts BOTH the v1.6 3-header format (X-Agent-Id / X-Timestamp /
+    X-Signature, hex HMAC) AND the v0.7 §1.4 7-header format
+    (X-Hermes-Method / X-Hermes-Path / X-Hermes-Body-SHA256 /
+    X-Hermes-Key-Id / X-Hermes-Timestamp / X-Hermes-Nonce /
+    X-Hermes-Signature, base64 HMAC). The dispatcher in
+    `auth/dispatch.py` routes to the right verifier based on header
+    presence; this route is unchanged from the operator's POV.
+
+    The returned `auth_agent_id` is the agent_id the verifier
+    looked up (by hmac_key_id for v0.7, by id for v1.6). The
+    `auth_agent_id != agent_id` check below prevents a valid
+    signature for agent A from heartbeating on behalf of agent B
+    (defense in depth).
 
     Returns list of tasks currently assigned to this agent.
     """
-    if x_agent_id != agent_id:
+    if auth_agent_id != agent_id:
         raise HTTPException(
-            401, f"X-Agent-Id ({x_agent_id}) does not match URL ({agent_id})"
+            401, f"Auth agent_id ({auth_agent_id}) does not match URL ({agent_id})"
         )
 
     db = request.app.state.db
@@ -970,6 +983,86 @@ async def heartbeat(
         # Defensive: same None -> 1 coercion as _agent_with_profiles
         # (legacy DB without the column would have None here).
         "max_concurrent_tasks": int(agent.get("max_concurrent_tasks") or 1),
+    }
+
+
+# === v0.7 §1.4: GET /api/agents/{id}/status ===
+
+@router.get("/{agent_id}/status")
+async def get_agent_status(
+    agent_id: str,
+    request: Request,
+    auth_agent_id: str = Depends(require_hmac_auth_v07),
+) -> dict:
+    """v0.7 §1.4 agent status endpoint. HMAC-authenticated.
+
+    The orch client (bootstrapper's Wait-ForEnrollment + the running
+    orch-client service) polls this endpoint during enrollment and
+    afterwards. Returns the agent's current status (one of:
+    'verifying', 'verified', 'blocked', 'suspended') plus timestamps.
+
+    Authentication is via the v0.7 §1.4 7-header format
+    (require_hmac_auth_v07 dependency). The verifier:
+      1. Checks all 7 X-Hermes-* headers are present
+      2. Validates timestamp within window
+      3. Rejects query strings (v0.7 §1.4 forbids)
+      4. Validates body SHA-256 (always the empty-body hash for GET)
+      5. Looks up the agent by hmac_key_id (NOT by id)
+      6. Constant-time compares the signature
+      7. Rejects replayed nonces
+
+    On success, the verifier returns the looked-up agent_id. We
+    then check that it matches the URL path's {agent_id} (so a
+    validly-signed v0.7 request for agent A can't read agent B's
+    status — same security check as v1.6 heartbeat).
+
+    Returns: {"status": "...", "agent_id": "...", "last_heartbeat_at": "..."}
+    The 1-field "status" response is what the bootstrapper's
+    Wait-ForEnrollment polls for (it returns when status == "verified").
+    """
+    # Defense in depth: the URL {agent_id} must match the
+    # verifier-returned auth_agent_id (looked up by hmac_key_id).
+    # Per spec §1.4 step 4: 403 with KEY_AGENT_MISMATCH if the URL
+    # agent_id doesn't match the key-id-bound agent.
+    if auth_agent_id != agent_id:
+        raise HTTPException(
+            403,
+            f"KEY_AGENT_MISMATCH: URL agent_id ({agent_id}) does not "
+            f"match the agent bound to the presented hmac_key_id "
+            f"({auth_agent_id})",
+        )
+
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT id, status, last_heartbeat_at FROM agents WHERE id = ?",
+        (agent_id,),
+    )
+    if not row:
+        raise HTTPException(404, f"Agent not found: {agent_id}")
+
+    # Hardening Phase 6 (2026-08-15): validate the status field
+    # against the canonical AgentStatus enum (spec §1.11). The
+    # pre-Phase-6 code did `row.get("status") or "unknown"`,
+    # which silently coerced NULL / typo'd values to "unknown"
+    # and leaked the typo through to the bootstrapper. The new
+    # code fails-closed: any non-enum value returns 500
+    # INVALID_AGENT_STATUS so the operator knows to fix the DB
+    # row, and the bootstrapper doesn't accidentally treat a
+    # typo'd value as "verified".
+    from hermes_orch.core.agent_status import validate_agent_status
+    raw_status = row.get("status")
+    try:
+        status = validate_agent_status(raw_status)
+    except ValueError as e:
+        raise HTTPException(
+            500,
+            f"INVALID_AGENT_STATUS: {e}",
+        )
+
+    return {
+        "agent_id": row["id"],
+        "status": status,
+        "last_heartbeat_at": row.get("last_heartbeat_at"),
     }
 
 

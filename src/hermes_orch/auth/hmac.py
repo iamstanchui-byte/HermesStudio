@@ -75,6 +75,38 @@ def _read_window_sec() -> int:
         return DEFAULT_HMAC_WINDOW_SEC
 
 
+# Hardening Phase 4 (2026-08-15, security/v07-hardening):
+# `HERMES_HMAC_ACCEPT_V06` env var controls whether the dispatcher
+# accepts v0.6 (X-Agent-Id) requests on the dual-format routes.
+# Default True (preserves pre-Phase-4 behavior). When False, the
+# dispatcher rejects v0.6 with 401 V0_6_DEPRECATED.
+#
+# Accepted truthy values: "1", "true", "yes", "on" (case-insensitive).
+# Accepted falsy values: "0", "false", "no", "off", "" (case-insensitive).
+# Anything else defaults to True (safer to accept than reject on
+# typo'd env var).
+DEFAULT_ACCEPT_V06 = True
+
+
+def _read_accept_v06() -> bool:
+    """Read the HERMES_HMAC_ACCEPT_V06 env var and return True/False.
+
+    Per spec §1.13: default True (preserve pre-Phase-4 behavior);
+    operator sets to "false" / "0" / "no" / "off" to disable v0.6
+    after the migration window.
+    """
+    raw = os.environ.get("HERMES_HMAC_ACCEPT_V06", "").strip().lower()
+    if not raw:
+        return DEFAULT_ACCEPT_V06
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    # Unknown value: default to True (safer to accept than reject
+    # on a typo; operator should fix the env var)
+    return DEFAULT_ACCEPT_V06
+
+
 def string_to_sign(method: str, path: str, body: bytes, timestamp: str) -> str:
     """Build the canonical string-to-sign. Stable across wrapper and
     server implementations (tested by test_hmac_auth.py).

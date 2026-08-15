@@ -765,6 +765,31 @@ MIGRATIONS = [
     # legacy agents that haven't bootstrapped yet — those are still
     # accepted if HERMES_HMAC_REQUIRED is unset.
     "ALTER TABLE agents ADD COLUMN hmac_secret TEXT",
+    # v0.7 HMAC (2026-08-15): per-agent key_id UNIQUE column for the
+    # v0.7 §1.4 key-id-to-agent authorization rule. The dispatcher
+    # (auth/hmac_v07.py) looks up agents by hmac_key_id (not by id);
+    # legacy v1.6 agents have hmac_key_id=NULL and continue to be
+    # routed by X-Agent-Id. The UNIQUE constraint applies to non-NULL
+    # values only (NULLs are not considered equal in UNIQUE indexes).
+    #
+    # SQLite restriction: ALTER TABLE ADD COLUMN does NOT support
+    # column-level UNIQUE constraints (raises "Cannot add a UNIQUE
+    # column" — verified 2026-08-15 on SQLite 3.46). Workaround:
+    # add the column as plain TEXT, then add a separate UNIQUE INDEX
+    # on it. Both statements are idempotent (the ALTER via the
+    # migration's try/except that swallows "duplicate column"; the
+    # INDEX via IF NOT EXISTS).
+    "ALTER TABLE agents ADD COLUMN hmac_key_id TEXT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_hmac_key_id "
+    "ON agents (hmac_key_id) WHERE hmac_key_id IS NOT NULL",
+    # v0.7 §1.4 enrollment (2026-08-15): self-reported agent hostname.
+    # Populated by POST /api/enrollment/v07 from the request body
+    # (informational only — the auth_agent_id from the v0.7 verifier
+    # is the source of truth for identity). Distinct from `ip`
+    # which is a network address; `hostname` is the OS-level machine
+    # name the agent host reports (e.g. "DESKTOP-ABC123", "win-test-01").
+    # DEFAULT '' for legacy agents that enrolled before v0.7.
+    "ALTER TABLE agents ADD COLUMN hostname TEXT NOT NULL DEFAULT ''",
     # v3.1.2: cache_read_tokens on token_usage. Captured from the LLM
     # `usage` block (Anthropic: usage.cache_read_input_tokens, OpenAI:
     # usage.prompt_tokens_details.cached_tokens). DEFAULT 0 so existing

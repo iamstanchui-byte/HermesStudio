@@ -12,12 +12,18 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
+from fastapi import HTTPException as FastAPIHTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 
 from hermes_orch.config import find_config_path, load_config
 from hermes_orch.core.cleanup import CleanupJob
+from hermes_orch.core.error_contract import (
+    make_error_response,
+    new_request_id,
+    parse_error_detail,
+)
 from hermes_orch.core.notifier import Notifier
 from hermes_orch.core.planner import Planner
 from hermes_orch.core.scheduler import Scheduler
@@ -38,6 +44,18 @@ logger = logging.getLogger(__name__)
 # now the explicit list + the systematic test is the safety net.
 _HMAC_PATH_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^/api/agents/[^/]+/heartbeat/?$"),
+    # v0.7 §1.4 (2026-08-15): the v0.7 status endpoint for
+    # bootstrapper enrollment polling. The endpoint itself is
+    # HMAC-authed via Depends(require_hmac_auth_v07); the
+    # user-cookie middleware just passes it through. Per
+    # the existing BUGFIX convention, no trailing-slash
+    # required.
+    re.compile(r"^/api/agents/[^/]+/status/?$"),
+    # v0.7 §1.4 (2026-08-15): the v0.7 enrollment endpoint
+    # (POST /api/enrollment/v07). The body is informational;
+    # the verifier proves identity via the hmac_key_id +
+    # hmac_secret pair (no token needed).
+    re.compile(r"^/api/enrollment/v07/?$"),
     re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/configs/pending/?$"),
     re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/cleanup-ack/?$"),
     re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/terminal-ack/?$"),
@@ -221,6 +239,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     db = Database(db_path)
     await db.connect()
     app.state.db = db
+    # v0.7 §1.4 (2026-08-15): in-process nonce store for HMAC replay
+    # protection. Attached to app.state so the v0.7 verifier
+    # (auth/hmac_v07.py::require_hmac_auth_v07) can read it on every
+    # request. Per-uvicorn-worker; production with multiple workers
+    # would need Redis (out of scope for v0.7; see impl plan §7).
+    from hermes_orch.auth.nonce_store import InMemoryNonceStore
+    app.state.v07_nonce_store = InMemoryNonceStore(ttl_seconds=300)
     # v3.12.2 #3: supervisor uses its own aiosqlite connection so its
     # tick-loop writes don't compete with the API on the same
     # in-process connection. The 2026-08-04 incident showed that
@@ -312,6 +337,74 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Hardening Phase 5 (2026-08-15, security/v07-hardening):
+    # Unified error JSON contract per spec §1.12. The custom
+    # HTTPException handler parses the "ERROR_CODE: human message"
+    # detail string and produces the unified shape:
+    #   {"error": "CODE", "message": "...", "request_id": "uuid"}
+    # The legacy `detail` field is preserved for backward compat
+    # with the pre-Phase-5 bootstrapper and dashboard.
+    @app.exception_handler(FastAPIHTTPException)
+    async def custom_http_exception_handler(
+        request: StarletteRequest, exc: FastAPIHTTPException
+    ) -> JSONResponse:
+        # Resolve the request_id: use the one from the request_id
+        # middleware if attached, else generate a new one. The
+        # middleware runs before the route handler, so for any
+        # HTTPException raised by a route, the request_id is
+        # already on request.state.
+        request_id = getattr(request.state, "request_id", None) or new_request_id()
+        code, message = parse_error_detail(exc.detail)
+        return make_error_response(
+            code=code,
+            message=message,
+            request_id=request_id,
+            status_code=exc.status_code,
+        )
+
+    # Catch-all for unhandled exceptions: return a 500 with the
+    # generic INTERNAL_SERVER_ERROR code. The actual exception
+    # is logged but NOT surfaced in the response body (don't leak
+    # stack traces to clients). The request_id lets operators
+    # correlate the response with server logs.
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(
+        request: StarletteRequest, exc: Exception
+    ) -> JSONResponse:
+        request_id = getattr(request.state, "request_id", None) or new_request_id()
+        logger.exception(
+            "unhandled exception in route %s %s (request_id=%s): %s",
+            request.method, request.url.path, request_id, exc,
+        )
+        return make_error_response(
+            code="INTERNAL_SERVER_ERROR",
+            message="An internal server error occurred; see server logs",
+            request_id=request_id,
+            status_code=500,
+        )
+
+    # Request ID middleware: generates a UUID4 per request,
+    # attaches it to request.state.request_id, and sets the
+    # X-Request-Id response header. The exception handler above
+    # reads request.state.request_id to include in the unified
+    # error body. For 200 responses, the X-Request-Id header is
+    # the only client-visible artifact.
+    class _RequestIdMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: StarletteRequest, call_next):
+            # Honor an existing X-Request-Id header (e.g. from
+            # the bootstrapper or a load balancer); else generate
+            # a new UUID4. This lets clients correlate across
+            # multiple hops if needed.
+            request_id = (
+                request.headers.get("X-Request-Id") or new_request_id()
+            )
+            request.state.request_id = request_id
+            response = await call_next(request)
+            response.headers["X-Request-Id"] = request_id
+            return response
+
+    app.add_middleware(_RequestIdMiddleware)
+
     # Static files (Phase 1 of visual workflow builder, 2026-07-24).
     # The visual builder's JS lives at src/hermes_orch/static/.
     # Templates reference /static/visual_workflow.js.
@@ -327,9 +420,10 @@ def create_app() -> FastAPI:
     # their browser had cached the previous API response). Setting
     # no-store on the skills endpoints forces a fresh fetch every time,
     # so the dashboard always shows the current server state.
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request as StarletteRequest
-
+    # (BaseHTTPMiddleware + StarletteRequest are imported at the
+    # top of the module — no function-scope re-import here, to keep
+    # Python's name resolution consistent for any middleware class
+    # defined before this one in the function body.)
     class _NoStoreOnSkills(BaseHTTPMiddleware):
         async def dispatch(self, request: StarletteRequest, call_next):
             response = await call_next(request)
