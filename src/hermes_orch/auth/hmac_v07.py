@@ -227,6 +227,21 @@ async def require_hmac_auth_v07(
         raise HTTPException(
             400, "MALFORMED_HEADERS: Query strings are not allowed on v0.7 signed endpoints"
         )
+    # 3b. Canonical path form: case-sensitive, no trailing slash
+    # (except for the root "/"). The X-Hermes-Path header is the
+    # source of truth for what the client signed; if it ends with
+    # a slash (other than root), the canonical form is violated.
+    # This guards against clients canonicalizing differently
+    # (e.g. adding "/" because their HTTP library appended it) —
+    # the signature would still match since both sides use the
+    # same X-Hermes-Path, but the result is a non-canonical path
+    # that violates the spec.
+    if x_hermes_path != "/" and x_hermes_path.endswith("/"):
+        raise HTTPException(
+            400,
+            f"MALFORMED_HEADERS: X-Hermes-Path has trailing slash "
+            f"(canonical form forbids it): {x_hermes_path!r}",
+        )
 
     # 4. Body hash matches the X-Hermes-Body-SHA256 header
     body_bytes = await request.body()

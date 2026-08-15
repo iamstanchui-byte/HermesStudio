@@ -252,21 +252,75 @@ def test_v07_key_agent_mismatch_returns_403(client, agent_with_key):
     """T7: the X-Hermes-Key-Id maps to agent A, but the URL agent_id
     is B. Per v0.7 §1.4 key-id-to-agent rule; expect 403
     KEY_AGENT_MISMATCH.
-    """
-    agent_a = ("win-test-1", "key-a", os.urandom(32))
-    agent_b = ("win-test-2", "key-b", os.urandom(32))
-    # Placeholder: insert both agents into the test DB
-    # setup_test_agent(client, *agent_a)
-    # setup_test_agent(client, *agent_b)
 
-    # Sign with A's key but request B's URL
-    headers = sign_v07_request(
-        "GET", f"/api/agents/{agent_b[0]}/status", b"",
-        key_id=agent_a[1], secret=agent_a[2],
-    )
-    response = client.get(f"/api/agents/{agent_b[0]}/status", headers=headers)
-    assert response.status_code == 403
-    assert response.json()["detail"].split(": ")[0] == "KEY_AGENT_MISMATCH"
+    Step 9 update (2026-08-15): the placeholder is replaced with a
+    real second-agent insert. The first agent is created via the
+    `agent_with_key` fixture; the second is inserted inline with the
+    same secret_hash + hmac_secret + hmac_key_id pattern. Both rows
+    are deleted in the test's teardown so the fixture's own teardown
+    only has to handle the first row.
+    """
+    import sqlite3 as _sqlite3
+    import time as _time
+    import hashlib as _h
+
+    # First agent from the fixture (already inserted)
+    agent_a_id, agent_a_key_id, agent_a_secret = agent_with_key
+
+    # Insert a second agent (agent B) directly into the same test DB
+    agent_b_id = f"win-test-{uuid.uuid4().hex[:8]}"
+    agent_b_key_id = f"key-{agent_b_id}"
+    agent_b_secret = os.urandom(32)
+    agent_b_secret_str = agent_b_secret.hex()
+    agent_b_secret_hash = _h.sha256(
+        agent_b_secret_str.encode("utf-8")
+    ).hexdigest()
+    now = _time.strftime("%Y-%m-%dT%H:%M:%S")
+    db_path = client.app.state.db.db_path
+
+    conn = _sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "DELETE FROM agent_profiles WHERE agent_id = ?",
+            (agent_b_id,),
+        )
+        conn.execute("DELETE FROM agents WHERE id = ?", (agent_b_id,))
+        conn.execute(
+            "INSERT INTO agents (id, secret_hash, hmac_secret, "
+            "hmac_key_id, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'verified', ?)",
+            (agent_b_id, agent_b_secret_hash, agent_b_secret_str,
+             agent_b_key_id, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        # Sign with A's key but request B's URL
+        headers = sign_v07_request(
+            "GET", f"/api/agents/{agent_b_id}/status", b"",
+            key_id=agent_a_key_id, secret=agent_a_secret,
+        )
+        response = client.get(
+            f"/api/agents/{agent_b_id}/status", headers=headers,
+        )
+        assert response.status_code == 403, (
+            f"got {response.status_code}: {response.text}"
+        )
+        assert response.json()["detail"].split(": ")[0] == "KEY_AGENT_MISMATCH"
+    finally:
+        # Teardown the second agent
+        conn = _sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "DELETE FROM agent_profiles WHERE agent_id = ?",
+                (agent_b_id,),
+            )
+            conn.execute("DELETE FROM agents WHERE id = ?", (agent_b_id,))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 # === T8 — Body hash mismatch ===
@@ -359,20 +413,29 @@ def test_v07_query_string_rejected(client, agent_with_key):
 
 # === T12 — Path normalization (parametrized) ===
 
-@pytest.mark.parametrize("path_variant,should_pass", [
-    ("/api/agents/win-test-1/status", True),       # canonical form
-    ("/api/agents//win-test-1/status", False),    # double slash
-    ("/API/AGENTS/WIN-TEST-1/STATUS", False),     # uppercase
-    ("/api/agents/win-test-1/status/", True),      # trailing slash
+@pytest.mark.parametrize("path_suffix,should_pass", [
+    ("/status", True),                  # canonical form
+    ("//status", False),                # double slash
+    ("/STATUS", False),                 # uppercase
+    ("/status/", False),                # trailing slash
 ])
 def test_v07_path_normalization(
-    client, agent_with_key, path_variant, should_pass
+    client, agent_with_key, path_suffix, should_pass
 ):
     """T12: the server must accept the exact canonical form the
-    client signs. Deviations (double slash, uppercase) fail.
-    Trailing slash is accepted (the server normalizes).
+    client signs. Deviations (double slash, uppercase, trailing
+    slash) all fail. Per spec §1.1 the canonical form is
+    case-sensitive with no trailing slash; any deviation produces
+    a path mismatch in the signature compare.
+
+    Step 9 fix (2026-08-15): the test was hard-coding the agent_id
+    to `win-test-1` but the fixture uses a random uuid, so every
+    test run was tripping the URL/agent_id mismatch check (401) on
+    even the canonical-path case. Now we build the path from the
+    fixture's actual agent_id and only mutate the suffix.
     """
     agent_id, key_id, secret = agent_with_key
+    path_variant = f"/api/agents/{agent_id}{path_suffix}"
     headers = sign_v07_request(
         "GET", path_variant, b"",
         key_id=key_id, secret=secret,

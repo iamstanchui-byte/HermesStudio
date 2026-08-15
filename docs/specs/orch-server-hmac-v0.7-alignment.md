@@ -111,6 +111,30 @@ first release, this can be a single optional column
 `agents.hmac_key_id` (UNIQUE constraint). Multiple keys per agent
 can be added later if rotation is needed.
 
+### 1.7 Path canonicalization policy (added step 9, 2026-08-15)
+
+The `X-Hermes-Path` header is the source of truth for the canonical
+request path. Per the T12 acceptance test, deviations from the
+canonical form are rejected (400 with `MALFORMED_HEADERS`):
+
+| Form | Verdict | Reason |
+|---|---|---|
+| `/api/agents/{id}/status` | **accept** | Canonical form |
+| `/api/agents/{id}/status/` | **reject** | Trailing slash; spec §1.1 forbids (root `/` is the only exception) |
+| `/api/agents//{id}/status` | **reject** | Double slash; multiple consecutive separators not canonical |
+| `/API/AGENTS/{ID}/STATUS` | **reject** | Case-sensitive; the URL path is byte-exact |
+| `/api/agents/{id}/status?foo=bar` | **reject** | §1.4 forbids query strings on signed endpoints (400 `MALFORMED_HEADERS`) |
+
+Implementation: the verifier checks the `X-Hermes-Path` value
+*before* computing the signature. If the value is non-canonical,
+the verifier returns 400 `MALFORMED_HEADERS` immediately. The
+signature is never computed against a non-canonical path.
+
+Cross-language invariant: the bootstrapper's `Wait-ForEnrollment`
+MUST send the canonical form (no trailing slash, case-correct).
+Verified by the cross-language compat test
+(`tests/golden/hmac_v07_golden.json`).
+
 ---
 
 ## 2. Current v1.6 implementation (what changes)

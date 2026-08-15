@@ -1022,11 +1022,14 @@ async def get_agent_status(
     """
     # Defense in depth: the URL {agent_id} must match the
     # verifier-returned auth_agent_id (looked up by hmac_key_id).
+    # Per spec §1.4 step 4: 403 with KEY_AGENT_MISMATCH if the URL
+    # agent_id doesn't match the key-id-bound agent.
     if auth_agent_id != agent_id:
         raise HTTPException(
-            401,
-            f"Auth agent_id ({auth_agent_id}) does not match URL "
-            f"path agent_id ({agent_id})",
+            403,
+            f"KEY_AGENT_MISMATCH: URL agent_id ({agent_id}) does not "
+            f"match the agent bound to the presented hmac_key_id "
+            f"({auth_agent_id})",
         )
 
     db = request.app.state.db
