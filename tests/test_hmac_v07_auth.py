@@ -1,16 +1,20 @@
-"""Tests for v0.7 §1.4 bound-metadata HMAC verification (DRAFT 2026-08-13).
+"""Tests for v0.7 §1.4 bound-metadata HMAC verification (DRAFT 2026-08-13,
+TDD RED PHASE STARTED 2026-08-15).
 
-This file is a DRAFT for future Day 5+ implementation. It is NOT
-executed today. The draft maps the 16 acceptance test cases (T1-T16)
-from docs/specs/orch-server-hmac-v0.7-alignment.md §6 to runnable
-pytest code, plus the 2 dual-format test cases (T13, T14) that exercise
-the Option B migration path. The 2 dual-format tests live in
+Maps the 16 acceptance test cases (T1-T16) from
+docs/specs/orch-server-hmac-v0.7-alignment.md §6 to runnable pytest
+code, plus the 2 dual-format test cases (T13, T14) that exercise the
+Option B migration path. The 2 dual-format tests live in
 tests/test_hmac_v06_compat.py.
 
-DRAFT status: not committed to the implementation branch yet. The
-test code is the spec; the actual implementation follows the
-TDD red-green-refactor sequence in
-docs/specs/orch-server-hmac-v0.7-impl-plan.md §4.
+TDD red phase (2026-08-15): fixtures are now real (use create_app()
+via TestClient + tmp DB per the test_endpoint_auth.py pattern).
+Tests still FAIL because the v0.7 verifier and the
+GET /api/agents/{id}/status endpoint don't exist yet. That is
+expected and correct: per the TDD red-green-refactor sequence in
+docs/specs/orch-server-hmac-v0.7-impl-plan.md §4, step 2 is the
+red phase. Implementation lands in step 4 (hmac_v07.py), step 6
+(status endpoint), step 7 (dual-format), step 8 (enrollment v07).
 
 Cross-reference: the sign_v07_request helper in
 tests/helpers/hmac_v07.py MUST stay in sync with the bootstrapper's
@@ -30,9 +34,10 @@ from typing import Optional
 import pytest
 from fastapi.testclient import TestClient
 
-# These imports are placeholders; the actual module names will be
-# decided during implementation per the impl plan §5.
-# from hermes_orch.main import create_app
+# Real imports (per test_endpoint_auth.py pattern)
+from hermes_orch import main as main_mod
+from hermes_orch import db as db_mod
+from hermes_orch.main import create_app
 
 from tests.helpers.hmac_v07 import sign_v07_request
 from tests.helpers.nonce_store import InMemoryNonceStore
@@ -41,44 +46,47 @@ from tests.helpers.nonce_store import InMemoryNonceStore
 # === Fixtures ===
 
 @pytest.fixture
-def client():
-    """FastAPI TestClient with the v0.7 routes registered.
+def client(tmp_path, monkeypatch):
+    """FastAPI TestClient with the orchestrator's create_app() — using
+    a tmp DB so the test is isolated. The autouse
+    `set_test_public_origin` fixture in tests/conftest.py sets
+    HERMES_ORCH_PUBLIC_ORIGIN so the lifespan doesn't fail-closed at
+    startup.
 
-    The actual app is created via create_app() (existing pattern per
-    the B12 hotfix tests in tests/test_endpoint_auth.py). The
-    v0.7 routes are added when the implementation lands.
+    For the TDD red phase (step 2): the v0.7 routes don't exist yet,
+    so tests that hit them will get 404. That's the red phase
+    behavior we want — the test fails because the implementation
+    is missing, and the failure message points to the missing
+    route. Step 6 (impl plan §4) adds the v0.7 routes and turns
+    these failures green.
     """
-    # Placeholder; replace with real create_app() when implementation lands.
-    # from hermes_orch.main import create_app
-    # app = create_app()
-    # with TestClient(app) as c:
-    #     yield c
-    raise NotImplementedError(
-        "DRAFT — replace with real create_app() at impl time. "
-        "The v0.7 routes (GET /api/agents/{id}/status, dual-format "
-        "support on /heartbeat, GET /{id}) are added per impl plan §4."
-    )
+    test_db = tmp_path / "test_hmac_v07.db"
+    orig_db_init = db_mod.Database.__init__
+
+    def patched_db_init(self, db_path):
+        orig_db_init(self, test_db)
+
+    monkeypatch.setattr(db_mod.Database, "__init__", patched_db_init)
+    app = create_app()
+    with TestClient(app) as c:
+        yield c
 
 
 @pytest.fixture
 def agent_with_key():
     """Yield (agent_id, key_id, secret_bytes) for a fresh test agent.
 
-    The agent row is inserted into the test DB with a fresh HMAC key
-    bound (per the new agents.hmac_key_id UNIQUE column). The test
-    cleans up after itself.
+    For the TDD red phase (step 2), this is a STUB that returns fresh
+    test data WITHOUT inserting into the DB. Step 5 (DB migration
+    adding the agents.hmac_key_id UNIQUE column) replaces this with
+    a real DB insert. Until then, the tests will fail with 401
+    UNKNOWN_KEY_ID or 404 if the v0.7 routes existed, which is the
+    correct red-phase behavior.
     """
     agent_id = f"win-test-{uuid.uuid4().hex[:8]}"
     key_id = f"key-{agent_id}"
     secret = os.urandom(32)
-    # Placeholder: insert into test DB
-    # yield (agent_id, key_id, secret)
-    # cleanup: remove the row
-    raise NotImplementedError(
-        "DRAFT — replace with real DB fixture at impl time. The "
-        "production shape is per impl plan §5: new column "
-        "agents.hmac_key_id (UNIQUE)."
-    )
+    yield (agent_id, key_id, secret)
 
 
 @pytest.fixture
