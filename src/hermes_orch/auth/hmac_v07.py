@@ -350,13 +350,21 @@ async def require_hmac_auth_v07(
         raise HTTPException(401, "INVALID_SIGNATURE: Invalid X-Hermes-Signature")
 
     # 7. Nonce replay check (in-process store, attached at lifespan)
+    # Hardening Phase 2 (2026-08-15): use `add_if_absent` for atomic
+    # check+record. The previous `is_seen` + `add` two-call pattern
+    # had a race window between the two lock acquisitions; two
+    # concurrent requests with the same nonce could both pass the
+    # is_seen check and both proceed to verify (accepting two
+    # requests with the same nonce). `add_if_absent` holds the
+    # lock across the full check+insert so the second caller
+    # deterministically returns False (replay detected).
     nonce_store = getattr(request.app.state, "v07_nonce_store", None)
     if nonce_store is not None:
-        if nonce_store.is_seen(x_hermes_nonce):
+        if not nonce_store.add_if_absent(x_hermes_nonce):
             raise HTTPException(
                 401,
-                f"NONCE_REPLAY: Nonce replay detected: {x_hermes_nonce[:8]}...",
+                f"NONCE_REPLAY: Nonce replay detected: "
+                f"{x_hermes_nonce[:8]}...",
             )
-        nonce_store.add(x_hermes_nonce)
 
     return agent_id

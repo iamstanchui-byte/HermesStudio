@@ -372,3 +372,104 @@ def test_h04_mixed_v07_v06_headers_returns_401(client, agent_with_key):
         f"got {response.status_code}: {response.text}"
     )
     assert response.json()["detail"].split(": ")[0] == "MIXED_HEADERS"
+
+
+# === Issue #2: Nonce atomic check+record (concurrent replay) ===
+
+def test_h05_add_if_absent_is_atomic_under_concurrent_call():
+    """H5: 50 threads call `add_if_absent(SAME_NONCE)` on the same
+    InMemoryNonceStore concurrently. Exactly one call must return
+    True (the first to record it); the other 49 must return False
+    (the nonce was already present).
+
+    This is a direct atomicity test of the new `add_if_absent`
+    method. The HTTP-level equivalent (2 concurrent requests with
+    the same nonce) is hard to make reliably racy in CPython
+    because `is_seen` and `add` are both sync GIL-protected
+    critical sections that the OS scheduler rarely interleaves
+    between. The unit test for `add_if_absent` is deterministic:
+    it asserts the contract that the verifier relies on
+    (single atomic check+record).
+
+    Red phase (2026-08-15): `add_if_absent` does not exist on
+    InMemoryNonceStore yet — this test will fail with AttributeError
+    on `store.add_if_absent`. Green phase (Phase 2 impl): the
+    method is added with `threading.Lock` guarding a single
+    `if nonce in _seen: return False; else: _seen[nonce] = ...;
+    return True` block; the test passes deterministically.
+
+    Future (Phase 7 multi-worker): the same test runs against
+    a RedisNonceStore stub using `SET NX TTL` for true cross-
+    process atomicity. The contract — "exactly one True for
+    concurrent adds" — is the production gate.
+    """
+    import threading as _threading
+
+    from hermes_orch.auth.nonce_store import InMemoryNonceStore
+
+    store = InMemoryNonceStore(ttl_seconds=300)
+    shared_nonce = "concurrent-test-nonce-001"
+
+    results: list[bool] = []
+    lock = _threading.Lock()
+
+    def worker():
+        r = store.add_if_absent(shared_nonce)
+        with lock:
+            results.append(r)
+
+    threads = [
+        _threading.Thread(target=worker) for _ in range(50)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    true_count = sum(1 for r in results if r is True)
+    false_count = sum(1 for r in results if r is False)
+    assert true_count == 1, (
+        f"expected exactly 1 True (first to record), got {true_count}; "
+        f"results: {results}"
+    )
+    assert false_count == 49, (
+        f"expected exactly 49 False (already seen), got {false_count}"
+    )
+    # The recorded nonce should be exactly 1 entry
+    assert len(store) == 1, f"expected 1 entry in store, got {len(store)}"
+
+
+def test_h05b_add_if_absent_distinguishes_different_nonces():
+    """H5b: `add_if_absent` with DIFFERENT nonces returns True for
+    each (atomic per-nonce, not global lock). 50 distinct nonces
+    across 50 threads all return True.
+    """
+    import threading as _threading
+
+    from hermes_orch.auth.nonce_store import InMemoryNonceStore
+
+    store = InMemoryNonceStore(ttl_seconds=300)
+
+    results: list[bool] = []
+    lock = _threading.Lock()
+
+    def worker(i: int):
+        r = store.add_if_absent(f"nonce-{i:04d}")
+        with lock:
+            results.append(r)
+
+    threads = [
+        _threading.Thread(target=worker, args=(i,)) for i in range(50)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    true_count = sum(1 for r in results if r is True)
+    assert true_count == 50, (
+        f"expected 50 True (all distinct nonces), got {true_count}"
+    )
+    assert len(store) == 50, (
+        f"expected 50 entries in store, got {len(store)}"
+    )

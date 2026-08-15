@@ -72,6 +72,50 @@ class InMemoryNonceStore:
             while len(self._seen) > self._max:
                 self._seen.popitem(last=False)
 
+    def add_if_absent(self, nonce: str) -> bool:
+        """Atomic check-and-record (Hardening Phase 2, 2026-08-15).
+
+        Returns True iff the nonce was NOT already in the store
+        (first to record it). Returns False if the nonce was
+        already seen within the TTL window (replay detected).
+
+        The check + record happens inside a single critical
+        section, so concurrent callers racing to add the same
+        nonce see deterministic behavior: exactly one caller
+        returns True; all others return False. The previous
+        `is_seen` + `add` two-call pattern had a race window
+        between the lock release after `is_seen` and the lock
+        acquisition for `add` — two concurrent callers could
+        both see `is_seen() == False` and both proceed to `add`,
+        effectively accepting two requests with the same nonce.
+
+        The atomic version closes that window. The lock is held
+        for the full check+insert, so the second caller always
+        sees the nonce already present in the dict.
+
+        Per-nonce TTL eviction: if the nonce is in the store
+        but has expired (older than `ttl_seconds`), the expired
+        entry is treated as absent and a fresh entry is recorded.
+        This matches the original `is_seen` semantics (expired =
+        not seen).
+        """
+        with self._lock:
+            entry = self._seen.get(nonce)
+            if entry is not None:
+                expiry_ts = entry
+                if time.time() <= expiry_ts:
+                    # Not expired, already seen -> replay
+                    return False
+                # Expired: evict and proceed to record
+                del self._seen[nonce]
+            # Not present (or just evicted as expired): record it
+            expiry = time.time() + self._ttl
+            self._seen[nonce] = expiry
+            # Bounded memory: evict oldest if over capacity
+            while len(self._seen) > self._max:
+                self._seen.popitem(last=False)
+            return True
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._seen)
