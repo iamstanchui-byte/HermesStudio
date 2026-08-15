@@ -428,6 +428,93 @@ def test_v07_enrollment_poll_end_to_end(client, agent_with_key):
 # Wait-ForEnrollment function for the bootstrapper's T16 coverage.
 
 
+# === Step 8: T-v07-enrollment (POST /api/enrollment/v07) ===
+
+def test_v07_enrollment_endpoint_marks_agent_verified(
+    client, agent_with_key
+):
+    """Step 8: POST /api/enrollment/v07 with a v0.7 signed body
+    marks the agent as 'verified' and returns 200.
+
+    Per the v0.7 spec §4: the agent presents its hmac_key_id +
+    hmac_secret via the 7 X-Hermes-* headers (verifier), and
+    this endpoint updates the agent row's status from
+    'verifying' to 'verified' and stamps last_heartbeat_at.
+
+    The test pre-sets the agent status to 'verifying' (the
+    agent_with_key fixture inserts with 'verified' for the
+    status-endpoint tests; here we override). Then POST to the
+    enrollment endpoint and verify:
+      - 200 + {"status": "verified", "agent_id": ...}
+      - The agent's status in the DB is now 'verified'
+    """
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    agent_id, key_id, secret = agent_with_key
+
+    # Pre-set the agent's status to 'verifying' (override the
+    # fixture's default 'verified' insert; this test simulates
+    # the operator's pre-provisioning state).
+    db_path = client.app.state.db.db_path
+    conn = _sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE agents SET status = 'verifying' WHERE id = ?",
+            (agent_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Build a v0.7 signed request with a JSON body. The body
+    # includes agent_name, hostname, os_type. The verifier
+    # checks the body SHA-256 against the body's actual bytes.
+    body_dict = {
+        "agent_name": "test-vm-01",
+        "hostname": "test-host-01",
+        "os_type": "windows-11",
+    }
+    body_bytes = _json.dumps(body_dict).encode("utf-8")
+
+    headers = sign_v07_request(
+        "POST", "/api/enrollment/v07",
+        body=body_bytes,
+        key_id=key_id, secret=secret,
+    )
+    # v0.7 verifier uses its own X-Hermes-* headers; we add
+    # Content-Type here so FastAPI parses the body as JSON.
+    headers["Content-Type"] = "application/json"
+    response = client.post(
+        "/api/enrollment/v07",
+        headers=headers,
+        content=body_bytes,
+    )
+    assert response.status_code == 200, (
+        f"v0.7 enrollment failed (status={response.status_code}, "
+        f"body={response.text}). The endpoint should mark the "
+        f"agent as verified and return 200."
+    )
+    body = response.json()
+    assert body.get("status") == "verified", f"body={body}"
+    assert body.get("agent_id") == agent_id, f"body={body}"
+
+    # Verify the DB row was updated
+    conn = _sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT status, hostname, os_type, name FROM agents "
+            "WHERE id = ?",
+            (agent_id,),
+        ).fetchone()
+        assert row[0] == "verified", f"status in DB: {row[0]}"
+        assert row[1] == "test-host-01", f"hostname in DB: {row[1]}"
+        assert row[2] == "windows-11", f"os_type in DB: {row[2]}"
+        assert row[3] == "test-vm-01", f"name in DB: {row[3]}"
+    finally:
+        conn.close()
+
+
 # === Notes for the actual implementation (Day 5+) ===
 
 # 1. The fixtures above (client, agent_with_key, nonce_store) need to be

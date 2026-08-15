@@ -782,6 +782,14 @@ MIGRATIONS = [
     "ALTER TABLE agents ADD COLUMN hmac_key_id TEXT",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_hmac_key_id "
     "ON agents (hmac_key_id) WHERE hmac_key_id IS NOT NULL",
+    # v0.7 §1.4 enrollment (2026-08-15): self-reported agent hostname.
+    # Populated by POST /api/enrollment/v07 from the request body
+    # (informational only — the auth_agent_id from the v0.7 verifier
+    # is the source of truth for identity). Distinct from `ip`
+    # which is a network address; `hostname` is the OS-level machine
+    # name the agent host reports (e.g. "DESKTOP-ABC123", "win-test-01").
+    # DEFAULT '' for legacy agents that enrolled before v0.7.
+    "ALTER TABLE agents ADD COLUMN hostname TEXT NOT NULL DEFAULT ''",
     # v3.1.2: cache_read_tokens on token_usage. Captured from the LLM
     # `usage` block (Anthropic: usage.cache_read_input_tokens, OpenAI:
     # usage.prompt_tokens_details.cached_tokens). DEFAULT 0 so existing

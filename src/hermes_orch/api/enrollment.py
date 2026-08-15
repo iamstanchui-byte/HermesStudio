@@ -1,5 +1,5 @@
 # coding: utf-8
-"""Enrollment token endpoints (v1.0.1 new-user-activation §3.3).
+"""Enrollment token endpoints (v1.0.1 new-user-activation §3.3 + v0.7).
 
 Endpoints:
 - POST /api/enrollment-tokens              issue a new token (admin-only)
@@ -7,6 +7,10 @@ Endpoints:
 - DELETE /api/enrollment-tokens/{id}       revoke a token (admin-only)
 - POST /api/agents/enroll                  consume a token (no auth, uses
                                             the token as proof of identity)
+- POST /api/enrollment/v07                 v0.7 §1.4 HMAC-signed enrollment
+                                            (no token; agent proves
+                                            identity via hmac_key_id +
+                                            hmac_secret)
 
 The consume flow (POST /api/agents/enroll) is the most security-sensitive
 part of v1.0.1. It:
@@ -34,7 +38,7 @@ import secrets
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from hermes_orch.auth.cookie import ROLE_ADMIN, current_user
@@ -438,3 +442,98 @@ def _new_agent_id() -> str:
     import string
     alphabet = string.ascii_lowercase + string.digits
     return "agent-" + "".join(secrets.choice(alphabet) for _ in range(12))
+
+
+# ===== v0.7 §1.4 HMAC-signed enrollment (step 8) =====
+#
+# Different from POST /api/agents/enroll (token-based, v0.6):
+#   - No enrollment token needed
+#   - The agent proves identity by signing the request with its
+#     hmac_key_id + hmac_secret (per the v0.7 verifier in
+#     auth/hmac_v07.py)
+#   - The agent row must already exist in the DB with status='verifying'
+#     and the matching hmac_key_id; the operator pre-issued these
+#     out-of-band (e.g. via the orch admin UI or `hermes-orch-agent
+#     pre-provision`)
+#
+# The endpoint reads the JSON body for informational fields
+# (hostname, os_type, agent_name) and updates the agent row:
+#   - status -> 'verified'
+#   - ip, os_type, name (if not already set)
+#   - last_heartbeat_at -> now
+# Then returns 200 with `{"status": "verified", "agent_id": ...}`
+# which the bootstrapper's Wait-ForEnrollment polls for.
+#
+# The verifier (require_hmac_auth_v07) has already validated the
+# 7 X-Hermes-* headers and looked up the agent by hmac_key_id
+# (the key-id-to-agent rule). The auth_agent_id returned is the
+# canonical agent id from the DB row.
+
+from hermes_orch.auth.hmac_v07 import require_hmac_auth_v07
+from pydantic import BaseModel
+
+
+class EnrollV07In(BaseModel):
+    """Body of POST /api/enrollment/v07. All fields informational;
+    the auth_agent_id from the v0.7 verifier is the source of truth.
+    """
+    agent_name: str | None = None
+    hostname: str | None = None
+    os_type: str | None = None
+
+
+@router.post("/enrollment/v07")
+async def post_enrollment_v07(
+    body: EnrollV07In,
+    request: Request,
+    auth_agent_id: str = Depends(require_hmac_auth_v07),
+) -> dict:
+    """v0.7 §1.4 HMAC-signed enrollment.
+
+    Per spec §4: the agent presents its hmac_key_id + hmac_secret
+    via the v0.7 7-header signature, the verifier looks up the
+    agent row by hmac_key_id, and this endpoint updates the row to
+    mark it verified (status='verified', last_heartbeat_at=now,
+    optional ip/os_type from the request body).
+
+    The body is informational only; the auth_agent_id from the
+    verifier is authoritative.
+
+    On success: 200 + {"status": "verified", "agent_id": ...}
+    The bootstrapper's Wait-ForEnrollment polls this; on receiving
+    status='verified' it considers enrollment complete and stops.
+    """
+    from datetime import datetime, timezone
+    db = request.app.state.db
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Update the agent row. The verifier already validated that
+    # the row exists (UNKNOWN_KEY_ID 401 if not). We do NOT touch
+    # the hmac_key_id / hmac_secret (those are operator-issued and
+    # shouldn't change on enrollment).
+    # If body fields are provided, set them; otherwise leave existing.
+    if body.hostname or body.os_type or body.agent_name:
+        await db.execute(
+            "UPDATE agents SET status = 'verified', "
+            "last_heartbeat_at = ?, "
+            "hostname = COALESCE(?, hostname), "
+            "os_type = COALESCE(?, os_type), "
+            "name = COALESCE(?, name) "
+            "WHERE id = ?",
+            (now_iso, body.hostname, body.os_type, body.agent_name,
+             auth_agent_id),
+        )
+    else:
+        await db.execute(
+            "UPDATE agents SET status = 'verified', "
+            "last_heartbeat_at = ? WHERE id = ?",
+            (now_iso, auth_agent_id),
+        )
+    # NOTE: db.execute() auto-commits when not inside a transaction
+    # block (per Database.execute docstring). Don't call db.commit()
+    # here — Database has no commit() method.
+
+    return {
+        "agent_id": auth_agent_id,
+        "status": "verified",
+    }

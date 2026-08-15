@@ -45,6 +45,11 @@ _HMAC_PATH_PATTERNS: list[re.Pattern[str]] = [
     # the existing BUGFIX convention, no trailing-slash
     # required.
     re.compile(r"^/api/agents/[^/]+/status/?$"),
+    # v0.7 §1.4 (2026-08-15): the v0.7 enrollment endpoint
+    # (POST /api/enrollment/v07). The body is informational;
+    # the verifier proves identity via the hmac_key_id +
+    # hmac_secret pair (no token needed).
+    re.compile(r"^/api/enrollment/v07/?$"),
     re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/configs/pending/?$"),
     re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/cleanup-ack/?$"),
     re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/terminal-ack/?$"),
