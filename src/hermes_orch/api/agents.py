@@ -1040,9 +1040,28 @@ async def get_agent_status(
     if not row:
         raise HTTPException(404, f"Agent not found: {agent_id}")
 
+    # Hardening Phase 6 (2026-08-15): validate the status field
+    # against the canonical AgentStatus enum (spec §1.11). The
+    # pre-Phase-6 code did `row.get("status") or "unknown"`,
+    # which silently coerced NULL / typo'd values to "unknown"
+    # and leaked the typo through to the bootstrapper. The new
+    # code fails-closed: any non-enum value returns 500
+    # INVALID_AGENT_STATUS so the operator knows to fix the DB
+    # row, and the bootstrapper doesn't accidentally treat a
+    # typo'd value as "verified".
+    from hermes_orch.core.agent_status import validate_agent_status
+    raw_status = row.get("status")
+    try:
+        status = validate_agent_status(raw_status)
+    except ValueError as e:
+        raise HTTPException(
+            500,
+            f"INVALID_AGENT_STATUS: {e}",
+        )
+
     return {
         "agent_id": row["id"],
-        "status": row.get("status") or "unknown",
+        "status": status,
         "last_heartbeat_at": row.get("last_heartbeat_at"),
     }
 

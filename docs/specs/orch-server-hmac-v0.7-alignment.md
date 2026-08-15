@@ -307,6 +307,91 @@ enrollment endpoint. New agents via the bootstrapper follow
 the new flow: operator pre-provisions with `status=verifying`,
 agent calls the v0.7 endpoint, row transitions to `verified`.
 
+### 1.11 AgentStatus enum + polling contract (added hardening Phase 6, 2026-08-15)
+
+The `agents.status` field has a fixed 4-value enum. The
+`GET /api/agents/{id}/status` endpoint and the v0.7 enrollment
+endpoint both validate the value against this enum at READ
+time; any value not in the enum returns 500 `INVALID_AGENT_STATUS`
+(operator must fix the DB row; the server does not silently
+coerce).
+
+**The enum** (canonical, used in Python `Literal` and as the
+source of truth for the v0.7 verifier + status endpoint):
+
+```python
+AgentStatus = Literal["verifying", "verified", "blocked", "suspended"]
+```
+
+| Value | When set | Bootstrapper behavior |
+|---|---|---|
+| `verifying` | Operator pre-provision, before v0.7 endpoint call | Keep polling (5s × up to 60s) |
+| `verified` | v0.7 endpoint call succeeded | **Stop polling, exit 0** |
+| `blocked` | Operator action (admin UI / script) | **Stop polling, exit non-zero with BLOCKED status** |
+| `suspended` | Operator action (admin UI / script) | **Stop polling, exit non-zero with SUSPENDED status** |
+
+**Polling contract** (the bootstrapper's `Wait-ForEnrollment`
+loop):
+
+- **Endpoint**: `GET /api/agents/{id}/status`
+- **Poll interval**: 5 seconds (fixed; do not exponential-backoff
+  — the spec deliberately keeps this simple so the bootstrapper
+  can complete in 60s worst case)
+- **Total timeout**: 60 seconds (12 polls × 5s)
+- **Auth**: v0.7 §1.4 HMAC, full 7 headers
+- **Response shape**: `{"agent_id": str, "status": "verifying"|"verified"|"blocked"|"suspended", "last_heartbeat_at": str|null}`
+- **On `status=verified`**: stop polling, exit 0
+- **On `status=blocked` or `status=suspended`**: stop polling,
+  exit non-zero with a human-readable error. The bootstrapper
+  surfaces this to the operator; the agent host is not enrolled
+  and the operator must take action (re-provision or unblock)
+- **On any other `status` value (e.g. `pending` from legacy
+  schemas, or a typo)**: the server returns **500
+  `INVALID_AGENT_STATUS`** with a generic message. The
+  bootstrapper treats this as a server-side bug and exits
+  non-zero. The operator should file a bug; the spec does
+  not allow the server to silently coerce unknown values to
+  `verifying` or `unknown`
+- **On network error / TLS error / HMAC error**: the
+  bootstrapper retries (the 60s window is generous enough to
+  cover 1-2 transient errors)
+- **On `ENROLLMENT_STATE_CONFLICT` (409)**: this is impossible
+  in the polling flow (the bootstrapper doesn't POST to
+  `/api/enrollment/v07` directly — the operator pre-provisions
+  the row with `status=verifying`, and the v0.7 endpoint
+  transitions it). If seen, treat as a server-side bug
+
+**Server-side validation rules**:
+
+1. `GET /api/agents/{id}/status` reads the `status` field
+   from the DB. If the value is not one of the 4 enum values
+   (case-sensitive exact match), the endpoint returns **500
+   `INVALID_AGENT_STATUS`** — NOT `200` with a coerced value,
+   NOT `404`. The 500 is fail-closed: the bootstrapper must
+   not treat unknown statuses as `verified`.
+
+2. The v0.7 enrollment endpoint's `ENROLLMENT_STATE_CONFLICT`
+   check (spec §1.10) uses the same enum. Any non-enum value
+   in the row at enrollment time also returns 409 (the row
+   must be `verifying` to transition; anything else is
+   conflict).
+
+3. The `agents.status` DB column is `TEXT NOT NULL DEFAULT
+   'verifying'`. The DB does NOT enforce the enum (SQLite
+   ALTER TABLE ADD CHECK is unsupported; the spec relies on
+   app-layer validation per the existing convention in
+   `db.py`). The app-layer validation lives in
+   `hermes_orch.core.agent_status.validate_agent_status()`.
+
+**Why the 500 fail-closed**: a typo'd status in the DB (e.g.
+`verfid` from a manual SQL update) would otherwise leak
+through as `200 + {status: "verfid"}`. The bootstrapper
+strict-compares against `"verified"`, so the typo would
+cause the bootstrapper to keep polling past 60s and time out
+— which is the *less* dangerous failure mode. But the
+operator wouldn't know there's a DB bug; the 500 surfaces
+the issue immediately with a structured error code.
+
 ---
 
 ## 2. Current v1.6 implementation (what changes)

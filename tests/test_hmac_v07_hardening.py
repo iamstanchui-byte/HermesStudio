@@ -605,3 +605,104 @@ def test_h07_enrollment_happy_path_requires_verifying_start(
     body = response.json()
     assert body["status"] == "verified"
     assert body["agent_id"] == agent_id
+
+
+# === Issue #8: AgentStatus enum + polling contract ===
+
+@pytest.mark.parametrize("valid_status", [
+    "verifying",
+    "verified",
+    "blocked",
+    "suspended",
+])
+def test_h08_status_endpoint_returns_canonical_enum(
+    client, agent_with_key, valid_status
+):
+    """H8 (parametrized): the status endpoint returns the
+    canonical 4-value enum. For each of the 4 valid values
+    (verifying / verified / blocked / suspended), the endpoint
+    returns 200 with the status field unchanged. This proves
+    the endpoint does not silently coerce unknown values to
+    'verifying' or 'unknown' (which is the pre-Phase-6 behavior
+    of `row.get('status') or 'unknown'`).
+
+    Today (red phase): the 4 valid statuses already return 200
+    (the endpoint just echoes whatever is in the DB). The test
+    documents the contract; Phase 6 adds explicit validation.
+    """
+    import sqlite3 as _sqlite3
+
+    agent_id, key_id, secret = agent_with_key
+    db_path = client.app.state.db.db_path
+
+    conn = _sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE agents SET status = ? WHERE id = ?",
+            (valid_status, agent_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    headers = sign_v07_request(
+        "GET", f"/api/agents/{agent_id}/status", b"",
+        key_id=key_id, secret=secret,
+    )
+    response = client.get(
+        f"/api/agents/{agent_id}/status", headers=headers,
+    )
+    assert response.status_code == 200, (
+        f"status={valid_status!r}: expected 200, got "
+        f"{response.status_code}: {response.text}"
+    )
+    body = response.json()
+    assert body["status"] == valid_status, (
+        f"expected echoed status={valid_status!r}, got {body!r}"
+    )
+
+
+def test_h08b_status_endpoint_rejects_invalid_enum_value(
+    client, agent_with_key
+):
+    """H8b: a typo or non-enum value in the DB (e.g. 'verfid',
+    'PENDING', '', or any other string) makes the status
+    endpoint return **500 INVALID_AGENT_STATUS** rather than
+    200 with a coerced value. The 500 is fail-closed: the
+    bootstrapper must not treat unknown statuses as 'verified'.
+
+    Today (red phase): the endpoint's
+    `row.get('status') or 'unknown'` returns the typo'd value
+    (or the literal string 'unknown' for NULL). The test
+    asserts the 500 fail-closed contract.
+    """
+    import sqlite3 as _sqlite3
+
+    agent_id, key_id, secret = agent_with_key
+    db_path = client.app.state.db.db_path
+
+    # Inject a typo into the status field (bypassing the spec's
+    # enum; this is the kind of bug a manual SQL update might
+    # leave behind)
+    conn = _sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE agents SET status = 'verfid' WHERE id = ?",
+            (agent_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    headers = sign_v07_request(
+        "GET", f"/api/agents/{agent_id}/status", b"",
+        key_id=key_id, secret=secret,
+    )
+    response = client.get(
+        f"/api/agents/{agent_id}/status", headers=headers,
+    )
+    assert response.status_code == 500, (
+        f"typo'd status='verfid' should fail-closed 500, got "
+        f"{response.status_code}: {response.text}"
+    )
+    assert response.json()["detail"].split(": ")[0] == "INVALID_AGENT_STATUS"
