@@ -475,6 +475,89 @@ detail format which the exception handler parses):
   via `app.add_exception_handler(HTTPException, ...)` parses
   the detail string and returns the unified shape
 
+### 1.13 HERMES_HMAC_ACCEPT_V06 flag + deprecation mechanism (added hardening Phase 4, 2026-08-15)
+
+The dispatcher (`auth/dispatch.py`) accepts BOTH v0.6 and v0.7
+HMAC formats on the 2 dual-format routes (heartbeat, GET /{id})
+during the migration window (per spec §3 Option B). After the
+operator has fully migrated all agents to v0.7, the v0.6 path
+should be disabled. This section defines the deprecation
+mechanism.
+
+**Two env vars** (both read at startup; not per-request):
+
+| Env var | Type | Default | Meaning |
+|---|---|---|---|
+| `HERMES_HMAC_ACCEPT_V06` | bool (`true` / `false` / `1` / `0` / `yes` / `no`) | `true` | If `true`, dispatcher accepts v0.6 HMAC format. If `false`, v0.6 requests are rejected with 401 `V0_6_DEPRECATED`. |
+| `HERMES_HMAC_DEPRECATION_DATE` | ISO 8601 date (`YYYY-MM-DD`) | unset | If set and the date is in the past, the server logs a deprecation warning on startup and tags every v0.6 request log with a `[DEPRECATION]` marker. |
+
+**Verdict table for v0.6 (X-Agent-Id) requests on dual-format routes**:
+
+| `HERMES_HMAC_ACCEPT_V06` | Verdict | Response |
+|---|---|---|
+| `true` (default) | route to v1.6 verifier | 200 + normal response |
+| `false` | reject | 401 `V0_6_DEPRECATED: v0.6 HMAC format is disabled; use v0.7 (X-Hermes-* headers) — see docs/specs/orch-server-hmac-v0.7-alignment.md` |
+
+**Cutover plan** (per the operator's day-30/60/90 deprecation window):
+
+1. **Day 0**: this branch lands; `HERMES_HMAC_ACCEPT_V06` defaults to `true`. All v0.6 + v0.7 requests work.
+2. **Day 30** (or operator's chosen date): operator sets `HERMES_HMAC_DEPRECATION_DATE=YYYY-MM-DD` 30 days in the future. Server starts logging a deprecation warning on startup; each v0.6 request is tagged with `[DEPRECATION]`. The operator uses these logs to identify any remaining v0.6 clients.
+3. **Day 60**: operator sets `HERMES_HMAC_ACCEPT_V06=false`. v0.6 requests now return 401 `V0_6_DEPRECATED`. The operator monitors logs to ensure no production traffic is using v0.6; if any is, the operator coordinates with the agent host to upgrade.
+4. **Day 90**: operator removes the v0.6 verifier from `auth/hmac.py` and the dispatcher from `auth/dispatch.py` (separate PR; one final v0.7-only cutover). At this point the migration is complete.
+
+**Why a flag, not just removing v0.6 code**:
+
+- Removing v0.6 support in one PR is too disruptive — any
+  agent still using v0.6 would 401 immediately. The flag
+  gives the operator a soft cutover with monitoring.
+- The flag is the standard 12-factor pattern: behavior
+  changes via env var, no code change required to flip
+  the behavior. Easy to roll back (set `true` again).
+
+**Why a deprecation date env var**:
+
+- Forces the operator to commit to a cutover date (not
+  "someday"). The server logs the warning on startup so
+  the operator sees it daily in their log review.
+- Tags each v0.6 request so the operator can count them
+  via log analysis. If the count drops to 0 before the
+  flag flips, the operator can safely proceed.
+
+**Implementation**:
+
+- `hermes_orch.auth.hmac._read_accept_v06()` reads the env
+  var at startup (and on each request — env var can change
+  without restart in a development context; in production,
+  a process restart is fine since the v0.6 cutover is a
+  planned event).
+- `hermes_orch.auth.hmac._read_deprecation_date()` reads
+  the ISO date and returns a `datetime.date` (or None).
+- `hermes_orch.main.lifespan()` logs a startup warning if
+  the deprecation date is set and in the past.
+- `hermes_orch.auth.dispatch.dispatch_hmac_auth` wraps
+  the v0.6 path in a flag check; on `false`, raise
+  `HTTPException(401, "V0_6_DEPRECATED: ...")`.
+
+**Test coverage**:
+
+- Flag=`true` (default): v0.6 request works on the
+  dual-format routes (heartbeat, GET /{id})
+- Flag=`false`: v0.6 request returns 401 `V0_6_DEPRECATED`
+- Flag state does NOT affect v0.7 requests (v0.7 always
+  works)
+- Deprecation date in the past: startup log emits a
+  deprecation warning (verifiable via caplog)
+
+**Production safety**:
+
+- Default `HERMES_HMAC_ACCEPT_V06=true` preserves the
+  pre-Phase-4 behavior — no production change unless the
+  operator flips the flag.
+- The deprecation date env var is informational; the
+  flag is the actual cutover control.
+- The 401 `V0_6_DEPRECATED` error code is documented in
+  spec §1.12 and surfaces in the unified error contract.
+
 ---
 
 ## 2. Current v1.6 implementation (what changes)

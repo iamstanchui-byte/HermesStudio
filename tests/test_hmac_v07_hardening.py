@@ -813,3 +813,139 @@ def test_h09c_honors_inbound_request_id_header(client, agent_with_key):
     assert response.status_code == 401
     assert response.headers["X-Request-Id"] == inbound_rid
     assert response.json()["request_id"] == inbound_rid
+
+
+# === Issue #7: HERMES_HMAC_ACCEPT_V06 flag + deprecation ===
+
+def test_h10_v06_accepted_by_default(client, agent_with_key, monkeypatch):
+    """H10: with `HERMES_HMAC_ACCEPT_V06` unset (default `true`),
+    a v0.6 (X-Agent-Id) request to a dual-format route is
+    accepted by the dispatcher. The default behavior preserves
+    the pre-Phase-4 contract: v0.6 + v0.7 both work on the
+    heartbeat + GET /{id} routes.
+
+    Today (red phase for the flag specifically): the dispatcher
+    has no flag at all — v0.6 always works. The test
+    documents that the default behavior is preserved when the
+    flag is unset.
+    """
+    import hashlib as _h
+    import sqlite3 as _sqlite3
+    import time as _time
+
+    agent_id, key_id, secret = agent_with_key
+    # Build a v0.6 request directly (X-Agent-Id + X-Timestamp +
+    # X-Signature). The test fixture already populates
+    # hmac_secret in the DB.
+    timestamp = str(int(_time.time()))
+    path = f"/api/agents/{agent_id}/heartbeat"
+    body = b'{"force": 1}'
+    body_sha256 = _h.sha256(body).hexdigest()
+    # v0.6 secret is the hex string of the v0.7 secret bytes
+    # (per the test fixture convention)
+    secret_hex = secret.hex()
+    string_to_sign = f"POST\n{path}\n{body_sha256}\n{timestamp}"
+    import hmac as _hmac
+    sig = _hmac.new(
+        secret_hex.encode("utf-8"),
+        string_to_sign.encode("utf-8"),
+        _h.sha256,
+    ).hexdigest()
+
+    # Default flag (unset) → v0.6 works
+    monkeypatch.delenv("HERMES_HMAC_ACCEPT_V06", raising=False)
+    response = client.post(
+        path,
+        headers={
+            "X-Agent-Id": agent_id,
+            "X-Timestamp": timestamp,
+            "X-Signature": sig,
+            "Content-Type": "application/json",
+        },
+        content=body,
+    )
+    assert response.status_code == 200, (
+        f"default flag=true: v0.6 should work, got "
+        f"{response.status_code}: {response.text}"
+    )
+
+
+def test_h11_v06_rejected_when_flag_false(
+    client, agent_with_key, monkeypatch
+):
+    """H11: with `HERMES_HMAC_ACCEPT_V06=false`, a v0.6
+    (X-Agent-Id) request returns 401 `V0_6_DEPRECATED`. The
+    dispatcher checks the flag BEFORE routing to the v0.6
+    verifier. v0.7 requests (with X-Hermes-Method) are NOT
+    affected by the flag — they always work.
+
+    Today (red phase): the dispatcher has no flag at all;
+    v0.6 always works. The test asserts the new strict-reject
+    behavior when the operator flips the flag to false.
+    """
+    import hashlib as _h
+    import sqlite3 as _sqlite3
+    import time as _time
+    import hmac as _hmac
+
+    agent_id, key_id, secret = agent_with_key
+    timestamp = str(int(_time.time()))
+    path = f"/api/agents/{agent_id}/heartbeat"
+    body = b'{"force": 1}'
+    body_sha256 = _h.sha256(body).hexdigest()
+    secret_hex = secret.hex()
+    string_to_sign = f"POST\n{path}\n{body_sha256}\n{timestamp}"
+    sig = _hmac.new(
+        secret_hex.encode("utf-8"),
+        string_to_sign.encode("utf-8"),
+        _h.sha256,
+    ).hexdigest()
+
+    monkeypatch.setenv("HERMES_HMAC_ACCEPT_V06", "false")
+    response = client.post(
+        path,
+        headers={
+            "X-Agent-Id": agent_id,
+            "X-Timestamp": timestamp,
+            "X-Signature": sig,
+            "Content-Type": "application/json",
+        },
+        content=body,
+    )
+    assert response.status_code == 401, (
+        f"flag=false: v0.6 should be rejected, got "
+        f"{response.status_code}: {response.text}"
+    )
+    assert response.json()["detail"].split(": ")[0] == "V0_6_DEPRECATED"
+
+
+def test_h12_v07_unaffected_by_v06_flag(
+    client, agent_with_key, monkeypatch
+):
+    """H12: v0.7 requests are NOT affected by the
+    `HERMES_HMAC_ACCEPT_V06` flag. Whether the flag is
+    `true` or `false`, v0.7 requests work normally. The
+    flag controls only the v0.6 path.
+
+    Today (red phase): the dispatcher has no flag at all,
+    so v0.7 always works. The test documents that the new
+    flag does not regress v0.7.
+    """
+    agent_id, key_id, secret = agent_with_key
+    # Sign a v0.7 GET /status request
+    headers = sign_v07_request(
+        "GET", f"/api/agents/{agent_id}/status", b"",
+        key_id=key_id, secret=secret,
+    )
+
+    # With flag=false, v0.7 should still work
+    monkeypatch.setenv("HERMES_HMAC_ACCEPT_V06", "false")
+    response = client.get(
+        f"/api/agents/{agent_id}/status", headers=headers,
+    )
+    assert response.status_code == 200, (
+        f"flag=false: v0.7 should NOT be affected, got "
+        f"{response.status_code}: {response.text}"
+    )
+    body = response.json()
+    assert body["status"] in ("verifying", "verified", "blocked", "suspended")

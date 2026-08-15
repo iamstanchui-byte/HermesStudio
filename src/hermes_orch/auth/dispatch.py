@@ -60,7 +60,7 @@ from hermes_orch.auth.hmac_v07 import require_hmac_auth_v07
 # v1.6 verifier (3 headers X-Agent-Id / X-Timestamp / X-Signature,
 # hex HMAC, agent id lookup). See auth/hmac.py. The 2 existing
 # HMAC-protected routes (heartbeat, GET /{id}) currently use this.
-from hermes_orch.auth.hmac import require_hmac_auth
+from hermes_orch.auth.hmac import _read_accept_v06, require_hmac_auth
 
 
 # v0.7 §1.4 requires all 7 of these headers. Any subset of <7 with
@@ -212,6 +212,24 @@ async def dispatch_hmac_auth(
             x_hermes_signature=x_hermes_signature,
         )
     if v06_present:
+        # Hardening Phase 4 (2026-08-15): check the
+        # HERMES_HMAC_ACCEPT_V06 env var. If the operator has
+        # flipped the flag to false (post-migration), reject
+        # v0.6 requests with 401 V0_6_DEPRECATED so the
+        # bootstrapper / client sees a clear signal to
+        # upgrade. v0.7 requests (the v07_present branch above)
+        # are unaffected.
+        #
+        # Per spec §1.13: this is the standard 12-factor
+        # pattern for a soft cutover. Default behavior (flag
+        # unset) is True, preserving the pre-Phase-4 contract.
+        if not _read_accept_v06():
+            raise HTTPException(
+                401,
+                "V0_6_DEPRECATED: v0.6 HMAC format is disabled; "
+                "use v0.7 (X-Hermes-* headers) — see "
+                "docs/specs/orch-server-hmac-v0.7-alignment.md",
+            )
         # v0.6 / v1.6 path (the 2 existing routes currently use this).
         return await require_hmac_auth(
             request=request,
