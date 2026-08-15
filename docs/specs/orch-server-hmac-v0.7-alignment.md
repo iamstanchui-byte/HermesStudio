@@ -41,8 +41,8 @@ Per `docs/proposals/orch-client-build-impl-plan-v0.7.md` §1.4:
 
 | Header | Value |
 |---|---|
-| `X-Hermes-Method` | Uppercase HTTP method (`GET`, `POST`, ...) |
-| `X-Hermes-Path` | Canonical path, **no query string** (per v0.7 §1.4 "no query strings on signed endpoints") |
+| `X-Hermes-Method` | Uppercase HTTP method (`GET`, `POST`, ...) — **MUST equal the actual request method** (see §1.8) |
+| `X-Hermes-Path` | Canonical path, **no query string, byte-exact match to request URL path** (per §1.7 + §1.8; v0.7 §1.4 "no query strings on signed endpoints") |
 | `X-Hermes-Body-SHA256` | Lower-case hex SHA-256 of the raw request body bytes; `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` for GET (empty body) |
 | `X-Hermes-Key-Id` | Operator-assigned HMAC key id (e.g. `key-2026-08-13-win-b-02`); server uses this to look up the agent |
 | `X-Hermes-Timestamp` | Unix epoch seconds, decimal string |
@@ -69,6 +69,11 @@ The server recomputes this and compares with `X-Hermes-Signature` via
 ### 1.4 Server verification steps
 
 1. All 7 headers present (else 401 with `MISSING_AUTH_HEADERS`)
+   (handled by the dispatcher; see §1.9)
+1a. **(Hardening Phase 1)** `X-Hermes-Method` MUST equal
+   `request.method` (case-insensitive); `X-Hermes-Path` MUST equal
+   `request.url.path` byte-exact (see §1.8). Mismatch → 401 with
+   `MALFORMED_HEADERS`.
 2. `X-Hermes-Timestamp` parses as int, `|now - ts| <= HMAC_WINDOW_SEC`
    (default 300s, same as v1.6; else 401 with `TIMESTAMP_OUT_OF_WINDOW`)
 3. Look up agent by `X-Hermes-Key-Id` (NOT by URL `agent_id`); if not
@@ -84,6 +89,9 @@ The server recomputes this and compares with `X-Hermes-Signature` via
 7. Check the nonce has not been seen recently (in-memory LRU with TTL
    matching the timestamp window; else 401 with `NONCE_REPLAY`)
 8. On success, return the `agent_id` (from the DB row, not the URL)
+
+(All steps before "8" return 401; step 4 specifically returns 403
+per spec §1.4 KEY_AGENT_MISMATCH rule.)
 
 ### 1.5 New endpoint: `GET /api/agents/{id}/status`
 
@@ -134,6 +142,68 @@ Cross-language invariant: the bootstrapper's `Wait-ForEnrollment`
 MUST send the canonical form (no trailing slash, case-correct).
 Verified by the cross-language compat test
 (`tests/golden/hmac_v07_golden.json`).
+
+### 1.8 Header-to-request binding (added hardening Phase 1, 2026-08-15)
+
+The `X-Hermes-Method` and `X-Hermes-Path` headers are bound to the
+actual HTTP request. The verifier checks them against `request.method`
+and `request.url.path` respectively, byte-for-byte (with case-
+insensitive comparison on the method per RFC 7230 §3.1.1).
+
+Without this binding, an attacker could sign `POST /api/agents/A/heartbeat`
+and send `GET /api/agents/B/status` with those headers — the
+signature would still match (the X-Hermes-* headers are internally
+consistent) but the request would be bound to a different agent
++ endpoint than the one the client actually sent. This defeats
+the binding the canonical input is supposed to provide.
+
+**Verdict table**:
+
+| X-Hermes-Method vs request.method | X-Hermes-Path vs request.url.path | Verdict | Error code |
+|---|---|---|---|
+| match (case-insensitive) | match (byte-exact) | continue to next check | — |
+| mismatch | any | **reject** | 401 `MALFORMED_HEADERS` |
+| any | mismatch | **reject** | 401 `MALFORMED_HEADERS` |
+
+Implementation: the verifier compares the headers against
+`request.method` and `request.url.path` *before* the signature
+compare (step 1b of the verifier flow, after the missing-header
+check at step 1).
+
+### 1.9 Mixed / partial header set rejection (added hardening Phase 1, 2026-08-15)
+
+The dispatcher (`auth/dispatch.py`) rejects any request that has
+EITHER:
+- a v0.6 header AND a v0.7 header (mixed protocol)
+- a partial v0.7 header set (1-6 of 7 X-Hermes-* headers)
+- a partial v0.6 header set (1-2 of 3 X-Agent-Id / X-Timestamp /
+  X-Signature headers)
+
+All three cases are rejected with **401 `MIXED_HEADERS`** (the
+single error code for "header set is not strictly v0.7-or-v0.6
+and complete"). The previous dispatcher routed partial v0.7 sets
+to the v0.7 verifier (which failed with `MISSING_AUTH_HEADERS` on
+the missing headers), but this leaked the v0.7 header presence
+to the v0.7 path and let an attacker fingerprint the server by
+including a v0.6 header (which was silently ignored by the v0.7
+verifier). Strict reject eliminates this attack surface.
+
+**Verdict table**:
+
+| v0.6 headers present | v0.7 headers present | Verdict | Error code |
+|---|---|---|---|
+| 0 | 0 | reject | 401 `MISSING_AUTH_HEADERS` |
+| 0 | 7 | route to v0.7 verifier | — |
+| 0 | 1-6 | **reject** | 401 `MIXED_HEADERS` |
+| 1-3 | 0 | route to v1.6 verifier | — |
+| 1-3 | 1-7 | **reject** | 401 `MIXED_HEADERS` |
+
+Implementation: the dispatcher enumerates the present headers
+from each format *before* routing. If both are present, or if
+either format has a partial set, the dispatcher raises
+`MIXED_HEADERS` immediately. The verifiers (v0.7 and v1.6) are
+then guaranteed to receive a complete header set for their
+format only.
 
 ---
 

@@ -1,5 +1,5 @@
 # coding: utf-8
-"""Dual-format HMAC dispatcher (2026-08-15).
+"""Dual-format HMAC dispatcher (2026-08-15, hardened 2026-08-15).
 
 Routes incoming HMAC-authenticated requests to the right verifier
 based on header presence:
@@ -25,6 +25,20 @@ signed with v0.7 won't have X-Agent-Id, and vice versa). The
 dispatcher enforces this implicitly by inspecting the presence of
 X-Hermes-Method (the v0.7 header) vs X-Agent-Id (the v1.6 header).
 
+Hardening 2026-08-15 (Phase 1 of security/v07-hardening):
+- Mixed v0.6 + v0.7 header set -> 401 MIXED_HEADERS (strict
+  reject; no fallthrough to v0.7 or v0.6 path)
+- Partial v0.7 header set (any X-Hermes-* but not all 7) -> 401
+  MIXED_HEADERS (strict reject; no fallthrough to v0.6 path)
+- Rationale: a request with 4/7 v0.7 headers + 1/3 v0.6 headers
+  is ambiguous. The previous dispatcher would route to v0.7 (because
+  X-Hermes-Method was present) and let the v0.7 verifier fail with
+  MISSING_AUTH_HEADERS on the missing 3 — a fail-open that leaks
+  the v0.6 header's value to the v0.7 verifier (which silently
+  ignores it) and lets an attacker fingerprint the server by
+  including X-Agent-Id without effect. Strict reject eliminates
+  this attack surface.
+
 Why a separate dispatcher instead of inlining the v0.7 verifier
 in the route:
   - Keeps the v0.7 verifier as a self-contained dependency
@@ -47,6 +61,25 @@ from hermes_orch.auth.hmac_v07 import require_hmac_auth_v07
 # hex HMAC, agent id lookup). See auth/hmac.py. The 2 existing
 # HMAC-protected routes (heartbeat, GET /{id}) currently use this.
 from hermes_orch.auth.hmac import require_hmac_auth
+
+
+# v0.7 §1.4 requires all 7 of these headers. Any subset of <7 with
+# at least 1 present triggers MIXED_HEADERS reject. Constants here
+# so the dispatcher + tests + spec share one definition.
+_V07_REQUIRED_HEADERS = (
+    "X-Hermes-Method",
+    "X-Hermes-Path",
+    "X-Hermes-Body-SHA256",
+    "X-Hermes-Key-Id",
+    "X-Hermes-Timestamp",
+    "X-Hermes-Nonce",
+    "X-Hermes-Signature",
+)
+_V06_REQUIRED_HEADERS = (
+    "X-Agent-Id",
+    "X-Timestamp",
+    "X-Signature",
+)
 
 
 async def dispatch_hmac_auth(
@@ -85,6 +118,10 @@ async def dispatch_hmac_auth(
     verifier if X-Agent-Id is present. If neither, returns 401
     MISSING_AUTH_HEADERS.
 
+    Hardening (2026-08-15): strict reject of:
+      - mixed v0.6 + v0.7 header sets (any header from each format)
+      - partial v0.7 header sets (any X-Hermes-* but not all 7)
+
     Returns the agent_id (str) on success. The route handler
     should compare this to the URL path's {agent_id} to prevent
     a valid signature for agent A from being used to access
@@ -103,7 +140,65 @@ async def dispatch_hmac_auth(
                 raise HTTPException(401, ...)
             ...
     """
-    if x_hermes_method is not None:
+    # === Hardening: detect mixed/partial header sets before routing ===
+    # Collect the present headers from each format into sorted lists
+    # so the error message is deterministic.
+    v07_present = sorted([
+        name for name, val in (
+            ("X-Hermes-Method", x_hermes_method),
+            ("X-Hermes-Path", x_hermes_path),
+            ("X-Hermes-Body-SHA256", x_hermes_body_sha256),
+            ("X-Hermes-Key-Id", x_hermes_key_id),
+            ("X-Hermes-Timestamp", x_hermes_timestamp),
+            ("X-Hermes-Nonce", x_hermes_nonce),
+            ("X-Hermes-Signature", x_hermes_signature),
+        ) if val is not None
+    ])
+    v06_present = sorted([
+        name for name, val in (
+            ("X-Agent-Id", x_agent_id),
+            ("X-Timestamp", x_timestamp),
+            ("X-Signature", x_signature),
+        ) if val is not None
+    ])
+
+    if v07_present and v06_present:
+        raise HTTPException(
+            401,
+            f"MIXED_HEADERS: Mixed v0.6 ({','.join(v06_present)}) + v0.7 "
+            f"({','.join(v07_present)}) headers in single request; "
+            f"spec forbids combining formats",
+        )
+
+    if v07_present and len(v07_present) != len(_V07_REQUIRED_HEADERS):
+        # Partial v0.7 set: 1-6 of 7 headers present, no v0.6 headers.
+        # Strict reject — no fallthrough to v0.6 path (which would
+        # fail with MISSING_AUTH_HEADERS anyway, but leaking the
+        # v0.7 header set to the v0.6 verifier is a fail-open attack
+        # surface).
+        raise HTTPException(
+            401,
+            f"MIXED_HEADERS: Partial v0.7 header set "
+            f"({len(v07_present)}/{len(_V07_REQUIRED_HEADERS)} present: "
+            f"{','.join(v07_present)}); all 7 required when any "
+            f"X-Hermes-* header is sent",
+        )
+
+    if v06_present and len(v06_present) != len(_V06_REQUIRED_HEADERS):
+        # Partial v0.6 set: 1-2 of 3 headers present, no v0.7 headers.
+        # The v1.6 verifier already returns MISSING_AUTH_HEADERS for
+        # this, but hardening demands the dispatcher surfaces the
+        # same MIXED_HEADERS error code as the v0.7 partial case
+        # for consistency.
+        raise HTTPException(
+            401,
+            f"MIXED_HEADERS: Partial v0.6 header set "
+            f"({len(v06_present)}/{len(_V06_REQUIRED_HEADERS)} present: "
+            f"{','.join(v06_present)}); all 3 required when any "
+            f"X-Agent-Id/X-Timestamp/X-Signature header is sent",
+        )
+
+    if v07_present:
         # v0.7 §1.4 path. Pass the v0.7 headers explicitly so
         # the v0.7 verifier doesn't see None (its Header defaults).
         return await require_hmac_auth_v07(
@@ -116,7 +211,7 @@ async def dispatch_hmac_auth(
             x_hermes_nonce=x_hermes_nonce,
             x_hermes_signature=x_hermes_signature,
         )
-    if x_agent_id is not None:
+    if v06_present:
         # v0.6 / v1.6 path (the 2 existing routes currently use this).
         return await require_hmac_auth(
             request=request,

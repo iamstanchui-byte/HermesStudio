@@ -206,6 +206,50 @@ async def require_hmac_auth_v07(
                 401, f"MISSING_AUTH_HEADERS: Missing header: {name}"
             )
 
+    # 1b. Hardening (2026-08-15, security/v07-hardening Phase 1):
+    # X-Hermes-Method MUST equal the actual request method (case-insensitive
+    # since HTTP methods are case-insensitive per RFC 7230 §3.1.1, but we
+    # uppercase both sides for canonical comparison).
+    # X-Hermes-Path MUST equal request.url.path byte-for-byte (case-sensitive,
+    # no trailing slash, no query string — all enforced by step 3b below).
+    #
+    # Without this check, an attacker could sign `POST /a` and send
+    # `GET /b` with those headers — the signature would still match
+    # (the X-Hermes-* headers are internally consistent) but the
+    # request would be bound to a different method + path. This
+    # defeats the binding that the canonical input is supposed to
+    # provide.
+    #
+    # Order matters: the X-Hermes-Path sub-checks run in a specific
+    # order so the error code matches the spec's intent:
+    #   1. Reject `?` in x_hermes_path first (spec §1.1 + §1.7: query
+    #      strings forbidden in signed path) — 400 MALFORMED_HEADERS.
+    #   2. Then compare x_hermes_path to request.url.path (spec §1.8
+    #      binding) — 401 MALFORMED_HEADERS.
+    # This way, T11 (query string in x_hermes_path) still returns 400
+    # as the spec requires, even with the new binding check in place.
+    if "?" in x_hermes_path:
+        raise HTTPException(
+            400,
+            f"MALFORMED_HEADERS: X-Hermes-Path contains '?' "
+            f"(query strings forbidden on signed endpoints): "
+            f"{x_hermes_path!r}",
+        )
+    if x_hermes_method.upper() != request.method.upper():
+        raise HTTPException(
+            401,
+            f"MALFORMED_HEADERS: X-Hermes-Method ({x_hermes_method!r}) "
+            f"does not match the actual request method "
+            f"({request.method!r})",
+        )
+    if x_hermes_path != request.url.path:
+        raise HTTPException(
+            401,
+            f"MALFORMED_HEADERS: X-Hermes-Path ({x_hermes_path!r}) "
+            f"does not match the actual request URL path "
+            f"({request.url.path!r})",
+        )
+
     # 2. Timestamp window
     try:
         ts_int = int(x_hermes_timestamp)

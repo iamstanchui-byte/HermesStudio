@@ -34,11 +34,24 @@ because the verifier does not yet enforce method/path binding.
 Phase 1 implementation lands the binding check; these tests turn
 green at the end of Phase 1.
 
+H1 + H2 are direct unit tests (calling the verifier function with
+a mocked Request object) rather than HTTP integration tests,
+because the production endpoints are method-restricted (e.g.
+`/heartbeat` is POST-only, `/status` is GET-only), so HTTP
+mismatch tests would hit router-level 405 before reaching the
+verifier. The unit test approach exercises the binding check
+directly.
+
+H3 + H4 are HTTP integration tests because the dispatcher runs
+BEFORE the router (FastAPI dependency injection order), so the
+strict-reject check happens before any method/path restriction.
+
 Cross-reference:
 - Operator review 2026-08-15: see summary block in
   docs/specs/orch-server-hmac-v07-feature-decisions.md (TBD when
   the hardening design doc lands)
-- Spec §1.1 + §1.7: path canonicalization policy
+- Spec §1.1 + §1.7 + §1.8 + §1.9: header canonicalization +
+  binding + mixed/partial rejection
 - Spec §1.4 step 4: KEY_AGENT_MISMATCH error code
 """
 from __future__ import annotations
@@ -46,16 +59,63 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from unittest.mock import MagicMock
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 # Reuse the same imports as test_hmac_v07_auth.py
 from hermes_orch import main as main_mod
 from hermes_orch import db as db_mod
+from hermes_orch.auth.hmac_v07 import (
+    require_hmac_auth_v07,
+)
 from hermes_orch.main import create_app
 
 from tests.helpers.hmac_v07 import sign_v07_request
+
+
+# === Unit-test helper: build a mock Request for the v0.7 verifier ===
+
+def _make_mock_request(
+    method: str,
+    path: str,
+    body: bytes,
+    db,
+    nonce_store=None,
+    headers: dict | None = None,
+):
+    """Build a MagicMock that quacks like a FastAPI Request enough to
+    call require_hmac_auth_v07. The mock exposes:
+      - request.method (str)
+      - request.url.path (str)
+      - request.url.query (str)
+      - request.body() -> bytes (coroutine)
+      - request.app.state.db (the real Database)
+      - request.app.state.v07_nonce_store (optional InMemoryNonceStore)
+      - request.headers (used by some validators; not strictly required
+        by the v0.7 verifier since headers come from FastAPI Header() deps)
+    """
+    import asyncio
+
+    req = MagicMock()
+    req.method = method
+    req.url.path = path
+    req.url.query = ""
+    # request.body() is async; use a coroutine that returns the body
+    async def _body():
+        return body
+    req.body = _body
+    req.app.state.db = db
+    if nonce_store is not None:
+        req.app.state.v07_nonce_store = nonce_store
+    if headers is not None:
+        # `headers` may be inspected by some middleware but the
+        # v0.7 verifier reads its inputs from FastAPI Header() deps,
+        # so this is just a defensive stub.
+        req.headers = headers
+    return req
 
 
 # === Fixtures (mirrored from test_hmac_v07_auth.py) ===
@@ -127,57 +187,76 @@ def agent_with_key(client, tmp_path, monkeypatch):
             conn.close()
 
 
-# === Issue #1: X-Hermes-Method binding ===
+# === Issue #1: X-Hermes-Method binding (unit test) ===
 
-def test_h01_method_mismatch_returns_401(client, agent_with_key):
-    """H1: sign POST /heartbeat, send GET /heartbeat. The signature
-    would internally match (the headers are self-consistent), but
-    the request method is GET while X-Hermes-Method says POST.
-    Hardening requires these to match byte-for-byte; mismatch → 401
-    MALFORMED_HEADERS.
+@pytest.mark.asyncio
+async def test_h01_method_mismatch_returns_401(client, agent_with_key):
+    """H1 (unit test): sign POST /heartbeat, but the mock Request
+    reports method=GET. The signature would internally match (the
+    headers are self-consistent), but the request method is GET
+    while X-Hermes-Method says POST. Hardening requires these to
+    match; mismatch → 401 MALFORMED_HEADERS.
+
+    This is a unit test (not HTTP integration) because the
+    production endpoints are method-restricted: an HTTP-level
+    test with method mismatch would hit router-level 405 before
+    reaching the verifier. The unit test exercises the binding
+    check directly via the require_hmac_auth_v07 dependency.
 
     Today (red phase): the verifier does not check X-Hermes-Method
-    against request.method. If the request reaches a POST-only route
-    via GET, FastAPI returns 405 Method Not Allowed (not 401). If
-    the route accepts both methods, the request would be accepted
-    with the wrong-method signature. Either way, the test asserts
-    401 (the hardening contract).
+    against request.method. The unit test would either:
+      - Return the agent_id (200) if all other checks pass — the
+        signature matches because X-Hermes-Method is internally
+        consistent with the other headers.
+      - Or fail on a different check (e.g. KEY_AGENT_MISMATCH).
+    Green phase (Phase 1): the verifier rejects with 401
+    MALFORMED_HEADERS.
     """
     agent_id, key_id, secret = agent_with_key
     # Sign for POST with a body
     signed_body = b'{"force": 1}'
-    headers = sign_v07_request(
+    signed_headers = sign_v07_request(
         "POST", f"/api/agents/{agent_id}/heartbeat",
         body=signed_body,
         key_id=key_id, secret=secret,
     )
-    # Send as GET (method mismatch)
-    response = client.get(
-        f"/api/agents/{agent_id}/heartbeat",
-        headers=headers,
+    # Build a mock Request that reports method=GET (mismatch)
+    mock_req = _make_mock_request(
+        method="GET",  # mismatch with X-Hermes-Method=POST
+        path=f"/api/agents/{agent_id}/heartbeat",  # path matches
+        body=signed_body,
+        db=client.app.state.db,
     )
-    # Red phase: response.status_code is one of [405, 200, 401] but
-    # NOT the expected 401 MALFORMED_HEADERS.
-    # Green phase (Phase 1): the verifier rejects with 401.
-    assert response.status_code == 401, (
-        f"got {response.status_code}: {response.text}"
-    )
-    assert response.json()["detail"].split(": ")[0] == "MALFORMED_HEADERS"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await require_hmac_auth_v07(
+            request=mock_req,
+            x_hermes_method=signed_headers["X-Hermes-Method"],
+            x_hermes_path=signed_headers["X-Hermes-Path"],
+            x_hermes_body_sha256=signed_headers["X-Hermes-Body-SHA256"],
+            x_hermes_key_id=signed_headers["X-Hermes-Key-Id"],
+            x_hermes_timestamp=signed_headers["X-Hermes-Timestamp"],
+            x_hermes_nonce=signed_headers["X-Hermes-Nonce"],
+            x_hermes_signature=signed_headers["X-Hermes-Signature"],
+        )
+    assert exc_info.value.status_code == 401
+    assert "MALFORMED_HEADERS" in str(exc_info.value.detail)
 
 
-# === Issue #1: X-Hermes-Path binding ===
+# === Issue #1: X-Hermes-Path binding (unit test) ===
 
-def test_h02_path_mismatch_returns_401(client, agent_with_key):
-    """H2: sign /api/agents/{id}/status, send /api/agents/{id}/heartbeat
-    (or any other path). The X-Hermes-Path header is internally
+@pytest.mark.asyncio
+async def test_h02_path_mismatch_returns_401(client, agent_with_key):
+    """H2 (unit test): sign /status, but the mock Request reports
+    url.path=/heartbeat. The X-Hermes-Path header is internally
     consistent with the signature, but the actual request URL is
     different. Hardening requires X-Hermes-Path to equal
     request.url.path byte-for-byte; mismatch → 401 MALFORMED_HEADERS.
 
-    Today (red phase): the verifier does not check X-Hermes-Path
-    against request.url.path. The request reaches the router
-    matching the actual URL, not the signed path, and may be
-    accepted (if the route exists) with the wrong-path signature.
+    Same as H1: this is a unit test because HTTP-level path
+    mismatch would hit router-level 404 (or 405) before reaching
+    the verifier. The unit test exercises the binding check
+    directly.
     """
     agent_id, key_id, secret = agent_with_key
     signed_path = f"/api/agents/{agent_id}/status"
@@ -186,13 +265,27 @@ def test_h02_path_mismatch_returns_401(client, agent_with_key):
         "GET", signed_path, b"",
         key_id=key_id, secret=secret,
     )
-    response = client.get(sent_path, headers=headers)
-    # Red phase: response.status_code is one of [200, 401, 404] but
-    # NOT the expected 401 MALFORMED_HEADERS (with the right code).
-    assert response.status_code == 401, (
-        f"got {response.status_code}: {response.text}"
+    # Build a mock Request that reports path=/heartbeat (mismatch)
+    mock_req = _make_mock_request(
+        method="GET",  # method matches (X-Hermes-Method=GET)
+        path=sent_path,  # mismatch with X-Hermes-Path=/status
+        body=b"",
+        db=client.app.state.db,
     )
-    assert response.json()["detail"].split(": ")[0] == "MALFORMED_HEADERS"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await require_hmac_auth_v07(
+            request=mock_req,
+            x_hermes_method=headers["X-Hermes-Method"],
+            x_hermes_path=headers["X-Hermes-Path"],
+            x_hermes_body_sha256=headers["X-Hermes-Body-SHA256"],
+            x_hermes_key_id=headers["X-Hermes-Key-Id"],
+            x_hermes_timestamp=headers["X-Hermes-Timestamp"],
+            x_hermes_nonce=headers["X-Hermes-Nonce"],
+            x_hermes_signature=headers["X-Hermes-Signature"],
+        )
+    assert exc_info.value.status_code == 401
+    assert "MALFORMED_HEADERS" in str(exc_info.value.detail)
 
 
 # === Issue #4: partial v0.7 header set ===
@@ -209,38 +302,38 @@ def test_h03_partial_v07_header_set_returns_401(client, agent_with_key):
     MISSING_AUTH_HEADERS check, but the dispatcher still routes
     to v0.7 (not v1.6) because some X-Hermes-* headers are there.
     The test asserts 401 with the hardening-required error code.
+
+    Uses POST /api/agents/{id}/heartbeat (the dispatcher-protected
+    route) because the v0.7-only /status endpoint bypasses the
+    dispatcher entirely and would never surface MIXED_HEADERS.
     """
     agent_id, key_id, secret = agent_with_key
+    signed_body = b'{"force": 1}'
     headers = sign_v07_request(
-        "GET", f"/api/agents/{agent_id}/status", b"",
+        "POST", f"/api/agents/{agent_id}/heartbeat",
+        body=signed_body,
         key_id=key_id, secret=secret,
     )
     # Drop 3 random v0.7 headers (leaves 4/7)
     for h in ("X-Hermes-Method", "X-Hermes-Path", "X-Hermes-Signature"):
         del headers[h]
-    response = client.get(
-        f"/api/agents/{agent_id}/status",
+    response = client.post(
+        f"/api/agents/{agent_id}/heartbeat",
         headers=headers,
+        content=signed_body,
     )
-    # Red phase: response.status_code is 401 (existing MISSING_AUTH_HEADERS
-    # check fires on the missing headers) but the assertion below
-    # may pass for the wrong reason (the standard MISSING check).
-    # Green phase: hardening adds the strict-reject error code or
-    # ensures the partial-set detection happens before the standard
-    # MISSING check. Either way, the test should pass.
     assert response.status_code == 401, (
         f"got {response.status_code}: {response.text}"
     )
-    error_code = response.json()["detail"].split(": ")[0]
-    # The hardening-required error codes are MISSING_AUTH_HEADERS
-    # (existing) or a new MIXED_HEADERS / PARTIAL_HEADERS code.
-    # The test accepts either as a forward-compatible assertion;
-    # Phase 1 will pin down which one.
-    assert error_code in (
-        "MISSING_AUTH_HEADERS",
-        "MIXED_HEADERS",
-        "PARTIAL_HEADERS",
-    ), f"unexpected error code: {error_code}"
+    # Phase 1 implementation: the dispatcher surfaces a uniform
+    # `MIXED_HEADERS` code for any non-strict header set (partial
+    # v0.7, partial v0.6, mixed v0.6+v0.7). This replaces the
+    # previous behavior of falling through to the v0.7 verifier
+    # which would have returned MISSING_AUTH_HEADERS on the
+    # missing headers.
+    assert response.json()["detail"].split(": ")[0] == "MIXED_HEADERS", (
+        f"expected MIXED_HEADERS but got: {response.text}"
+    )
 
 
 # === Issue #4b: mixed v0.7 + v1.6 header set ===
@@ -256,23 +349,25 @@ def test_h04_mixed_v07_v06_headers_returns_401(client, agent_with_key):
     ignored, and the request may be accepted (200) or fail at a
     later check. The test asserts 401 with the strict MIXED_HEADERS
     code.
+
+    Uses POST /api/agents/{id}/heartbeat (the dispatcher-protected
+    route) because the v0.7-only /status endpoint bypasses the
+    dispatcher entirely and would never surface MIXED_HEADERS.
     """
     agent_id, key_id, secret = agent_with_key
+    signed_body = b'{"force": 1}'
     headers = sign_v07_request(
-        "GET", f"/api/agents/{agent_id}/status", b"",
+        "POST", f"/api/agents/{agent_id}/heartbeat",
+        body=signed_body,
         key_id=key_id, secret=secret,
     )
     # Add a v1.6-style header to the v0.7 set
     headers["X-Agent-Id"] = agent_id
-    response = client.get(
-        f"/api/agents/{agent_id}/status",
+    response = client.post(
+        f"/api/agents/{agent_id}/heartbeat",
         headers=headers,
+        content=signed_body,
     )
-    # Red phase: response.status_code is 200 (silent accept) or
-    # 401 (existing verifier step) but the error code is not
-    # the required MIXED_HEADERS.
-    # Green phase (Phase 1): the dispatcher detects mixed headers
-    # and rejects with 401 MIXED_HEADERS.
     assert response.status_code == 401, (
         f"got {response.status_code}: {response.text}"
     )
