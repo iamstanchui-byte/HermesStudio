@@ -205,6 +205,108 @@ either format has a partial set, the dispatcher raises
 then guaranteed to receive a complete header set for their
 format only.
 
+### 1.10 Enrollment v07 state machine (added hardening Phase 3, 2026-08-15)
+
+The `POST /api/enrollment/v07` endpoint is a **pre-provision
+activation** — the operator pre-issues a row in the `agents`
+table with `hmac_key_id` + `hmac_secret` + `status='verifying'`,
+and the v0.7 endpoint transitions the row from `verifying` to
+`verified` when the agent host proves possession of the secret
+via the 7-header HMAC signature. The endpoint does NOT create
+new agent rows (that path is the legacy `/api/agents/enroll`
+which uses an enrollment token, NOT the v0.7 HMAC path).
+
+**State machine** (the only allowed transitions):
+
+```
+  (pre-provision via operator)
+              │
+              ▼
+         ┌──────────┐    POST /api/enrollment/v07     ┌──────────┐
+         │ verifying│ ─────────────────────────────▶ │ verified │
+         └──────────┘   200 + {status: verified}     └──────────┘
+              │                                          │
+              │ (operator action via admin UI /          │ (operator action)
+              │  script, out of scope for v0.7)           ▼
+              ▼                                       ┌──────────┐
+         ┌──────────┐                                  │ blocked  │
+         │ blocked  │                                  └──────────┘
+         └──────────┘                                       │
+              │ (operator action)                            ▼
+              ▼                                       ┌──────────┐
+         ┌──────────┐                                  │suspended │
+         │suspended │                                  └──────────┘
+         └──────────┘
+```
+
+**Allowed values of `agents.status`** (the canonical enum):
+
+| Value | Meaning |
+|---|---|
+| `verifying` | Pre-provisioned; awaiting the v0.7 endpoint call to activate |
+| `verified` | Active; the v0.7 endpoint has confirmed the secret |
+| `blocked` | Operator-blocked; the row is preserved for audit but the agent cannot heartbeat or re-enroll |
+| `suspended` | Operator-suspended; same as `blocked` but reversible (e.g. temporary maintenance) |
+
+**Verdict table for `POST /api/enrollment/v07`** (the only allowed
+starting state is `verifying`):
+
+| Current `status` | Endpoint verdict | Error code |
+|---|---|---|
+| `verifying` | 200 + `{status: verified}` | — |
+| `verified` | **reject** (already activated; idempotent re-enroll is not allowed; the bootstrapper should stop polling) | 409 `ENROLLMENT_STATE_CONFLICT` |
+| `blocked` | **reject** | 409 `ENROLLMENT_STATE_CONFLICT` |
+| `suspended` | **reject** | 409 `ENROLLMENT_STATE_CONFLICT` |
+| (no row found by `hmac_key_id`) | **reject** | 401 `UNKNOWN_KEY_ID` (verifier step 5) |
+| (any other value, including typos) | **reject** | 409 `ENROLLMENT_STATE_CONFLICT` |
+
+**Implementation contract**:
+
+1. The endpoint runs the v0.7 verifier (7 X-Hermes-* headers,
+   `hmac_key_id` → `agent_id` lookup, signature verify, etc.) —
+   the verifier runs **before** the state check, so an
+   unauthenticated or replayed request never sees the status.
+
+2. After the verifier returns the `auth_agent_id`, the endpoint
+   runs a single atomic UPDATE:
+   ```sql
+   UPDATE agents
+   SET status = 'verified', last_heartbeat_at = ?, ...
+   WHERE id = ? AND status = 'verifying'
+   ```
+   If `rowcount == 0` (no row updated), the row was NOT in
+   `verifying` state — return 409 `ENROLLMENT_STATE_CONFLICT`.
+   The atomic UPDATE prevents two concurrent enrollments from
+   both transitioning the same row.
+
+3. The endpoint also validates the `status` enum at READ time
+   (e.g. when populating the response): any non-enum value in
+   the DB returns 500 `INVALID_AGENT_STATUS` (operator should
+   fix the DB; the spec does not silently coerce).
+
+4. The GET `/api/agents/{id}/status` endpoint validates the
+   enum the same way and returns the `status` field unchanged.
+   The bootstrapper's Wait-ForEnrollment poll stops on
+   `status: verified`. Operators can observe `blocked` /
+   `suspended` via the dashboard.
+
+**Rationale for explicit `verifying` start state**: the
+pre-Phase-3 endpoint accepted ANY status, including
+`verified`. This meant a malicious or buggy agent could
+re-enroll an already-verified row, resetting its
+`last_heartbeat_at` and changing the `os_type` / `hostname`
+fields. The `verifying`-only start state makes enrollment
+single-shot per pre-provisioned row, and `ENROLLMENT_STATE_CONFLICT`
+gives the operator a clear signal when something tries to
+re-enroll.
+
+**Backward compatibility**: existing agents (the 2 known
+production agents `win-local-1` + `linux-a-01` on the v1.6
+HMAC path) are NOT affected. They never call the v0.7
+enrollment endpoint. New agents via the bootstrapper follow
+the new flow: operator pre-provisions with `status=verifying`,
+agent calls the v0.7 endpoint, row transitions to `verified`.
+
 ---
 
 ## 2. Current v1.6 implementation (what changes)

@@ -507,27 +507,52 @@ async def post_enrollment_v07(
     db = request.app.state.db
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Update the agent row. The verifier already validated that
-    # the row exists (UNKNOWN_KEY_ID 401 if not). We do NOT touch
-    # the hmac_key_id / hmac_secret (those are operator-issued and
-    # shouldn't change on enrollment).
-    # If body fields are provided, set them; otherwise leave existing.
+    # Hardening Phase 3 (2026-08-15): strict state machine guard.
+    # Per spec §1.10, the only allowed start state for enrollment
+    # is `verifying`. The atomic UPDATE's WHERE clause includes
+    # `status = 'verifying'`; if no row matches, the row was
+    # already in a non-verifying state (verified / blocked /
+    # suspended / pending / typo'd value) and we return 409
+    # `ENROLLMENT_STATE_CONFLICT` rather than silently
+    # overwriting the existing status.
+    #
+    # Without this guard, a malicious or buggy agent could
+    # re-enroll an already-verified row, resetting its
+    # last_heartbeat_at and changing os_type / hostname / name.
+    # The guard makes enrollment single-shot per pre-provisioned
+    # row.
     if body.hostname or body.os_type or body.agent_name:
-        await db.execute(
+        cursor = await db.execute(
             "UPDATE agents SET status = 'verified', "
             "last_heartbeat_at = ?, "
             "hostname = COALESCE(?, hostname), "
             "os_type = COALESCE(?, os_type), "
             "name = COALESCE(?, name) "
-            "WHERE id = ?",
+            "WHERE id = ? AND status = 'verifying'",
             (now_iso, body.hostname, body.os_type, body.agent_name,
              auth_agent_id),
         )
     else:
-        await db.execute(
+        cursor = await db.execute(
             "UPDATE agents SET status = 'verified', "
-            "last_heartbeat_at = ? WHERE id = ?",
+            "last_heartbeat_at = ? "
+            "WHERE id = ? AND status = 'verifying'",
             (now_iso, auth_agent_id),
+        )
+    if cursor.rowcount == 0:
+        # Row was not in `verifying` state. The verifier already
+        # confirmed the row exists (UNKNOWN_KEY_ID 401 otherwise),
+        # so this is strictly a state-machine conflict. Read the
+        # current status to include it in the error message.
+        row = await db.fetchone(
+            "SELECT status FROM agents WHERE id = ?", (auth_agent_id,)
+        )
+        current_status = row.get("status") if row else "missing"
+        raise HTTPException(
+            409,
+            f"ENROLLMENT_STATE_CONFLICT: agent is in "
+            f"status={current_status!r}; enrollment requires "
+            f"status='verifying' (operator pre-provision state)",
         )
     # NOTE: db.execute() auto-commits when not inside a transaction
     # block (per Database.execute docstring). Don't call db.commit()

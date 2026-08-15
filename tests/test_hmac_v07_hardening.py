@@ -473,3 +473,135 @@ def test_h05b_add_if_absent_distinguishes_different_nonces():
     assert len(store) == 50, (
         f"expected 50 entries in store, got {len(store)}"
     )
+
+
+# === Issue #3: Enrollment v07 state machine ===
+
+@pytest.mark.parametrize("preflight_status,expected_error_code", [
+    ("verified", "ENROLLMENT_STATE_CONFLICT"),
+    ("blocked", "ENROLLMENT_STATE_CONFLICT"),
+    ("suspended", "ENROLLMENT_STATE_CONFLICT"),
+    ("pending", "ENROLLMENT_STATE_CONFLICT"),
+    ("bogus_status_xyz", "ENROLLMENT_STATE_CONFLICT"),
+])
+def test_h06_enrollment_rejects_non_verifying_status(
+    client, agent_with_key, preflight_status, expected_error_code
+):
+    """H6 (parametrized): the v0.7 enrollment endpoint only
+    transitions rows whose current status is `verifying`. Any
+    other status — `verified`, `blocked`, `suspended`, the
+    legacy `pending`, or any unknown / typo'd value — must
+    return 409 with `ENROLLMENT_STATE_CONFLICT` (NOT 200, NOT
+    silently overwrite).
+
+    Today (red phase): the endpoint runs the UPDATE without
+    a status guard, so the row's status flips to `verified`
+    regardless of its pre-call value. The test asserts the
+    new strict-reject contract: only `verifying` is the
+    allowed start state.
+
+    Green phase (Phase 3 impl): the endpoint's UPDATE gains
+    `AND status = 'verifying'` and the row count check
+    surfaces 409 if 0 rows updated.
+
+    Cross-reference: spec §1.10 "Enrollment v07 state machine".
+    """
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    agent_id, key_id, secret = agent_with_key
+    db_path = client.app.state.db.db_path
+
+    # Pre-set the agent's status to the parametrized value
+    conn = _sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE agents SET status = ? WHERE id = ?",
+            (preflight_status, agent_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Sign + send the v0.7 enrollment request
+    body_dict = {
+        "agent_name": "test-vm",
+        "hostname": "test-host",
+        "os_type": "windows-11",
+    }
+    body_bytes = _json.dumps(body_dict).encode("utf-8")
+    headers = sign_v07_request(
+        "POST", "/api/enrollment/v07",
+        body=body_bytes,
+        key_id=key_id, secret=secret,
+    )
+    headers["Content-Type"] = "application/json"
+    response = client.post(
+        "/api/enrollment/v07",
+        headers=headers,
+        content=body_bytes,
+    )
+    assert response.status_code == 409, (
+        f"preflight status={preflight_status!r}: expected 409, "
+        f"got {response.status_code}: {response.text}"
+    )
+    assert (
+        response.json()["detail"].split(": ")[0] == expected_error_code
+    ), f"got detail: {response.text}"
+
+
+def test_h07_enrollment_happy_path_requires_verifying_start(
+    client, agent_with_key
+):
+    """H7: when the row's status IS `verifying` (the only allowed
+    start state), the v0.7 enrollment endpoint transitions it
+    to `verified` and returns 200. This is the happy path that
+    the pre-existing test_v07_enrollment_endpoint_marks_agent_verified
+    already covers; this hardening test re-asserts it explicitly
+    with the state-machine context (preflight = 'verifying').
+
+    Together, H6 + H7 prove the strict-reject contract: only
+    `verifying` is allowed; any other status returns 409.
+    """
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    agent_id, key_id, secret = agent_with_key
+    db_path = client.app.state.db.db_path
+
+    # Pre-set the agent's status to 'verifying' (the only allowed
+    # start state for enrollment)
+    conn = _sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE agents SET status = 'verifying' WHERE id = ?",
+            (agent_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    body_dict = {
+        "agent_name": "test-vm",
+        "hostname": "test-host",
+        "os_type": "windows-11",
+    }
+    body_bytes = _json.dumps(body_dict).encode("utf-8")
+    headers = sign_v07_request(
+        "POST", "/api/enrollment/v07",
+        body=body_bytes,
+        key_id=key_id, secret=secret,
+    )
+    headers["Content-Type"] = "application/json"
+    response = client.post(
+        "/api/enrollment/v07",
+        headers=headers,
+        content=body_bytes,
+    )
+    assert response.status_code == 200, (
+        f"expected 200 from verifying start state, got "
+        f"{response.status_code}: {response.text}"
+    )
+    body = response.json()
+    assert body["status"] == "verified"
+    assert body["agent_id"] == agent_id
