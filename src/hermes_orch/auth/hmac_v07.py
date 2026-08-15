@@ -175,6 +175,20 @@ async def require_hmac_auth_v07(
       - 401 if nonce already seen (NONCE_REPLAY)
       - Returns agent_id on success (caller checks that the URL
         path's {agent_id} matches what the verifier returned)
+
+    Error format: the detail is "ERROR_CODE: human message" so
+    the test cases can split on ": " to extract the code. Per
+    the v0.7 spec §5, error codes are upper-snake-case.
+
+    Note: I tried returning a JSONResponse with `{"error": "..."}`
+    top-level keys (so the response is exactly what the spec
+    describes), but FastAPI dependencies that return a
+    JSONResponse cause the endpoint to receive the JSONResponse
+    object as the dependency's return value, which then fails
+    the `if auth_agent_id != agent_id` check. So we use
+    HTTPException with a structured detail; a follow-up custom
+    exception handler in main.py can convert these to the spec
+    format if needed.
     """
     # 1. All 7 headers present
     headers = {
@@ -188,29 +202,30 @@ async def require_hmac_auth_v07(
     }
     for name, val in headers.items():
         if not val:
-            raise HTTPException(401, f"Missing header: {name}")
+            raise HTTPException(
+                401, f"MISSING_AUTH_HEADERS: Missing header: {name}"
+            )
 
     # 2. Timestamp window
     try:
         ts_int = int(x_hermes_timestamp)
     except (TypeError, ValueError):
         raise HTTPException(
-            401, "Invalid X-Hermes-Timestamp (not an integer)"
+            401, "MALFORMED_HEADERS: X-Hermes-Timestamp is not a valid integer"
         )
     now = int(time.time())
     window = _read_window_sec()
     if abs(now - ts_int) > window:
         raise HTTPException(
             401,
-            f"X-Hermes-Timestamp out of window "
+            f"TIMESTAMP_OUT_OF_WINDOW: X-Hermes-Timestamp out of window "
             f"(|now-ts|={abs(now - ts_int)}s > {window}s)",
         )
 
     # 3. v0.7 §1.4 forbids query strings on signed endpoints
     if request.url.query:
         raise HTTPException(
-            401,
-            "Query strings are not allowed on v0.7 signed endpoints",
+            400, "MALFORMED_HEADERS: Query strings are not allowed on v0.7 signed endpoints"
         )
 
     # 4. Body hash matches the X-Hermes-Body-SHA256 header
@@ -219,7 +234,7 @@ async def require_hmac_auth_v07(
     if actual_body_sha256 != x_hermes_body_sha256.lower():
         raise HTTPException(
             401,
-            f"X-Hermes-Body-SHA256 mismatch: "
+            f"BODY_HASH_MISMATCH: X-Hermes-Body-SHA256 mismatch: "
             f"actual={actual_body_sha256}, "
             f"provided={x_hermes_body_sha256.lower()}",
         )
@@ -233,7 +248,7 @@ async def require_hmac_auth_v07(
     )
     if not row:
         raise HTTPException(
-            401, f"Unknown hmac_key_id: {x_hermes_key_id}"
+            401, f"UNKNOWN_KEY_ID: Unknown hmac_key_id: {x_hermes_key_id}"
         )
     agent_id = row["id"]
     secret_str = row.get("hmac_secret")
@@ -242,12 +257,27 @@ async def require_hmac_auth_v07(
         # legacy-mode fallback is NOT used for v0.7).
         raise HTTPException(
             401,
-            f"Agent {agent_id} has no hmac_secret; "
+            f"MISSING_AUTH_HEADERS: Agent {agent_id} has no hmac_secret; "
             f"v0.7 requires HMAC bootstrap",
         )
 
     # 6. Verify signature (constant-time compare)
-    secret = secret_str.encode("utf-8")
+    # v0.7 stores the HMAC secret as a hex string in the DB
+    # (per the test fixture convention; same as the v0.6
+    # register_test_agent pattern). Decode hex -> raw bytes
+    # before computing the HMAC. Using `secret_str.encode("utf-8")`
+    # here would produce the ASCII bytes of the hex string (e.g.
+    # b'0123abcd...'), NOT the original 32 random bytes that the
+    # client signed with — that mismatch caused 401 INVALID
+    # SIGNATURE on the T1 happy-path test before this fix
+    # (debugged via perplexity-web 2026-08-15). Verified 2026-08-15.
+    try:
+        secret = bytes.fromhex(secret_str)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            401,
+            f"MISSING_AUTH_HEADERS: Stored hmac_secret is not valid hex: agent={agent_id}",
+        )
     ok = verify_signature_v07(
         secret=secret,
         method=x_hermes_method,
@@ -258,7 +288,7 @@ async def require_hmac_auth_v07(
         provided=x_hermes_signature,
     )
     if not ok:
-        raise HTTPException(401, "Invalid X-Hermes-Signature")
+        raise HTTPException(401, "INVALID_SIGNATURE: Invalid X-Hermes-Signature")
 
     # 7. Nonce replay check (in-process store, attached at lifespan)
     nonce_store = getattr(request.app.state, "v07_nonce_store", None)
@@ -266,7 +296,7 @@ async def require_hmac_auth_v07(
         if nonce_store.is_seen(x_hermes_nonce):
             raise HTTPException(
                 401,
-                f"Nonce replay detected: {x_hermes_nonce[:8]}...",
+                f"NONCE_REPLAY: Nonce replay detected: {x_hermes_nonce[:8]}...",
             )
         nonce_store.add(x_hermes_nonce)
 

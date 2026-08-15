@@ -38,6 +38,13 @@ logger = logging.getLogger(__name__)
 # now the explicit list + the systematic test is the safety net.
 _HMAC_PATH_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^/api/agents/[^/]+/heartbeat/?$"),
+    # v0.7 §1.4 (2026-08-15): the v0.7 status endpoint for
+    # bootstrapper enrollment polling. The endpoint itself is
+    # HMAC-authed via Depends(require_hmac_auth_v07); the
+    # user-cookie middleware just passes it through. Per
+    # the existing BUGFIX convention, no trailing-slash
+    # required.
+    re.compile(r"^/api/agents/[^/]+/status/?$"),
     re.compile(r"^/api/agents/[^/]+/profiles/[^/]+/configs/pending/?$"),
     re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/cleanup-ack/?$"),
     re.compile(r"^/api/agents/[^/]+/sessions/[^/]+/terminal-ack/?$"),
