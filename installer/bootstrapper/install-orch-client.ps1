@@ -1,5 +1,5 @@
 ﻿# === install-orch-client.ps1 ===
-# v0.7.1 Orch Client Bootstrapper (DRAFT 3, 2026-08-13)
+# v0.7.2 Orch Client Bootstrapper (DRAFT 5, 2026-08-15)
 #
 # One-shot interactive install for the new orch client (PyInstaller + WiX
 # MSI per docs/proposals/orch-client-build-impl-plan-v0.7.md). Replaces the
@@ -401,6 +401,71 @@ function Start-AndWaitService {
     throw "SERVICE_NOT_RUNNING: The '$Name' service did not reach Running state within ${TimeoutSeconds}s. Current state: $($svc.Status). Check the Windows Event Log (eventvwr.msc -> Windows Logs -> Application, Source = '$Name') for details. Common causes: (a) config.yaml is malformed, (b) the orchestrator is unreachable from this machine, (c) the HMAC secret mismatch."
 }
 
+# === Add-FirewallRule (v0.7.2 NEW) ===
+# Idempotently adds a Windows Firewall outbound rule allowing TCP to the
+# orchestrator's FQDN:Port. Removes one user step from the per-machine
+# install flow (was: user had to add the rule manually in Windows Firewall
+# UI). Rule name is unique per FQDN:Port so multiple orch targets can coexist.
+#
+# Returns: hashtable with ok=true, created=$true|false (false if already
+# existed), rule_name=<string>.
+#
+# Throws:
+#   - FIREWALL_RULE_FAILED: netsh exited non-zero adding the rule
+function Add-FirewallRule {
+    param(
+        [Parameter(Mandatory)][string]$Fqdn,
+        [Parameter(Mandatory)][int]$Port
+    )
+    # Rule name includes FQDN+Port (no spaces in our format, but quote anyway)
+    $ruleName = "HermesOrchestrator Agent (Outbound) - ${Fqdn}:${Port}"
+
+    # Idempotent: check if rule already exists
+    & netsh.exe advfirewall firewall show rule name="$ruleName" 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-BootstrapLog 'INFO' "firewall_rule_already_exists: $ruleName"
+        return @{ ok = $true; created = $false; rule_name = $ruleName }
+    }
+
+    # Add the rule. netsh key=value args; build as an array for clean invocation.
+    $argList = @(
+        'advfirewall', 'firewall', 'add', 'rule',
+        "name=$ruleName",
+        'dir=Out',
+        'action=Allow',
+        'protocol=TCP',
+        'localport=any',
+        "remoteport=$Port",
+        'profile=any',
+        "description=Hermes Orchestrator Agent outbound to ${Fqdn}:${Port} (added by bootstrapper v$BootstrapperVersion)"
+    )
+    & netsh.exe @argList 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "FIREWALL_RULE_FAILED: Could not add Windows Firewall rule '$ruleName' (netsh exit code $LASTEXITCODE). The agent may not be able to reach the orchestrator. Try: (a) re-run this script as Administrator, (b) manually allow outbound TCP on port $Port via Windows Firewall, or (c) ask your operator to confirm the orchestrator port."
+    }
+    Write-BootstrapLog 'INFO' "firewall_rule_added: $ruleName"
+    return @{ ok = $true; created = $true; rule_name = $ruleName }
+}
+
+# === Remove-FirewallRule (v0.7.2 NEW) ===
+# Best-effort cleanup of the firewall rule added by Add-FirewallRule.
+# Used by the catch block when a later install step fails (rollback).
+# Does NOT throw if the rule doesn't exist; just logs.
+function Remove-FirewallRule {
+    param(
+        [Parameter(Mandatory)][string]$Fqdn,
+        [Parameter(Mandatory)][int]$Port
+    )
+    $ruleName = "HermesOrchestrator Agent (Outbound) - ${Fqdn}:${Port}"
+    & netsh.exe advfirewall firewall delete rule name="$ruleName" 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-BootstrapLog 'INFO' "firewall_rule_removed: $ruleName"
+    } else {
+        # Non-zero is acceptable (rule may not have existed); just log a warn
+        Write-BootstrapLog 'WARN' "firewall_rule_remove_exit_$LASTEXITCODE (best-effort, ignored): $ruleName"
+    }
+}
+
 # === Wait-ForEnrollment (Draft 4 NEW) ===
 # Polls the orchestrator's HMAC-signed /api/agents/<agent_id>/status
 # endpoint for up to 60s (configurable). Returns when status='verified'.
@@ -497,11 +562,12 @@ function Wait-ForEnrollment {
 }
 
 # === Show-PlainEnglishError (Draft 4 NEW — extract from inline switch) ===
-# Maps internal exception codes / messages to the 12 plain-English
-# error messages from the v0.7.1 §0.af-bootstrap-errors table. Per the
-# user profile, NEVER shows a stack trace, .NET HRESULT, or raw
-# exception message; every error has: (a) what happened, (b) what the
-# user does, (c) who to ask.
+# Maps internal exception codes / messages to the 13 plain-English
+# error messages from the v0.7.2 §0.af-bootstrap-errors table (12 from
+# v0.7.1 + FIREWALL_RULE_FAILED added in v0.7.2). Per the user profile,
+# NEVER shows a stack trace, .NET HRESULT, or raw exception message;
+# every error has: (a) what happened, (b) what the user does, (c) who
+# to ask.
 function Show-PlainEnglishError {
     param([string]$Message)
     switch -Wildcard ($Message) {
@@ -537,6 +603,17 @@ function Show-PlainEnglishError {
             Write-Host ''
             Write-Host 'An OrchClient service is already installed on this machine.' -ForegroundColor Red
             Write-Host 'The bootstrapper refuses to install over an existing service. To reinstall, first uninstall via Add/Remove Programs, then re-run this bootstrapper.' -ForegroundColor Red
+        }
+        'FIREWALL_RULE_FAILED' {
+            Write-Host ''
+            Write-Host 'Could not add the Windows Firewall rule for the orchestrator.' -ForegroundColor Red
+            Write-Host 'The agent may not be able to reach the orchestrator.' -ForegroundColor Red
+            Write-Host '' -ForegroundColor Red
+            Write-Host 'Try in order:' -ForegroundColor Red
+            Write-Host '  1. Right-click PowerShell and re-run this script as Administrator.' -ForegroundColor Red
+            Write-Host '  2. Manually add an outbound allow rule: Windows Firewall with Advanced Security' -ForegroundColor Red
+            Write-Host '     -> Outbound Rules -> New Rule -> Port -> TCP -> remote port = <orch port> -> Allow.' -ForegroundColor Red
+            Write-Host '  3. Ask your operator to confirm the orchestrator port is correct.' -ForegroundColor Red
         }
         'MSI_NOT_FOUND' {
             Write-Host ''
@@ -614,7 +691,7 @@ try {
     # (Day 4 will move it to the top as a clean refactor.)
 
     Write-Host ''
-    Write-Host '=== Orch Client Bootstrapper v0.7.1 (Draft 3) ===' -ForegroundColor Cyan
+    Write-Host '=== Orch Client Bootstrapper v0.7.2 (Draft 5) ===' -ForegroundColor Cyan
     Write-Host ''
     Write-Host 'Your operator will give you the values below. The HMAC secret is' -ForegroundColor Gray
     Write-Host 'hidden as you type. Press Enter to accept a default in [brackets].' -ForegroundColor Gray
@@ -716,6 +793,18 @@ try {
     }
     Write-BootstrapLog 'INFO' 'pre-flight=PASS (10 checks; 1 warning; 0 errors)'
 
+    # === v0.7.2: AUTO-ADD FIREWALL RULE (one less step for the user) ===
+    Write-Host ''
+    Write-Host 'Add Windows Firewall rule (outbound allow)...' -ForegroundColor Cyan
+    $fwResult = Add-FirewallRule -Fqdn $OrchFqdn -Port $OrchPort
+    if ($fwResult.created) {
+        Write-Host '  [+] Firewall rule added: ' $fwResult.rule_name -ForegroundColor Green
+    } else {
+        Write-Host '  [+] Firewall rule already exists: ' $fwResult.rule_name -ForegroundColor Green
+    }
+    $Script:FirewallRuleCreated = $fwResult.created
+    Write-BootstrapLog 'INFO' "firewall_rule_ok: created=$($fwResult.created)"
+
     # === INSTALL (Draft 3: REAL) ===
     Write-Host ''
     Write-Host 'Install OrchClient MSI...' -ForegroundColor Cyan
@@ -785,6 +874,18 @@ try {
 } catch {
     # === DRAFT 4: full 12-case error mapping via Show-PlainEnglishError ===
     $msg = $_.Exception.Message
+    # v0.7.2: best-effort cleanup of firewall rule if we created it before
+    # a later step failed (rollback). Errors here are warnings, not fatal —
+    # we never want to mask the original error from the user.
+    if ($Script:FirewallRuleCreated) {
+        try {
+            Remove-FirewallRule -Fqdn $OrchFqdn -Port $OrchPort
+            Write-Host '' -ForegroundColor Yellow
+            Write-Host '(Rolled back the firewall rule added earlier in this run.)' -ForegroundColor Yellow
+        } catch {
+            Write-BootstrapLog 'WARN' "firewall_rule_cleanup_failed: $($_.Exception.Message)"
+        }
+    }
     Show-PlainEnglishError -Message $msg
     Write-BootstrapLog 'ERROR' "FAILED: $msg"
     exit 1

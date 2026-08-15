@@ -1,7 +1,7 @@
-# Orch Client Build — Implementation Plan v0.7 (final plan-only iteration) + cert-pinning patch + v0.7.1 bootstrapper
+# Orch Client Build — Implementation Plan v0.7 (final plan-only iteration) + cert-pinning patch + v0.7.1 bootstrapper + v0.7.2 firewall auto-add
 
-**Date:** 2026-08-13
-**Status:** PROPOSAL for review (Perplexity + operator) — v0.7 + cert-pinning patch + v0.7.1 bootstrapper
+**Date:** 2026-08-15 (v0.7.2 patch added)
+**Status:** PROPOSAL for review (Perplexity + operator) — v0.7 + cert-pinning patch + v0.7.1 bootstrapper + v0.7.2 firewall auto-add
 **Supersedes:** v0.6 (commit `aa49a71` on branch `proposal/orch-client-build-impl-plan-v0.1`)
 **Scope:** end-to-end build of a Windows MSI installer for the new orch
 client, on the orchestrator host (Windows A). The MSI will be carried
@@ -116,6 +116,104 @@ script, just run `install-orch-client.ps1` as Administrator. The 8
 manual steps below are for operators / power users only." The
 manual steps are demoted to a "Manual install (advanced)" section at
 the bottom, not deleted.
+
+---
+
+## 0.quart v0.7.2 firewall auto-add patch (2026-08-15)
+
+After the v0.7.1 bootstrapper landed, the operator (target audience
+for productization) raised the deeper product question: **"can a
+regular user actually do all these steps?"** Deep-review of the
+install flow surfaced 3 friction points that an honest regular user
+cannot do without operator help:
+
+1. **Get the cert fingerprint (64 hex chars)** — requires the user to
+   SSH/RDP into the orch server, run `openssl x509 -fingerprint -sha256
+   -noout`, copy 64 chars, paste into the bootstrapper. One typo =
+   `CERT_MISMATCH`.
+2. **Get the `key_id` (random 32 chars)** — requires the user to have
+   admin on the orch server, create the agent in the admin UI, copy
+   the assigned `key_id`.
+3. **Get the `enrollment_token` (random 64+ chars)** — operator-issued,
+   communicated out-of-band.
+
+The user CAN type 7 prompts. The user CAN click "Yes" on UAC. The user
+CAN read a plain-English error. But typing 64-char hex strings is
+real friction; a regular user will get it wrong on the first try.
+
+**v0.7.2 scope (this patch):** eliminate the 4th friction point that
+**the user CAN avoid with our help**: the Windows Firewall outbound
+allow rule for the orchestrator port. Today, after the bootstrapper
+runs, the user has to manually open Windows Firewall with Advanced
+Security → Outbound Rules → New Rule → Port → TCP → <port> → Allow
+(4-5 dialog clicks, multiple decisions, easy to get wrong).
+
+**What v0.7.2 changes:**
+
+- **Auto-add firewall rule** — new `Add-FirewallRule` function in
+  `installer/bootstrapper/install-orch-client.ps1` runs after
+  pre-flight passes and before MSI install. It calls
+  `netsh advfirewall firewall add rule` with a unique rule name
+  `HermesOrchestrator Agent (Outbound) - <fqdn>:<port>` (unique per
+  orch target, so multiple orchs can coexist). The add is idempotent:
+  if the rule already exists (re-run), it's a no-op. Returns a
+  hashtable `{ ok=true, created=$true|false, rule_name=<string> }`.
+
+- **`Remove-FirewallRule` rollback helper** — best-effort cleanup of
+  the rule if a later install step fails. Wired into the outer catch
+  block: if `$Script:FirewallRuleCreated` is true, remove the rule
+  before showing the plain-English error. Errors during cleanup are
+  logged as warnings (never mask the original error).
+
+- **New `FIREWALL_RULE_FAILED` plain-English error case** — 13th case
+  in `Show-PlainEnglishError`. Tells the user (a) what happened, (b)
+  3 fallback options in order: re-run as Admin, manually add the rule
+  via Windows Firewall UI, or ask the operator to confirm the port.
+
+- **Version bump v0.7.1 → v0.7.2** in the header, banner, and
+  design-reference comment. Internal Draft 4 → Draft 5 (one new draft
+  for the firewall auto-add).
+
+**What v0.7.2 does NOT change (deferred to v0.8 / invite token):**
+
+- **Cert fingerprint typing friction** — addressed by v0.8 invite
+  token (one short token encodes orch URL + cert fingerprint + key_id
+  + agent_id + enrollment token, user pastes once). The invite token
+  work is a separate scope (3-5 days) and is the **true gate** for
+  productization to a regular user; v0.7.2 is a quick win on the
+  path to v0.8.
+- **Code signing of the bootstrapper** — bootstrapper `.ps1` is still
+  unsigned. For internal / pilot use, this is acceptable (operator
+  hands the script to the user via SMB / chat). For broad
+  distribution, Authenticode or Azure Trusted Signing is required.
+- **HTTPS server-side change** — orthogonal to this patch. The
+  bootstrapper already uses `https://` in `Wait-ForEnrollment`. The
+  server-side HTTPS switch is a separate track (estimated 1-2 days
+  with NSSM + cert + config.yaml + restart ceremony).
+
+**Files changed in v0.7.2:**
+
+| File | Before | After | Delta |
+|---|---|---|---|
+| `installer/bootstrapper/install-orch-client.ps1` | 36988 bytes (18 functions, 14 error cases) | 42112 bytes (20 functions, 15 error cases) | +5124 bytes, +2 functions, +1 error case |
+| `docs/runbooks/orch-client-install-runbook.md` | v0.4 (8-step manual + bootstrapper reference) | v0.4.1 (added §0.3 firewall patch changelog row 15-16) | +2 rows in changelog |
+| `docs/proposals/orch-client-build-impl-plan-v0.7.md` | v0.7 + cert-pinning + v0.7.1 (header) | v0.7 + cert-pinning + v0.7.1 + v0.7.2 (this section) | +this section |
+
+**Acceptance criteria for v0.7.2:**
+
+1. PowerShell parser: 0 errors on `install-orch-client.ps1` (verified)
+2. UTF-8 BOM preserved (verified: `EF BB BF`)
+3. Function count: 18 → 20 (verified: 20)
+4. `Show-PlainEnglishError` error cases: 14 → 15 (verified: 15, with
+   `EXISTING_SERVICE*` wildcard counted)
+5. New `Add-FirewallRule` call appears between pre-flight pass and
+   MSI install (verified: line ~720)
+6. Catch block has best-effort `Remove-FirewallRule` rollback if
+   `$Script:FirewallRuleCreated` is true (verified: catch block at
+   end of script)
+7. NOT YET VM-TESTED: actual `netsh advfirewall firewall add rule`
+   invocation on a real Windows machine. The PowerShell parser
+   check is the static gate; the VM test gate is a follow-up.
 
 ---
 
@@ -1222,6 +1320,14 @@ A-M: same as v0.5 (file system layout, ACLs, service registration, doctor binary
 - Bootstrapper log file (`C:\ProgramData\HermesOrchClient\install.log`) is human-readable with timestamps + plain-English messages
 - Bootstrapper is added to `MANIFEST.json::payload_inventory` with `role='bootstrapper'` and the SHA-256 of the shipped file
 
+**P (v0.7.2 added — firewall auto-add)**:
+- Bootstrapper `install-orch-client.ps1` auto-adds a Windows Firewall outbound allow rule via `netsh advfirewall firewall add rule` (no manual firewall UI steps required from the user)
+- Rule name format: `HermesOrchestrator Agent (Outbound) - <fqdn>:<port>` (unique per orch target)
+- Idempotent: re-running the bootstrapper is a no-op if the rule already exists
+- `netsh` failure surfaces as a plain-English `FIREWALL_RULE_FAILED` error with 3 fallback options (re-run as Admin, manual firewall rule via UI, ask operator)
+- If MSI install / config write / service start / enrollment poll fails AFTER the rule was added, the catch block best-effort removes the rule (rollback) before showing the user the error
+- PowerShell parser reports 0 errors; UTF-8 BOM preserved (`EF BB BF`); 20 functions (was 18); 15 plain-English error cases (was 14)
+
 ---
 
 ## 10. What I will NOT do (without separate approval)
@@ -1254,6 +1360,8 @@ A-M: same as v0.5 (file system layout, ACLs, service registration, doctor binary
 | Manifest handling | (n/a) | Object throughout, JSON once, read-back + parse + assert gate |
 | Bootstrapper (v0.7.1) | (n/a) | `install-orch-client.ps1` ships in MSI bundle directory; PowerShell parser 0 errors; 7 interactive prompts (FQDN, port, cert fingerprint, agent_id, key_id, enrollment_token, HMAC secret) with format validators; 12 plain-English error cases (zero stack traces); MSI install + config.yaml + agent-secret.bin + SDDL + service start + 60s enrollment poll; success in < 2 min on happy path; bootstrapper is added to MANIFEST.json payload_inventory with role='bootstrapper' and SHA-256 |
 | Runbook v0.4 | (n/a) | Adds "Quick start" section pointing to bootstrapper; demotes 8 manual steps to "Manual install (advanced)" section at the bottom |
+| Bootstrapper (v0.7.2) | (n/a) | `install-orch-client.ps1` auto-adds a Windows Firewall outbound allow rule via `netsh advfirewall firewall add rule` after pre-flight and before MSI install; unique rule name per FQDN:Port (multi-orch coexistence); idempotent (no-op if rule exists); rollback on later install failure; new `FIREWALL_RULE_FAILED` plain-English error case (15 total). PowerShell parser 0 errors, UTF-8 BOM preserved, 20 functions (was 18). Removes 1 user-facing step (4-5 dialog clicks in Windows Firewall UI) for the "regular user" target audience |
+| Runbook v0.4.1 | (n/a) | §0.3 changelog: 2 new rows documenting v0.4 → v0.4.1 firewall auto-add patch and the 13 → 14 → 15 plain-English error case count |
 
 ---
 

@@ -1,9 +1,9 @@
 # Orch Client Install & Register Runbook (Windows target)
 
-> **v0.4** — aligned with `docs/proposals/orch-client-build-impl-plan-v0.7.md`
-> (`a09b4ee` on branch `proposal/orch-client-build-impl-plan-v0.1`) +
-> v0.7 cert-pinning patch + v0.7.1 bootstrapper patch. See the plan's
-> §0.ter (bootstrapper patch) and §0.af-bootstrap (bootstrapper design).
+> **v0.4.1** — aligned with `docs/proposals/orch-client-build-impl-plan-v0.7.md`
+> + v0.7 cert-pinning patch + v0.7.1 bootstrapper patch + **v0.7.2 firewall
+> auto-add patch**. See the plan's §0.ter (bootstrapper patch),
+> §0.quart (firewall auto-add patch), and §0.af-bootstrap (bootstrapper design).
 >
 > **For a new operator.** Assumes the orchestrator is already running on
 > another machine (the "orchestrator host"). This runbook is executed on
@@ -95,6 +95,13 @@ host.
 |---|---|---|---|
 | 13 | No Quick-start section; the runbook jumped straight into 8 manual PowerShell steps | New "Quick start" section at the top: "if your operator gave you `install-orch-client.ps1`, just run it as Administrator. The 8 manual steps below are for operators and power users only." The bootstrapper collects the same 7 values interactively, validates them, runs the install, and verifies enrollment | User profile (locked): target audience is semi-technical, NOT developers. A 8-step PowerShell runbook with a manual base64 secret write is a 7-place footgun. The bootstrapper reduces 8 steps + 7 manual YAML edits + 1 base64 secret write to one interactive script with plain-English error messages at every failure |
 | 14 | Step 1-8 presented as the user-facing path | All 8 steps demoted to a "Manual install (advanced)" section at the bottom, with a note that "every step below corresponds to a section of the bootstrapper source code (`installer/bootstrapper/install-orch-client.ps1`)" | Manual install is still the reference for operators / power users; it is NOT deleted. The Quick start supersedes it as the user-facing path |
+
+### 0.3 v0.4 → v0.4.1 firewall auto-add patch (2026-08-15)
+
+| # | v0.4 said | v0.4.1 says | Reason |
+|---|---|---|---|
+| 15 | User has to manually add a Windows Firewall outbound allow rule for the orchestrator port (TCP 8765 or whatever port the operator chose) before the agent can reach the orchestrator. The bootstrapper's `PORT_UNREACHABLE` error tells the user to "check firewall" but doesn't fix it | The bootstrapper auto-adds a Windows Firewall outbound allow rule via `netsh advfirewall firewall add rule` as part of the install flow, right after pre-flight and before MSI install. The rule name is `HermesOrchestrator Agent (Outbound) - <fqdn>:<port>` (unique per orch target, so multiple orchs can coexist). The add is idempotent: if the rule already exists, it's a no-op. A new `FIREWALL_RULE_FAILED` plain-English error case handles the rare netsh failure. If a later install step fails after the rule was added, the catch block best-effort removes the rule (rollback) before showing the error | The "user manually edits Windows Firewall" step is the single biggest friction for a regular user — 4-5 dialog clicks, they have to know "Outbound Rules", "Port", "TCP", the right port number. Auto-add removes that step entirely. The user's mental model collapses to: "I ran the script, it asked me 7 questions, it said SUCCESS in 2 minutes." Matches the user-profile principle: "東西都齊, 就是怎樣方便新user 安裝" |
+| 16 | 13 plain-English error cases (12 from v0.7.1 + EXISTING_SERVICE* wildcard) | 14 plain-English error cases (added FIREWALL_RULE_FAILED) | New failure mode needs a new error mapping. The error message includes 3 fallback options so the user can self-recover without operator intervention |
 | 15 | Header / `## 0. v0.1 → v0.2 changelog` did not mention bootstrapper | Header bumped to v0.4; changelog gets a `### 0.2` subsection listing the Quick-start + manual-demotion | Change is structural, not a content correction |
 
 **The 8 manual steps (Step 1 through Step 8 + Uninstall + Troubleshooting
