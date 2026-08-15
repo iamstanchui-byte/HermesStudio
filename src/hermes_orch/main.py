@@ -221,6 +221,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     db = Database(db_path)
     await db.connect()
     app.state.db = db
+    # v0.7 §1.4 (2026-08-15): in-process nonce store for HMAC replay
+    # protection. Attached to app.state so the v0.7 verifier
+    # (auth/hmac_v07.py::require_hmac_auth_v07) can read it on every
+    # request. Per-uvicorn-worker; production with multiple workers
+    # would need Redis (out of scope for v0.7; see impl plan §7).
+    from hermes_orch.auth.nonce_store import InMemoryNonceStore
+    app.state.v07_nonce_store = InMemoryNonceStore(ttl_seconds=300)
     # v3.12.2 #3: supervisor uses its own aiosqlite connection so its
     # tick-loop writes don't compete with the API on the same
     # in-process connection. The 2026-08-04 incident showed that

@@ -73,20 +73,61 @@ def client(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def agent_with_key():
-    """Yield (agent_id, key_id, secret_bytes) for a fresh test agent.
+def agent_with_key(client, tmp_path, monkeypatch):
+    """Yield (agent_id, key_id, secret_bytes) for a fresh test agent
+    inserted into the tmp DB.
 
-    For the TDD red phase (step 2), this is a STUB that returns fresh
-    test data WITHOUT inserting into the DB. Step 5 (DB migration
-    adding the agents.hmac_key_id UNIQUE column) replaces this with
-    a real DB insert. Until then, the tests will fail with 401
-    UNKNOWN_KEY_ID or 404 if the v0.7 routes existed, which is the
-    correct red-phase behavior.
+    Step 4 + 5 update (2026-08-15): now does a real DB insert. The
+    agent row has BOTH the v1.6 hmac_secret (string) AND the v0.7
+    hmac_key_id (UNIQUE). The `client` fixture is required so the
+    monkeypatched Database points at the test DB.
     """
+    import sqlite3 as _sqlite3
+    import time as _time
+    import hashlib as _h
+
     agent_id = f"win-test-{uuid.uuid4().hex[:8]}"
     key_id = f"key-{agent_id}"
     secret = os.urandom(32)
-    yield (agent_id, key_id, secret)
+    secret_str = secret.hex()  # v0.7 helper encodes bytes as hex string
+    secret_hash = _h.sha256(secret_str.encode("utf-8")).hexdigest()
+    now = _time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Get the tmp DB path from the Database instance (which has
+    # been monkeypatched to use the tmp path by the client fixture).
+    db_path = client.app.state.db.db_path
+    conn = _sqlite3.connect(str(db_path))
+    try:
+        # Idempotent: delete + insert (matches the v1.6
+        # register_test_agent pattern in tests/_hmac_util.py).
+        conn.execute(
+            "DELETE FROM agent_profiles WHERE agent_id = ?", (agent_id,)
+        )
+        conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+        conn.execute(
+            "INSERT INTO agents (id, secret_hash, hmac_secret, "
+            "hmac_key_id, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'verified', ?)",
+            (agent_id, secret_hash, secret_str, key_id, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        yield (agent_id, key_id, secret)
+    finally:
+        # Cleanup: remove the test agent row
+        conn = _sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "DELETE FROM agent_profiles WHERE agent_id = ?",
+                (agent_id,),
+            )
+            conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 @pytest.fixture

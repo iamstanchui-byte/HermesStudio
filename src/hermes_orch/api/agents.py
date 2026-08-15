@@ -9,6 +9,7 @@ Endpoints:
 - DELETE /api/agents/{id}                  — delete agent
 - POST   /api/agents/{id}/secret           — set/push the HMAC shared secret (v1.6 bootstrap)
 - POST   /api/agents/{id}/heartbeat        — agent heartbeat (HMAC-authed)
+- GET    /api/agents/{id}/status           — v0.7 agent status (HMAC-authed via v0.7 §1.4)
 - POST   /api/agents/{id}/rotate-key        — rotate secret
 - POST   /api/agents/{id}/profiles         — add new profile
 - DELETE /api/agents/{id}/profiles/{name}  — remove profile
@@ -42,6 +43,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from hermes_orch.auth import require_hmac_auth
+from hermes_orch.auth.hmac_v07 import require_hmac_auth_v07
 
 from hermes_orch.core.audit import audit_log
 from hermes_orch.utils import now_iso as _now_iso
@@ -970,6 +972,64 @@ async def heartbeat(
         # Defensive: same None -> 1 coercion as _agent_with_profiles
         # (legacy DB without the column would have None here).
         "max_concurrent_tasks": int(agent.get("max_concurrent_tasks") or 1),
+    }
+
+
+# === v0.7 §1.4: GET /api/agents/{id}/status ===
+
+@router.get("/{agent_id}/status")
+async def get_agent_status(
+    agent_id: str,
+    request: Request,
+    auth_agent_id: str = Depends(require_hmac_auth_v07),
+) -> dict:
+    """v0.7 §1.4 agent status endpoint. HMAC-authenticated.
+
+    The orch client (bootstrapper's Wait-ForEnrollment + the running
+    orch-client service) polls this endpoint during enrollment and
+    afterwards. Returns the agent's current status (one of:
+    'verifying', 'verified', 'blocked', 'suspended') plus timestamps.
+
+    Authentication is via the v0.7 §1.4 7-header format
+    (require_hmac_auth_v07 dependency). The verifier:
+      1. Checks all 7 X-Hermes-* headers are present
+      2. Validates timestamp within window
+      3. Rejects query strings (v0.7 §1.4 forbids)
+      4. Validates body SHA-256 (always the empty-body hash for GET)
+      5. Looks up the agent by hmac_key_id (NOT by id)
+      6. Constant-time compares the signature
+      7. Rejects replayed nonces
+
+    On success, the verifier returns the looked-up agent_id. We
+    then check that it matches the URL path's {agent_id} (so a
+    validly-signed v0.7 request for agent A can't read agent B's
+    status — same security check as v1.6 heartbeat).
+
+    Returns: {"status": "...", "agent_id": "...", "last_heartbeat_at": "..."}
+    The 1-field "status" response is what the bootstrapper's
+    Wait-ForEnrollment polls for (it returns when status == "verified").
+    """
+    # Defense in depth: the URL {agent_id} must match the
+    # verifier-returned auth_agent_id (looked up by hmac_key_id).
+    if auth_agent_id != agent_id:
+        raise HTTPException(
+            401,
+            f"Auth agent_id ({auth_agent_id}) does not match URL "
+            f"path agent_id ({agent_id})",
+        )
+
+    db = request.app.state.db
+    row = await db.fetchone(
+        "SELECT id, status, last_heartbeat_at FROM agents WHERE id = ?",
+        (agent_id,),
+    )
+    if not row:
+        raise HTTPException(404, f"Agent not found: {agent_id}")
+
+    return {
+        "agent_id": row["id"],
+        "status": row.get("status") or "unknown",
+        "last_heartbeat_at": row.get("last_heartbeat_at"),
     }
 
 
