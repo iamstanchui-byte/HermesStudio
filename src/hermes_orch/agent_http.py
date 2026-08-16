@@ -114,3 +114,129 @@ def patch(url: str, **kwargs: Any):
 def delete(url: str, **kwargs: Any):
     """httpx.delete with the wrapper's verify policy applied."""
     return httpx.delete(url, verify=_VERIFY, **kwargs)
+
+
+# ===== Scheme-fallback helpers (2026-08-16 wrapper self-heal) =====
+#
+# Production story:
+#   1. Operator flipped the server from HTTP to HTTPS on 2026-08-15.
+#   2. Every wrapper with `orchestrator_url: "http://..."` in
+#      wrapper-config.json broke. They couldn't reach the server any
+#      more (port 8765 is HTTPS-only now).
+#   3. We manually SSH'd into each agent host and edited the JSON
+#      to flip the URL to https. Worked for 2 hosts, but doesn't
+#      scale.
+#
+# Design:
+#   When a wrapper's heartbeat / config-poll / ack call gets a
+#   TCP-level failure (connection refused, timeout, "server
+#   disconnected"), the wrapper now retries with the other scheme
+#   (http <-> https). On success the wrapper re-reads `/api/server/info`
+#   to learn the canonical URL, then writes it to
+#   `wrapper-config.json` so the next restart uses the new URL.
+#
+#   The retry is bounded to ONE attempt with the other scheme. If
+#   both fail, the LAST error propagates so the existing logging +
+#   back-off behaviour continues to work. The retry is suppressed
+#   for non-connection failures (e.g. invalid URL, HTTP 5xx) because
+#   swapping scheme would not help and could mask real bugs.
+#
+# Security:
+#   With `INSECURE_SKIP_TLS_VERIFY=1` (test mode, self-signed cert)
+#   an MITM on either scheme is possible -- fallback is no worse
+#   than the current state. With cert verification on (certifi or
+#   ORCHESTRATOR_CA_BUNDLE) the wrapper already rejects MITM certs;
+#   fallback is safe. Long-term the v0.7.3 cert fingerprint pin
+#   eliminates the concern entirely.
+
+
+def _swap_scheme(url: str) -> str:
+    """Return `url` with its scheme toggled http<->https. Path, query,
+    fragment, userinfo, and port are preserved verbatim.
+
+    The function is intentionally narrow: it only handles `http` and
+    `https`. Other schemes (e.g. `ws://`, `ftp://`) pass through
+    unchanged so we don't accidentally rewrite a non-HTTP URL the
+    caller is using for a different purpose. Non-strings raise.
+    """
+    if not isinstance(url, str):
+        raise TypeError(f"_swap_scheme requires str, got {type(url).__name__}")
+    if url.startswith("https://"):
+        return "http://" + url[len("https://"):]
+    if url.startswith("http://"):
+        return "https://" + url[len("http://"):]
+    # unknown / non-http scheme: pass through. Callers should pre-validate.
+    return url
+
+
+def _classify_failure(exc: BaseException) -> str:
+    """Classify a httpx exception for the fallback decision.
+
+    Returns one of:
+      - "connection"  : swap scheme and retry (TCP / TLS / wire errors)
+      - "other"       : propagate as-is (invalid URL, HTTP status, etc.)
+
+    'connection' covers the cases where the server MIGHT be on the
+    other scheme (e.g. an HTTPS server returns nothing over plain
+    HTTP, which the kernel reports as a connection failure). 'other'
+    covers everything else, where swapping scheme would just turn
+    one failure into another.
+    """
+    import httpx as _httpx
+    # ConnectError = ConnectError (TCP refused / no route / etc.)
+    # ConnectTimeout / ReadTimeout / PoolTimeout = transient network
+    # RemoteProtocolError = wire-level garbage (e.g. plain HTTP
+    #   against HTTPS) -- exactly the symptom of a server-flip
+    if isinstance(exc, (
+        _httpx.ConnectError,
+        _httpx.ConnectTimeout,
+        _httpx.ReadTimeout,
+        _httpx.PoolTimeout,
+        _httpx.RemoteProtocolError,
+    )):
+        return "connection"
+    return "other"
+
+
+def request_with_fallback(method: str, url: str, **kwargs: Any):
+    """Call `httpx.<method>(url, ...)` with the wrapper's verify policy
+    applied. On a classified "connection" failure, retry once with the
+    other scheme. Return `(response, actual_url)`.
+
+    On a non-connection failure, the exception propagates immediately
+    (no retry). If both attempts fail, the LAST exception propagates
+    so the caller's existing error handling / back-off still fires.
+
+    The caller is expected to:
+      1. Use this for periodic checks (heartbeat, config poll, ack).
+      2. After a successful call, fetch `/api/server/info` to learn
+         the canonical URL.
+      3. If the canonical URL differs from the configured URL, write
+         it to wrapper-config.json. Next restart uses the new URL.
+    """
+    # Lazy import to avoid a circular import: agent_cli imports
+    # agent_http at module load, so importing httpx here would
+    # potentially re-enter agent_cli.
+    import httpx as _httpx
+
+    # Map method name to httpx.<method> callable.
+    fn_name = method.lower()
+    fn = getattr(_httpx, fn_name, None)
+    if fn is None:
+        raise ValueError(f"unsupported HTTP method: {method!r}")
+
+    try:
+        resp = fn(url, verify=_VERIFY, **kwargs)
+        return resp, url
+    except BaseException as exc:
+        kind = _classify_failure(exc)
+        if kind != "connection":
+            raise
+        # Try the other scheme. If THAT also fails with a connection
+        # error, surface the new error (which is more recent and
+        # likely more informative -- e.g. "no HTTPS server on 8765"
+        # beats the original "no HTTP server on 8765" when the
+        # server actually moved to HTTPS).
+        alt_url = _swap_scheme(url)
+        resp = fn(alt_url, verify=_VERIFY, **kwargs)
+        return resp, alt_url

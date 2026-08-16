@@ -130,3 +130,79 @@ async def restart_server(request: Request, response: Response) -> RestartOut:
     # Unreachable in supervised/direct mode (process is gone).
     # Unreachable in undetectable mode too (handled above).
     return out
+
+
+# ===== Wrapper self-heal scheme discovery (2026-08-16) =====
+#
+# When the server flips between HTTP and HTTPS (or changes
+# public_origin for any other reason), every wrapper that hard-codes
+# the old URL in wrapper-config.json breaks. We don't want operators
+# to SSH into every agent host and edit the JSON by hand.
+#
+# This endpoint is the source of truth: the wrapper calls it (over
+# whatever URL it currently has configured) to learn the canonical
+# scheme + public_origin + cert fingerprint, then writes that to
+# wrapper-config.json locally. Next restart uses the new URL.
+#
+# No auth: the response is just public config -- anyone who can
+# reach the port can already learn whether it's TLS. The
+# fingerprint is bonus data for a future v0.7.3-style pinning path.
+class ServerInfoOut(BaseModel):
+    scheme: str                    # "http" | "https"
+    public_origin: str             # bare URL, e.g. "https://hermes-win:8765"
+    cert_fingerprint_sha256: str   # 64-char hex; "" if scheme=http
+
+
+def _compute_cert_fingerprint(cert_path: str) -> str:
+    """Return lower-case hex SHA-256 of the cert DER bytes.
+
+    Empty string if the file is missing or unreadable (we don't
+    want this endpoint to 500 on a misconfigured cert -- it's a
+    discovery helper, not a critical-path).
+    """
+    if not cert_path:
+        return ""
+    try:
+        from pathlib import Path
+        data = Path(cert_path).read_bytes()
+    except (OSError, ValueError):
+        return ""
+    # PEM → DER: strip the header/footer + base64-decode. We use
+    # stdlib only to avoid a new dependency. (cryptography is already
+    # a project dep and used in tests, but keeping the server
+    # hot-path stdlib-only is a small win.)
+    import base64
+    import re as _re
+    m = _re.search(
+        rb"-----BEGIN CERTIFICATE-----\s*(.+?)\s*-----END CERTIFICATE-----",
+        data,
+        _re.DOTALL,
+    )
+    if not m:
+        return ""
+    der = base64.b64decode(m.group(1))
+    import hashlib
+    return hashlib.sha256(der).hexdigest()
+
+
+@router.get("/info", response_model=ServerInfoOut)
+async def server_info(request: Request) -> ServerInfoOut:
+    """Return the orchestrator's current scheme + public_origin + cert fingerprint.
+
+    Used by agent wrappers for self-heal after the server flips between
+    HTTP and HTTPS (or any other public_origin change). The wrapper
+    re-reads this on heartbeat and persists the URL to
+    wrapper-config.json on the agent host.
+
+    See tests/test_server_info_endpoint.py for the contract.
+    """
+    cfg = request.app.state.config or {}
+    https_cfg = (cfg.get("https") or {})
+    scheme = "https" if https_cfg.get("enabled") else "http"
+    public_origin = request.app.state.public_origin or ""
+    cert_path = (https_cfg.get("ssl_cert_path") or "").strip()
+    return ServerInfoOut(
+        scheme=scheme,
+        public_origin=public_origin,
+        cert_fingerprint_sha256=_compute_cert_fingerprint(cert_path),
+    )
