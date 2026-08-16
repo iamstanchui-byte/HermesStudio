@@ -466,6 +466,7 @@ def create_app() -> FastAPI:
         "/approval/",  # magic-link approval (future)
         "/api/auth/",
         "/api/health",
+        "/api/server/info",  # wrapper self-heal discovery (no auth, public config)
         "/docs",  # FastAPI auto-generated
         "/openapi.json",
         "/redoc",

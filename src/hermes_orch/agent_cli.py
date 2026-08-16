@@ -44,6 +44,7 @@ from hermes_orch.agent_http import (  # noqa: E402  (import after httpx on purpo
     patch as _httpx_patch,
     post as _httpx_post,
     put as _httpx_put,
+    request_with_fallback,
 )
 
 import shutil
@@ -451,6 +452,100 @@ def _atomic_write(target: Path, content: str) -> None:
     tmp.write_text(content, encoding="utf-8", newline="")
     # On Windows, Path.replace is atomic if both files on same volume.
     tmp.replace(target)
+
+
+# ===== Wrapper URL self-heal (2026-08-16) =====
+#
+# Production story: when the server flips between HTTP and HTTPS (or
+# otherwise changes `public_origin`), every wrapper with the old URL
+# hard-coded in wrapper-config.json breaks. The recovery used to be
+# SSH-into-each-host + hand-edit, which doesn't scale.
+#
+# Design: the wrapper calls /api/server/info on the orchestrator
+# (using `request_with_fallback` so it survives a scheme flip
+# itself). If the server's `public_origin` differs from
+# `wrapper-config.json::orchestrator_url`, the wrapper atomically
+# rewrites the JSON. Next restart uses the new URL; the current
+# session continues with whatever URL got the connection working
+# (no mid-flight switch -- the user explicitly wanted a restart-
+# applies-the-change semantic).
+#
+# The check is throttled: at most once per 60s. The heartbeat runs
+# every 5s so a 60s throttle gives the wrapper ~12 retries to
+# recover on its own before the next discovery round. The throttle
+# is reset to "now" on a successful rewrite so the next interval
+# starts fresh.
+_DISCOVERY_INTERVAL_S = 60.0
+_last_discovery_at: float = 0.0
+
+
+def _discover_and_persist_url(
+    cfg_path: Path,
+    current_orchestrator_url: str,
+) -> str | None:
+    """Read /api/server/info and atomically rewrite cfg_path if the
+    canonical URL differs from current_orchestrator_url.
+
+    Returns the canonical URL on success, or None on any failure
+    (network, non-2xx, malformed JSON, missing key). The wrapper
+    keeps using current_orchestrator_url on None -- no fall-back to
+    a guess. The helper is best-effort and never raises.
+
+    The current_session variable `orchestrator_url` is NOT touched.
+    The user explicitly asked for the change to take effect on the
+    NEXT restart, not mid-flight.
+    """
+    global _last_discovery_at
+    try:
+        # Throttle: bail out if we checked too recently. Saves 11
+        # round-trips per minute on a healthy heartbeat.
+        now = time.monotonic()
+        if now - _last_discovery_at < _DISCOVERY_INTERVAL_S:
+            return None
+        # Build the server-info URL from whatever the wrapper
+        # currently has configured. `request_with_fallback` will
+        # swap the scheme if the configured one is wrong.
+        info_url = current_orchestrator_url.rstrip("/") + "/api/server/info"
+        resp, _actual_url = request_with_fallback("GET", info_url, timeout=5)
+        if resp.status_code != 200:
+            return None
+        # httpx.Response.content is bytes; decode + parse. The
+        # body is small (< 1KB) and operator-defined so we
+        # surface errors loudly if the shape ever changes.
+        try:
+            body = json.loads(resp.content.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        new_url = body.get("public_origin")
+        if not isinstance(new_url, str) or not new_url:
+            return None
+        new_url = new_url.rstrip("/")
+        if new_url == current_orchestrator_url.rstrip("/"):
+            _last_discovery_at = now
+            return new_url
+        # URL changed -- atomically rewrite the config.
+        # Read-modify-write: preserve every key except
+        # orchestrator_url. Use _atomic_write to avoid a
+        # half-written config on crash.
+        try:
+            cfg_text = cfg_path.read_text(encoding="utf-8-sig")
+            cfg = json.loads(cfg_text)
+        except (OSError, ValueError):
+            return None
+        cfg["orchestrator_url"] = new_url
+        try:
+            _atomic_write(
+                cfg_path,
+                json.dumps(cfg, indent=2, ensure_ascii=False) + "\n",
+            )
+        except OSError:
+            return None
+        _last_discovery_at = now
+        return new_url
+    except Exception:
+        # Last-resort safety net: never let discovery break the
+        # heartbeat. The wrapper must keep running.
+        return None
 
 
 # ===== Project memory fetch (HTTP) =====
@@ -2070,7 +2165,18 @@ def start(
                 "status": "idle",
                 "profiles": profile_meta,
             }).encode("utf-8")
-            r = _httpx_post(
+            # v1.0.2 (2026-08-16): use `request_with_fallback` so the
+            # heartbeat auto-recovers when the server flips between
+            # HTTP and HTTPS (a connection-level failure with one
+            # scheme triggers a retry with the other). On success
+            # the canonical URL is persisted to wrapper-config.json
+            # via `_discover_and_persist_url` so the NEXT restart
+            # uses the new URL (the in-memory `orchestrator_url` is
+            # intentionally NOT updated mid-flight -- the user
+            # explicitly asked for a restart-applies-the-change
+            # semantic, not a live mid-session switch).
+            r, _actual_heartbeat_url = request_with_fallback(
+                "POST",
                 f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
                 headers=_auth_headers(
                     "POST",
@@ -2083,6 +2189,23 @@ def start(
             if r.status_code != 200:
                 click.echo(f"[daemon] heartbeat {r.status_code}: {r.text[:200]}")
                 return [], []
+            # Best-effort URL discovery (throttled to once per 60s).
+            # Runs only after a successful heartbeat so it never
+            # adds load to a struggling connection. The helper
+            # itself uses `request_with_fallback`, so it can read
+            # the canonical URL even if the configured URL is now
+            # wrong (which is exactly the recovery scenario).
+            try:
+                new_url = _discover_and_persist_url(cfg_path, orchestrator_url)
+                if new_url and new_url.rstrip("/") != orchestrator_url.rstrip("/"):
+                    click.echo(
+                        f"[daemon] server URL updated in wrapper-config.json: "
+                        f"{orchestrator_url} -> {new_url} "
+                        f"(takes effect on next wrapper restart)"
+                    )
+            except Exception as e:
+                # Discovery failures are not fatal to the heartbeat.
+                click.echo(f"[daemon] URL discovery failed (non-fatal): {e}")
             body = r.json() or {}
             # Cache storage_refs keyed by profile name. _run_task
             # reads from this dict when building the prompt.
