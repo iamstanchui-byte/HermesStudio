@@ -626,6 +626,17 @@ def _hmac_headers(
     """
     import time as _t
     from hermes_orch.auth import compute_signature
+    # v0.7 transition (2026-08-16): when an HMAC v0.7 credential is
+    # configured on the agent_http layer (via set_hmac_credential),
+    # the agent_http.post / .get / etc. wrappers auto-inject the 7
+    # X-Hermes-* headers on every request. If we ALSO add the v0.6
+    # 3 headers here, the request carries BOTH formats and the
+    # server's dispatch_hmac_auth returns 401 MIXED_HEADERS (strict
+    # reject per v0.7 §1.4 hardening). So when v0.7 is configured,
+    # we suppress the v0.6 headers and let agent_http handle it.
+    from hermes_orch import agent_http
+    if agent_http.has_hmac_credential():
+        return {}
     ts = str(int(_t.time()))
     sig = compute_signature(secret, method, path, body, ts)
     return {
@@ -2213,6 +2224,16 @@ def start(
         requests can't be replayed against a different endpoint.
         """
         from hermes_orch.auth import compute_signature
+        # v0.7 transition (2026-08-16): when an HMAC v0.7 credential is
+        # configured on the agent_http layer, agent_http.post / .get
+        # / etc. auto-inject the 7 X-Hermes-* headers on every request.
+        # If we ALSO add the v0.6 3 headers here, the server's
+        # dispatch_hmac_auth returns 401 MIXED_HEADERS (strict reject
+        # per v0.7 §1.4 hardening). So when v0.7 is configured, we
+        # suppress the v0.6 headers and let agent_http handle it.
+        from hermes_orch import agent_http
+        if agent_http.has_hmac_credential():
+            return {}
         ts = str(int(time_mod.time()))
         sig = compute_signature(secret, method, path, body, ts)
         return {

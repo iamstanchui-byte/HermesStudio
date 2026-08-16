@@ -234,6 +234,27 @@ async def require_hmac_auth(
     """
     from hermes_orch.core.audit import audit_log  # late import: avoid cycle
 
+    # v0.7 transition (2026-08-16): if the request carries the 7
+    # X-Hermes-* headers (v0.7 §1.4), delegate to the v0.7 verifier.
+    # This lets the routes that still depend on require_hmac_auth
+    # (the 12+ wrapper endpoints that haven't been switched to
+    # dispatch_hmac_auth) accept v0.7-signed requests without
+    # changing each route's dependency.
+    from hermes_orch.auth.hmac_v07 import require_hmac_auth_v07
+    if x_agent_id is None and request.headers.get("X-Hermes-Method"):
+        # All v0.7 headers must be present; require_hmac_auth_v07
+        # raises 401 itself if any is missing.
+        return await require_hmac_auth_v07(
+            request=request,
+            x_hermes_method=request.headers.get("X-Hermes-Method"),
+            x_hermes_path=request.headers.get("X-Hermes-Path"),
+            x_hermes_body_sha256=request.headers.get("X-Hermes-Body-SHA256"),
+            x_hermes_key_id=request.headers.get("X-Hermes-Key-Id"),
+            x_hermes_timestamp=request.headers.get("X-Hermes-Timestamp"),
+            x_hermes_nonce=request.headers.get("X-Hermes-Nonce"),
+            x_hermes_signature=request.headers.get("X-Hermes-Signature"),
+        )
+
     if not x_agent_id or not x_timestamp or not x_signature:
         raise HTTPException(
             401,
