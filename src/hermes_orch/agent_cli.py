@@ -141,6 +141,46 @@ def _merge_orch_profiles_into_config(
 # ===== Helpers =====
 
 
+# v1.0.2 hotfix (2026-08-16): the orchestrator's heartbeat response has
+# occasionally surfaced a `cleanup_session_ids` entry whose value contains
+# an ANSI escape byte (0x1B) -- apparently some path through the server
+# is double-encoding the session id with a colour/formatting prefix.
+# The wrapper used to splice the value straight into the URL, and httpx
+# rejects the request with "Invalid non-printable ASCII character in URL"
+# at offset 77. The per-sid except block then catches the failure but
+# the same bad id keeps coming back on every heartbeat, so the wrapper
+# effectively loops on the same error forever and the row stays in
+# `pending_cleanup` in the orchestrator DB.
+#
+# Defensive fix: validate the id at the boundary. The set of legal
+# characters is the one our session id format actually uses
+# (digits + lowercase hex + underscore + dash). Anything else is
+# rejected; the loop logs once and moves on. The DB row is left for
+# operator review -- it would have been stuck anyway because the server
+# is sending us a string we can never construct a valid URL from.
+_SESSION_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _is_safe_session_id(sid: object) -> bool:
+    """Return True iff `sid` is a non-empty string of URL-safe characters
+    suitable for direct splicing into a /sessions/{sid}/... path segment.
+
+    See module-level note above for the rationale. The contract is
+    intentionally narrow: anything not in [A-Za-z0-9_-] is rejected, even
+    if it would technically be accepted by httpx after percent-encoding.
+    We don't want to silently rewrite the orchestrator's id; we want to
+    refuse the bad input loudly.
+
+    Non-strings (None, bytes, int) are also rejected -- the function
+    must never raise on a bad input from a server we don't control.
+    """
+    if not isinstance(sid, str):
+        return False
+    if not sid:
+        return False
+    return bool(_SESSION_ID_SAFE_RE.match(sid))
+
+
 def _resolve_hermes_bin() -> str | None:
     """Find the hermes CLI binary.
 
@@ -2149,6 +2189,20 @@ def start(
         if not hermes_bin:
             hermes_bin = "hermes"
         for sid in session_ids:
+            # v1.0.2 hotfix (2026-08-16): if the orchestrator handed us a
+            # bad id (e.g. contains an ANSI escape byte that the server
+            # leaked from a colour/formatting prefix), neither the local
+            # hermes delete nor the cleanup-ack URL is safe to construct.
+            # Skip cleanly and log a single warning per bad id -- the row
+            # stays in `pending_cleanup` in the DB for operator review.
+            if not _is_safe_session_id(sid):
+                click.echo(
+                    f"[daemon] cleanup-ack skipped for unsafe session id "
+                    f"(non-printable or URL-unsafe chars): "
+                    f"len={len(sid) if isinstance(sid, str) else '?'} "
+                    f"preview={repr(sid)[:80] if isinstance(sid, str) else repr(sid)}"
+                )
+                continue
             try:
                 proc = subprocess.run(
                     [hermes_bin, "sessions", "delete", sid, "--yes"],
