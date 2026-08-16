@@ -1935,6 +1935,26 @@ def enroll(
     click.echo(f"Enrolling agent '{agent_name}' (host={hostname}, os={os_type}) ...")
     click.echo(f"  Server: {server}")
 
+    # v0.7 + new-user-activation (2026-08-16 23:00): build an SSL
+    # context that honors INSECURE_SKIP_TLS_VERIFY. Without this,
+    # enroll fails on self-signed orchestrator certs (the user has
+    # to set the env var on the agent host for productization
+    # bootstrapper to work). The same env var is already honored by
+    # agent_http.post/.get for the runtime daemon.
+    #
+    # We duplicate the policy here (rather than going through
+    # agent_http) because enroll runs BEFORE the agent has an HMAC
+    # credential, so the v0.7 auto-inject is irrelevant and the
+    # token-based enroll has its own request shape.
+    import os as _os
+    import ssl as _ssl
+    _ssl_ctx = _ssl.create_default_context()
+    _insecure = (_os.environ.get("INSECURE_SKIP_TLS_VERIFY") or "").strip().lower()
+    if _insecure in ("1", "true", "yes", "on"):
+        _ssl_ctx.check_hostname = False
+        _ssl_ctx.verify_mode = _ssl.CERT_NONE
+        click.echo("  TLS: INSECURE_SKIP_TLS_VERIFY=1 → self-signed certs accepted")
+
     # POST /api/agents/enroll — no auth, the token IS the credential
     url = server.rstrip("/") + "/api/agents/enroll"
     body = _json.dumps({
@@ -1948,7 +1968,7 @@ def enroll(
         headers={"Content-Type": "application/json"},
     )
     try:
-        resp = urllib.request.urlopen(req, timeout=15)
+        resp = urllib.request.urlopen(req, timeout=15, context=_ssl_ctx)
     except urllib.error.HTTPError as e:
         # The 410/404/500 cases: parse the JSON detail and surface
         # a clean error message (no secret leakage, even if the
