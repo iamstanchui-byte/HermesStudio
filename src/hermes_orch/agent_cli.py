@@ -626,17 +626,31 @@ def _hmac_headers(
     """
     import time as _t
     from hermes_orch.auth import compute_signature
-    # v0.7 transition (2026-08-16): when an HMAC v0.7 credential is
-    # configured on the agent_http layer (via set_hmac_credential),
-    # the agent_http.post / .get / etc. wrappers auto-inject the 7
-    # X-Hermes-* headers on every request. If we ALSO add the v0.6
-    # 3 headers here, the request carries BOTH formats and the
-    # server's dispatch_hmac_auth returns 401 MIXED_HEADERS (strict
-    # reject per v0.7 §1.4 hardening). So when v0.7 is configured,
-    # we suppress the v0.6 headers and let agent_http handle it.
+    # v0.7 transition (2026-08-16, hotfix 2026-08-16 22:24): when an
+    # HMAC v0.7 credential is configured on the agent_http layer, we
+    # MUST sign and return the 7 X-Hermes-* headers HERE -- not just
+    # suppress the v0.6 headers. The previous "return {}" was wrong
+    # for any call site that uses `httpx.Client` directly (config
+    # poll loop, skills sync, apply_configs, _claim_one, _ack) --
+    # those don't go through `agent_http.get/post`, so the v0.7
+    # headers were never injected and the server returned 401.
+    # agent_http.post/.get also call this same signer, so we keep
+    # both code paths in lockstep.
     from hermes_orch import agent_http
     if agent_http.has_hmac_credential():
-        return {}
+        from urllib.parse import urlparse
+        from hermes_orch.auth.hmac_v07 import sign_v07_request
+        # v0.7 §1.4 forbids query strings on signed endpoints; the
+        # server's verifier returns 400 MALFORMED_HEADERS if the
+        # X-Hermes-Path carries a '?'. The caller passes the full
+        # request path INCLUDING query string (for logging), so we
+        # strip it before signing.
+        path_only = urlparse(path).path
+        key_id, secret_bytes = agent_http.get_hmac_credential()
+        return sign_v07_request(
+            method=method, path=path_only, body=body,
+            key_id=key_id, secret=secret_bytes,
+        )
     ts = str(int(_t.time()))
     sig = compute_signature(secret, method, path, body, ts)
     return {
@@ -2224,16 +2238,23 @@ def start(
         requests can't be replayed against a different endpoint.
         """
         from hermes_orch.auth import compute_signature
-        # v0.7 transition (2026-08-16): when an HMAC v0.7 credential is
-        # configured on the agent_http layer, agent_http.post / .get
-        # / etc. auto-inject the 7 X-Hermes-* headers on every request.
-        # If we ALSO add the v0.6 3 headers here, the server's
-        # dispatch_hmac_auth returns 401 MIXED_HEADERS (strict reject
-        # per v0.7 §1.4 hardening). So when v0.7 is configured, we
-        # suppress the v0.6 headers and let agent_http handle it.
+        # v0.7 transition (2026-08-16, hotfix 2026-08-16 22:24): when an
+        # HMAC v0.7 credential is configured, sign and return the 7
+        # X-Hermes-* headers HERE. The previous "return {}" was wrong
+        # for any call site that uses `httpx.Client` directly -- the
+        # config poll loop and skills sync all do, and without the
+        # headers the server returns 401. See _hmac_headers for the
+        # full rationale; this is the inner-function mirror of it.
         from hermes_orch import agent_http
         if agent_http.has_hmac_credential():
-            return {}
+            from urllib.parse import urlparse
+            from hermes_orch.auth.hmac_v07 import sign_v07_request
+            path_only = urlparse(path).path  # v0.7 §1.4: no query string
+            key_id, secret_bytes = agent_http.get_hmac_credential()
+            return sign_v07_request(
+                method=method, path=path_only, body=body,
+                key_id=key_id, secret=secret_bytes,
+            )
         ts = str(int(time_mod.time()))
         sig = compute_signature(secret, method, path, body, ts)
         return {
