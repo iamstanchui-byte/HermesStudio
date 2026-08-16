@@ -38,6 +38,7 @@ import httpx
 # use `from hermes_orch.agent_http import get/post/...` so swapping
 # the import is enough Ã¢â‚¬â€ no per-call verify= plumbing.
 from hermes_orch.agent_http import (  # noqa: E402  (import after httpx on purpose)
+    Client as _HttpClient,
     delete as _httpx_delete,
     get as _httpx_get,
     get_verify as _agent_http_verify,
@@ -654,10 +655,14 @@ def _hmac_headers(
     # HMAC v0.7 credential is configured on the agent_http layer, we
     # MUST sign and return the 7 X-Hermes-* headers HERE -- not just
     # suppress the v0.6 headers. The previous "return {}" was wrong
-    # for any call site that uses `httpx.Client` directly (config
+    # for any call site that used `httpx.Client` directly (config
     # poll loop, skills sync, apply_configs, _claim_one, _ack) --
-    # those don't go through `agent_http.get/post`, so the v0.7
+    # those didn't go through `agent_http.get/post`, so the v0.7
     # headers were never injected and the server returned 401.
+    # 2026-08-17 fix: those call sites now use `agent_http.Client`
+    # which auto-injects the headers; this helper still exists for
+    # the legacy call sites that pass `headers=_auth_headers(...)`
+    # to raw `agent_http.get/post` (mostly the heartbeat loop).
     # agent_http.post/.get also call this same signer, so we keep
     # both code paths in lockstep.
     from hermes_orch import agent_http
@@ -2344,10 +2349,15 @@ def start(
         # v0.7 transition (2026-08-16, hotfix 2026-08-16 22:24): when an
         # HMAC v0.7 credential is configured, sign and return the 7
         # X-Hermes-* headers HERE. The previous "return {}" was wrong
-        # for any call site that uses `httpx.Client` directly -- the
-        # config poll loop and skills sync all do, and without the
-        # headers the server returns 401. See _hmac_headers for the
-        # full rationale; this is the inner-function mirror of it.
+        # for any call site that used `httpx.Client` directly -- the
+        # config poll loop and skills sync all did, and without the
+        # headers the server returned 401. 2026-08-17 fix: those
+        # call sites now use `agent_http.Client` which auto-injects
+        # the headers; this helper still exists for the legacy call
+        # sites that pass `headers=_auth_headers(...)` to raw
+        # `agent_http.get/post` (mostly the heartbeat loop). See
+        # _hmac_headers for the full rationale; this is the
+        # inner-function mirror of it.
         from hermes_orch import agent_http
         if agent_http.has_hmac_credential():
             from urllib.parse import urlparse
@@ -3953,7 +3963,7 @@ def start(
     _last_skill_sync: dict[str, float] = {}  # profile_name -> last sync time
 
     def _sync_one_profile_skills(
-        client: httpx.Client,
+        client: _HttpClient,
         pname: str,
         pcfg: dict,
         *,
@@ -4196,7 +4206,7 @@ def start(
             return 0
         applied = 0
         try:
-            with httpx.Client(timeout=10, verify=_agent_http_verify()) as client:
+            with _HttpClient(timeout=10) as client:
                 for pname, pcfg in profiles_cfg.items():
                     # Resolve the profile root (template like <profiles_dir>/<role>)
                     try:
@@ -4233,7 +4243,7 @@ def start(
                             # by the dashboard's "Sync from disk" button. We
                             # run the sync and ack as applied (no file written).
                             if cfg_row["file_path"] == "__sync_skills__":
-                                with httpx.Client(timeout=30, verify=_agent_http_verify()) as sync_client:
+                                with _HttpClient(timeout=30) as sync_client:
                                     n = _sync_one_profile_skills(sync_client, pname, pcfg)
                                 click.echo(
                                     f"[daemon] sync-skills trigger for {pname}: "
@@ -4544,7 +4554,7 @@ def start(
             # this profile Ã¢â‚¬â€ the file scan is cheap but no point doing it
             # every 5s.
             now_ts = time_mod.time()
-            with httpx.Client(timeout=30, verify=_agent_http_verify()) as sync_client:
+            with _HttpClient(timeout=30) as sync_client:
                 for pname, pcfg in profiles_cfg.items():
                     last = _last_skill_sync.get(pname, 0)
                     if (now_ts - last) < _SKILL_AUTO_SYNC_INTERVAL:
@@ -4832,7 +4842,7 @@ def apply_configs(config_path: str, profile_filter: str | None) -> None:
         return
 
     applied_count = 0
-    with httpx.Client(timeout=30, verify=_agent_http_verify()) as client:
+    with _HttpClient(timeout=30) as client:
         for pname, pcfg in profiles.items():
             root = Path(pcfg["root"])
             click.echo(f"[{pname}] root = {root}")
@@ -4910,7 +4920,7 @@ def apply_configs_loop(config_path: str, interval: int) -> None:
 
 
 def _claim_one(
-    client: httpx.Client, base: str, agent_id: str, profile: str, secret: str
+    client: _HttpClient, base: str, agent_id: str, profile: str, secret: str
 ) -> dict | None:
     path = f"/api/agents/{agent_id}/profiles/{profile}/configs/pending"
     headers = _hmac_headers(agent_id, secret, method="GET", path=path)
@@ -4925,7 +4935,7 @@ def _claim_one(
 
 
 def _ack(
-    client: httpx.Client,
+    client: _HttpClient,
     base: str,
     agent_id: str,
     profile: str,

@@ -406,3 +406,106 @@ def request_with_fallback(method: str, url: str, **kwargs: Any):
         alt_url = _swap_scheme(url)
         resp = fn(alt_url, verify=_VERIFY, **call_kwargs)
         return resp, alt_url
+
+
+# ===== Client class (v0.7-aware connection pool) =====
+#
+# Long-running daemon loops (the wrapper's config-poll, skills-sync, etc.)
+# want a connection pool instead of one TCP+TLS handshake per request.
+# `httpx.Client(...)` is the natural fit, but the raw `httpx.Client`
+# bypasses this module's HMAC-injection logic. This `Client` class is
+# a drop-in replacement: same constructor, same `get/post/put/patch/delete`
+# surface, but every outbound request gets the 7 X-Hermes-* headers
+# injected (when a credential is configured) and the wrapper's
+# `verify` policy applied.
+#
+# Usage:
+#     with agent_http.Client(timeout=10) as client:
+#         r = client.get(url)
+#         r = client.post(url, json=...)
+#
+# Why not subclass httpx.Client and only override .request()? Because
+# httpx's surface is large; subclassing risks subtle signature drift.
+# Wrapping and exposing only the methods the wrapper actually uses
+# (get/post/put/patch/delete + request) keeps the API small and
+# audited. If you need other httpx methods, add them here.
+class Client:
+    """v0.7-aware httpx.Client wrapper. See module docstring for rationale.
+
+    The constructor accepts the same kwargs as `httpx.Client` (most
+    commonly `timeout=`, `verify=`). `verify=` defaults to this module's
+    cached policy if not passed (or if `None` is passed).
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Honor the module's TLS verify policy when caller doesn't
+        # explicitly pass verify=... (or passes verify=None).
+        if "verify" not in kwargs or kwargs.get("verify") is None:
+            kwargs["verify"] = _VERIFY
+        self._client = httpx.Client(**kwargs)
+
+    # ---- passthrough context manager ----
+    def __enter__(self) -> "Client":
+        self._client.__enter__()
+        return self
+
+    def __exit__(self, *args: Any) -> Any:
+        return self._client.__exit__(*args)
+
+    def close(self) -> None:
+        self._client.close()
+
+    # ---- low-level: every method funnels through here ----
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        content: bytes | None = None,
+        data: Any = None,
+        files: Any = None,
+        json: Any = None,
+        params: Any = None,
+        headers: dict[str, str] | None = None,
+        cookies: Any = None,
+        auth: Any = None,
+        follow_redirects: bool = False,
+        timeout: Any = None,
+        extensions: Any = None,
+    ) -> Any:
+        """Issue an HTTP request, auto-injecting v0.7 HMAC headers if a
+        credential is configured. The signature matches the subset of
+        `httpx.Client.request` that the wrapper actually uses.
+        """
+        kwargs: dict[str, Any] = {
+            "content": content,
+            "data": data,
+            "files": files,
+            "json": json,
+            "params": params,
+            "cookies": cookies,
+            "auth": auth,
+            "follow_redirects": follow_redirects,
+            "timeout": timeout,
+            "extensions": extensions,
+        }
+        # Compute v0.7 signed headers (returns {} if no credential).
+        signed = _signed_headers(method, url, kwargs)
+        if signed:
+            headers = _merge_headers({"headers": headers}, signed)["headers"]
+        return self._client.request(method, url, headers=headers, **kwargs)
+
+    def get(self, url: str, **kwargs: Any) -> Any:
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any) -> Any:
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url: str, **kwargs: Any) -> Any:
+        return self.request("PUT", url, **kwargs)
+
+    def patch(self, url: str, **kwargs: Any) -> Any:
+        return self.request("PATCH", url, **kwargs)
+
+    def delete(self, url: str, **kwargs: Any) -> Any:
+        return self.request("DELETE", url, **kwargs)
