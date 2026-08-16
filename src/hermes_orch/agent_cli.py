@@ -250,6 +250,30 @@ def _read_secret(secret_path: Path) -> str:
     return secret_path.read_text(encoding="utf-8-sig").strip()
 
 
+def _resolve_secret_path(cfg: dict) -> Path:
+    """Resolve the secret file path from a wrapper config dict.
+
+    Reads `secret_file` (canonical v0.7 §1.4 name). Falls back to legacy
+    `hmac_secret_file` for one-release migration (Bug #1 fix, 2026-08-17).
+    The legacy field is read but NOT logged at WARN to avoid noise on every
+    `start` call -- the deprecation warning fires once per wrapper install
+    in the enroll path.
+
+    Returns:
+        Resolved Path to the secret file.
+
+    Raises:
+        click.ClickException: if neither field is present or both are empty.
+    """
+    sf = (cfg.get("secret_file") or cfg.get("hmac_secret_file") or "").strip()
+    if not sf:
+        raise click.ClickException(
+            "wrapper-config.json missing 'secret_file' (or legacy 'hmac_secret_file'). "
+            "Re-run `hermes-orch-agent enroll` to regenerate the config."
+        )
+    return Path(sf).expanduser()
+
+
 # Cap on the cleaned task summary stored in the DB. 32KB is enough for
 # long research / backtest tasks; a "Show full" button on the dashboard
 # lets the user read the whole thing in a scrollable block.
@@ -1687,7 +1711,9 @@ def _load_wrapper_config(config_path: Path) -> dict:
     for pname, pcfg in raw.get("profiles", {}).items():
         if "root" in pcfg:
             pcfg["root"] = str(Path(pcfg["root"]).expanduser())
-    raw["secret_file"] = str(Path(raw["secret_file"]).expanduser())
+    # v0.7 §1.4 (Bug #1 fix, 2026-08-17): resolve `secret_file` (canonical)
+    # with one-release fallback to legacy `hmac_secret_file`.
+    raw["secret_file"] = str(_resolve_secret_path(raw))
     return raw
 
 
@@ -1986,19 +2012,62 @@ def enroll(
 
     data = _json.loads(resp.read().decode("utf-8"))
     agent_id = data.get("agent_id") or ""
-    hmac_secret = data.get("hmac_secret") or ""
-    if not agent_id or not hmac_secret:
-        click.echo(f"  ERROR: server returned no agent_id / hmac_secret", err=True)
+
+    # v0.7 §1.5a enrollment response shape (2026-08-17, fix #1):
+    #   v0.6 legacy: { "agent_id": ..., "hmac_secret": <base64url text> }
+    #   v0.7:        { "agent_id": ..., "hmac_key_id": <uuid>,
+    #                  "hmac_secret_hex": <64 lowercase hex chars> }
+    # We accept BOTH for migration. If v0.7 fields present, prefer them
+    # (server-generated 32 random bytes hex-encoded; the canonical format
+    # per v0.7 spec §1.4). If only v0.6 fields present, fall back to
+    # legacy text format and warn.
+    hmac_key_id = (data.get("hmac_key_id") or "").strip()
+    hmac_secret_hex = (data.get("hmac_secret_hex") or "").strip()
+    hmac_secret_v06 = (data.get("hmac_secret") or "").strip()
+
+    if not agent_id:
+        click.echo(f"  ERROR: server returned no agent_id", err=True)
         sys.exit(1)
 
-    click.echo(f"  OK. agent_id={agent_id}")
+    if hmac_key_id and hmac_secret_hex:
+        # v0.7 path (preferred). Strict validation: exactly 64 lowercase hex.
+        if not re.fullmatch(r"[0-9a-f]{64}", hmac_secret_hex):
+            click.echo(
+                f"  ERROR: server returned malformed hmac_secret_hex "
+                f"(expected 64 lowercase hex chars, got {len(hmac_secret_hex)} chars)",
+                err=True,
+            )
+            sys.exit(1)
+        secret_to_write = hmac_secret_hex
+        secret_format = "v0.7-hex"
+    elif hmac_secret_v06:
+        # v0.6 legacy fallback. Will be deprecated once v0.6 server
+        # path is sunset (per spec migration: HERMES_HMAC_ACCEPT_V06=false
+        # gate, then delete after 30-day zero-volume observation).
+        secret_to_write = hmac_secret_v06
+        secret_format = "v0.6-text"
+        click.echo(
+            "  WARN: server returned legacy v0.6 hmac_secret (text format) "
+            "but no hmac_key_id/hmac_secret_hex. Wrapper will operate in v0.6 "
+            "mode only. Ask the operator to upgrade the orchestrator to a "
+            "version that returns v0.7 enrollment fields.",
+            err=True,
+        )
+    else:
+        click.echo(
+            f"  ERROR: server returned no hmac_secret / hmac_secret_hex",
+            err=True,
+        )
+        sys.exit(1)
 
-    # Write hmac_secret to a chmod-0600 file
+    click.echo(f"  OK. agent_id={agent_id}  format={secret_format}")
+
+    # Write the secret to a chmod-0600 file
     secret_path = Path(hmac_secret_file).expanduser() if hmac_secret_file else (
         Path.home() / ".hermes-orchestrator" / f".hmac-{agent_id}"
     )
     secret_path.parent.mkdir(parents=True, exist_ok=True)
-    secret_path.write_text(hmac_secret, encoding="utf-8")
+    secret_path.write_text(secret_to_write, encoding="utf-8")
     try:
         os.chmod(secret_path, 0o600)
     except Exception:
@@ -2016,17 +2085,31 @@ def enroll(
     existing: dict = {}
     if cfg_path.exists():
         try:
-            existing = _json.loads(cfg_path.read_text(encoding="utf-8")) or {}
+            # utf-8-sig strips the PowerShell Set-Content BOM transparently
+            # (see Bug #5 in the 2026-08-17 bug-discovery report).
+            existing = _json.loads(cfg_path.read_text(encoding="utf-8-sig")) or {}
         except Exception:
             existing = {}
     existing.setdefault("orchestrator_url", server)
     existing.setdefault("agent_id", agent_id)
+    # v0.7 §1.4 canonical field name is `secret_file` (Bug #1 fix).
+    # We write BOTH the canonical name AND the legacy `hmac_secret_file`
+    # for one-release migration (read sites fall back to legacy name).
+    # The legacy field will be removed in a follow-up release once all
+    # deployed wrappers have been upgraded.
+    existing["secret_file"] = str(secret_path)
     existing["hmac_secret_file"] = str(secret_path)
+    if hmac_key_id:
+        existing["hmac_key_id"] = hmac_key_id
+    if hmac_secret_hex:
+        existing["hmac_secret_hex"] = hmac_secret_hex
     cfg_path.write_text(
         _json.dumps(existing, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     click.echo(f"  wrapper-config.json written to {cfg_path}")
+    if hmac_key_id and hmac_secret_hex:
+        click.echo(f"  v0.7 HMAC fields: hmac_key_id={hmac_key_id} (in cfg)")
 
     if data.get("requested_name_used"):
         click.echo(
@@ -2085,7 +2168,7 @@ def start(
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     agent_id = cfg.get("agent_id")
     orchestrator_url = cfg.get("orchestrator_url", "").rstrip("/")
-    secret_path = Path(cfg.get("secret_file", "")).expanduser()
+    secret_path = _resolve_secret_path(cfg)
     profiles_cfg = cfg.get("profiles") or {}
 
     if not agent_id:
@@ -4581,7 +4664,7 @@ def sync_config(config_file: str) -> None:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     agent_id = cfg.get("agent_id")
     orchestrator_url = cfg.get("orchestrator_url", "").rstrip("/")
-    secret_path = Path(cfg.get("secret_file", "")).expanduser()
+    secret_path = _resolve_secret_path(cfg)
     if not agent_id or not orchestrator_url:
         raise click.ClickException("Config missing agent_id or orchestrator_url")
     if not secret_path.exists():
@@ -4665,7 +4748,7 @@ def status() -> None:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     agent_id = cfg.get("agent_id")
     orchestrator_url = cfg.get("orchestrator_url", "").rstrip("/")
-    secret_path = Path(cfg.get("secret_file", "")).expanduser()
+    secret_path = _resolve_secret_path(cfg)
     profiles_cfg = cfg.get("profiles") or {}
 
     click.echo(f"Config: {cfg_path}")
