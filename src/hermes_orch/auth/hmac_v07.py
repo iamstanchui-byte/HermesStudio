@@ -403,13 +403,23 @@ async def require_hmac_auth_v07(
     # client signed with — that mismatch caused 401 INVALID
     # SIGNATURE on the T1 happy-path test before this fix
     # (debugged via perplexity-web 2026-08-15). Verified 2026-08-15.
-    try:
+    #
+    # v0.7 transition (2026-08-16): the DB column may have either
+    # hex (v0.7 format, 64 chars) or utf-8 text (v0.6 format,
+    # historically base64). We try hex first, fall back to text.
+    if secret_str and len(secret_str) == 64 and all(
+        c in "0123456789abcdefABCDEF" for c in secret_str
+    ):
         secret = bytes.fromhex(secret_str)
-    except (TypeError, ValueError):
-        raise HTTPException(
-            401,
-            f"MISSING_AUTH_HEADERS: Stored hmac_secret is not valid hex: agent={agent_id}",
-        )
+    else:
+        try:
+            secret = secret_str.encode("utf-8")
+        except (AttributeError, UnicodeEncodeError) as e:
+            raise HTTPException(
+                401,
+                f"MISSING_AUTH_HEADERS: Stored hmac_secret is malformed: "
+                f"agent={agent_id}: {e}",
+            )
     ok = verify_signature_v07(
         secret=secret,
         method=x_hermes_method,

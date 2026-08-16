@@ -598,7 +598,7 @@ def _discover_and_persist_url(
 # works regardless of where the wrapper is running.
 
 def _hmac_headers(
-    agent_id: str, secret: str, *, method: str = "GET", path: str = "", body: bytes = b""
+    agent_id: str, secret: str | bytes, *, method: str = "GET", path: str = "", body: bytes = b""
 ) -> dict:
     """Build HMAC-signed headers for a wrapper request (v1.6+).
 
@@ -2056,6 +2056,18 @@ def start(
     if not secret:
         raise click.ClickException(f"Secret file {secret_path} is empty")
 
+    # v0.7 transition (2026-08-16): when hmac_key_id + hmac_secret_hex
+    # are in wrapper-config.json, use the hex bytes for the v0.6 path
+    # too. The server's v0.6 verifier (after the same transition fix)
+    # accepts both formats: hex (v0.7) or utf-8 text (v0.6 legacy).
+    # We standardize on hex here so both verifier paths compute the
+    # same 32-byte secret from the same source.
+    # v0.6-LEGACY-BOOTSTRAP: if hmac_key_id NOT in cfg, fall back to
+    # the v0.6 secret_file text (base64). Wrapper will sign with
+    # text-encoded bytes, server verifier will do the same.
+    # v0.7-MODE (hmac_key_id set): sign with bytes.fromhex(secret_hex).
+    v07_secret_bytes: bytes | None = None
+
     # v0.7 §1.4 client-side HMAC: if `hmac_key_id` + `hmac_secret_hex`
     # are in wrapper-config.json, set them on the agent_http layer.
     # All outgoing requests then get the 7 X-Hermes-* headers
@@ -2076,6 +2088,13 @@ def start(
         try:
             from hermes_orch.agent_http import set_hmac_credential
             set_hmac_credential(hmac_key_id, hmac_secret_hex)
+            # ALSO set the v0.6 path's `secret` variable to the raw
+            # 32-byte secret so the v0.6 verifier (which now accepts
+            # bytes too) sees the same value as the v0.7 verifier.
+            # This keeps both code paths (heartbeat, config poll)
+            # in lockstep with the v0.7 transition.
+            v07_secret_bytes = bytes.fromhex(hmac_secret_hex)
+            secret = v07_secret_bytes  # bytes, not str
             click.echo(f"  v0.7 HMAC: enabled (key_id={hmac_key_id})")
         except ValueError as e:
             # Bad hex in cfg -- fail loudly so the operator notices.
@@ -2102,7 +2121,19 @@ def start(
     # calls with the same value are no-ops, mismatched values get
     # 409 (the operator must rotate to change secrets). This means
     # the wrapper self-heals if the orchestrator's DB was wiped.
-    _bootstrap_hmac_secret(orchestrator_url, agent_id, secret)
+    #
+    # v0.7 transition (2026-08-16): if the wrapper is configured
+    # with v0.7 HMAC (hmac_key_id + hmac_secret_hex in cfg), the
+    # server's v0.7 verifier expects the secret in HEX format
+    # (bytes.fromhex). The v0.6 bootstrap pushes the secret as raw
+    # text; if we ran it now it would overwrite the hex we put in
+    # the DB. Skip the bootstrap in v0.7 mode -- the operator has
+    # already provisioned the key (admin script), and re-pushing on
+    # every wrapper start would defeat the hex format.
+    if hmac_key_id and hmac_secret_hex:
+        click.echo("  v0.7 HMAC: bootstrap skipped (key already provisioned)")
+    else:
+        _bootstrap_hmac_secret(orchestrator_url, agent_id, secret)
 
     # Auto-sync config from orchestrator (picks up newly added roles)
     if not no_sync:
