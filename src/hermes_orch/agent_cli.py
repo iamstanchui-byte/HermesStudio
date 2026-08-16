@@ -2056,6 +2056,46 @@ def start(
     if not secret:
         raise click.ClickException(f"Secret file {secret_path} is empty")
 
+    # v0.7 §1.4 client-side HMAC: if `hmac_key_id` + `hmac_secret_hex`
+    # are in wrapper-config.json, set them on the agent_http layer.
+    # All outgoing requests then get the 7 X-Hermes-* headers
+    # injected automatically. The server's HMAC middleware (v0.7
+    # allowlist) accepts these; v0.6 (`X-Agent-Id` + 3-header) is
+    # still accepted for backward compat while the server has
+    # `HERMES_HMAC_ACCEPT_V06=true` (the default).
+    #
+    # If the fields are absent, the wrapper continues in v0.6 mode
+    # only (existing behavior). Operators opt into v0.7 by either:
+    #   - Running `hermes-orch agent provision-hmac-key --agent-id X`
+    #     which writes the fields into wrapper-config.json
+    #   - Hand-editing wrapper-config.json (see
+    #     docs/proposals/orch-client-build-impl-plan-v0.7.md §3.2)
+    hmac_key_id = (cfg.get("hmac_key_id") or "").strip()
+    hmac_secret_hex = (cfg.get("hmac_secret_hex") or "").strip()
+    if hmac_key_id and hmac_secret_hex:
+        try:
+            from hermes_orch.agent_http import set_hmac_credential
+            set_hmac_credential(hmac_key_id, hmac_secret_hex)
+            click.echo(f"  v0.7 HMAC: enabled (key_id={hmac_key_id})")
+        except ValueError as e:
+            # Bad hex in cfg -- fail loudly so the operator notices.
+            raise click.ClickException(
+                f"wrapper-config.json hmac_secret_hex is invalid: {e}"
+            )
+    else:
+        # No v0.7 credential -- fall back to v0.6 only. The server
+        # accepts v0.6 by default; once HERMES_HMAC_ACCEPT_V06=false
+        # is set on the server, this wrapper will be 401'd until the
+        # operator provisions a v0.7 key.
+        if hmac_key_id or hmac_secret_hex:
+            click.echo(
+                "WARN: only one of hmac_key_id/hmac_secret_hex is set in "
+                "wrapper-config.json; v0.7 HMAC disabled. Both are required.",
+                err=True,
+            )
+        # No log line for the "neither set" case -- v0.6-only is the
+        # long-running default and would be noisy.
+
     # v1.6 HMAC bootstrap: on every start, push the local secret to
     # the orchestrator so it can verify our signatures. The
     # endpoint is one-shot: first call sets hmac_secret, subsequent

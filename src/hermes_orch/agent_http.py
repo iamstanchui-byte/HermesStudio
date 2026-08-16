@@ -51,10 +51,14 @@ testing), pass `verify=` explicitly to these helpers and it wins.
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
+
+from hermes_orch.auth.hmac_v07 import sign_v07_request
 
 
 def _compute_verify() -> bool | str:
@@ -89,30 +93,187 @@ def get_verify() -> bool | str:
     return _VERIFY
 
 
+# === HMAC v0.7 client-side signing (2026-08-16) ===
+#
+# When the wrapper has an HMAC credential configured, ALL outgoing
+# requests to the orchestrator get signed (7 X-Hermes-* headers).
+# When no credential is configured, requests go out unsigned (v0.6
+# X-Agent-Id is added by the caller separately if needed).
+#
+# The credential is set ONCE on wrapper startup via
+# `set_hmac_credential()`; the wrapper reads it from
+# `wrapper-config.json` (`hmac_key_id` + `hmac_secret_hex` fields).
+# See docs/proposals/orch-client-build-impl-plan-v0.7.md §1.4.
+#
+# Why module-level: avoids threading the credential through 23 call
+# sites in agent_cli.py. The 7 headers are computed once per request
+# (~0.1ms) so this is free in practice.
+
+_HMAC_KEY_ID: str | None = None
+_HMAC_SECRET: bytes | None = None
+
+
+def set_hmac_credential(key_id: str, secret_hex: str) -> None:
+    """Configure the wrapper's HMAC v0.7 credential.
+
+    After this call, all outgoing requests are signed with the 7
+    X-Hermes-* headers. To disable, call `set_hmac_credential("", "")`
+    or restart the wrapper.
+
+    The secret is stored as bytes (decoded from hex). The hex form is
+    the on-disk / config-file representation because binary secrets
+    don't survive JSON round-trips cleanly.
+
+    Raises:
+        ValueError: if `secret_hex` is not valid hex.
+    """
+    global _HMAC_KEY_ID, _HMAC_SECRET
+    _HMAC_KEY_ID = key_id or None
+    if secret_hex:
+        _HMAC_SECRET = bytes.fromhex(secret_hex)
+    else:
+        _HMAC_SECRET = None
+
+
+def get_hmac_credential() -> tuple[str | None, bytes | None]:
+    """Return the active HMAC credential (key_id, secret_bytes) for tests."""
+    return _HMAC_KEY_ID, _HMAC_SECRET
+
+
+def has_hmac_credential() -> bool:
+    """True iff an HMAC credential is configured. Cheap, used per request."""
+    return _HMAC_KEY_ID is not None and _HMAC_SECRET is not None
+
+
+def _body_bytes_for_hmac(kwargs: dict[str, Any]) -> bytes | None:
+    """Extract the body bytes that httpx will send, for HMAC body-SHA256.
+
+    Returns None if the body shape is not amenable to signing (form data,
+    streaming, etc.) -- the caller should skip signing in that case and
+    let the server's middleware reject the request (no silent corruption).
+
+    Matches httpx's encoding for the kwargs we use in agent_cli:
+      - `content=<bytes/str>` -> as-is (or .encode("utf-8") if str)
+      - `json=<dict>` -> json.dumps(json, separators=(",", ":")).encode("utf-8")
+        (the default compact form; httpx uses this)
+      - `data=<...>` -> form data, NOT signed (HMAC is for JSON requests)
+      - none of the above -> b"" (empty body)
+
+    Note: the EXACT bytes httpx sends depend on its internal serializer.
+    We use the same default JSON encoder to keep parity. If a future
+    httpx change diverges, the server will reject with BODY_HASH_MISMATCH
+    and the operator will see clear logs.
+    """
+    content = kwargs.get("content")
+    if content is not None:
+        if isinstance(content, str):
+            return content.encode("utf-8")
+        if isinstance(content, (bytes, bytearray)):
+            return bytes(content)
+        return None
+    json_data = kwargs.get("json")
+    if json_data is not None:
+        # Default httpx JSON encoding: separators=(",", ":") (compact).
+        # json.dumps default separators are (', ', ': ') -- NOT compact.
+        # Match httpx explicitly to avoid body-hash mismatch on the server.
+        try:
+            return json.dumps(
+                json_data,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+    # `data=` is form-encoded; HMAC §1.4 expects JSON. Skip signing.
+    if "data" in kwargs:
+        return None
+    # Nothing in the kwargs -> empty body. Sign as b"" (the well-known
+    # empty-body SHA-256 is a valid value per v0.7 §1.4).
+    return b""
+
+
+def _signed_headers(method: str, url: str, kwargs: dict[str, Any]) -> dict[str, str]:
+    """Compute the 7 X-Hermes-* headers for this request, or {} if not configured."""
+    if not has_hmac_credential():
+        return {}
+    body = _body_bytes_for_hmac(kwargs)
+    if body is None:
+        # Form data or unencodable payload. Don't sign -- server will
+        # reject with a clear 401 if the path requires HMAC.
+        return {}
+    # Path-only: v0.7 §1.4 forbids query strings on signed paths.
+    # urlparse is cheap (~0.01ms) and avoids accidentally including
+    # the orchestrator host or query in the signed material.
+    path = urlparse(url).path
+    return sign_v07_request(
+        method=method,
+        path=path,
+        body=body,
+        key_id=_HMAC_KEY_ID,  # type: ignore[arg-type]
+        secret=_HMAC_SECRET,  # type: ignore[arg-type]
+    )
+
+
+def _merge_headers(kwargs: dict[str, Any], signed: dict[str, str]) -> dict[str, str]:
+    """Merge signed headers into the request's `headers=` kwarg.
+
+    Existing headers (e.g. the v0.6 `X-Agent-Id` fallback) are
+    preserved -- signing is additive. The signed headers always win
+    on collision (defense: caller-supplied X-Hermes-* could be
+    malicious; the module's signing is the source of truth).
+    """
+    if not signed:
+        return kwargs.get("headers") or {}
+    existing = dict(kwargs.get("headers") or {})
+    existing.update(signed)
+    return existing
+
+
 # ===== httpx method wrappers =====
+#
+# Each wrapper:
+#   1. Resolves TLS verify policy (existing behavior)
+#   2. If HMAC credential is configured, injects the 7 X-Hermes-* headers
+#      (new in 2026-08-16; signing is opt-in via set_hmac_credential)
+#   3. Forwards to httpx.<method>
 
 def get(url: str, **kwargs: Any):
-    """httpx.get with the wrapper's verify policy applied."""
+    """httpx.get with the wrapper's verify policy + (optional) HMAC headers applied."""
+    signed = _signed_headers("GET", url, kwargs)
+    if signed:
+        kwargs = {**kwargs, "headers": _merge_headers(kwargs, signed)}
     return httpx.get(url, verify=_VERIFY, **kwargs)
 
 
 def post(url: str, **kwargs: Any):
-    """httpx.post with the wrapper's verify policy applied."""
+    """httpx.post with the wrapper's verify policy + (optional) HMAC headers applied."""
+    signed = _signed_headers("POST", url, kwargs)
+    if signed:
+        kwargs = {**kwargs, "headers": _merge_headers(kwargs, signed)}
     return httpx.post(url, verify=_VERIFY, **kwargs)
 
 
 def put(url: str, **kwargs: Any):
-    """httpx.put with the wrapper's verify policy applied."""
+    """httpx.put with the wrapper's verify policy + (optional) HMAC headers applied."""
+    signed = _signed_headers("PUT", url, kwargs)
+    if signed:
+        kwargs = {**kwargs, "headers": _merge_headers(kwargs, signed)}
     return httpx.put(url, verify=_VERIFY, **kwargs)
 
 
 def patch(url: str, **kwargs: Any):
-    """httpx.patch with the wrapper's verify policy applied."""
+    """httpx.patch with the wrapper's verify policy + (optional) HMAC headers applied."""
+    signed = _signed_headers("PATCH", url, kwargs)
+    if signed:
+        kwargs = {**kwargs, "headers": _merge_headers(kwargs, signed)}
     return httpx.patch(url, verify=_VERIFY, **kwargs)
 
 
 def delete(url: str, **kwargs: Any):
-    """httpx.delete with the wrapper's verify policy applied."""
+    """httpx.delete with the wrapper's verify policy + (optional) HMAC headers applied."""
+    signed = _signed_headers("DELETE", url, kwargs)
+    if signed:
+        kwargs = {**kwargs, "headers": _merge_headers(kwargs, signed)}
     return httpx.delete(url, verify=_VERIFY, **kwargs)
 
 
@@ -226,7 +387,12 @@ def request_with_fallback(method: str, url: str, **kwargs: Any):
         raise ValueError(f"unsupported HTTP method: {method!r}")
 
     try:
-        resp = fn(url, verify=_VERIFY, **kwargs)
+        # Inject HMAC v0.7 headers if a credential is configured.
+        # Sign once for the primary URL; the alt URL reuses the same
+        # headers (path doesn't change between http<->https swap).
+        signed = _signed_headers(method, url, kwargs)
+        call_kwargs = kwargs if not signed else {**kwargs, "headers": _merge_headers(kwargs, signed)}
+        resp = fn(url, verify=_VERIFY, **call_kwargs)
         return resp, url
     except BaseException as exc:
         kind = _classify_failure(exc)
@@ -238,5 +404,5 @@ def request_with_fallback(method: str, url: str, **kwargs: Any):
         # beats the original "no HTTP server on 8765" when the
         # server actually moved to HTTPS).
         alt_url = _swap_scheme(url)
-        resp = fn(alt_url, verify=_VERIFY, **kwargs)
+        resp = fn(alt_url, verify=_VERIFY, **call_kwargs)
         return resp, alt_url
