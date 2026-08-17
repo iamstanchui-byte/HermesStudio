@@ -393,6 +393,11 @@ async def _load_agents(db: Any) -> list[dict[str, Any]]:
         agents.append(
             {
                 "id": row["id"],
+                # v1.0.1 §3.3 enrollment: the agent's self-declared name
+                # from --agent-name. The template renders `a.name or a.id`
+                # so this surface name wins when set; falls back to the
+                # auto-generated id for pre-v1.0.1 agents with no name.
+                "name": row.get("name") or "",
                 "ip": row.get("ip"),
                 "os_type": row.get("os_type"),
                 "status": row["status"],
