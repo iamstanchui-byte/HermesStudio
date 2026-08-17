@@ -84,13 +84,47 @@ def _compute_verify() -> bool | str:
 
 
 # Module-level cache. Read once at import. Re-import the module to
-# pick up env changes (or just restart the wrapper).
+# pick up env changes (or just restart the wrapper). Send SIGHUP to
+# the running wrapper to call `reload_verify()` (see below) without
+# a full restart.
 _VERIFY: bool | str = _compute_verify()
 
 
 def get_verify() -> bool | str:
     """Return the active `verify` policy. Useful for tests + logging."""
     return _VERIFY
+
+
+def reload_verify() -> tuple[bool | str, bool | str]:
+    """Re-read the TLS verify policy from env vars and update the cache.
+
+    Why this exists
+    ---------------
+    The verify policy is computed once at import time (`_VERIFY` above)
+    and cached in the module global, because the wrapper's heartbeat
+    hot path calls `httpx.<method>(url, verify=_VERIFY, ...)` for every
+    tick (~5s) and we don't want an env-var re-read on every request.
+
+    The downside: changing `INSECURE_SKIP_TLS_VERIFY` or
+    `ORCHESTRATOR_CA_BUNDLE` at runtime has no effect until restart.
+
+    The fix: this function re-runs `_compute_verify()` and updates the
+    module global. The wrapper's start function installs a SIGHUP
+    handler that calls this -- on Unix, `kill -HUP <pid>` re-reads the
+    env without a restart. On Windows (no real SIGHUP), operators
+    should use the service manager: `nssm restart <svc>` or
+    `sc stop <svc> && sc start <svc>`.
+
+    Returns:
+        (old_verify, new_verify) -- useful for the operator to see
+        the change took effect in the log.
+
+    See docs/wrapper-runbook.md (TBD) for the operational pattern.
+    """
+    global _VERIFY
+    old = _VERIFY
+    _VERIFY = _compute_verify()
+    return old, _VERIFY
 
 
 # === HMAC v0.7 client-side signing (2026-08-16) ===

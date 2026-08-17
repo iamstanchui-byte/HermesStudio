@@ -2333,9 +2333,29 @@ def start(
         click.echo("\n[daemon] SIGINT received, stopping after current task...")
         stop_flag["stop"] = True
 
+    # v0.7 §2 (2026-08-17, Fix #4): SIGHUP handler re-reads the
+    # TLS verify env vars (INSECURE_SKIP_TLS_VERIFY, ORCHESTRATOR_CA_BUNDLE)
+    # without a full wrapper restart. The agent_http module caches the
+    # verify policy at import time; SIGHUP triggers reload_verify()
+    # which re-runs the env-var resolution. Unix only (Windows has no
+    # real SIGHUP; operators should use the service manager there).
+    def _handle_sighup(signum, frame):
+        try:
+            from hermes_orch.agent_http import reload_verify
+            old, new = reload_verify()
+            click.echo(
+                f"[daemon] SIGHUP received: TLS verify policy reloaded "
+                f"{old!r} -> {new!r}"
+            )
+        except Exception as e:
+            click.echo(f"[daemon] SIGHUP reload failed: {e}")
+
     try:
         import signal
         signal.signal(signal.SIGINT, _handle_sigint)
+        # SIGHUP exists on Unix; on Windows it's not defined.
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, _handle_sighup)
     except (AttributeError, ValueError):
         pass  # Windows quirks
 
