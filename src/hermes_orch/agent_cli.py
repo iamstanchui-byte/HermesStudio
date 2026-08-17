@@ -4044,13 +4044,20 @@ def start(
         # Fetch current DB view (include_deleted so we know about deletes too,
         # but we'll only ever push new/upsert here Ã¢â‚¬â€ deletes are dashboard-driven)
         try:
+            # v0.7 §1.4: query strings are forbidden on signed endpoints, so we pass
+            # `include_deleted` as `X-Include-Deleted: 1` header instead of
+            # `?include_deleted=1`. Merge into the v0.6 auth headers (the v0.7
+            # auto-inject path in agent_http.Client handles the 7 X-Hermes-*
+            # headers separately, so we only need to attach this one extra header
+            # to the v0.6 fallback headers dict).
+            skills_headers = _auth_headers(
+                "GET",
+                f"/api/agents/{agent_id}/profiles/{pname}/skills",
+            )
+            skills_headers["X-Include-Deleted"] = "1"
             r = client.get(
                 f"{orchestrator_url}/api/agents/{agent_id}/profiles/{pname}/skills",
-                headers=_auth_headers(
-                    "GET",
-                    f"/api/agents/{agent_id}/profiles/{pname}/skills",
-                ),
-                extra_headers={"X-Include-Deleted": "1"},
+                headers=skills_headers,
                 timeout=10,
             )
             r.raise_for_status()
