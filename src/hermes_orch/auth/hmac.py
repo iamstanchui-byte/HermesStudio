@@ -129,7 +129,46 @@ def compute_signature(
     compares with hmac.compare_digest.
     """
     msg = string_to_sign(method, path, body, timestamp).encode("utf-8")
-    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    # v0.7 transition (2026-08-16): accept bytes (raw 32-byte secret)
+    # in addition to str (utf-8 text). The DB column may have either.
+    if isinstance(secret, bytes):
+        secret_bytes = secret
+    else:
+        secret_bytes = secret.encode("utf-8")
+    return hmac.new(secret_bytes, msg, hashlib.sha256).hexdigest()
+
+
+def _parse_hmac_secret(secret_str: str) -> bytes:
+    """Decode a stored HMAC secret into the bytes the wrapper signs with.
+
+    The DB column `agents.hmac_secret` is historically a text value
+    (base64-encoded 32 bytes, written by the v0.6 bootstrap). The
+    v0.7 transition (2026-08-16) writes HEX-encoded 32 bytes in the
+    same column (the v0.7 verifier's `bytes.fromhex` rejects text).
+
+    To keep both formats working on the same column, we try hex
+    first (v0.7 format) and fall back to utf-8 text (v0.6 format).
+    The two formats are unambiguous: hex is always 64 chars of
+    `[0-9a-f]`, while base64/urlsafe is shorter with `+/=` chars.
+
+    Args:
+        secret_str: The raw value from `agents.hmac_secret`.
+
+    Returns:
+        The secret as bytes (32 bytes for both formats).
+
+    Raises:
+        ValueError: if the secret can't be decoded as either hex or
+            utf-8 text.
+    """
+    if not secret_str:
+        raise ValueError("empty secret")
+    s = secret_str.strip()
+    # Try hex first (v0.7 format: exactly 64 chars of [0-9a-f])
+    if len(s) == 64 and all(c in "0123456789abcdefABCDEF" for c in s):
+        return bytes.fromhex(s)
+    # Fall back to utf-8 text (v0.6 format: base64 or arbitrary text)
+    return s.encode("utf-8")
 
 
 def verify_signature(
@@ -195,6 +234,27 @@ async def require_hmac_auth(
     """
     from hermes_orch.core.audit import audit_log  # late import: avoid cycle
 
+    # v0.7 transition (2026-08-16): if the request carries the 7
+    # X-Hermes-* headers (v0.7 §1.4), delegate to the v0.7 verifier.
+    # This lets the routes that still depend on require_hmac_auth
+    # (the 12+ wrapper endpoints that haven't been switched to
+    # dispatch_hmac_auth) accept v0.7-signed requests without
+    # changing each route's dependency.
+    from hermes_orch.auth.hmac_v07 import require_hmac_auth_v07
+    if x_agent_id is None and request.headers.get("X-Hermes-Method"):
+        # All v0.7 headers must be present; require_hmac_auth_v07
+        # raises 401 itself if any is missing.
+        return await require_hmac_auth_v07(
+            request=request,
+            x_hermes_method=request.headers.get("X-Hermes-Method"),
+            x_hermes_path=request.headers.get("X-Hermes-Path"),
+            x_hermes_body_sha256=request.headers.get("X-Hermes-Body-SHA256"),
+            x_hermes_key_id=request.headers.get("X-Hermes-Key-Id"),
+            x_hermes_timestamp=request.headers.get("X-Hermes-Timestamp"),
+            x_hermes_nonce=request.headers.get("X-Hermes-Nonce"),
+            x_hermes_signature=request.headers.get("X-Hermes-Signature"),
+        )
+
     if not x_agent_id or not x_timestamp or not x_signature:
         raise HTTPException(
             401,
@@ -248,7 +308,7 @@ async def require_hmac_auth(
         try:
             await audit_log(
                 db,
-                "agent.hmac_legacy_auth",
+                "agent.hmac_legacy",
                 actor="auth",
                 agent_id=x_agent_id,
                 payload={"path": request.url.path, "method": request.method},
@@ -268,8 +328,17 @@ async def require_hmac_auth(
     if request.url.query:
         full_path = full_path + "?" + request.url.query
 
+    # v0.7 transition (2026-08-16): hmac_secret may be hex (v0.7) or
+    # utf-8 text (v0.6). _parse_hmac_secret handles both.
+    try:
+        secret_bytes = _parse_hmac_secret(secret)
+    except (ValueError, UnicodeEncodeError) as e:
+        raise HTTPException(
+            401,
+            f"Agent {x_agent_id} hmac_secret is malformed: {e}",
+        )
     ok = verify_signature(
-        secret=secret,
+        secret=secret_bytes,
         method=request.method,
         path=full_path,
         body=body_bytes,
