@@ -38,6 +38,7 @@ import httpx
 # use `from hermes_orch.agent_http import get/post/...` so swapping
 # the import is enough Ã¢â‚¬â€ no per-call verify= plumbing.
 from hermes_orch.agent_http import (  # noqa: E402  (import after httpx on purpose)
+    Client as _HttpClient,
     delete as _httpx_delete,
     get as _httpx_get,
     get_verify as _agent_http_verify,
@@ -248,6 +249,30 @@ def _read_secret(secret_path: Path) -> str:
             f"Run 'hermes-orch-agent register' first."
         )
     return secret_path.read_text(encoding="utf-8-sig").strip()
+
+
+def _resolve_secret_path(cfg: dict) -> Path:
+    """Resolve the secret file path from a wrapper config dict.
+
+    Reads `secret_file` (canonical v0.7 §1.4 name). Falls back to legacy
+    `hmac_secret_file` for one-release migration (Bug #1 fix, 2026-08-17).
+    The legacy field is read but NOT logged at WARN to avoid noise on every
+    `start` call -- the deprecation warning fires once per wrapper install
+    in the enroll path.
+
+    Returns:
+        Resolved Path to the secret file.
+
+    Raises:
+        click.ClickException: if neither field is present or both are empty.
+    """
+    sf = (cfg.get("secret_file") or cfg.get("hmac_secret_file") or "").strip()
+    if not sf:
+        raise click.ClickException(
+            "wrapper-config.json missing 'secret_file' (or legacy 'hmac_secret_file'). "
+            "Re-run `hermes-orch-agent enroll` to regenerate the config."
+        )
+    return Path(sf).expanduser()
 
 
 # Cap on the cleaned task summary stored in the DB. 32KB is enough for
@@ -598,7 +623,7 @@ def _discover_and_persist_url(
 # works regardless of where the wrapper is running.
 
 def _hmac_headers(
-    agent_id: str, secret: str, *, method: str = "GET", path: str = "", body: bytes = b""
+    agent_id: str, secret: str | bytes, *, method: str = "GET", path: str = "", body: bytes = b""
 ) -> dict:
     """Build HMAC-signed headers for a wrapper request (v1.6+).
 
@@ -626,6 +651,35 @@ def _hmac_headers(
     """
     import time as _t
     from hermes_orch.auth import compute_signature
+    # v0.7 transition (2026-08-16, hotfix 2026-08-16 22:24): when an
+    # HMAC v0.7 credential is configured on the agent_http layer, we
+    # MUST sign and return the 7 X-Hermes-* headers HERE -- not just
+    # suppress the v0.6 headers. The previous "return {}" was wrong
+    # for any call site that used `httpx.Client` directly (config
+    # poll loop, skills sync, apply_configs, _claim_one, _ack) --
+    # those didn't go through `agent_http.get/post`, so the v0.7
+    # headers were never injected and the server returned 401.
+    # 2026-08-17 fix: those call sites now use `agent_http.Client`
+    # which auto-injects the headers; this helper still exists for
+    # the legacy call sites that pass `headers=_auth_headers(...)`
+    # to raw `agent_http.get/post` (mostly the heartbeat loop).
+    # agent_http.post/.get also call this same signer, so we keep
+    # both code paths in lockstep.
+    from hermes_orch import agent_http
+    if agent_http.has_hmac_credential():
+        from urllib.parse import urlparse
+        from hermes_orch.auth.hmac_v07 import sign_v07_request
+        # v0.7 §1.4 forbids query strings on signed endpoints; the
+        # server's verifier returns 400 MALFORMED_HEADERS if the
+        # X-Hermes-Path carries a '?'. The caller passes the full
+        # request path INCLUDING query string (for logging), so we
+        # strip it before signing.
+        path_only = urlparse(path).path
+        key_id, secret_bytes = agent_http.get_hmac_credential()
+        return sign_v07_request(
+            method=method, path=path_only, body=body,
+            key_id=key_id, secret=secret_bytes,
+        )
     ts = str(int(_t.time()))
     sig = compute_signature(secret, method, path, body, ts)
     return {
@@ -1662,7 +1716,9 @@ def _load_wrapper_config(config_path: Path) -> dict:
     for pname, pcfg in raw.get("profiles", {}).items():
         if "root" in pcfg:
             pcfg["root"] = str(Path(pcfg["root"]).expanduser())
-    raw["secret_file"] = str(Path(raw["secret_file"]).expanduser())
+    # v0.7 §1.4 (Bug #1 fix, 2026-08-17): resolve `secret_file` (canonical)
+    # with one-release fallback to legacy `hmac_secret_file`.
+    raw["secret_file"] = str(_resolve_secret_path(raw))
     return raw
 
 
@@ -1910,6 +1966,26 @@ def enroll(
     click.echo(f"Enrolling agent '{agent_name}' (host={hostname}, os={os_type}) ...")
     click.echo(f"  Server: {server}")
 
+    # v0.7 + new-user-activation (2026-08-16 23:00): build an SSL
+    # context that honors INSECURE_SKIP_TLS_VERIFY. Without this,
+    # enroll fails on self-signed orchestrator certs (the user has
+    # to set the env var on the agent host for productization
+    # bootstrapper to work). The same env var is already honored by
+    # agent_http.post/.get for the runtime daemon.
+    #
+    # We duplicate the policy here (rather than going through
+    # agent_http) because enroll runs BEFORE the agent has an HMAC
+    # credential, so the v0.7 auto-inject is irrelevant and the
+    # token-based enroll has its own request shape.
+    import os as _os
+    import ssl as _ssl
+    _ssl_ctx = _ssl.create_default_context()
+    _insecure = (_os.environ.get("INSECURE_SKIP_TLS_VERIFY") or "").strip().lower()
+    if _insecure in ("1", "true", "yes", "on"):
+        _ssl_ctx.check_hostname = False
+        _ssl_ctx.verify_mode = _ssl.CERT_NONE
+        click.echo("  TLS: INSECURE_SKIP_TLS_VERIFY=1 → self-signed certs accepted")
+
     # POST /api/agents/enroll — no auth, the token IS the credential
     url = server.rstrip("/") + "/api/agents/enroll"
     body = _json.dumps({
@@ -1923,7 +1999,7 @@ def enroll(
         headers={"Content-Type": "application/json"},
     )
     try:
-        resp = urllib.request.urlopen(req, timeout=15)
+        resp = urllib.request.urlopen(req, timeout=15, context=_ssl_ctx)
     except urllib.error.HTTPError as e:
         # The 410/404/500 cases: parse the JSON detail and surface
         # a clean error message (no secret leakage, even if the
@@ -1941,19 +2017,62 @@ def enroll(
 
     data = _json.loads(resp.read().decode("utf-8"))
     agent_id = data.get("agent_id") or ""
-    hmac_secret = data.get("hmac_secret") or ""
-    if not agent_id or not hmac_secret:
-        click.echo(f"  ERROR: server returned no agent_id / hmac_secret", err=True)
+
+    # v0.7 §1.5a enrollment response shape (2026-08-17, fix #1):
+    #   v0.6 legacy: { "agent_id": ..., "hmac_secret": <base64url text> }
+    #   v0.7:        { "agent_id": ..., "hmac_key_id": <uuid>,
+    #                  "hmac_secret_hex": <64 lowercase hex chars> }
+    # We accept BOTH for migration. If v0.7 fields present, prefer them
+    # (server-generated 32 random bytes hex-encoded; the canonical format
+    # per v0.7 spec §1.4). If only v0.6 fields present, fall back to
+    # legacy text format and warn.
+    hmac_key_id = (data.get("hmac_key_id") or "").strip()
+    hmac_secret_hex = (data.get("hmac_secret_hex") or "").strip()
+    hmac_secret_v06 = (data.get("hmac_secret") or "").strip()
+
+    if not agent_id:
+        click.echo(f"  ERROR: server returned no agent_id", err=True)
         sys.exit(1)
 
-    click.echo(f"  OK. agent_id={agent_id}")
+    if hmac_key_id and hmac_secret_hex:
+        # v0.7 path (preferred). Strict validation: exactly 64 lowercase hex.
+        if not re.fullmatch(r"[0-9a-f]{64}", hmac_secret_hex):
+            click.echo(
+                f"  ERROR: server returned malformed hmac_secret_hex "
+                f"(expected 64 lowercase hex chars, got {len(hmac_secret_hex)} chars)",
+                err=True,
+            )
+            sys.exit(1)
+        secret_to_write = hmac_secret_hex
+        secret_format = "v0.7-hex"
+    elif hmac_secret_v06:
+        # v0.6 legacy fallback. Will be deprecated once v0.6 server
+        # path is sunset (per spec migration: HERMES_HMAC_ACCEPT_V06=false
+        # gate, then delete after 30-day zero-volume observation).
+        secret_to_write = hmac_secret_v06
+        secret_format = "v0.6-text"
+        click.echo(
+            "  WARN: server returned legacy v0.6 hmac_secret (text format) "
+            "but no hmac_key_id/hmac_secret_hex. Wrapper will operate in v0.6 "
+            "mode only. Ask the operator to upgrade the orchestrator to a "
+            "version that returns v0.7 enrollment fields.",
+            err=True,
+        )
+    else:
+        click.echo(
+            f"  ERROR: server returned no hmac_secret / hmac_secret_hex",
+            err=True,
+        )
+        sys.exit(1)
 
-    # Write hmac_secret to a chmod-0600 file
+    click.echo(f"  OK. agent_id={agent_id}  format={secret_format}")
+
+    # Write the secret to a chmod-0600 file
     secret_path = Path(hmac_secret_file).expanduser() if hmac_secret_file else (
         Path.home() / ".hermes-orchestrator" / f".hmac-{agent_id}"
     )
     secret_path.parent.mkdir(parents=True, exist_ok=True)
-    secret_path.write_text(hmac_secret, encoding="utf-8")
+    secret_path.write_text(secret_to_write, encoding="utf-8")
     try:
         os.chmod(secret_path, 0o600)
     except Exception:
@@ -1971,17 +2090,31 @@ def enroll(
     existing: dict = {}
     if cfg_path.exists():
         try:
-            existing = _json.loads(cfg_path.read_text(encoding="utf-8")) or {}
+            # utf-8-sig strips the PowerShell Set-Content BOM transparently
+            # (see Bug #5 in the 2026-08-17 bug-discovery report).
+            existing = _json.loads(cfg_path.read_text(encoding="utf-8-sig")) or {}
         except Exception:
             existing = {}
     existing.setdefault("orchestrator_url", server)
     existing.setdefault("agent_id", agent_id)
+    # v0.7 §1.4 canonical field name is `secret_file` (Bug #1 fix).
+    # We write BOTH the canonical name AND the legacy `hmac_secret_file`
+    # for one-release migration (read sites fall back to legacy name).
+    # The legacy field will be removed in a follow-up release once all
+    # deployed wrappers have been upgraded.
+    existing["secret_file"] = str(secret_path)
     existing["hmac_secret_file"] = str(secret_path)
+    if hmac_key_id:
+        existing["hmac_key_id"] = hmac_key_id
+    if hmac_secret_hex:
+        existing["hmac_secret_hex"] = hmac_secret_hex
     cfg_path.write_text(
         _json.dumps(existing, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     click.echo(f"  wrapper-config.json written to {cfg_path}")
+    if hmac_key_id and hmac_secret_hex:
+        click.echo(f"  v0.7 HMAC fields: hmac_key_id={hmac_key_id} (in cfg)")
 
     if data.get("requested_name_used"):
         click.echo(
@@ -2040,7 +2173,7 @@ def start(
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     agent_id = cfg.get("agent_id")
     orchestrator_url = cfg.get("orchestrator_url", "").rstrip("/")
-    secret_path = Path(cfg.get("secret_file", "")).expanduser()
+    secret_path = _resolve_secret_path(cfg)
     profiles_cfg = cfg.get("profiles") or {}
 
     if not agent_id:
@@ -2056,13 +2189,84 @@ def start(
     if not secret:
         raise click.ClickException(f"Secret file {secret_path} is empty")
 
+    # v0.7 transition (2026-08-16): when hmac_key_id + hmac_secret_hex
+    # are in wrapper-config.json, use the hex bytes for the v0.6 path
+    # too. The server's v0.6 verifier (after the same transition fix)
+    # accepts both formats: hex (v0.7) or utf-8 text (v0.6 legacy).
+    # We standardize on hex here so both verifier paths compute the
+    # same 32-byte secret from the same source.
+    # v0.6-LEGACY-BOOTSTRAP: if hmac_key_id NOT in cfg, fall back to
+    # the v0.6 secret_file text (base64). Wrapper will sign with
+    # text-encoded bytes, server verifier will do the same.
+    # v0.7-MODE (hmac_key_id set): sign with bytes.fromhex(secret_hex).
+    v07_secret_bytes: bytes | None = None
+
+    # v0.7 §1.4 client-side HMAC: if `hmac_key_id` + `hmac_secret_hex`
+    # are in wrapper-config.json, set them on the agent_http layer.
+    # All outgoing requests then get the 7 X-Hermes-* headers
+    # injected automatically. The server's HMAC middleware (v0.7
+    # allowlist) accepts these; v0.6 (`X-Agent-Id` + 3-header) is
+    # still accepted for backward compat while the server has
+    # `HERMES_HMAC_ACCEPT_V06=true` (the default).
+    #
+    # If the fields are absent, the wrapper continues in v0.6 mode
+    # only (existing behavior). Operators opt into v0.7 by either:
+    #   - Running `hermes-orch agent provision-hmac-key --agent-id X`
+    #     which writes the fields into wrapper-config.json
+    #   - Hand-editing wrapper-config.json (see
+    #     docs/proposals/orch-client-build-impl-plan-v0.7.md §3.2)
+    hmac_key_id = (cfg.get("hmac_key_id") or "").strip()
+    hmac_secret_hex = (cfg.get("hmac_secret_hex") or "").strip()
+    if hmac_key_id and hmac_secret_hex:
+        try:
+            from hermes_orch.agent_http import set_hmac_credential
+            set_hmac_credential(hmac_key_id, hmac_secret_hex)
+            # ALSO set the v0.6 path's `secret` variable to the raw
+            # 32-byte secret so the v0.6 verifier (which now accepts
+            # bytes too) sees the same value as the v0.7 verifier.
+            # This keeps both code paths (heartbeat, config poll)
+            # in lockstep with the v0.7 transition.
+            v07_secret_bytes = bytes.fromhex(hmac_secret_hex)
+            secret = v07_secret_bytes  # bytes, not str
+            click.echo(f"  v0.7 HMAC: enabled (key_id={hmac_key_id})")
+        except ValueError as e:
+            # Bad hex in cfg -- fail loudly so the operator notices.
+            raise click.ClickException(
+                f"wrapper-config.json hmac_secret_hex is invalid: {e}"
+            )
+    else:
+        # No v0.7 credential -- fall back to v0.6 only. The server
+        # accepts v0.6 by default; once HERMES_HMAC_ACCEPT_V06=false
+        # is set on the server, this wrapper will be 401'd until the
+        # operator provisions a v0.7 key.
+        if hmac_key_id or hmac_secret_hex:
+            click.echo(
+                "WARN: only one of hmac_key_id/hmac_secret_hex is set in "
+                "wrapper-config.json; v0.7 HMAC disabled. Both are required.",
+                err=True,
+            )
+        # No log line for the "neither set" case -- v0.6-only is the
+        # long-running default and would be noisy.
+
     # v1.6 HMAC bootstrap: on every start, push the local secret to
     # the orchestrator so it can verify our signatures. The
     # endpoint is one-shot: first call sets hmac_secret, subsequent
     # calls with the same value are no-ops, mismatched values get
     # 409 (the operator must rotate to change secrets). This means
     # the wrapper self-heals if the orchestrator's DB was wiped.
-    _bootstrap_hmac_secret(orchestrator_url, agent_id, secret)
+    #
+    # v0.7 transition (2026-08-16): if the wrapper is configured
+    # with v0.7 HMAC (hmac_key_id + hmac_secret_hex in cfg), the
+    # server's v0.7 verifier expects the secret in HEX format
+    # (bytes.fromhex). The v0.6 bootstrap pushes the secret as raw
+    # text; if we ran it now it would overwrite the hex we put in
+    # the DB. Skip the bootstrap in v0.7 mode -- the operator has
+    # already provisioned the key (admin script), and re-pushing on
+    # every wrapper start would defeat the hex format.
+    if hmac_key_id and hmac_secret_hex:
+        click.echo("  v0.7 HMAC: bootstrap skipped (key already provisioned)")
+    else:
+        _bootstrap_hmac_secret(orchestrator_url, agent_id, secret)
 
     # Auto-sync config from orchestrator (picks up newly added roles)
     if not no_sync:
@@ -2129,9 +2333,29 @@ def start(
         click.echo("\n[daemon] SIGINT received, stopping after current task...")
         stop_flag["stop"] = True
 
+    # v0.7 §2 (2026-08-17, Fix #4): SIGHUP handler re-reads the
+    # TLS verify env vars (INSECURE_SKIP_TLS_VERIFY, ORCHESTRATOR_CA_BUNDLE)
+    # without a full wrapper restart. The agent_http module caches the
+    # verify policy at import time; SIGHUP triggers reload_verify()
+    # which re-runs the env-var resolution. Unix only (Windows has no
+    # real SIGHUP; operators should use the service manager there).
+    def _handle_sighup(signum, frame):
+        try:
+            from hermes_orch.agent_http import reload_verify
+            old, new = reload_verify()
+            click.echo(
+                f"[daemon] SIGHUP received: TLS verify policy reloaded "
+                f"{old!r} -> {new!r}"
+            )
+        except Exception as e:
+            click.echo(f"[daemon] SIGHUP reload failed: {e}")
+
     try:
         import signal
         signal.signal(signal.SIGINT, _handle_sigint)
+        # SIGHUP exists on Unix; on Windows it's not defined.
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, _handle_sighup)
     except (AttributeError, ValueError):
         pass  # Windows quirks
 
@@ -2142,6 +2366,28 @@ def start(
         requests can't be replayed against a different endpoint.
         """
         from hermes_orch.auth import compute_signature
+        # v0.7 transition (2026-08-16, hotfix 2026-08-16 22:24): when an
+        # HMAC v0.7 credential is configured, sign and return the 7
+        # X-Hermes-* headers HERE. The previous "return {}" was wrong
+        # for any call site that used `httpx.Client` directly -- the
+        # config poll loop and skills sync all did, and without the
+        # headers the server returned 401. 2026-08-17 fix: those
+        # call sites now use `agent_http.Client` which auto-injects
+        # the headers; this helper still exists for the legacy call
+        # sites that pass `headers=_auth_headers(...)` to raw
+        # `agent_http.get/post` (mostly the heartbeat loop). See
+        # _hmac_headers for the full rationale; this is the
+        # inner-function mirror of it.
+        from hermes_orch import agent_http
+        if agent_http.has_hmac_credential():
+            from urllib.parse import urlparse
+            from hermes_orch.auth.hmac_v07 import sign_v07_request
+            path_only = urlparse(path).path  # v0.7 §1.4: no query string
+            key_id, secret_bytes = agent_http.get_hmac_credential()
+            return sign_v07_request(
+                method=method, path=path_only, body=body,
+                key_id=key_id, secret=secret_bytes,
+            )
         ts = str(int(time_mod.time()))
         sig = compute_signature(secret, method, path, body, ts)
         return {
@@ -2215,17 +2461,48 @@ def start(
             # intentionally NOT updated mid-flight -- the user
             # explicitly asked for a restart-applies-the-change
             # semantic, not a live mid-session switch).
-            r, _actual_heartbeat_url = request_with_fallback(
-                "POST",
-                f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
-                headers=_auth_headers(
+            #
+            # v0.7 §1.4 (2026-08-17, fix #8 in the 8-bug report):
+            # the heartbeat call site now uses the v0.7 7-header
+            # signing when a v0.7 credential is configured on
+            # agent_http (set via set_hmac_credential() during
+            # start()). The v0.6 path (3-headers via _auth_headers
+            # + request_with_fallback) is kept as a fallback for
+            # legacy wrappers that never had v0.7 fields in
+            # wrapper-config.json. Previously the heartbeat ALWAYS
+            # used v0.6 even when v0.7 was configured, which
+            # triggered the v0.6 POST `/heartbeat` disconnect
+            # bug on the server side (server-side crash in the
+            # legacy handler after auth passed). After this fix
+            # the v0.7-wrapped heartbeat uses agent_http.post()
+            # which auto-injects the 7 X-Hermes-* headers.
+            from hermes_orch.agent_http import has_hmac_credential
+            if has_hmac_credential():
+                # v0.7 path: agent_http.post auto-injects the 7
+                # X-Hermes-* headers. No _auth_headers needed.
+                from hermes_orch.agent_http import post as _agent_http_post
+                r = _agent_http_post(
+                    f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
+                    content=_heartbeat_body,
+                    timeout=10,
+                )
+                _actual_heartbeat_url = (
+                    f"{orchestrator_url}/api/agents/{agent_id}/heartbeat"
+                )
+            else:
+                # v0.6 legacy path: explicit 3-headers + scheme
+                # fallback retry via request_with_fallback.
+                r, _actual_heartbeat_url = request_with_fallback(
                     "POST",
-                    f"/api/agents/{agent_id}/heartbeat",
-                    _heartbeat_body,
-                ),
-                content=_heartbeat_body,
-                timeout=10,
-            )
+                    f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
+                    headers=_auth_headers(
+                        "POST",
+                        f"/api/agents/{agent_id}/heartbeat",
+                        _heartbeat_body,
+                    ),
+                    content=_heartbeat_body,
+                    timeout=10,
+                )
             if r.status_code != 200:
                 click.echo(f"[daemon] heartbeat {r.status_code}: {r.text[:200]}")
                 return [], []
@@ -3737,7 +4014,7 @@ def start(
     _last_skill_sync: dict[str, float] = {}  # profile_name -> last sync time
 
     def _sync_one_profile_skills(
-        client: httpx.Client,
+        client: _HttpClient,
         pname: str,
         pcfg: dict,
         *,
@@ -3767,12 +4044,20 @@ def start(
         # Fetch current DB view (include_deleted so we know about deletes too,
         # but we'll only ever push new/upsert here Ã¢â‚¬â€ deletes are dashboard-driven)
         try:
+            # v0.7 §1.4: query strings are forbidden on signed endpoints, so we pass
+            # `include_deleted` as `X-Include-Deleted: 1` header instead of
+            # `?include_deleted=1`. Merge into the v0.6 auth headers (the v0.7
+            # auto-inject path in agent_http.Client handles the 7 X-Hermes-*
+            # headers separately, so we only need to attach this one extra header
+            # to the v0.6 fallback headers dict).
+            skills_headers = _auth_headers(
+                "GET",
+                f"/api/agents/{agent_id}/profiles/{pname}/skills",
+            )
+            skills_headers["X-Include-Deleted"] = "1"
             r = client.get(
-                f"{orchestrator_url}/api/agents/{agent_id}/profiles/{pname}/skills?include_deleted=1",
-                headers=_auth_headers(
-                    "GET",
-                    f"/api/agents/{agent_id}/profiles/{pname}/skills?include_deleted=1",
-                ),
+                f"{orchestrator_url}/api/agents/{agent_id}/profiles/{pname}/skills",
+                headers=skills_headers,
                 timeout=10,
             )
             r.raise_for_status()
@@ -3980,7 +4265,7 @@ def start(
             return 0
         applied = 0
         try:
-            with httpx.Client(timeout=10, verify=_agent_http_verify()) as client:
+            with _HttpClient(timeout=10) as client:
                 for pname, pcfg in profiles_cfg.items():
                     # Resolve the profile root (template like <profiles_dir>/<role>)
                     try:
@@ -4017,7 +4302,7 @@ def start(
                             # by the dashboard's "Sync from disk" button. We
                             # run the sync and ack as applied (no file written).
                             if cfg_row["file_path"] == "__sync_skills__":
-                                with httpx.Client(timeout=30, verify=_agent_http_verify()) as sync_client:
+                                with _HttpClient(timeout=30) as sync_client:
                                     n = _sync_one_profile_skills(sync_client, pname, pcfg)
                                 click.echo(
                                     f"[daemon] sync-skills trigger for {pname}: "
@@ -4328,7 +4613,7 @@ def start(
             # this profile Ã¢â‚¬â€ the file scan is cheap but no point doing it
             # every 5s.
             now_ts = time_mod.time()
-            with httpx.Client(timeout=30, verify=_agent_http_verify()) as sync_client:
+            with _HttpClient(timeout=30) as sync_client:
                 for pname, pcfg in profiles_cfg.items():
                     last = _last_skill_sync.get(pname, 0)
                     if (now_ts - last) < _SKILL_AUTO_SYNC_INTERVAL:
@@ -4448,7 +4733,7 @@ def sync_config(config_file: str) -> None:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     agent_id = cfg.get("agent_id")
     orchestrator_url = cfg.get("orchestrator_url", "").rstrip("/")
-    secret_path = Path(cfg.get("secret_file", "")).expanduser()
+    secret_path = _resolve_secret_path(cfg)
     if not agent_id or not orchestrator_url:
         raise click.ClickException("Config missing agent_id or orchestrator_url")
     if not secret_path.exists():
@@ -4532,7 +4817,7 @@ def status() -> None:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     agent_id = cfg.get("agent_id")
     orchestrator_url = cfg.get("orchestrator_url", "").rstrip("/")
-    secret_path = Path(cfg.get("secret_file", "")).expanduser()
+    secret_path = _resolve_secret_path(cfg)
     profiles_cfg = cfg.get("profiles") or {}
 
     click.echo(f"Config: {cfg_path}")
@@ -4616,7 +4901,7 @@ def apply_configs(config_path: str, profile_filter: str | None) -> None:
         return
 
     applied_count = 0
-    with httpx.Client(timeout=30, verify=_agent_http_verify()) as client:
+    with _HttpClient(timeout=30) as client:
         for pname, pcfg in profiles.items():
             root = Path(pcfg["root"])
             click.echo(f"[{pname}] root = {root}")
@@ -4694,7 +4979,7 @@ def apply_configs_loop(config_path: str, interval: int) -> None:
 
 
 def _claim_one(
-    client: httpx.Client, base: str, agent_id: str, profile: str, secret: str
+    client: _HttpClient, base: str, agent_id: str, profile: str, secret: str
 ) -> dict | None:
     path = f"/api/agents/{agent_id}/profiles/{profile}/configs/pending"
     headers = _hmac_headers(agent_id, secret, method="GET", path=path)
@@ -4709,7 +4994,7 @@ def _claim_one(
 
 
 def _ack(
-    client: httpx.Client,
+    client: _HttpClient,
     base: str,
     agent_id: str,
     profile: str,

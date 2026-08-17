@@ -175,7 +175,7 @@
                 <div class="flex items-center gap-3">
                     <span class="status-dot {{ 'dot-running' if a.status == 'verified' else 'dot-idle' if a.status == 'idle' else 'dot-error' }}"></span>
                     <div class="flex-1 min-w-0">
-                        <div class="font-medium text-sm text-gray-800 truncate">{{ a.id }}</div>
+                        <div class="font-medium text-sm text-gray-800 truncate" title="{{ a.id }}">{{ a.name or a.id }}</div>
                         <div class="text-xs text-gray-500 mt-0.5 flex items-center gap-2 flex-wrap">
                             <span>OS: {{ a.os_type or '—' }}</span>
                             <span>IP: {{ a.ip or '—' }}</span>
@@ -423,6 +423,7 @@
 {% for a in agents %}
 <template id="agent-tpl-{{ a.id }}">
     <div class="agent-template-data"
+         data-name="{{ a.name or a.id }}"
          data-os="{{ a.os_type or '—' }}"
          data-ip="{{ a.ip or '—' }}"
          data-heartbeat="{{ a.last_heartbeat_at or 'never' }}"
@@ -604,7 +605,7 @@ function selectAgent(agentId) {
     // Update the right panel
     document.getElementById('agent-detail-empty').style.display = 'none';
     document.getElementById('agent-detail-content').style.display = 'flex';
-    document.getElementById('detail-agent-name').textContent = agentId;
+    document.getElementById('detail-agent-name').textContent = data.dataset.name || agentId;
     document.getElementById('detail-agent-meta').textContent =
         'OS: ' + data.dataset.os + ' · IP: ' + data.dataset.ip + ' · Heartbeat: ' + data.dataset.heartbeat;
     // v3.6.0: populate the Max concurrent tasks input. Coerce to int

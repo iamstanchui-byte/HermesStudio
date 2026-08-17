@@ -1913,7 +1913,15 @@ async def list_skills(
         "file_path ASC, created_at DESC",
         (profile["id"],),
     )
-    include_deleted = request.query_params.get("include_deleted") == "1"
+    # v0.7 §1.4 forbids query strings on signed endpoints, so the
+    # wrapper now passes `include_deleted` as a request header instead
+    # of `?include_deleted=1`. We still honor the legacy query string
+    # for v0.6 callers and curl/manual testing — read header first,
+    # fall back to query string.
+    include_deleted = (
+        request.headers.get("x-include-deleted") == "1"
+        or request.query_params.get("include_deleted") == "1"
+    )
     # Flat-path support dropped 2026-07-19 (commit d5b7c9a). The newest
     # row per (profile, skill_name) wins — guaranteed by the
     # `created_at DESC` tiebreak in the ORDER BY above. The dedup

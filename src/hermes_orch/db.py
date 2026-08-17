@@ -782,6 +782,17 @@ MIGRATIONS = [
     "ALTER TABLE agents ADD COLUMN hmac_key_id TEXT",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_hmac_key_id "
     "ON agents (hmac_key_id) WHERE hmac_key_id IS NOT NULL",
+    # v0.7 §1.4 (2026-08-17): hmac_secret_hex column for the v0.7
+    # canonical hex format. The original `hmac_secret` column holds
+    # the v0.6 base64url text (43 chars, no padding) for backward
+    # compat with the v0.6 verifier; v0.7 reads from hmac_secret_hex
+    # (64 lowercase hex chars). Both columns are populated at enroll
+    # time from the SAME 32 random bytes. The split is required
+    # because the v0.7 verifier requires strict 32-byte hex per
+    # spec §1.4, and the v0.6 verifier requires base64url -- they
+    # can't share a single column. Both NULL for legacy agents that
+    # enrolled before v0.7.
+    "ALTER TABLE agents ADD COLUMN hmac_secret_hex TEXT",
     # v0.7 §1.4 enrollment (2026-08-15): self-reported agent hostname.
     # Populated by POST /api/enrollment/v07 from the request body
     # (informational only — the auth_agent_id from the v0.7 verifier

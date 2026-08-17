@@ -269,10 +269,70 @@ async def test_consume_happy_path_creates_agent(client):
     )
     assert agent is not None
     assert agent["name"] == "win-01"
-    assert agent["ip"] == "test-host"
+    # v0.7 IP fix (2026-08-17): `ip` is the actual TCP connection
+    # source (request.client.host), `hostname` is the agent-declared
+    # hostname. Previously the column-position was wrong and the
+    # hostname string ended up in the `ip` column. The TestClient
+    # connects from 127.0.0.1.
+    assert agent["ip"] == "127.0.0.1"
+    assert agent["hostname"] == "test-host"
     assert agent["status"] == "verifying"
     assert agent["hmac_secret"] == data["hmac_secret"]
     assert agent["secret_hash"] != data["hmac_secret"]  # hash != plaintext
+
+
+@pytest.mark.asyncio
+async def test_consume_returns_v07_fields_with_correct_format(client):
+    """v0.7 §1.4 (2026-08-17): EnrollOut includes hmac_secret_hex and
+    hmac_key_id. The DB row has hmac_key_id populated, hex is 64
+    lowercase chars, and hmac_key_id is `kw_` + 12 lowercase alnum.
+    """
+    import re as _re
+
+    ac, app = client
+    await _login(ac, ADMIN_USERNAME, ADMIN_PASSWORD)
+    r_issue = await ac.post(
+        "/api/enrollment-tokens",
+        json={"label": "v0.7 test", "requested_agent_name": "v07-01"},
+    )
+    token = r_issue.json()["token"]
+
+    r_consume = await ac.post(
+        "/api/agents/enroll",
+        json={"token": token, "agent_name": "v07-01", "hostname": "v07-host"},
+    )
+    assert r_consume.status_code == 200, r_consume.text
+    data = r_consume.json()
+
+    # hmac_secret_hex: exactly 64 lowercase hex chars
+    assert "hmac_secret_hex" in data, "EnrollOut missing hmac_secret_hex (v0.7 §1.4)"
+    assert _re.fullmatch(r"[0-9a-f]{64}", data["hmac_secret_hex"]), (
+        f"hmac_secret_hex must be 64 lowercase hex chars, got {data['hmac_secret_hex']!r}"
+    )
+
+    # hmac_key_id: 'kw_' + 12 lowercase alnum
+    assert "hmac_key_id" in data, "EnrollOut missing hmac_key_id (v0.7 §1.4)"
+    assert _re.fullmatch(r"kw_[a-z0-9]{12}", data["hmac_key_id"]), (
+        f"hmac_key_id must be 'kw_' + 12 lowercase alnum, got {data['hmac_key_id']!r}"
+    )
+
+    # Invariant: hex secret and base64url secret must be the same 32 bytes
+    import base64 as _b64
+    hmac_secret_padded = data["hmac_secret"] + "=" * (-len(data["hmac_secret"]) % 4)
+    base64_bytes = _b64.urlsafe_b64decode(hmac_secret_padded)
+    hex_bytes = bytes.fromhex(data["hmac_secret_hex"])
+    assert base64_bytes == hex_bytes, (
+        "v0.6 hmac_secret (base64url) and v0.7 hmac_secret_hex must encode the same bytes"
+    )
+
+    # DB row: hmac_key_id populated, matches response
+    agent = await app.state.db.fetchone(
+        "SELECT hmac_key_id FROM agents WHERE id = ?", (data["agent_id"],)
+    )
+    assert agent is not None
+    assert agent["hmac_key_id"] == data["hmac_key_id"], (
+        "agents.hmac_key_id must match the EnrollOut.hmac_key_id"
+    )
 
 
 @pytest.mark.asyncio

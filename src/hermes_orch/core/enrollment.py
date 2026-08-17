@@ -131,14 +131,26 @@ CONSUME_ALREADY_USED = "already_used"
 class ConsumeResult:
     """Result of attempting to consume an enrollment token.
 
-    On `CONSUME_OK`, `agent_id` and `hmac_secret` are set (both shown
-    to the agent host ONCE).
+    On `CONSUME_OK`, `agent_id`, `hmac_secret`, `hmac_secret_hex`, and
+    `hmac_key_id` are set. The secret is shown to the agent host ONCE.
+    Three forms are returned for one-release migration:
+      - `hmac_secret`     : v0.6 base64url text (43 chars, no padding)
+      - `hmac_secret_hex` : v0.7 §1.4 canonical hex (64 lowercase chars)
+      - `hmac_key_id`     : v0.7 §1.4 operator-assigned key id
+                            (the server-side `agents.hmac_key_id` value;
+                            the wrapper uses this as the lookup key in
+                            its X-Hermes-Key-Id header)
+    Both `hmac_secret` and `hmac_secret_hex` are derived from the SAME
+    32 random bytes (server-side invariant: signing key parity between
+    v0.6 and v0.7 paths).
     """
 
     outcome: str  # one of CONSUME_*
     agent_id: str = ""
     agent_name: str = ""
-    hmac_secret: str = ""  # set on ok
+    hmac_secret: str = ""  # v0.6 base64url text; set on ok
+    hmac_secret_hex: str = ""  # v0.7 §1.4 hex; set on ok
+    hmac_key_id: str = ""  # v0.7 §1.4 operator-assigned key id; set on ok
     requested_name_used: bool = False  # True if requested_agent_name won
                                      # (i.e. agent_name was empty/missing)
 
