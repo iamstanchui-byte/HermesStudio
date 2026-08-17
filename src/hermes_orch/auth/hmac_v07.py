@@ -117,6 +117,79 @@ def compute_signature_v07(secret: bytes, method: str, path: str,
     ).decode("ascii")
 
 
+# === Client-side signer (NEW: 2026-08-16) ===
+
+def sign_v07_request(
+    method: str,
+    path: str,
+    body: bytes,
+    key_id: str,
+    secret: bytes,
+    timestamp: int | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    """Sign a v0.7 request and return the 7 X-Hermes-* headers.
+
+    This is the canonical Python signer. The PowerShell bootstrapper's
+    `Wait-ForEnrollment` (installer/bootstrapper/install-orch-client.ps1
+    line ~285) is the PowerShell counterpart and MUST stay byte-for-byte
+    in sync — both produce the same canonical input + signature. The
+    cross-language compat test on 2026-08-13 byte-equal-verified these.
+
+    Args:
+        method: HTTP method (uppercase, e.g. "GET", "POST").
+        path:   Canonical path, no query string. v0.7 §1.4 forbids
+                query strings on signed endpoints.
+        body:   Raw request body bytes (b"" for GET with no body).
+        key_id: The agent's HMAC key id; the server looks up the
+                agent by this id (per the key-id-to-agent rule).
+        secret: The agent's HMAC secret bytes.
+        timestamp: Optional override; default is `int(time.time())`.
+        nonce:  Optional override; default is `uuid.uuid4().hex`.
+
+    Returns:
+        A dict of 7 headers:
+            X-Hermes-Method
+            X-Hermes-Path
+            X-Hermes-Body-SHA256
+            X-Hermes-Key-Id
+            X-Hermes-Timestamp
+            X-Hermes-Nonce
+            X-Hermes-Signature
+
+    Thread-safety: not thread-safe at the timestamp/nonce level. If you
+    call this from multiple threads concurrently, pass explicit
+    `timestamp` and `nonce` to avoid reuse (server rejects replays).
+    """
+    import time as _time
+    import uuid as _uuid
+
+    if timestamp is None:
+        timestamp = int(_time.time())
+    if nonce is None:
+        nonce = _uuid.uuid4().hex
+
+    body_sha256_hex = hashlib.sha256(body or b"").hexdigest()
+    sig = compute_signature_v07(
+        secret=secret,
+        method=method,
+        path=path,
+        body_sha256_hex=body_sha256_hex,
+        timestamp=str(timestamp),
+        nonce=nonce,
+    )
+
+    return {
+        "X-Hermes-Method": method.upper(),
+        "X-Hermes-Path": path,
+        "X-Hermes-Body-SHA256": body_sha256_hex,
+        "X-Hermes-Key-Id": key_id,
+        "X-Hermes-Timestamp": str(timestamp),
+        "X-Hermes-Nonce": nonce,
+        "X-Hermes-Signature": sig,
+    }
+
+
 def verify_signature_v07(
     secret: bytes,
     method: str,
@@ -321,14 +394,21 @@ async def require_hmac_auth_v07(
         )
 
     # 6. Verify signature (constant-time compare)
-    # v0.7 stores the HMAC secret as a 64-char lowercase hex string
-    # in the `hmac_secret_hex` column. Decode hex -> raw 32 bytes
+    # v0.7 stores the HMAC secret as a hex string in the DB
+    # (per the test fixture convention; same as the v0.6
+    # register_test_agent pattern). Decode hex -> raw bytes
     # before computing the HMAC. Using `secret_str.encode("utf-8")`
     # here would produce the ASCII bytes of the hex string (e.g.
     # b'0123abcd...'), NOT the original 32 random bytes that the
     # client signed with — that mismatch caused 401 INVALID
     # SIGNATURE on the T1 happy-path test before this fix
-    # (debugged via perplexity-web 2026-08-15).
+    # (debugged via perplexity-web 2026-08-15). Verified 2026-08-15.
+    #
+    # v0.7 strict: hmac_secret_hex must be valid hex (64 chars, 32 bytes).
+    # No utf-8 fallback -- the column was added in the v0.7 migration and
+    # backfilled for all existing agents. Any agent that doesn't have hex
+    # in the column is missing the v0.7 backfill and should be re-enrolled
+    # or have its secret manually migrated before v0.7 enforcement.
     try:
         secret = bytes.fromhex(secret_str)
     except (TypeError, ValueError):
