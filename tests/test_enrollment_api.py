@@ -269,7 +269,13 @@ async def test_consume_happy_path_creates_agent(client):
     )
     assert agent is not None
     assert agent["name"] == "win-01"
-    assert agent["ip"] == "test-host"
+    # v0.7 IP fix (2026-08-17): `ip` is the actual TCP connection
+    # source (request.client.host), `hostname` is the agent-declared
+    # hostname. Previously the column-position was wrong and the
+    # hostname string ended up in the `ip` column. The TestClient
+    # connects from 127.0.0.1.
+    assert agent["ip"] == "127.0.0.1"
+    assert agent["hostname"] == "test-host"
     assert agent["status"] == "verifying"
     assert agent["hmac_secret"] == data["hmac_secret"]
     assert agent["secret_hash"] != data["hmac_secret"]  # hash != plaintext

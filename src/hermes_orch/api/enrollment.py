@@ -292,11 +292,20 @@ async def post_agent_enroll(body: EnrollIn, request: Request) -> EnrollOut:
     transaction.
     """
     db = request.app.state.db
+    # v0.7 enroll IP fix (2026-08-17): the IP we store in `agents.ip` is
+    # the actual TCP connection's source IP (request.client.host), NOT
+    # the agent-declared hostname. Previously the column-position was
+    # wrong and `hostname` was being inserted into the `ip` column, so
+    # HermesCtl ended up with `ip='HermesCtl'` instead of `ip='192.168.2.153'`.
+    # The hostname string still goes into its own `agents.hostname` column
+    # (added in v0.7 schema migration).
+    client_ip = (request.client.host if request.client else "") or ""
     result = await _consume_token_atomic(
         db,
         plaintext=body.token,
         agent_name=body.agent_name,
         hostname=body.hostname,
+        client_ip=client_ip,
         os_type=body.os_type,
     )
     if result.outcome == CONSUME_NOT_FOUND:
@@ -346,6 +355,7 @@ async def _consume_token_atomic(
     plaintext: str,
     agent_name: str,
     hostname: str,
+    client_ip: str,
     os_type: str,
 ) -> ConsumeResult:
     """Atomic 7-step consume per spec §3.3.
@@ -439,10 +449,11 @@ async def _consume_token_atomic(
             await db.execute(
                 "INSERT INTO agents "
                 "(id, secret_hash, ip, os_type, status, created_at, name, "
-                " hmac_secret, hmac_secret_hex, hmac_key_id) "
-                "VALUES (?, ?, ?, ?, 'verifying', ?, ?, ?, ?, ?)",
-                (agent_id, secret_hash, hostname or "", os_type or "",
-                 now, effective_name, hmac_secret, hmac_secret_hex, hmac_key_id),
+                " hostname, hmac_secret, hmac_secret_hex, hmac_key_id) "
+                "VALUES (?, ?, ?, ?, 'verifying', ?, ?, ?, ?, ?, ?)",
+                (agent_id, secret_hash, client_ip or "", os_type or "",
+                 now, effective_name, hostname or "",
+                 hmac_secret, hmac_secret_hex, hmac_key_id),
             )
 
             # Step 5 (spec §3.3 step 6): write used_by_agent_id back
