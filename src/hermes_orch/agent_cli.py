@@ -3768,11 +3768,12 @@ def start(
         # but we'll only ever push new/upsert here Ã¢â‚¬â€ deletes are dashboard-driven)
         try:
             r = client.get(
-                f"{orchestrator_url}/api/agents/{agent_id}/profiles/{pname}/skills?include_deleted=1",
+                f"{orchestrator_url}/api/agents/{agent_id}/profiles/{pname}/skills",
                 headers=_auth_headers(
                     "GET",
-                    f"/api/agents/{agent_id}/profiles/{pname}/skills?include_deleted=1",
+                    f"/api/agents/{agent_id}/profiles/{pname}/skills",
                 ),
+                extra_headers={"X-Include-Deleted": "1"},
                 timeout=10,
             )
             r.raise_for_status()
