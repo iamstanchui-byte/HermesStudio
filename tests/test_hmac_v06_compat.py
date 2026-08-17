@@ -176,7 +176,7 @@ def test_v07_heartbeat_accepts_v07_format(client):
                        (agent_id,))
         conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
         conn.execute(
-            "INSERT INTO agents (id, secret_hash, hmac_secret, "
+            "INSERT INTO agents (id, secret_hash, hmac_secret_hex, "
             "hmac_key_id, status, created_at) "
             "VALUES (?, ?, ?, ?, 'verified', ?)",
             (agent_id, secret_hash, secret_str, key_id, now),

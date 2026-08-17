@@ -439,10 +439,10 @@ async def _consume_token_atomic(
             await db.execute(
                 "INSERT INTO agents "
                 "(id, secret_hash, ip, os_type, status, created_at, name, "
-                " hmac_secret, hmac_key_id) "
-                "VALUES (?, ?, ?, ?, 'verifying', ?, ?, ?, ?)",
+                " hmac_secret, hmac_secret_hex, hmac_key_id) "
+                "VALUES (?, ?, ?, ?, 'verifying', ?, ?, ?, ?, ?)",
                 (agent_id, secret_hash, hostname or "", os_type or "",
-                 now, effective_name, hmac_secret, hmac_key_id),
+                 now, effective_name, hmac_secret, hmac_secret_hex, hmac_key_id),
             )
 
             # Step 5 (spec §3.3 step 6): write used_by_agent_id back
