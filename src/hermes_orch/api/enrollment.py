@@ -33,8 +33,10 @@ read path).
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import secrets
+import string
 from datetime import datetime, timezone
 from typing import Any
 
@@ -122,12 +124,29 @@ class EnrollIn(BaseModel):
 class EnrollOut(BaseModel):
     """Response from POST /api/agents/enroll.
 
-    `hmac_secret` is the agent's long-lived shared secret — shown to
-    the agent host ONCE. The agent must store it in agent.yaml (mode
-    0600) and use it for all subsequent HMAC-authenticated requests.
+    `hmac_secret` is the agent's long-lived shared secret in v0.6
+    base64url form (43 chars, no padding) — shown to the agent host
+    ONCE for backward compat with v0.6 wrappers.
+
+    v0.7 §1.4 fields (added 2026-08-17, see commit for fix):
+    - `hmac_secret_hex`: the same 32 random bytes encoded as 64-char
+      lowercase hex. This is the v0.7 canonical format; new wrappers
+      should use this and ignore `hmac_secret`.
+    - `hmac_key_id`: the operator-assigned key id stored in
+      `agents.hmac_key_id` (a separate column added in the v0.7
+      hardening migration). The wrapper uses this as the lookup key
+      in its `X-Hermes-Key-Id` header; the server-side v0.7 verifier
+      looks up the agent by this value (NOT by `agent_id`).
+
+    All three secret/key values are derived from the same 32 random
+    bytes server-side (see `_consume_token_atomic`). Legacy v0.6
+    wrappers keep working (they read `hmac_secret` and fall back to
+    v0.6 base auth); new v0.7 wrappers prefer the hex + key_id pair.
     """
     agent_id: str
     hmac_secret: str
+    hmac_secret_hex: str = ""  # v0.7 §1.4 canonical hex (64 lowercase)
+    hmac_key_id: str = ""  # v0.7 §1.4 operator-assigned key id
     requested_name_used: bool = False  # informational: True iff the
                                        # operator's requested_agent_name
                                        # ended up as the agent's name
@@ -315,6 +334,8 @@ async def post_agent_enroll(body: EnrollIn, request: Request) -> EnrollOut:
     return EnrollOut(
         agent_id=result.agent_id,
         hmac_secret=result.hmac_secret,
+        hmac_secret_hex=result.hmac_secret_hex,
+        hmac_key_id=result.hmac_key_id,
         requested_name_used=result.requested_name_used,
     )
 
@@ -396,15 +417,32 @@ async def _consume_token_atomic(
 
             # Step 4: create the agent row
             agent_id = _new_agent_id()
-            # hmac_secret: 32 random bytes (256 bits), base64-encoded
-            hmac_secret = secrets.token_urlsafe(32)
+            # v0.7 §1.4 (2026-08-17): generate ONE 32-byte secret and
+            # derive BOTH forms from it. v0.6 wrappers use the base64url
+            # text; v0.7 wrappers use the hex. They MUST be the same
+            # bytes (server-side invariant: signing key parity).
+            secret_bytes = secrets.token_bytes(32)
+            # v0.6 legacy form: base64url without padding (43 chars).
+            hmac_secret = base64.urlsafe_b64encode(secret_bytes).rstrip(b"=").decode("ascii")
+            # v0.7 §1.4 canonical form: 64 lowercase hex chars.
+            hmac_secret_hex = secret_bytes.hex()
+            # v0.7 §1.4 operator-assigned key id. Format: 'kw_' prefix
+            # + 12 random lowercase alphanumeric chars (matches
+            # `agent_id` style: 36^12 = 4.7e18 keyspace, collision-
+            # negligible for the operator scale; the UNIQUE partial
+            # index on agents.hmac_key_id catches the rare collision).
+            kw_alphabet = string.ascii_lowercase + string.digits
+            hmac_key_id = "kw_" + "".join(
+                secrets.choice(kw_alphabet) for _ in range(12)
+            )
             secret_hash = _hash_agent_secret(hmac_secret)
             await db.execute(
                 "INSERT INTO agents "
-                "(id, secret_hash, ip, os_type, status, created_at, name, hmac_secret) "
-                "VALUES (?, ?, ?, ?, 'verifying', ?, ?, ?)",
+                "(id, secret_hash, ip, os_type, status, created_at, name, "
+                " hmac_secret, hmac_key_id) "
+                "VALUES (?, ?, ?, ?, 'verifying', ?, ?, ?, ?)",
                 (agent_id, secret_hash, hostname or "", os_type or "",
-                 now, effective_name, hmac_secret),
+                 now, effective_name, hmac_secret, hmac_key_id),
             )
 
             # Step 5 (spec §3.3 step 6): write used_by_agent_id back
@@ -424,6 +462,8 @@ async def _consume_token_atomic(
             agent_id=agent_id,
             agent_name=effective_name,
             hmac_secret=hmac_secret,
+            hmac_secret_hex=hmac_secret_hex,
+            hmac_key_id=hmac_key_id,
             requested_name_used=requested_name_used,
         )
     except Exception as e:
