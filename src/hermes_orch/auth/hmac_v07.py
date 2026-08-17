@@ -301,7 +301,7 @@ async def require_hmac_auth_v07(
     # 5. Look up agent by hmac_key_id (key-id-to-agent rule, §1.4)
     db = request.app.state.db
     row = await db.fetchone(
-        "SELECT id, hmac_secret, hmac_key_id FROM agents "
+        "SELECT id, hmac_secret_hex, hmac_key_id FROM agents "
         "WHERE hmac_key_id = ?",
         (x_hermes_key_id,),
     )
@@ -310,32 +310,31 @@ async def require_hmac_auth_v07(
             401, f"UNKNOWN_KEY_ID: Unknown hmac_key_id: {x_hermes_key_id}"
         )
     agent_id = row["id"]
-    secret_str = row.get("hmac_secret")
+    secret_str = row.get("hmac_secret_hex")
     if not secret_str:
-        # v0.7 requires hmac_secret to be populated (the v1.6
+        # v0.7 requires hmac_secret_hex to be populated (the v1.6
         # legacy-mode fallback is NOT used for v0.7).
         raise HTTPException(
             401,
-            f"MISSING_AUTH_HEADERS: Agent {agent_id} has no hmac_secret; "
+            f"MISSING_AUTH_HEADERS: Agent {agent_id} has no hmac_secret_hex; "
             f"v0.7 requires HMAC bootstrap",
         )
 
     # 6. Verify signature (constant-time compare)
-    # v0.7 stores the HMAC secret as a hex string in the DB
-    # (per the test fixture convention; same as the v0.6
-    # register_test_agent pattern). Decode hex -> raw bytes
+    # v0.7 stores the HMAC secret as a 64-char lowercase hex string
+    # in the `hmac_secret_hex` column. Decode hex -> raw 32 bytes
     # before computing the HMAC. Using `secret_str.encode("utf-8")`
     # here would produce the ASCII bytes of the hex string (e.g.
     # b'0123abcd...'), NOT the original 32 random bytes that the
     # client signed with — that mismatch caused 401 INVALID
     # SIGNATURE on the T1 happy-path test before this fix
-    # (debugged via perplexity-web 2026-08-15). Verified 2026-08-15.
+    # (debugged via perplexity-web 2026-08-15).
     try:
         secret = bytes.fromhex(secret_str)
     except (TypeError, ValueError):
         raise HTTPException(
             401,
-            f"MISSING_AUTH_HEADERS: Stored hmac_secret is not valid hex: agent={agent_id}",
+            f"MISSING_AUTH_HEADERS: Stored hmac_secret_hex is not valid hex: agent={agent_id}",
         )
     ok = verify_signature_v07(
         secret=secret,
