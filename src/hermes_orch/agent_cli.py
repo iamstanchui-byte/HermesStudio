@@ -2461,17 +2461,48 @@ def start(
             # intentionally NOT updated mid-flight -- the user
             # explicitly asked for a restart-applies-the-change
             # semantic, not a live mid-session switch).
-            r, _actual_heartbeat_url = request_with_fallback(
-                "POST",
-                f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
-                headers=_auth_headers(
+            #
+            # v0.7 §1.4 (2026-08-17, fix #8 in the 8-bug report):
+            # the heartbeat call site now uses the v0.7 7-header
+            # signing when a v0.7 credential is configured on
+            # agent_http (set via set_hmac_credential() during
+            # start()). The v0.6 path (3-headers via _auth_headers
+            # + request_with_fallback) is kept as a fallback for
+            # legacy wrappers that never had v0.7 fields in
+            # wrapper-config.json. Previously the heartbeat ALWAYS
+            # used v0.6 even when v0.7 was configured, which
+            # triggered the v0.6 POST `/heartbeat` disconnect
+            # bug on the server side (server-side crash in the
+            # legacy handler after auth passed). After this fix
+            # the v0.7-wrapped heartbeat uses agent_http.post()
+            # which auto-injects the 7 X-Hermes-* headers.
+            from hermes_orch.agent_http import has_hmac_credential
+            if has_hmac_credential():
+                # v0.7 path: agent_http.post auto-injects the 7
+                # X-Hermes-* headers. No _auth_headers needed.
+                from hermes_orch.agent_http import post as _agent_http_post
+                r = _agent_http_post(
+                    f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
+                    content=_heartbeat_body,
+                    timeout=10,
+                )
+                _actual_heartbeat_url = (
+                    f"{orchestrator_url}/api/agents/{agent_id}/heartbeat"
+                )
+            else:
+                # v0.6 legacy path: explicit 3-headers + scheme
+                # fallback retry via request_with_fallback.
+                r, _actual_heartbeat_url = request_with_fallback(
                     "POST",
-                    f"/api/agents/{agent_id}/heartbeat",
-                    _heartbeat_body,
-                ),
-                content=_heartbeat_body,
-                timeout=10,
-            )
+                    f"{orchestrator_url}/api/agents/{agent_id}/heartbeat",
+                    headers=_auth_headers(
+                        "POST",
+                        f"/api/agents/{agent_id}/heartbeat",
+                        _heartbeat_body,
+                    ),
+                    content=_heartbeat_body,
+                    timeout=10,
+                )
             if r.status_code != 200:
                 click.echo(f"[daemon] heartbeat {r.status_code}: {r.text[:200]}")
                 return [], []
